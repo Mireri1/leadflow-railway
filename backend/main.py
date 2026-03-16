@@ -1,0 +1,406 @@
+"""
+LeadFlow Railway Backend — Google Places scraper
+"""
+
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt, os, re, time, requests as req_lib
+from datetime import datetime, timedelta
+from typing import Optional
+from pydantic import BaseModel
+
+SECRET_KEY    = os.getenv("SECRET_KEY",    "leadflow-secret")
+TEAM_PASSWORD = os.getenv("TEAM_PASSWORD", "LeadFlow2024")
+ALGORITHM     = "HS256"
+
+SUPABASE_URL  = os.getenv("SUPABASE_URL",  "https://ucpwpjokyconwzwqvdad.supabase.co")
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVjcHdwam9reWNvbnd6d3F2ZGFkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5NjMxMjksImV4cCI6MjA4NzUzOTEyOX0.j1Ibnm3rhOnvdnfS3WPf2RLDH91wopuJbTByQmwVZ7w")
+GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "AIzaSyAqWVfEpEgbtyraNvE-MR_FEG_qPqyMHWU")
+
+SB_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=ignore-duplicates,return=representation"
+}
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+security = HTTPBearer(auto_error=False)
+
+def create_token(username):
+    return jwt.encode(
+        {"sub": username, "exp": datetime.utcnow() + timedelta(hours=24)},
+        SECRET_KEY, algorithm=ALGORITHM
+    )
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload["sub"]
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    if req.password != TEAM_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    return {"token": create_token(req.username), "username": req.username}
+
+@app.get("/api/auth/me")
+def me(user: str = Depends(verify_token)):
+    return {"username": user}
+
+INDUSTRY_MAP = {
+    "Healthcare":         "health clinic",
+    "Home Health Care":   "home health care agency",
+    "Hospitals":          "hospital",
+    "Nursing Facilities": "nursing home",
+    "Medical Equipment":  "medical equipment supplier",
+    "Software":           "software company",
+    "IT Services":        "IT services company",
+    "Consulting":         "business consulting firm",
+    "Accounting / CPA":   "accounting firm CPA",
+    "Legal Services":     "law firm",
+    "Marketing":          "marketing agency",
+    "Staffing / HR":      "staffing agency",
+    "Engineering":        "engineering firm",
+    "Insurance":          "insurance agency",
+    "Real Estate":        "real estate agency",
+    "Logistics":          "logistics company",
+    "Construction":       "construction company",
+    "Manufacturing":      "manufacturing company",
+    "Finance":            "financial services",
+    "Education":          "private school",
+}
+
+def clean(v): return str(v).strip() if v else ""
+
+def score_lead(lead):
+    s = 5
+    if lead.get("company","").strip():  s += 8
+    if lead.get("phone","").strip():    s += 15
+    if lead.get("email","").strip():    s += 6
+    if lead.get("website","").strip():  s += 5
+    if lead.get("address","").strip():  s += 3
+    return min(100, max(0, s))
+
+def scrape_google_places(keyword="health clinic", state="", limit=25):
+    leads = []
+    query = f"{keyword} {state}".strip() if state else keyword
+    print(f"[PLACES] query: '{query}' limit: {limit}")
+
+    params = {
+        "query": query,
+        "key": GOOGLE_KEY,
+        "type": "establishment",
+    }
+
+    fetched = 0
+    next_page_token = None
+
+    while fetched < limit:
+        if next_page_token:
+            params = {"pagetoken": next_page_token, "key": GOOGLE_KEY}
+            time.sleep(2)  # Google requires delay before using next page token
+
+        try:
+            r = req_lib.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params=params, timeout=30
+            )
+            print(f"[PLACES] HTTP {r.status_code}")
+            data = r.json()
+            status = data.get("status")
+            print(f"[PLACES] status: {status}, results: {len(data.get('results',[]))}")
+
+            if status == "REQUEST_DENIED":
+                print(f"[PLACES] denied: {data.get('error_message')}")
+                break
+            if status not in ("OK", "ZERO_RESULTS"):
+                break
+
+            results = data.get("results", [])
+            for place in results:
+                if fetched >= limit:
+                    break
+                addr = place.get("formatted_address", "")
+                parts = addr.split(",")
+                city  = parts[-3].strip() if len(parts) >= 3 else ""
+                st    = parts[-2].strip().split(" ")[0] if len(parts) >= 2 else state
+
+                lead = {
+                    "company":     clean(place.get("name", "")),
+                    "industry":    keyword,
+                    "phone":       clean(place.get("formatted_phone_number", "")),
+                    "address":     parts[0].strip() if parts else "",
+                    "city":        city,
+                    "state":       st,
+                    "website":     clean(place.get("website", "")),
+                    "notes":       f"Google rating: {place.get('rating','N/A')} | {place.get('user_ratings_total',0)} reviews",
+                    "source":      "Google Places",
+                    "firstName":   "",
+                    "lastName":    "",
+                    "title":       "",
+                    "email":       "",
+                    "assignedTo":  "",
+                    "callbackDate":"",
+                    "status":      "new",
+                    "createdAt":   datetime.utcnow().isoformat(),
+                    "updatedAt":   datetime.utcnow().isoformat(),
+                    "createdBy":   "system",
+                }
+                lead["score"] = score_lead(lead)
+
+                # Get phone via place details if missing
+                if not lead["phone"]:
+                    place_id = place.get("place_id")
+                    if place_id:
+                        try:
+                            det = req_lib.get(
+                                "https://maps.googleapis.com/maps/api/place/details/json",
+                                params={"place_id": place_id, "fields": "formatted_phone_number,website", "key": GOOGLE_KEY},
+                                timeout=10
+                            ).json()
+                            result = det.get("result", {})
+                            lead["phone"]   = clean(result.get("formatted_phone_number", ""))
+                            lead["website"] = clean(result.get("website", "")) or lead["website"]
+                            lead["score"]   = score_lead(lead)
+                        except:
+                            pass
+
+                if lead["company"]:
+                    leads.append(lead)
+                    fetched += 1
+
+            next_page_token = data.get("next_page_token")
+            if not next_page_token or fetched >= limit:
+                break
+
+        except Exception as e:
+            print(f"[PLACES] Exception: {e}")
+            break
+
+    print(f"[PLACES] Returning {len(leads)} leads")
+    return leads[:limit]
+
+def save_to_supabase(leads):
+    if not leads:
+        return 0
+    try:
+        r = req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers=SB_HEADERS, json=leads, timeout=30
+        )
+        print(f"[SUPABASE] POST {r.status_code}")
+        if r.status_code not in (200, 201):
+            print(f"[SUPABASE] Error: {r.text[:300]}")
+            return 0
+        saved = r.json()
+        return len(saved) if isinstance(saved, list) else 1
+    except Exception as e:
+        print(f"[SUPABASE] Exception: {e}")
+        return 0
+
+class ScrapeRequest(BaseModel):
+    industry:  str
+    state:     Optional[str] = ""
+    limit:     Optional[int] = 25
+    source:    Optional[str] = "places"
+
+@app.post("/api/scrape")
+def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
+    keyword = INDUSTRY_MAP.get(body.industry, body.industry.lower())
+    limit   = min(max(body.limit or 25, 5), 60)
+    print(f"[SCRAPE] {body.industry} → '{keyword}', state: {body.state}, limit: {limit}")
+    leads = scrape_google_places(keyword=keyword, state=body.state or "", limit=limit)
+    saved = save_to_supabase(leads)
+    print(f"[SCRAPE] Saved {saved} leads")
+    return {"leads": leads, "count": len(leads), "saved": saved}
+
+@app.get("/api/industries")
+def get_industries():
+    return {"industries": list(INDUSTRY_MAP.keys())}
+
+@app.get("/api/leads")
+def list_leads(status: str = "", search: str = "", sort: str = "score",
+               callbacks: str = "", user: str = Depends(verify_token)):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/leads?select=*"
+        if status:   url += f"&status=eq.{status}"
+        if callbacks == "true":
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            url += f"&callbackDate=lte.{today}&callbackDate=neq.&status=neq.converted"
+        if search:
+            s = search.replace(" ", "%20")
+            url += f"&or=(company.ilike.%25{s}%25,firstName.ilike.%25{s}%25,lastName.ilike.%25{s}%25,phone.ilike.%25{s}%25)"
+        order_map = {"score":"score.desc","newest":"createdAt.desc","company":"company.asc","callbacks":"callbackDate.asc"}
+        url += f"&order={order_map.get(sort,'score.desc')}"
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/leads")
+def create_lead(lead: dict, user: str = Depends(verify_token)):
+    try:
+        lead["score"] = score_lead(lead)
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=lead, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/leads/import")
+def import_leads(leads: list, user: str = Depends(verify_token)):
+    try:
+        for lead in leads:
+            lead["score"] = score_lead(lead)
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=leads, timeout=30)
+        saved = r.json()
+        return {"count": len(saved) if isinstance(saved, list) else 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/leads/{lead_id}")
+def update_lead(lead_id: str, data: dict, user: str = Depends(verify_token)):
+    try:
+        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+                         headers=SB_HEADERS, json=data, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/leads/{lead_id}")
+def delete_lead(lead_id: str, user: str = Depends(verify_token)):
+    try:
+        req_lib.delete(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+                      headers={**SB_HEADERS, "Prefer":""}, timeout=30)
+        return {"deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/calls")
+def log_call(call: dict, user: str = Depends(verify_token)):
+    try:
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_outcomes",
+                        headers=SB_HEADERS, json=call, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/calls/today")
+def get_calls_today(user: str = Depends(verify_token)):
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{today}T00:00:00",
+                       headers=SB_HEADERS, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/calls/{lead_id}")
+def get_calls(lead_id: str, user: str = Depends(verify_token)):
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=eq.{lead_id}&order=calledAt.desc",
+                       headers=SB_HEADERS, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/stats")
+def get_stats(user: str = Depends(verify_token)):
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        r1 = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?select=status,score,callbackDate,createdAt",
+                        headers=SB_HEADERS, timeout=30)
+        r2 = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{today}T00:00:00",
+                        headers=SB_HEADERS, timeout=30)
+        sl = r1.json() if r1.status_code == 200 else []
+        sc = r2.json() if r2.status_code == 200 else []
+        total     = len(sl)
+        converted = len([l for l in sl if l.get("status")=="converted"])
+        return {
+            "total": total,
+            "newToday": len([l for l in sl if (l.get("createdAt","")).startswith(today)]),
+            "interested": len([l for l in sl if l.get("status")=="interested"]),
+            "converted": converted,
+            "callbacksDue": len([l for l in sl if l.get("callbackDate","")<=today and l.get("callbackDate") and l.get("status")!="converted"]),
+            "callsToday": len(sc),
+            "conversionRate": f"{(converted/total*100):.1f}" if total else "0.0"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── Scripts endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/api/scripts")
+def get_scripts(industry: str = "", user: str = Depends(verify_token)):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/scripts?is_active=eq.true&order=usage_count.desc"
+        if industry:
+            url += f"&industry=eq.{industry}"
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/scripts")
+def create_script(script: dict, user: str = Depends(verify_token)):
+    try:
+        script["is_active"] = True
+        script["usage_count"] = 0
+        script["created_at"] = datetime.utcnow().isoformat()
+        script["updated_at"] = datetime.utcnow().isoformat()
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/scripts", headers=SB_HEADERS, json=script, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/scripts/{script_id}")
+def update_script(script_id: str, data: dict, user: str = Depends(verify_token)):
+    try:
+        data["updated_at"] = datetime.utcnow().isoformat()
+        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{script_id}",
+                         headers=SB_HEADERS, json=data, timeout=30)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/scripts/{script_id}")
+def delete_script(script_id: str, user: str = Depends(verify_token)):
+    try:
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{script_id}",
+                     headers=SB_HEADERS, json={"is_active": False}, timeout=30)
+        return {"deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/scripts/{script_id}/use")
+def increment_script_usage(script_id: str, user: str = Depends(verify_token)):
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{script_id}&select=usage_count",
+                       headers=SB_HEADERS, timeout=30)
+        scripts = r.json()
+        count = scripts[0].get("usage_count", 0) + 1 if scripts else 1
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{script_id}",
+                     headers=SB_HEADERS, json={"usage_count": count, "last_used": datetime.utcnow().isoformat()}, timeout=30)
+        return {"usage_count": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.exists(frontend_dist):
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    def serve_frontend(full_path: str):
+        return FileResponse(os.path.join(frontend_dist, "index.html"))
