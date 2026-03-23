@@ -293,6 +293,20 @@ def log_call(call: dict, user: str = Depends(verify_token)):
     try:
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_outcomes",
                         headers=SB_HEADERS, json=call, timeout=30)
+        # Auto-claim the lead for the caller if it isn't already assigned
+        lead_id  = call.get("leadId")
+        caller   = call.get("calledBy") or user
+        if lead_id:
+            lr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=assignedTo",
+                headers=SB_HEADERS, timeout=30)
+            rows = lr.json() if lr.status_code == 200 else []
+            if rows and not rows[0].get("assignedTo"):
+                req_lib.patch(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+                    headers=SB_HEADERS,
+                    json={"assignedTo": caller},
+                    timeout=30)
         return r.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

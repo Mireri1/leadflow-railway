@@ -369,6 +369,8 @@ function CallModal({lead,onClose,onSaved}){
         followUpSequence: followUpSeq||null,
         nextFollowUp: nextFollowUp||null,
         followUpStep: fuDays ? 0 : null,
+        // Claim the lead for this rep if not already assigned
+        ...(!lead.assignedTo ? {assignedTo: getUser()} : {}),
         updatedAt:new Date().toISOString()
       })})
       onSaved(); onClose()
@@ -889,6 +891,7 @@ export default function App(){
   const [cbOnly,setCbOnly]         = useState(false)
   const [fIndustry,setFIndustry]   = useState("")
   const [fState,setFState]         = useState("")
+  const [availableOnly,setAvailOnly] = useState(false)
   const [activeNav,setNav]         = useState("dashboard")
   const [callHistory,setCallHistory] = useState([])
   const [histLoading,setHistLoading] = useState(false)
@@ -962,10 +965,11 @@ export default function App(){
   const displayLeads=leads.filter(l=>{
     if(fIndustry&&l.industry!==fIndustry) return false
     if(fState&&l.state!==fState) return false
+    if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
     return true
   })
 
-  function reset(){setSearch("");setFIndustry("");setFState("");setFStatus("all");setCbOnly(false)}
+  function reset(){setSearch("");setFIndustry("");setFState("");setFStatus("all");setCbOnly(false);setAvailOnly(false)}
 
   return(
     <div style={{minHeight:"100vh",background:"#060e20"}}>
@@ -1210,6 +1214,14 @@ export default function App(){
                     <option value="callbacks">Callbacks Due</option>
                   </select>
                   <button className="btn btn-g" style={{fontSize:12,padding:"8px 16px"}} onClick={reset}>Reset</button>
+                  <button
+                    onClick={()=>setAvailOnly(p=>!p)}
+                    style={{fontSize:12,padding:"8px 14px",borderRadius:8,border:"none",cursor:"pointer",
+                      fontFamily:"'Inter',sans-serif",fontWeight:600,transition:"all .15s",
+                      background:availableOnly?"#69f6b8":"#192540",
+                      color:availableOnly?"#003d26":"#a3aac4"}}>
+                    {availableOnly?"✓ Available only":"Available only"}
+                  </button>
                 </div>
               </section>
 
@@ -1240,12 +1252,15 @@ export default function App(){
                     const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
                     const score=lead.score||scoreLead(lead)||0
                     const ac=avatarColor(lead.company||lead.firstName||"?")
+                    const isMine=!lead.assignedTo||lead.assignedTo===user
+                    const takenBy=!isMine?lead.assignedTo:null
                     return(
                       <div key={lead.id} className={isCb?"lrow-cb":""}
                         style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
                           padding:"16px 24px",alignItems:"center",gap:16,
-                          borderBottom:"1px solid #40485d12",transition:"background .12s",cursor:"default"}}
-                        onMouseEnter={e=>e.currentTarget.style.background=isCb?"#8b5cf612":"#192540"}
+                          borderBottom:"1px solid #40485d12",transition:"background .12s",cursor:"default",
+                          opacity:takenBy?0.55:1}}
+                        onMouseEnter={e=>e.currentTarget.style.background=isCb?"#8b5cf612":takenBy?"#0f1930":"#192540"}
                         onMouseLeave={e=>e.currentTarget.style.background=isCb?"#8b5cf608":"transparent"}>
                         <div style={{display:"flex",alignItems:"center",gap:14,minWidth:0}}>
                           <div style={{width:40,height:40,borderRadius:"50%",flexShrink:0,
@@ -1258,6 +1273,8 @@ export default function App(){
                               {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
                             <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}</div>
                             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
+                              {takenBy&&<span style={{fontSize:9,background:"#ff6e8420",color:"#ff6e84",padding:"2px 7px",borderRadius:4,border:"1px solid #ff6e8430"}}>🔒 {takenBy}</span>}
+                              {!takenBy&&lead.assignedTo&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>✓ mine</span>}
                               {lead.source&&<span className="src-tag">{lead.source}</span>}
                               {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf630"}}>🔔 {lead.callbackDate}</span>}
                               {lead.contract_value>0&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>${(lead.contract_value||0).toLocaleString()}</span>}
@@ -1326,17 +1343,24 @@ export default function App(){
               <div style={{marginBottom:24}}>
                 <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
                   color:"#dee5ff",letterSpacing:"-.02em"}}>Dialer</h1>
-                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Focused calling mode</p>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Focused calling mode — only showing unclaimed leads</p>
               </div>
-              {leads.length===0?(
-                <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
-                  <div style={{fontSize:40,marginBottom:12}}>📞</div>
-                  <div style={{color:"#a3aac4",fontSize:14,marginBottom:16}}>No leads to dial yet</div>
-                  <button className="btn btn-p" onClick={()=>setNav("leads")}>Go to Leads</button>
-                </div>
-              ):(()=>{
-                const idx=Math.min(dialerIdx,leads.length-1)
-                const lead=leads[idx]
+              {(()=>{
+                const dialerLeads=leads.filter(l=>!l.assignedTo||l.assignedTo===user)
+                if(dialerLeads.length===0) return(
+                  <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
+                    <div style={{fontSize:40,marginBottom:12}}>✅</div>
+                    <div style={{color:"#a3aac4",fontSize:14,marginBottom:8}}>
+                      {leads.length>0?"All leads have been claimed by your team!":"No leads to dial yet"}
+                    </div>
+                    <div style={{color:"#40485d",fontSize:12,marginBottom:20}}>
+                      {leads.length>0?`${leads.length} lead${leads.length!==1?"s":""} total, all assigned`:"Import a CSV or use Find Leads to get started"}
+                    </div>
+                    <button className="btn btn-p" onClick={()=>setNav("leads")}>View All Leads</button>
+                  </div>
+                )
+                const idx=Math.min(dialerIdx,dialerLeads.length-1)
+                const lead=dialerLeads[idx]
                 const score=lead.score||scoreLead(lead)||0
                 const ac=avatarColor(lead.company||lead.firstName||"?")
                 const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
@@ -1344,7 +1368,7 @@ export default function App(){
                   <div style={{maxWidth:520,margin:"0 auto"}}>
                     <div style={{textAlign:"center",color:"#a3aac4",fontSize:13,marginBottom:24,
                       fontFamily:"'Space Grotesk',sans-serif"}}>
-                      Lead {idx+1} of {leads.length}
+                      {dialerLeads.length} unclaimed lead{dialerLeads.length!==1?"s":""} · showing {idx+1} of {dialerLeads.length}
                     </div>
                     <div style={{background:"#0f1930",borderRadius:20,padding:40,textAlign:"center",marginBottom:16}}>
                       <div style={{width:80,height:80,borderRadius:"50%",background:ac+"22",margin:"0 auto 20px",
@@ -1362,7 +1386,18 @@ export default function App(){
                       </div>
                       {lead.phone&&(
                         <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:32,fontWeight:700,
-                          color:"#a3a6ff",letterSpacing:".04em",marginBottom:28}}>{lead.phone}</div>
+                          color:"#a3a6ff",letterSpacing:".04em",marginBottom:20}}>{lead.phone}</div>
+                      )}
+                      {/* Claim before calling */}
+                      {!lead.assignedTo&&(
+                        <button className="btn btn-g"
+                          style={{width:"100%",padding:"11px",fontSize:13,marginBottom:10}}
+                          onClick={async()=>{
+                            await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({assignedTo:user,updatedAt:new Date().toISOString()})})
+                            setLeads(p=>p.map(l=>l.id===lead.id?{...l,assignedTo:user}:l))
+                          }}>
+                          🔒 Claim Lead
+                        </button>
                       )}
                       <button className="btn btn-p"
                         style={{width:"100%",padding:"16px",fontSize:16,fontFamily:"'Space Grotesk',sans-serif",
@@ -1376,8 +1411,8 @@ export default function App(){
                         onClick={()=>setDialerIdx(i=>Math.max(0,i-1))}
                         disabled={idx===0}>← Previous</button>
                       <button className="btn btn-g" style={{flex:1,padding:11}}
-                        onClick={()=>setDialerIdx(i=>Math.min(leads.length-1,i+1))}
-                        disabled={idx>=leads.length-1}>Skip →</button>
+                        onClick={()=>setDialerIdx(i=>Math.min(dialerLeads.length-1,i+1))}
+                        disabled={idx>=dialerLeads.length-1}>Skip →</button>
                     </div>
                     {lead.notes&&(
                       <div style={{marginTop:16,background:"#0f1930",borderRadius:12,padding:16}}>
