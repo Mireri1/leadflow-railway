@@ -340,6 +340,61 @@ def get_stats(user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/leaderboard")
+def get_leaderboard(user: str = Depends(verify_token)):
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        # All-time calls
+        r1 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt",
+            headers=SB_HEADERS, timeout=30)
+        # Leads for assignment tracking
+        r2 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo,status,score",
+            headers=SB_HEADERS, timeout=30)
+        calls = r1.json() if r1.status_code == 200 else []
+        leads = r2.json() if r2.status_code == 200 else []
+
+        # Build per-user call stats
+        users = {}
+        for c in calls:
+            name = c.get("calledBy") or "Unknown"
+            if name not in users:
+                users[name] = {"name": name, "total_calls": 0, "calls_today": 0,
+                               "conversions": 0, "interested": 0, "no_answer": 0,
+                               "voicemail": 0, "callbacks": 0}
+            u = users[name]
+            u["total_calls"] += 1
+            if (c.get("calledAt") or "").startswith(today):
+                u["calls_today"] += 1
+            outcome = c.get("outcome", "")
+            if outcome == "converted":    u["conversions"] += 1
+            elif outcome == "interested": u["interested"]  += 1
+            elif outcome == "no_answer":  u["no_answer"]   += 1
+            elif outcome == "voicemail":  u["voicemail"]   += 1
+            elif outcome == "callback":   u["callbacks"]   += 1
+
+        # Add lead assignment counts
+        for l in leads:
+            name = l.get("assignedTo") or ""
+            if name and name in users:
+                users[name].setdefault("leads_assigned", 0)
+                users[name]["leads_assigned"] = users[name].get("leads_assigned", 0) + 1
+
+        # Compute conversion rate per user
+        result = []
+        for u in users.values():
+            tc = u["total_calls"]
+            u["conv_rate"] = f"{(u['conversions']/tc*100):.1f}" if tc else "0.0"
+            u["leads_assigned"] = u.get("leads_assigned", 0)
+            result.append(u)
+
+        # Sort by calls today desc, then total calls
+        result.sort(key=lambda x: (-x["calls_today"], -x["total_calls"]))
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── Scripts endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/scripts")

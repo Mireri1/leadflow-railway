@@ -893,6 +893,8 @@ export default function App(){
   const [callHistory,setCallHistory] = useState([])
   const [histLoading,setHistLoading] = useState(false)
   const [dialerIdx,setDialerIdx]   = useState(0)
+  const [leaderboard,setLeaderboard] = useState([])
+  const [lbLoading,setLbLoading]   = useState(false)
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -920,6 +922,12 @@ export default function App(){
     const t=setTimeout(loadLeads,search?350:0)
     return()=>clearTimeout(t)
   },[user,loadLeads])
+
+  useEffect(()=>{
+    if(activeNav!=="analytics"||!user) return
+    setLbLoading(true)
+    api("/api/leaderboard").then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+  },[activeNav,user])
 
   useEffect(()=>{
     if(activeNav!=="history"||!user) return
@@ -1391,10 +1399,117 @@ export default function App(){
                 <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
                   color:"#dee5ff",letterSpacing:"-.02em"}}>Analytics</h1>
                 <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
-                  Performance across {leads.length} lead{leads.length!==1?"s":""}
+                  Team performance · {leads.length} lead{leads.length!==1?"s":""} in pipeline
                 </p>
               </div>
               <StatsBar stats={stats} onCallbacks={()=>{setNav("leads");setCbOnly(true)}}/>
+
+              {/* ── Leaderboard ── */}
+              <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:28}}>
+                <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
+                  display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                  <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                    🏆 Rep Leaderboard — Today
+                  </div>
+                  <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                    onClick={()=>{
+                      setLbLoading(true)
+                      api("/api/leaderboard").then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+                    }}>Refresh</button>
+                </div>
+                {lbLoading?(
+                  <div style={{padding:48,textAlign:"center",color:"#40485d"}}>Loading…</div>
+                ):leaderboard.length===0?(
+                  <div style={{padding:48,textAlign:"center",color:"#40485d",fontSize:13}}>
+                    No call data yet — start logging calls to see rep stats
+                  </div>
+                ):(
+                  <>
+                    {/* Header row */}
+                    <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                      padding:"9px 24px",fontSize:"0.55rem",fontWeight:700,color:"#a3aac4",
+                      textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d15"}}>
+                      <div>Rep</div>
+                      <div style={{textAlign:"center"}}>Today</div>
+                      <div style={{textAlign:"center"}}>All-Time</div>
+                      <div style={{textAlign:"center"}}>Converted</div>
+                      <div style={{textAlign:"center"}}>Interested</div>
+                      <div style={{textAlign:"center"}}>Conv %</div>
+                      <div style={{textAlign:"center"}}>No Answer</div>
+                      <div style={{textAlign:"center"}}>Callbacks</div>
+                    </div>
+                    {leaderboard.map((rep,i)=>{
+                      const medal=i===0?"🥇":i===1?"🥈":i===2?"🥉":null
+                      const ac=avatarColor(rep.name)
+                      const convPct=parseFloat(rep.conv_rate)||0
+                      return(
+                        <div key={rep.name}
+                          style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                            padding:"14px 24px",alignItems:"center",
+                            borderBottom:"1px solid #40485d10",
+                            background:i===0?"#ffe08306":i===1?"#ffffff04":"transparent",
+                            transition:"background .12s"}}
+                          onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                          onMouseLeave={e=>e.currentTarget.style.background=i===0?"#ffe08306":i===1?"#ffffff04":"transparent"}>
+                          {/* Rep name */}
+                          <div style={{display:"flex",alignItems:"center",gap:12}}>
+                            <div style={{width:34,height:34,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                              display:"flex",alignItems:"center",justifyContent:"center",
+                              fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                              {rep.name.slice(0,2).toUpperCase()}
+                            </div>
+                            <div>
+                              <div style={{fontWeight:600,color:"#dee5ff",fontSize:14,display:"flex",alignItems:"center",gap:6}}>
+                                {medal&&<span>{medal}</span>}{rep.name}
+                              </div>
+                              {rep.leads_assigned>0&&(
+                                <div style={{fontSize:11,color:"#40485d"}}>{rep.leads_assigned} lead{rep.leads_assigned!==1?"s":""} assigned</div>
+                              )}
+                            </div>
+                          </div>
+                          {/* Calls today */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:18,fontWeight:700,
+                              color:rep.calls_today>0?"#a3a6ff":"#40485d"}}>{rep.calls_today}</span>
+                          </div>
+                          {/* All-time */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:600,color:"#dee5ff"}}>{rep.total_calls}</span>
+                          </div>
+                          {/* Converted */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:700,
+                              color:rep.conversions>0?"#69f6b8":"#40485d"}}>{rep.conversions}</span>
+                          </div>
+                          {/* Interested */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:600,
+                              color:rep.interested>0?"#ffe083":"#40485d"}}>{rep.interested}</span>
+                          </div>
+                          {/* Conv rate */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                              color:convPct>=10?"#69f6b8":convPct>=5?"#ffe083":"#a3aac4"}}>
+                              {rep.conv_rate}%
+                            </span>
+                          </div>
+                          {/* No answer */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#40485d"}}>{rep.no_answer}</span>
+                          </div>
+                          {/* Callbacks */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
+                              color:rep.callbacks>0?"#8b5cf6":"#40485d"}}>{rep.callbacks}</span>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </>
+                )}
+              </div>
+
+              {/* ── Status + Industry ── */}
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:24,marginTop:24}}>
                 <div style={{background:"#0f1930",borderRadius:16,padding:24}}>
                   <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
@@ -1440,6 +1555,8 @@ export default function App(){
                   )}
                 </div>
               </div>
+
+              {/* ── Score tiers ── */}
               <div style={{background:"#0f1930",borderRadius:16,padding:24,marginTop:24}}>
                 <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
                   textTransform:"uppercase",marginBottom:20}}>Lead Score Tiers</div>
