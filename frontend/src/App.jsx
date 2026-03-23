@@ -890,6 +890,9 @@ export default function App(){
   const [fIndustry,setFIndustry]   = useState("")
   const [fState,setFState]         = useState("")
   const [activeNav,setNav]         = useState("dashboard")
+  const [callHistory,setCallHistory] = useState([])
+  const [histLoading,setHistLoading] = useState(false)
+  const [dialerIdx,setDialerIdx]   = useState(0)
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -917,6 +920,12 @@ export default function App(){
     const t=setTimeout(loadLeads,search?350:0)
     return()=>clearTimeout(t)
   },[user,loadLeads])
+
+  useEffect(()=>{
+    if(activeNav!=="history"||!user) return
+    setHistLoading(true)
+    api("/api/calls/today").then(r=>setCallHistory(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setHistLoading(false))
+  },[activeNav,user])
 
   async function quickStatus(lead,status){
     let cbDate=""
@@ -1069,206 +1078,455 @@ export default function App(){
       <main className="lg-main" style={{marginLeft:256,paddingTop:64,minHeight:"100vh"}}>
         <div style={{padding:"32px 28px",maxWidth:1240}}>
 
-          {/* Page header + stats row */}
-          <section style={{display:"flex",flexWrap:"wrap",alignItems:"flex-end",
-            justifyContent:"space-between",gap:20,marginBottom:32}}>
+          {/* ── DASHBOARD ───────────────────────────────────────────────── */}
+          {activeNav==="dashboard"&&(
             <div>
-              <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
-                color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>
-                Daily Performance
-              </h1>
-              <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Cleaning Prospecting Dashboard</p>
-            </div>
-            <StatsBar stats={stats} onCallbacks={()=>setCbOnly(p=>!p)}/>
-          </section>
-
-          {/* Lead Finder */}
-          {industries.length>0&&<LeadFinder onFound={loadLeads} industries={industries}/>}
-
-          {/* Filter Bar */}
-          <section style={{background:"#141f38",borderRadius:16,padding:"16px 20px",
-            display:"flex",flexWrap:"wrap",alignItems:"center",gap:12,marginBottom:20}}>
-
-            <div style={{flex:"1 1 200px",position:"relative",display:"flex",alignItems:"center"}}>
-              <span style={{position:"absolute",left:12,color:"#40485d",display:"flex"}}>
-                <IconFilter/>
-              </span>
-              <input value={search} onChange={e=>setSearch(e.target.value)}
-                placeholder="Filter by company or contact…"
-                style={{width:"100%",background:"#000011",border:"1px solid #40485d30",
-                  borderRadius:8,padding:"8px 12px 8px 32px",color:"#dee5ff",
-                  fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none"}}/>
-            </div>
-
-            <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
-              <select className="sel" value={fIndustry} onChange={e=>setFIndustry(e.target.value)}>
-                <option value="">Industry: All</option>
-                {(industries.length>0?industries:INDUSTRIES).map(i=><option key={i} value={i}>{i}</option>)}
-              </select>
-              <select className="sel" value={fState} onChange={e=>setFState(e.target.value)}>
-                <option value="">State: All States</option>
-                {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
-              </select>
-              <select className="sel" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
-                <option value="all">Status: All</option>
-                {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
-              </select>
-              <select className="sel" value={sortBy} onChange={e=>setSort(e.target.value)}>
-                <option value="score">Highest Score</option>
-                <option value="newest">Newest First</option>
-                <option value="company">Company A–Z</option>
-                <option value="callbacks">Callbacks Due</option>
-              </select>
-              <button className="btn btn-g" style={{fontSize:12,padding:"8px 16px"}} onClick={reset}>
-                Reset
-              </button>
-            </div>
-          </section>
-
-          {/* Lead Table */}
-          <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
-
-            {/* Column header row */}
-            <div style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
-              padding:"10px 24px",fontSize:"0.6rem",fontWeight:700,
-              color:"#a3aac4",textTransform:"uppercase",letterSpacing:".1em",
-              opacity:.65,borderBottom:"1px solid #40485d20"}}>
-              <div>Contact &amp; Company</div>
-              <div>Phone Number</div>
-              <div>Lead Score</div>
-              <div>Status</div>
-              <div style={{textAlign:"right"}}>Actions</div>
-            </div>
-
-            {loading?(
-              <div style={{padding:"64px 24px",textAlign:"center",color:"#40485d",fontSize:13}}>
-                Loading leads…
+              <div style={{marginBottom:32}}>
+                <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                  color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>
+                  Welcome back, {(user||"").split("@")[0]}
+                </h1>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Here's what's happening today</p>
               </div>
-            ):displayLeads.length===0?(
-              <div style={{padding:"72px 24px",textAlign:"center"}}>
-                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:52,fontWeight:700,
-                  color:"#192540",marginBottom:10}}>0</div>
-                <div style={{fontSize:11,color:"#40485d",letterSpacing:".1em",textTransform:"uppercase"}}>
-                  {cbOnly?"No callbacks due":"Use Find Leads above or import a CSV to get started"}
+              <StatsBar stats={stats} onCallbacks={()=>{setNav("leads");setCbOnly(p=>!p)}}/>
+
+              {leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length>0&&(
+                <div style={{marginTop:32}}>
+                  <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",
+                    textTransform:"uppercase",marginBottom:14}}>🔔 Callbacks Due</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").slice(0,5).map(lead=>{
+                      const ac=avatarColor(lead.company||lead.firstName||"?")
+                      return(
+                        <div key={lead.id} style={{background:"#1a1030",borderRadius:10,padding:"14px 18px",
+                          display:"flex",alignItems:"center",gap:14,border:"1px solid #8b5cf620"}}>
+                          <div style={{width:36,height:36,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                            display:"flex",alignItems:"center",justifyContent:"center",
+                            fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                            {getInitials(lead)}</div>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:600,color:"#dee5ff",fontSize:14}}>
+                              {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                            <div style={{fontSize:12,color:"#a3aac4"}}>{lead.company}</div>
+                          </div>
+                          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#ffe083"}}>{lead.callbackDate}</div>
+                          <button className="btn btn-p" style={{fontSize:12,padding:"7px 14px"}}
+                            onClick={()=>setCallModal(lead)}>Call Now</button>
+                        </div>
+                      )
+                    })}
+                  </div>
                 </div>
+              )}
+
+              <div style={{marginTop:32}}>
+                <div style={{fontSize:"0.6rem",color:"#ff6e84",fontWeight:700,letterSpacing:".1em",
+                  textTransform:"uppercase",marginBottom:14}}>🔥 Hot Leads</div>
+                {leads.filter(l=>{const s=l.score||scoreLead(l)||0;return s>=75&&l.status!=="converted"}).length===0?(
+                  <div style={{background:"#0f1930",borderRadius:10,padding:24,textAlign:"center",color:"#40485d",fontSize:13}}>
+                    No hot leads yet — keep prospecting!</div>
+                ):(
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {leads.filter(l=>{const s=l.score||scoreLead(l)||0;return s>=75&&l.status!=="converted"})
+                      .sort((a,b)=>(b.score||scoreLead(b))-(a.score||scoreLead(a))).slice(0,6).map(lead=>{
+                      const score=lead.score||scoreLead(lead)||0
+                      const ac=avatarColor(lead.company||lead.firstName||"?")
+                      const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
+                      return(
+                        <div key={lead.id} style={{background:"#0f1930",borderRadius:10,padding:"14px 18px",
+                          display:"flex",alignItems:"center",gap:14}}>
+                          <div style={{width:36,height:36,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                            display:"flex",alignItems:"center",justifyContent:"center",
+                            fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                            {getInitials(lead)}</div>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:600,color:"#dee5ff",fontSize:14}}>
+                              {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                            <div style={{fontSize:12,color:"#a3aac4"}}>{lead.company}</div>
+                          </div>
+                          <ScoreRing score={score}/>
+                          <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>{info.label}</span>
+                          <button className="btn btn-p" style={{fontSize:12,padding:"7px 14px"}}
+                            onClick={()=>setCallModal(lead)}>Call</button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
-            ):(
-              displayLeads.map(lead=>{
-                const info=si(lead.status)
-                const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
-                const score=lead.score||scoreLead(lead)||0
-                const ac=avatarColor(lead.company||lead.firstName||"?")
-                return(
-                  <div key={lead.id}
-                    className={isCb?"lrow-cb":""}
-                    style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
-                      padding:"16px 24px",alignItems:"center",gap:16,
-                      borderBottom:"1px solid #40485d12",transition:"background .12s",cursor:"default"}}
-                    onMouseEnter={e=>e.currentTarget.style.background=isCb?"#8b5cf612":"#192540"}
-                    onMouseLeave={e=>e.currentTarget.style.background=isCb?"#8b5cf608":"transparent"}>
 
-                    {/* Contact & Company */}
-                    <div style={{display:"flex",alignItems:"center",gap:14,minWidth:0}}>
-                      <div style={{width:40,height:40,borderRadius:"50%",flexShrink:0,
-                        background:ac+"22",display:"flex",alignItems:"center",justifyContent:"center",
-                        fontSize:13,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-.01em"}}>
-                        {getInitials(lead)}
-                      </div>
-                      <div style={{minWidth:0}}>
-                        <div style={{fontWeight:700,color:"#dee5ff",
-                          fontFamily:"'Space Grotesk',sans-serif",fontSize:14,
-                          overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                          {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}
-                        </div>
-                        <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>
-                          {lead.company||"—"}
-                        </div>
-                        <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
-                          {lead.source&&<span className="src-tag">{lead.source}</span>}
-                          {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf630"}}>🔔 {lead.callbackDate}</span>}
-                          {lead.contract_value>0&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>${(lead.contract_value||0).toLocaleString()}</span>}
-                          {lead.followUpSequence&&<span style={{fontSize:9,background:"#ffe08312",color:"#ffe083",padding:"2px 7px",borderRadius:4,border:"1px solid #ffe08325"}}>⏱ fu</span>}
-                        </div>
-                      </div>
-                    </div>
+              {industries.length>0&&(
+                <div style={{marginTop:32}}><LeadFinder onFound={loadLeads} industries={industries}/></div>
+              )}
+            </div>
+          )}
 
-                    {/* Phone */}
-                    <div style={{display:"flex",alignItems:"center",gap:7,fontSize:13,color:"#dee5ff",opacity:.85}}>
-                      {lead.phone?(
-                        <>
-                          <svg width={14} height={14} fill="none" viewBox="0 0 24 24" stroke="#a3a6ff" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/>
-                          </svg>
-                          {lead.phone}
-                        </>
-                      ):<span style={{color:"#40485d"}}>—</span>}
-                    </div>
+          {/* ── LEADS ───────────────────────────────────────────────────────── */}
+          {activeNav==="leads"&&(
+            <div>
+              <div style={{marginBottom:28}}>
+                <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                  color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Leads</h1>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                  {leads.length} prospect{leads.length!==1?"s":""} in your pipeline
+                </p>
+              </div>
 
-                    {/* Lead Score */}
-                    <div>
-                      <ScoreRing score={score}/>
-                      {(lead.assignedTo||lead.total_calls>0)&&(
-                        <div style={{marginTop:4,fontSize:11,color:"#40485d"}}>
-                          {lead.assignedTo&&<span>{lead.assignedTo}</span>}
-                          {lead.total_calls>0&&<span style={{marginLeft:4}}>· {lead.total_calls} call{lead.total_calls!==1?"s":""}</span>}
-                        </div>
-                      )}
-                    </div>
+              <section style={{background:"#141f38",borderRadius:16,padding:"16px 20px",
+                display:"flex",flexWrap:"wrap",alignItems:"center",gap:12,marginBottom:20}}>
+                <div style={{flex:"1 1 200px",position:"relative",display:"flex",alignItems:"center"}}>
+                  <span style={{position:"absolute",left:12,color:"#40485d",display:"flex"}}><IconFilter/></span>
+                  <input value={search} onChange={e=>setSearch(e.target.value)}
+                    placeholder="Filter by company or contact…"
+                    style={{width:"100%",background:"#000011",border:"1px solid #40485d30",
+                      borderRadius:8,padding:"8px 12px 8px 32px",color:"#dee5ff",
+                      fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none"}}/>
+                </div>
+                <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+                  <select className="sel" value={fIndustry} onChange={e=>setFIndustry(e.target.value)}>
+                    <option value="">Industry: All</option>
+                    {(industries.length>0?industries:INDUSTRIES).map(i=><option key={i} value={i}>{i}</option>)}
+                  </select>
+                  <select className="sel" value={fState} onChange={e=>setFState(e.target.value)}>
+                    <option value="">State: All States</option>
+                    {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
+                  </select>
+                  <select className="sel" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
+                    <option value="all">Status: All</option>
+                    {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
+                  </select>
+                  <select className="sel" value={sortBy} onChange={e=>setSort(e.target.value)}>
+                    <option value="score">Highest Score</option>
+                    <option value="newest">Newest First</option>
+                    <option value="company">Company A–Z</option>
+                    <option value="callbacks">Callbacks Due</option>
+                  </select>
+                  <button className="btn btn-g" style={{fontSize:12,padding:"8px 16px"}} onClick={reset}>Reset</button>
+                </div>
+              </section>
 
-                    {/* Status */}
-                    <div>
-                      <span className="pill"
-                        style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>
-                        {info.label}
-                      </span>
-                      <div style={{display:"flex",gap:3,marginTop:6,flexWrap:"wrap"}}>
-                        {STATUS_OPTIONS.filter(s=>s.value!==lead.status).slice(0,2).map(s=>(
-                          <button key={s.value} className="qs"
-                            onClick={e=>{e.stopPropagation();quickStatus(lead,s.value)}}
-                            style={{color:s.color,borderColor:s.color+"30",fontSize:"10px"}}>
-                            {s.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Actions */}
-                    <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6}}>
-                      <LogCallBtn onClick={e=>{e.stopPropagation();setCallModal(lead)}}/>
-                      <IconBtn onClick={e=>{e.stopPropagation();setEditModal(lead)}} title="Edit lead">
-                        <IconEdit/>
-                      </IconBtn>
-                      <IconBtn onClick={e=>{e.stopPropagation();deleteL(lead.id)}} title="Delete"
-                        hoverColor="#ff6e84" baseColor="#40485d">
-                        <IconTrash/>
-                      </IconBtn>
+              <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+                <div style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
+                  padding:"10px 24px",fontSize:"0.6rem",fontWeight:700,
+                  color:"#a3aac4",textTransform:"uppercase",letterSpacing:".1em",
+                  opacity:.65,borderBottom:"1px solid #40485d20"}}>
+                  <div>Contact &amp; Company</div>
+                  <div>Phone Number</div>
+                  <div>Lead Score</div>
+                  <div>Status</div>
+                  <div style={{textAlign:"right"}}>Actions</div>
+                </div>
+                {loading?(
+                  <div style={{padding:"64px 24px",textAlign:"center",color:"#40485d",fontSize:13}}>Loading leads…</div>
+                ):displayLeads.length===0?(
+                  <div style={{padding:"72px 24px",textAlign:"center"}}>
+                    <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:52,fontWeight:700,
+                      color:"#192540",marginBottom:10}}>0</div>
+                    <div style={{fontSize:11,color:"#40485d",letterSpacing:".1em",textTransform:"uppercase"}}>
+                      {cbOnly?"No callbacks due":"Import a CSV or use Find Leads to get started"}
                     </div>
                   </div>
-                )
-              })
-            )}
-          </div>
+                ):(
+                  displayLeads.map(lead=>{
+                    const info=si(lead.status)
+                    const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
+                    const score=lead.score||scoreLead(lead)||0
+                    const ac=avatarColor(lead.company||lead.firstName||"?")
+                    return(
+                      <div key={lead.id} className={isCb?"lrow-cb":""}
+                        style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
+                          padding:"16px 24px",alignItems:"center",gap:16,
+                          borderBottom:"1px solid #40485d12",transition:"background .12s",cursor:"default"}}
+                        onMouseEnter={e=>e.currentTarget.style.background=isCb?"#8b5cf612":"#192540"}
+                        onMouseLeave={e=>e.currentTarget.style.background=isCb?"#8b5cf608":"transparent"}>
+                        <div style={{display:"flex",alignItems:"center",gap:14,minWidth:0}}>
+                          <div style={{width:40,height:40,borderRadius:"50%",flexShrink:0,
+                            background:ac+"22",display:"flex",alignItems:"center",justifyContent:"center",
+                            fontSize:13,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-.01em"}}>
+                            {getInitials(lead)}</div>
+                          <div style={{minWidth:0}}>
+                            <div style={{fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,
+                              overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                              {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                            <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}</div>
+                            <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
+                              {lead.source&&<span className="src-tag">{lead.source}</span>}
+                              {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf630"}}>🔔 {lead.callbackDate}</span>}
+                              {lead.contract_value>0&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>${(lead.contract_value||0).toLocaleString()}</span>}
+                              {lead.followUpSequence&&<span style={{fontSize:9,background:"#ffe08312",color:"#ffe083",padding:"2px 7px",borderRadius:4,border:"1px solid #ffe08325"}}>⏱ fu</span>}
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{display:"flex",alignItems:"center",gap:7,fontSize:13,color:"#dee5ff",opacity:.85}}>
+                          {lead.phone?(
+                            <><svg width={14} height={14} fill="none" viewBox="0 0 24 24" stroke="#a3a6ff" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/>
+                            </svg>{lead.phone}</>
+                          ):<span style={{color:"#40485d"}}>—</span>}
+                        </div>
+                        <div>
+                          <ScoreRing score={score}/>
+                          {(lead.assignedTo||lead.total_calls>0)&&(
+                            <div style={{marginTop:4,fontSize:11,color:"#40485d"}}>
+                              {lead.assignedTo&&<span>{lead.assignedTo}</span>}
+                              {lead.total_calls>0&&<span style={{marginLeft:4}}>· {lead.total_calls} call{lead.total_calls!==1?"s":""}</span>}
+                            </div>
+                          )}
+                        </div>
+                        <div>
+                          <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>
+                            {info.label}</span>
+                          <div style={{display:"flex",gap:3,marginTop:6,flexWrap:"wrap"}}>
+                            {STATUS_OPTIONS.filter(s=>s.value!==lead.status).slice(0,2).map(s=>(
+                              <button key={s.value} className="qs"
+                                onClick={e=>{e.stopPropagation();quickStatus(lead,s.value)}}
+                                style={{color:s.color,borderColor:s.color+"30",fontSize:"10px"}}>{s.label}</button>
+                            ))}
+                          </div>
+                        </div>
+                        <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6}}>
+                          <LogCallBtn onClick={e=>{e.stopPropagation();setCallModal(lead)}}/>
+                          <IconBtn onClick={e=>{e.stopPropagation();setEditModal(lead)}} title="Edit lead"><IconEdit/></IconBtn>
+                          <IconBtn onClick={e=>{e.stopPropagation();deleteL(lead.id)}} title="Delete"
+                            hoverColor="#ff6e84" baseColor="#40485d"><IconTrash/></IconBtn>
+                        </div>
+                      </div>
+                    )
+                  })
+                )}
+              </div>
 
-          {/* Pagination footer */}
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-            marginTop:24,padding:"0 4px"}}>
-            <p style={{fontSize:14,color:"#a3aac4"}}>
-              {loading?"Loading…":
-                `Showing ${displayLeads.length} of ${leads.length} lead${leads.length!==1?"s":""}`}
-            </p>
-            <div style={{display:"flex",alignItems:"center",gap:8}}>
-              <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
-                border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}>
-                <IconChevLeft/>
-              </button>
-              <span style={{fontSize:14,fontWeight:700,color:"#a3a6ff",padding:"0 12px",
-                fontFamily:"'Space Grotesk',sans-serif"}}>1</span>
-              <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
-                border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}>
-                <IconChevRight/>
-              </button>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:24,padding:"0 4px"}}>
+                <p style={{fontSize:14,color:"#a3aac4"}}>
+                  {loading?"Loading…":`Showing ${displayLeads.length} of ${leads.length} lead${leads.length!==1?"s":""}`}
+                </p>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
+                    border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}><IconChevLeft/></button>
+                  <span style={{fontSize:14,fontWeight:700,color:"#a3a6ff",padding:"0 12px",
+                    fontFamily:"'Space Grotesk',sans-serif"}}>1</span>
+                  <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
+                    border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}><IconChevRight/></button>
+                </div>
+              </div>
             </div>
-          </div>
+          )}
+
+          {/* ── DIALER ──────────────────────────────────────────────────────── */}
+          {activeNav==="dialer"&&(
+            <div>
+              <div style={{marginBottom:24}}>
+                <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                  color:"#dee5ff",letterSpacing:"-.02em"}}>Dialer</h1>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Focused calling mode</p>
+              </div>
+              {leads.length===0?(
+                <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
+                  <div style={{fontSize:40,marginBottom:12}}>📞</div>
+                  <div style={{color:"#a3aac4",fontSize:14,marginBottom:16}}>No leads to dial yet</div>
+                  <button className="btn btn-p" onClick={()=>setNav("leads")}>Go to Leads</button>
+                </div>
+              ):(()=>{
+                const idx=Math.min(dialerIdx,leads.length-1)
+                const lead=leads[idx]
+                const score=lead.score||scoreLead(lead)||0
+                const ac=avatarColor(lead.company||lead.firstName||"?")
+                const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
+                return(
+                  <div style={{maxWidth:520,margin:"0 auto"}}>
+                    <div style={{textAlign:"center",color:"#a3aac4",fontSize:13,marginBottom:24,
+                      fontFamily:"'Space Grotesk',sans-serif"}}>
+                      Lead {idx+1} of {leads.length}
+                    </div>
+                    <div style={{background:"#0f1930",borderRadius:20,padding:40,textAlign:"center",marginBottom:16}}>
+                      <div style={{width:80,height:80,borderRadius:"50%",background:ac+"22",margin:"0 auto 20px",
+                        display:"flex",alignItems:"center",justifyContent:"center",
+                        fontSize:28,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                        {getInitials(lead)}</div>
+                      <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:26,fontWeight:700,
+                        color:"#dee5ff",marginBottom:4}}>
+                        {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                      <div style={{color:"#a3aac4",fontSize:15,marginBottom:16}}>{lead.company}</div>
+                      <div style={{display:"flex",justifyContent:"center",gap:10,marginBottom:24,flexWrap:"wrap"}}>
+                        <ScoreRing score={score}/>
+                        <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>{info.label}</span>
+                        {lead.industry&&<span className="pill" style={{background:"#a3a6ff18",color:"#a3a6ff"}}>{lead.industry}</span>}
+                      </div>
+                      {lead.phone&&(
+                        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:32,fontWeight:700,
+                          color:"#a3a6ff",letterSpacing:".04em",marginBottom:28}}>{lead.phone}</div>
+                      )}
+                      <button className="btn btn-p"
+                        style={{width:"100%",padding:"16px",fontSize:16,fontFamily:"'Space Grotesk',sans-serif",
+                          fontWeight:700,boxShadow:"0 8px 32px rgba(163,166,255,.25)"}}
+                        onClick={()=>setCallModal(lead)}>
+                        📞 Log Call
+                      </button>
+                    </div>
+                    <div style={{display:"flex",gap:12}}>
+                      <button className="btn btn-g" style={{flex:1,padding:11}}
+                        onClick={()=>setDialerIdx(i=>Math.max(0,i-1))}
+                        disabled={idx===0}>← Previous</button>
+                      <button className="btn btn-g" style={{flex:1,padding:11}}
+                        onClick={()=>setDialerIdx(i=>Math.min(leads.length-1,i+1))}
+                        disabled={idx>=leads.length-1}>Skip →</button>
+                    </div>
+                    {lead.notes&&(
+                      <div style={{marginTop:16,background:"#0f1930",borderRadius:12,padding:16}}>
+                        <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+                          textTransform:"uppercase",marginBottom:8}}>Notes</div>
+                        <div style={{fontSize:13,color:"#a3aac4",lineHeight:1.6}}>{lead.notes}</div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+            </div>
+          )}
+
+          {/* ── ANALYTICS ───────────────────────────────────────────────────── */}
+          {activeNav==="analytics"&&(
+            <div>
+              <div style={{marginBottom:32}}>
+                <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                  color:"#dee5ff",letterSpacing:"-.02em"}}>Analytics</h1>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                  Performance across {leads.length} lead{leads.length!==1?"s":""}
+                </p>
+              </div>
+              <StatsBar stats={stats} onCallbacks={()=>{setNav("leads");setCbOnly(true)}}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:24,marginTop:24}}>
+                <div style={{background:"#0f1930",borderRadius:16,padding:24}}>
+                  <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+                    textTransform:"uppercase",marginBottom:20}}>Status Distribution</div>
+                  {STATUS_OPTIONS.map(st=>{
+                    const count=leads.filter(l=>l.status===st.value).length
+                    const pct=leads.length?Math.round(count/leads.length*100):0
+                    return(
+                      <div key={st.value} style={{marginBottom:14}}>
+                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                          <span style={{fontSize:13,color:"#dee5ff"}}>{st.label}</span>
+                          <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,color:st.color}}>{count}</span>
+                        </div>
+                        <div style={{height:6,background:"#141f38",borderRadius:3,overflow:"hidden"}}>
+                          <div style={{height:"100%",width:`${pct}%`,background:st.color,borderRadius:3}}/>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+                <div style={{background:"#0f1930",borderRadius:16,padding:24}}>
+                  <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+                    textTransform:"uppercase",marginBottom:20}}>Top Industries</div>
+                  {Object.entries(
+                    leads.reduce((acc,l)=>{if(l.industry)acc[l.industry]=(acc[l.industry]||0)+1;return acc},{})
+                  ).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([ind,count])=>{
+                    const pct=leads.length?Math.round(count/leads.length*100):0
+                    return(
+                      <div key={ind} style={{marginBottom:14}}>
+                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                          <span style={{fontSize:13,color:"#dee5ff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ind}</span>
+                          <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                            color:"#a3a6ff",flexShrink:0,marginLeft:8}}>{count}</span>
+                        </div>
+                        <div style={{height:6,background:"#141f38",borderRadius:3,overflow:"hidden"}}>
+                          <div style={{height:"100%",width:`${pct}%`,background:"#a3a6ff",borderRadius:3}}/>
+                        </div>
+                      </div>
+                    )
+                  })}
+                  {leads.every(l=>!l.industry)&&(
+                    <div style={{color:"#40485d",fontSize:13,textAlign:"center",paddingTop:20}}>No industry data yet</div>
+                  )}
+                </div>
+              </div>
+              <div style={{background:"#0f1930",borderRadius:16,padding:24,marginTop:24}}>
+                <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+                  textTransform:"uppercase",marginBottom:20}}>Lead Score Tiers</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16}}>
+                  {[
+                    {label:"Hot",  min:75,max:100,color:"#ff6e84"},
+                    {label:"Warm", min:50,max:74, color:"#ffe083"},
+                    {label:"Cool", min:25,max:49, color:"#a3a6ff"},
+                    {label:"Cold", min:0, max:24, color:"#40485d"},
+                  ].map(tier=>{
+                    const count=leads.filter(l=>{const s=l.score||scoreLead(l)||0;return s>=tier.min&&s<=tier.max}).length
+                    return(
+                      <div key={tier.label} style={{background:"#141f38",borderRadius:12,padding:18,
+                        textAlign:"center",borderLeft:`4px solid ${tier.color}`}}>
+                        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:32,fontWeight:700,
+                          color:tier.color,marginBottom:4}}>{count}</div>
+                        <div style={{fontSize:12,color:"#a3aac4"}}>{tier.label} leads</div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── HISTORY ─────────────────────────────────────────────────────── */}
+          {activeNav==="history"&&(
+            <div>
+              <div style={{marginBottom:32,display:"flex",alignItems:"flex-end",
+                justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
+                <div>
+                  <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                    color:"#dee5ff",letterSpacing:"-.02em"}}>Call History</h1>
+                  <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Calls logged today</p>
+                </div>
+                <button className="btn btn-p" style={{fontSize:13,padding:"10px 20px"}}
+                  onClick={()=>{
+                    setHistLoading(true)
+                    api("/api/calls/today").then(r=>setCallHistory(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setHistLoading(false))
+                  }}>Refresh</button>
+              </div>
+              {histLoading?(
+                <div style={{padding:60,textAlign:"center",color:"#40485d"}}>Loading…</div>
+              ):callHistory.length===0?(
+                <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
+                  <div style={{fontSize:40,marginBottom:12}}>📞</div>
+                  <div style={{color:"#a3aac4",fontSize:14}}>No calls logged today yet</div>
+                  <div style={{color:"#40485d",fontSize:12,marginTop:6}}>Use "Log Call" on any lead to track activity</div>
+                </div>
+              ):(
+                <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+                  <div style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 1fr",
+                    padding:"10px 24px",fontSize:"0.6rem",fontWeight:700,
+                    color:"#a3aac4",textTransform:"uppercase",letterSpacing:".1em",
+                    borderBottom:"1px solid #40485d20"}}>
+                    <div>Outcome</div><div>Called By</div><div>Time</div><div/>
+                  </div>
+                  {callHistory.map((call,i)=>{
+                    const oc=CALL_OUTCOMES.find(o=>o.value===call.outcome)||{label:call.outcome||"Call"}
+                    const col=call.outcome==="converted"?"#69f6b8":call.outcome==="interested"?"#a3a6ff":
+                      call.outcome==="no_answer"?"#40485d":"#dee5ff"
+                    return(
+                      <div key={i} style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 1fr",
+                        padding:"14px 24px",alignItems:"center",borderBottom:"1px solid #40485d12",
+                        transition:"background .12s"}}
+                        onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                        onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                        <span className="pill" style={{background:col+"20",color:col,
+                          border:`1px solid ${col}30`,width:"fit-content"}}>{oc.label}</span>
+                        <div style={{fontSize:13,color:"#dee5ff"}}>{call.calledBy||"—"}</div>
+                        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4"}}>
+                          {call.calledAt?new Date(call.calledAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"—"}
+                        </div>
+                        <div/>
+                      </div>
+                    )
+                  })}
+                  <div style={{padding:"14px 24px",borderTop:"1px solid #40485d20",textAlign:"right"}}>
+                    <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#a3a6ff",fontWeight:700}}>
+                      {callHistory.length} call{callHistory.length!==1?"s":""} today
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
         </div>
       </main>
 
