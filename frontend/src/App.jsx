@@ -10,13 +10,13 @@ const STATES = [
 ]
 
 const STATUS_OPTIONS = [
-  { value:"new",            label:"New",            color:"#6366f1" },
-  { value:"called",         label:"Called",          color:"#f59e0b" },
-  { value:"no_answer",      label:"No Answer",       color:"#94a3b8" },
-  { value:"interested",     label:"Interested",      color:"#10b981" },
-  { value:"not_interested", label:"Not Interested",  color:"#ef4444" },
+  { value:"new",            label:"New",            color:"#a3a6ff" },
+  { value:"called",         label:"Called",          color:"#ffe083" },
+  { value:"no_answer",      label:"No Answer",       color:"#a3aac4" },
+  { value:"interested",     label:"Interested",      color:"#69f6b8" },
+  { value:"not_interested", label:"Not Interested",  color:"#ff6e84" },
   { value:"callback",       label:"Callback",        color:"#8b5cf6" },
-  { value:"converted",      label:"Converted",       color:"#059669" },
+  { value:"converted",      label:"Converted",       color:"#06d6a0" },
 ]
 
 const CALL_OUTCOMES = [
@@ -54,7 +54,7 @@ function scoreLead(lead) {
   s+=sta[lead.status]||0
   return Math.max(0,Math.min(100,s))
 }
-function scoreColor(s){return s>=75?"#ef4444":s>=50?"#f59e0b":s>=25?"#6366f1":"#475569"}
+function scoreColor(s){return s>=75?"#ff6e84":s>=50?"#ffe083":s>=25?"#a3a6ff":"#40485d"}
 function scoreLabel(s){return s>=75?"Hot":s>=50?"Warm":s>=25?"Cool":"Cold"}
 
 function getUser()  { return localStorage.getItem("lf_user") || "" }
@@ -92,56 +92,80 @@ function parseCSV(text) {
 }
 
 const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap');
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  body{background:#080810;color:#dde1f0;font-family:'DM Mono',monospace;font-size:13px}
-  ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#0f1018}::-webkit-scrollbar-thumb{background:#2a2d3e;border-radius:4px}
+  body{background:#060e20;color:#dee5ff;font-family:'Inter',sans-serif;font-size:14px}
+  ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#060e20}::-webkit-scrollbar-thumb{background:#40485d;border-radius:4px}
   input,select,textarea,button{font-family:inherit}
   .ff{display:flex;flex-direction:column;gap:4px}
-  .ff label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#525878}
-  .ff input,.ff select,.ff textarea{background:#0d0e18;border:1px solid #1e2236;color:#dde1f0;padding:9px 11px;border-radius:7px;font-size:12px;outline:none;transition:border-color .15s}
-  .ff input:focus,.ff select:focus,.ff textarea:focus{border-color:#5b5fef;box-shadow:0 0 0 3px #5b5fef18}
-  .ff select option{background:#0d0e18}
-  .btn{cursor:pointer;border:none;font-family:inherit;font-size:12px;font-weight:500;letter-spacing:.04em;transition:all .15s;border-radius:7px}
-  .btn-p{background:#5b5fef;color:#fff;padding:9px 20px}.btn-p:hover{background:#7478f5;transform:translateY(-1px)}
-  .btn-g{background:transparent;color:#6b7194;padding:8px 14px;border:1px solid #1e2236}.btn-g:hover{background:#1e2236;color:#dde1f0}
-  .btn-r{background:transparent;color:#f06060;padding:5px 10px;border:1px solid #f0606025;font-size:11px}.btn-r:hover{background:#f0606012}
-  .btn-gr{background:#1a9e6e;color:#fff;padding:9px 20px}.btn-gr:hover{background:#22c98a}
-  .btn-amber{background:#f0b42918;color:#f0b429;border:1px solid #f0b42930;padding:6px 14px;font-size:11px}.btn-amber:hover{background:#f0b42928}
-  .card{background:#0d0e1a;border:1px solid #181b2e;border-radius:12px;padding:18px 22px}
-  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:10px;letter-spacing:.07em;font-weight:500}
-  .qs{background:transparent;border:1px solid #1e2236;font-size:10px;padding:3px 7px;border-radius:5px;cursor:pointer;font-family:inherit;transition:all .1s}.qs:hover{background:#1e2236}
-  .modal-bg{position:fixed;inset:0;background:#00000090;backdrop-filter:blur(4px);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
-  .modal{background:#0d0e1a;border:1px solid #1e2236;border-radius:16px;padding:28px;width:100%;max-width:600px;max-height:90vh;overflow-y:auto}
-  .toast{position:fixed;bottom:24px;right:24px;padding:11px 18px;background:#141628;border:1px solid #2a2d4a;border-radius:10px;font-size:12px;z-index:9999;animation:fadeUp .2s ease}
+  .ff label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#a3aac4}
+  .ff input,.ff select,.ff textarea{background:#000011;border:1px solid #40485d50;color:#dee5ff;padding:9px 11px;border-radius:8px;font-size:12px;outline:none;transition:border-color .15s}
+  .ff input:focus,.ff select:focus,.ff textarea:focus{border-color:#a3a6ff;box-shadow:0 0 0 3px #a3a6ff15}
+  .ff select option{background:#0f1930}
+  .btn{cursor:pointer;border:none;font-family:inherit;font-size:13px;font-weight:600;letter-spacing:.02em;transition:all .15s;border-radius:8px}
+  .btn-p{background:linear-gradient(135deg,#a3a6ff 0%,#6063ee 100%);color:#000011;padding:9px 20px}.btn-p:hover{opacity:.88;transform:translateY(-1px)}
+  .btn-g{background:transparent;color:#a3aac4;padding:8px 14px;border:1px solid #40485d50}.btn-g:hover{background:#192540;color:#dee5ff}
+  .btn-r{background:transparent;color:#ff6e84;padding:5px 10px;border:1px solid #ff6e8425;font-size:11px}.btn-r:hover{background:#ff6e8412}
+  .btn-gr{background:#006c49;color:#69f6b8;padding:9px 20px}.btn-gr:hover{background:#00805a}
+  .btn-amber{background:#ffe08318;color:#ffe083;border:1px solid #ffe08330;padding:6px 14px;font-size:11px}.btn-amber:hover{background:#ffe08328}
+  .card{background:#0f1930;border-radius:12px;padding:18px 22px}
+  .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;letter-spacing:.04em;font-weight:600}
+  .qs{background:transparent;border:1px solid #40485d40;font-size:10px;padding:3px 7px;border-radius:5px;cursor:pointer;font-family:inherit;transition:all .1s;color:#a3aac4}.qs:hover{background:#192540;color:#dee5ff}
+  .modal-bg{position:fixed;inset:0;background:#00000095;backdrop-filter:blur(6px);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
+  .modal{background:#0f1930;border:1px solid #40485d40;border-radius:16px;padding:28px;width:100%;max-width:600px;max-height:90vh;overflow-y:auto}
+  .toast{position:fixed;bottom:24px;right:24px;padding:11px 18px;background:#141f38;border:1px solid #40485d;border-radius:10px;font-size:13px;z-index:9999;animation:fadeUp .2s ease}
   @keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-  .dropzone{background:#0d0e18;border:2px dashed #1e2236;border-radius:12px;padding:36px;text-align:center;cursor:pointer;transition:all .2s}.dropzone:hover{border-color:#5b5fef;background:#5b5fef08}
-  .sel{background:#0d0e1a;border:1px solid #1e2236;color:#6b7194;padding:8px 11px;border-radius:7px;font-size:12px;font-family:inherit;cursor:pointer;outline:none}
-  .lrow{background:#0d0e1a;border:1px solid #181b2e;border-radius:10px;padding:14px 18px;transition:border-color .15s}.lrow:hover{border-color:#5b5fef28}
-  .lrow-cb{border-color:#8b5cf635!important;background:#8b5cf608!important}
-  .src-tag{font-size:9px;background:#181b2e;color:#525878;padding:2px 6px;border-radius:4px;letter-spacing:.05em}
-  .finder{background:linear-gradient(135deg,#0d0e1a 0%,#0f1022 100%);border:1px solid #5b5fef30;border-radius:14px;padding:24px;margin-bottom:22px}
-  .finder-title{font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#fff;margin-bottom:4px}
-  .finder-sub{font-size:11px;color:#525878;margin-bottom:20px}
+  .dropzone{background:#000011;border:2px dashed #40485d;border-radius:12px;padding:36px;text-align:center;cursor:pointer;transition:all .2s}.dropzone:hover{border-color:#a3a6ff;background:#a3a6ff08}
+  .sel{background:#0f1930;border:1px solid #40485d40;color:#a3aac4;padding:8px 12px;border-radius:8px;font-size:13px;font-family:inherit;cursor:pointer;outline:none;transition:border-color .15s}.sel:focus,.sel:hover{border-color:#a3a6ff50;color:#dee5ff}
+  .src-tag{font-size:9px;background:#192540;color:#a3aac4;padding:2px 6px;border-radius:4px;letter-spacing:.05em}
+  .finder{background:linear-gradient(135deg,#0f1930 0%,#091328 100%);border:1px solid #a3a6ff25;border-radius:14px;padding:24px;margin-bottom:24px}
+  .finder-title{font-family:'Space Grotesk',sans-serif;font-size:17px;font-weight:700;color:#dee5ff;margin-bottom:4px}
+  .finder-sub{font-size:12px;color:#a3aac4;margin-bottom:20px}
   .range-wrap{display:flex;flex-direction:column;gap:6px}
-  .range-wrap input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:2px;background:#1e2236;outline:none}
-  .range-wrap input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#5b5fef;cursor:pointer}
+  .range-wrap input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:2px;background:#40485d;outline:none}
+  .range-wrap input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#a3a6ff;cursor:pointer}
   .pulse{animation:pulse 1.5s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .lrow-cb{background:#8b5cf608!important}
+  @media(max-width:1023px){.lg-sidebar{display:none!important}.lg-main{margin-left:0!important}}
+  @media(max-width:767px){.mobile-nav{display:flex!important}.lg-topnav-tabs{display:none!important}}
 `
 
+// ─── Icons ───────────────────────────────────────────────────────────────────
+
+function IconDashboard(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>}
+function IconPeople(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>}
+function IconPhone(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>}
+function IconChart(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>}
+function IconHistory(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>}
+function IconHelp(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>}
+function IconPerson(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>}
+function IconUpload(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>}
+function IconSearch(){return<svg width={16} height={16} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>}
+function IconBell(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>}
+function IconSettings(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>}
+function IconEdit(){return<svg width={17} height={17} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>}
+function IconTrash(){return<svg width={16} height={16} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>}
+function IconCallFwd(){return<svg width={16} height={16} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M17 8l4 4m0 0l-4 4m4-4H3"/></svg>}
+function IconFilter(){return<svg width={14} height={14} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M3 4h18M7 8h10M11 12h2"/></svg>}
+function IconChevLeft(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7"/></svg>}
+function IconChevRight(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7"/></svg>}
+function IconPlus(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4"/></svg>}
+
+// ─── ScoreRing (redesigned as dot + label) ───────────────────────────────────
+
 function ScoreRing({score=0}){
-  const c=scoreColor(score),l=scoreLabel(score)
+  const c=scoreColor(score), l=scoreLabel(score)
   return(
-    <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
-      <div style={{width:44,height:44,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",
-        background:c+"18",border:`2px solid ${c}35`,color:c,fontFamily:"'Syne',sans-serif",fontSize:13,fontWeight:800}}>
-        {score}
-      </div>
-      <div style={{fontSize:9,color:c,letterSpacing:".06em"}}>{l}</div>
+    <div style={{display:"flex",alignItems:"center",gap:7}}>
+      <span style={{width:10,height:10,borderRadius:"50%",background:c,
+        boxShadow:`0 0 8px ${c}99`,flexShrink:0,display:"inline-block"}}/>
+      <span style={{fontSize:13,fontWeight:600,color:c,fontFamily:"'Space Grotesk',sans-serif"}}>{l}</span>
     </div>
   )
 }
+
+// ─── Login ───────────────────────────────────────────────────────────────────
 
 function Login({onLogin}){
   const [name,setName]=useState("")
@@ -161,16 +185,16 @@ function Login({onLogin}){
   }
 
   return(
-    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#080810"}}>
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#060e20"}}>
       <style>{CSS}</style>
       <div style={{width:340}}>
-        <div style={{textAlign:"center",marginBottom:32}}>
-          <div style={{fontFamily:"'Syne',sans-serif",fontSize:34,fontWeight:800,color:"#fff",letterSpacing:"-.02em"}}>
-            LEAD<span style={{color:"#5b5fef"}}>FLOW</span>
+        <div style={{textAlign:"center",marginBottom:36}}>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:32,fontWeight:700,color:"#a3a6ff",letterSpacing:"-.02em"}}>
+            LeadFlow
           </div>
-          <div style={{fontSize:10,color:"#525878",letterSpacing:".12em",marginTop:4}}>B2B COLD CALL PLATFORM</div>
+          <div style={{fontSize:11,color:"#40485d",letterSpacing:".12em",marginTop:6,textTransform:"uppercase"}}>B2B Cold Call Platform</div>
         </div>
-        <div className="card" style={{border:"1px solid #5b5fef28"}}>
+        <div className="card" style={{border:"1px solid #a3a6ff25"}}>
           <form onSubmit={submit} style={{display:"flex",flexDirection:"column",gap:14}}>
             <div className="ff"><label>Your Name</label>
               <input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Alice" autoFocus/>
@@ -178,9 +202,9 @@ function Login({onLogin}){
             <div className="ff"><label>Team Password</label>
               <input type="password" value={pass} onChange={e=>setPass(e.target.value)} placeholder="••••••••"/>
             </div>
-            {err&&<div style={{color:"#f06060",fontSize:11}}>⚠ {err}</div>}
-            <button type="submit" className="btn btn-p" style={{padding:"11px",fontSize:13}} disabled={loading}>
-              {loading?"Signing in...":"Sign In →"}
+            {err&&<div style={{color:"#ff6e84",fontSize:12}}>⚠ {err}</div>}
+            <button type="submit" className="btn btn-p" style={{padding:"12px",fontSize:14,marginTop:4}} disabled={loading}>
+              {loading?"Signing in…":"Sign In →"}
             </button>
           </form>
         </div>
@@ -188,6 +212,8 @@ function Login({onLogin}){
     </div>
   )
 }
+
+// ─── LeadFinder ──────────────────────────────────────────────────────────────
 
 function LeadFinder({onFound, industries}){
   const [industry,setIndustry] = useState(industries[0]||"Healthcare")
@@ -213,39 +239,41 @@ function LeadFinder({onFound, industries}){
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr auto",gap:12,alignItems:"flex-end"}}>
         <div className="ff">
           <label>Industry</label>
-          <select value={industry} onChange={e=>setIndustry(e.target.value)} className="sel" style={{color:"#dde1f0"}}>
+          <select value={industry} onChange={e=>setIndustry(e.target.value)} className="sel" style={{color:"#dee5ff"}}>
             {industries.map(i=><option key={i} value={i}>{i}</option>)}
           </select>
         </div>
         <div className="ff">
           <label>State (optional)</label>
-          <select value={state} onChange={e=>setState(e.target.value)} className="sel" style={{color:state?"#dde1f0":"#525878"}}>
+          <select value={state} onChange={e=>setState(e.target.value)} className="sel" style={{color:state?"#dee5ff":"#a3aac4"}}>
             <option value="">All States</option>
             {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
           </select>
         </div>
         <div className="range-wrap">
-          <label style={{fontSize:10,letterSpacing:".1em",textTransform:"uppercase",color:"#525878",display:"flex",justifyContent:"space-between"}}>
-            <span>How Many</span><span style={{color:"#5b5fef"}}>{limit}</span>
+          <label style={{fontSize:10,letterSpacing:".1em",textTransform:"uppercase",color:"#a3aac4",display:"flex",justifyContent:"space-between"}}>
+            <span>How Many</span><span style={{color:"#a3a6ff"}}>{limit}</span>
           </label>
           <input type="range" min={25} max={200} step={25} value={limit} onChange={e=>setLimit(Number(e.target.value))}/>
-          <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#2a2d3e"}}><span>25</span><span>200</span></div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#40485d"}}><span>25</span><span>200</span></div>
         </div>
         <button className="btn btn-p" onClick={find} disabled={loading} style={{padding:"10px 22px",whiteSpace:"nowrap",alignSelf:"flex-end"}}>
-          {loading?"Searching...":"Find Leads →"}
+          {loading?"Searching…":"Find Leads →"}
         </button>
       </div>
-      {loading&&<div style={{marginTop:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#6b7194"}}>
-        <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#5b5fef"}}/>Pulling records...
+      {loading&&<div style={{marginTop:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
+        <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#a3a6ff"}}/>Pulling records…
       </div>}
       {lastResult&&!loading&&(
-        <div style={{marginTop:14,padding:"10px 14px",background:"#1a9e6e15",border:"1px solid #1a9e6e30",borderRadius:8,fontSize:12,color:"#1a9e6e"}}>
+        <div style={{marginTop:14,padding:"10px 14px",background:"#69f6b815",border:"1px solid #69f6b830",borderRadius:8,fontSize:12,color:"#69f6b8"}}>
           ✓ {lastResult.saved} leads saved — ready to call
         </div>
       )}
     </div>
   )
 }
+
+// ─── Follow-up sequences ─────────────────────────────────────────────────────
 
 const FOLLOW_UP_SEQUENCES = [
   { value:"", label:"No Follow-up Sequence" },
@@ -266,17 +294,19 @@ function addDays(days){
   return d.toISOString().split("T")[0]
 }
 
+// ─── QualChip ────────────────────────────────────────────────────────────────
+
 function QualChip({label, value, options, onChange}){
   return(
     <div style={{display:"flex",flexDirection:"column",gap:4}}>
-      <div style={{fontSize:9,letterSpacing:".1em",textTransform:"uppercase",color:"#525878"}}>{label}</div>
+      <div style={{fontSize:9,letterSpacing:".1em",textTransform:"uppercase",color:"#a3aac4"}}>{label}</div>
       <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
         {options.map(o=>(
           <button key={o} onClick={()=>onChange(value===o?"":o)}
             style={{padding:"4px 10px",borderRadius:5,fontSize:11,fontFamily:"inherit",cursor:"pointer",
-              background:value===o?"#5b5fef":"transparent",
-              color:value===o?"#fff":"#6b7194",
-              border:`1px solid ${value===o?"#5b5fef":"#1e2236"}`,
+              background:value===o?"#a3a6ff":"transparent",
+              color:value===o?"#000011":"#a3aac4",
+              border:`1px solid ${value===o?"#a3a6ff":"#40485d40"}`,
               transition:"all .1s"}}>
             {o}
           </button>
@@ -285,6 +315,8 @@ function QualChip({label, value, options, onChange}){
     </div>
   )
 }
+
+// ─── CallModal ───────────────────────────────────────────────────────────────
 
 function CallModal({lead,onClose,onSaved}){
   const [calls,setCalls]          = useState([])
@@ -352,24 +384,23 @@ function CallModal({lead,onClose,onSaved}){
       <div className="modal" style={{maxWidth:640}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
           <div>
-            <div style={{fontFamily:"Syne,sans-serif",fontSize:15,fontWeight:800,color:"#fff",marginBottom:4}}>
+            <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:16,fontWeight:700,color:"#dee5ff",marginBottom:4}}>
               {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}
             </div>
-            <div style={{display:"flex",gap:12,fontSize:11,color:"#525878"}}>
+            <div style={{display:"flex",gap:12,fontSize:12,color:"#a3aac4"}}>
               {lead.phone&&<span>📞 {lead.phone}</span>}
               {lead.email&&<span>✉ {lead.email}</span>}
             </div>
           </div>
-          <button className="btn btn-g" style={{fontSize:11,padding:"5px 10px"}} onClick={onClose}>✕</button>
+          <button className="btn btn-g" style={{fontSize:12,padding:"5px 10px"}} onClick={onClose}>✕</button>
         </div>
 
-        {/* Script selector */}
         {scripts.length>0&&(
-          <div style={{marginBottom:16,background:"#080810",border:"1px solid #5b5fef25",borderRadius:10,padding:14}}>
-            <div style={{fontSize:10,color:"#5b5fef",letterSpacing:".1em",marginBottom:10}}>CALL SCRIPT</div>
+          <div style={{marginBottom:16,background:"#060e20",border:"1px solid #a3a6ff25",borderRadius:10,padding:14}}>
+            <div style={{fontSize:10,color:"#a3a6ff",letterSpacing:".1em",marginBottom:10}}>CALL SCRIPT</div>
             <div style={{display:"flex",gap:8,marginBottom:scriptId?10:0}}>
               <select value={scriptId} onChange={e=>{setScriptId(e.target.value);setShowScript(false)}}
-                style={{flex:1,background:"#0d0e1a",border:"1px solid #1e2236",color:"#dde1f0",padding:"8px 10px",borderRadius:7,fontSize:12,fontFamily:"inherit"}}>
+                style={{flex:1,background:"#0f1930",border:"1px solid #40485d40",color:"#dee5ff",padding:"8px 10px",borderRadius:7,fontSize:12,fontFamily:"inherit"}}>
                 <option value="">No script selected</option>
                 {scripts.map(s=><option key={s.id} value={s.id}>{s.name}{s.industry?` (${s.industry})`:""}</option>)}
               </select>
@@ -380,15 +411,15 @@ function CallModal({lead,onClose,onSaved}){
               )}
             </div>
             {showScript&&selectedScript&&(
-              <div style={{background:"#0d0e1a",border:"1px solid #1e2236",borderRadius:8,padding:14,fontSize:12,color:"#a0a3b8",lineHeight:1.8,whiteSpace:"pre-wrap",maxHeight:200,overflowY:"auto"}}>
+              <div style={{background:"#060e20",border:"1px solid #40485d40",borderRadius:8,padding:14,fontSize:12,color:"#a3aac4",lineHeight:1.8,whiteSpace:"pre-wrap",maxHeight:200,overflowY:"auto"}}>
                 {selectedScript.script_text}
                 {selectedScript.objection_handlers?.length>0&&(
-                  <div style={{marginTop:12,borderTop:"1px solid #1e2236",paddingTop:10}}>
-                    <div style={{fontSize:10,color:"#5b5fef",letterSpacing:".08em",marginBottom:8}}>OBJECTION HANDLERS</div>
+                  <div style={{marginTop:12,borderTop:"1px solid #40485d40",paddingTop:10}}>
+                    <div style={{fontSize:10,color:"#a3a6ff",letterSpacing:".08em",marginBottom:8}}>OBJECTION HANDLERS</div>
                     {selectedScript.objection_handlers.map((obj,i)=>(
                       <div key={i} style={{marginBottom:8}}>
-                        <div style={{color:"#f0b429",fontSize:11}}>"{obj.objection}"</div>
-                        <div style={{color:"#a0a3b8",fontSize:11,paddingLeft:10}}>→ {obj.response}</div>
+                        <div style={{color:"#ffe083",fontSize:11}}>"{obj.objection}"</div>
+                        <div style={{color:"#a3aac4",fontSize:11,paddingLeft:10}}>→ {obj.response}</div>
                       </div>
                     ))}
                   </div>
@@ -398,18 +429,19 @@ function CallModal({lead,onClose,onSaved}){
           </div>
         )}
 
-        <div style={{display:"flex",gap:4,marginBottom:16,borderBottom:"1px solid #1e2236",paddingBottom:12}}>
+        <div style={{display:"flex",gap:4,marginBottom:16,borderBottom:"1px solid #40485d30",paddingBottom:12}}>
           {[["call","📞 Log Call"],["qualify","🎯 Qualify"]].map(([t,l])=>(
             <button key={t} onClick={()=>setTab(t)}
-              style={{padding:"6px 14px",borderRadius:6,fontSize:11,fontFamily:"inherit",cursor:"pointer",
-                background:tab===t?"#5b5fef":"transparent",color:tab===t?"#fff":"#6b7194",
-                border:`1px solid ${tab===t?"#5b5fef":"#1e2236"}`}}>
+              style={{padding:"6px 14px",borderRadius:6,fontSize:12,fontFamily:"inherit",cursor:"pointer",
+                background:tab===t?"#a3a6ff":"transparent",color:tab===t?"#000011":"#a3aac4",
+                border:`1px solid ${tab===t?"#a3a6ff":"#40485d40"}`}}>
               {l}
             </button>
           ))}
         </div>
+
         {tab==="call"&&(
-          <div style={{background:"#080810",border:"1px solid #5b5fef25",borderRadius:10,padding:16,marginBottom:16}}>
+          <div style={{background:"#060e20",border:"1px solid #a3a6ff20",borderRadius:10,padding:16,marginBottom:16}}>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
               <div className="ff"><label>Outcome</label>
                 <select value={outcome} onChange={e=>setOutcome(e.target.value)}>
@@ -444,18 +476,18 @@ function CallModal({lead,onClose,onSaved}){
               </select>
             </div>
             {followUpSeq&&(
-              <div style={{fontSize:11,color:"#f0b429",background:"#f0b42910",border:"1px solid #f0b42925",borderRadius:6,padding:"8px 12px",marginBottom:12}}>
+              <div style={{fontSize:11,color:"#ffe083",background:"#ffe08310",border:"1px solid #ffe08325",borderRadius:6,padding:"8px 12px",marginBottom:12}}>
                 🔔 Next follow-up: <strong>{addDays(FOLLOW_UP_DAYS[followUpSeq][0])}</strong>
                 {" · then "}
                 {FOLLOW_UP_DAYS[followUpSeq].slice(1).map(d=>"+"+d+"d").join(" · ")}
               </div>
             )}
-            <button className="btn btn-p" onClick={log} disabled={saving}>{saving?"Saving...":"Log Call ↵"}</button>
+            <button className="btn btn-p" onClick={log} disabled={saving}>{saving?"Saving…":"Log Call ↵"}</button>
           </div>
         )}
         {tab==="qualify"&&(
-          <div style={{background:"#080810",border:"1px solid #10b98125",borderRadius:10,padding:16,marginBottom:16,display:"flex",flexDirection:"column",gap:14}}>
-            <div style={{fontSize:10,color:"#10b981",letterSpacing:".1em"}}>QUALIFICATION DATA</div>
+          <div style={{background:"#060e20",border:"1px solid #69f6b825",borderRadius:10,padding:16,marginBottom:16,display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{fontSize:10,color:"#69f6b8",letterSpacing:".1em"}}>QUALIFICATION DATA</div>
             <QualChip label="Focus" value={budgetFocus} onChange={setBudget}
               options={["Budget Focused","Quality Focused","Value Balanced"]}/>
             <QualChip label="Vendor Status" value={vendorStatus} onChange={setVendor}
@@ -467,33 +499,33 @@ function CallModal({lead,onClose,onSaved}){
             <QualChip label="Qualified?" value={qualified} onChange={setQualified}
               options={["Hot","Warm","Not Yet","Disqualified"]}/>
             <button className="btn btn-p" onClick={log} disabled={saving} style={{alignSelf:"flex-start"}}>
-              {saving?"Saving...":"Save ↵"}
+              {saving?"Saving…":"Save ↵"}
             </button>
           </div>
         )}
         {calls.length>0&&(
           <>
-            <div style={{fontSize:10,color:"#525878",letterSpacing:".08em",marginBottom:10}}>HISTORY ({calls.length})</div>
+            <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".08em",marginBottom:10}}>HISTORY ({calls.length})</div>
             <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:200,overflowY:"auto"}}>
               {calls.map(c=>{
                 const info=si(c.outcome?.replace("voicemail","no_answer").replace("answered","called"))
                 return(
-                  <div key={c.id} style={{background:"#080810",border:"1px solid #181b2e",borderRadius:8,padding:"10px 12px"}}>
+                  <div key={c.id} style={{background:"#060e20",border:"1px solid #40485d30",borderRadius:8,padding:"10px 12px"}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-                      <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}35`}}>
+                      <span className="pill" style={{background:info.color+"25",color:info.color,border:`1px solid ${info.color}35`}}>
                         {(c.outcome||"").replace(/_/g," ")}
                       </span>
-                      <div style={{fontSize:10,color:"#525878"}}>
+                      <div style={{fontSize:10,color:"#a3aac4"}}>
                         {new Date(c.calledAt).toLocaleDateString()}
                         {c.duration>0&&<span style={{marginLeft:8}}>{Math.round(c.duration/60)}m</span>}
-                        <span style={{marginLeft:8,color:"#2a2d3e"}}>· {c.calledBy}</span>
+                        <span style={{marginLeft:8,color:"#40485d"}}>· {c.calledBy}</span>
                       </div>
                     </div>
-                    {c.notes&&<div style={{fontSize:11,color:"#6b7194",marginBottom:4}}>{c.notes}</div>}
+                    {c.notes&&<div style={{fontSize:11,color:"#a3aac4",marginBottom:4}}>{c.notes}</div>}
                     {(c.budgetFocus||c.vendorStatus||c.decisionMaker||c.timeline||c.qualified)&&(
                       <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
                         {[c.budgetFocus,c.vendorStatus,c.decisionMaker,c.timeline,c.qualified].filter(Boolean).map((t,i)=>(
-                          <span key={i} style={{fontSize:9,background:"#1e2236",color:"#94a3b8",padding:"2px 6px",borderRadius:4}}>{t}</span>
+                          <span key={i} style={{fontSize:9,background:"#192540",color:"#a3aac4",padding:"2px 6px",borderRadius:4}}>{t}</span>
                         ))}
                       </div>
                     )}
@@ -507,6 +539,8 @@ function CallModal({lead,onClose,onSaved}){
     </div>
   )
 }
+
+// ─── LeadModal ───────────────────────────────────────────────────────────────
 
 function LeadModal({lead,onClose,onSaved}){
   const [form,setForm]=useState(lead?{...emptyForm,...lead}:emptyForm)
@@ -532,7 +566,7 @@ function LeadModal({lead,onClose,onSaved}){
     <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="modal" style={{maxWidth:660}}>
         <div style={{display:"flex",justifyContent:"space-between",marginBottom:20}}>
-          <div style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:800}}>{isEdit?"EDIT LEAD":"NEW LEAD"}</div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:16,fontWeight:700,color:"#dee5ff"}}>{isEdit?"EDIT LEAD":"NEW LEAD"}</div>
           <button className="btn btn-g" onClick={onClose}>✕</button>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:10}}>
@@ -547,20 +581,22 @@ function LeadModal({lead,onClose,onSaved}){
           </div>
           <div className="ff"><label>Assigned To</label><input {...f("assignedTo")} placeholder="Alice"/></div>
           <div className="ff"><label>Callback Date</label><input type="date" {...f("callbackDate")}/></div>
-          <div className="ff"><label>Source</label><input {...f("source")} placeholder="SAM.gov..."/></div>
+          <div className="ff"><label>Source</label><input {...f("source")} placeholder="SAM.gov…"/></div>
         </div>
         <div className="ff" style={{marginBottom:18}}>
           <label>Notes</label>
-          <textarea {...f("notes")} rows={2} style={{resize:"vertical"}} placeholder="Notes..."/>
+          <textarea {...f("notes")} rows={2} style={{resize:"vertical"}} placeholder="Notes…"/>
         </div>
         <div style={{display:"flex",gap:8}}>
-          <button className="btn btn-p" onClick={save} disabled={saving}>{saving?"Saving...":isEdit?"Save Changes":"Add Lead"}</button>
+          <button className="btn btn-p" onClick={save} disabled={saving}>{saving?"Saving…":isEdit?"Save Changes":"Add Lead"}</button>
           <button className="btn btn-g" onClick={onClose}>Cancel</button>
         </div>
       </div>
     </div>
   )
 }
+
+// ─── ImportModal ─────────────────────────────────────────────────────────────
 
 function ImportModal({onClose,onDone}){
   const [preview,setPrev]=useState(null)
@@ -589,25 +625,25 @@ function ImportModal({onClose,onDone}){
     <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="modal">
         <div style={{display:"flex",justifyContent:"space-between",marginBottom:20}}>
-          <div style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:800}}>IMPORT CSV</div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:16,fontWeight:700,color:"#dee5ff"}}>IMPORT CSV</div>
           <button className="btn btn-g" onClick={onClose}>✕</button>
         </div>
         {!preview?(
           <div className="dropzone" onClick={()=>fileRef.current?.click()}>
             <div style={{fontSize:28,marginBottom:8}}>↑</div>
-            <div style={{color:"#6b7194",fontSize:13}}>Click to upload CSV</div>
+            <div style={{color:"#a3aac4",fontSize:13}}>Click to upload CSV</div>
             <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={handleFile}/>
           </div>
         ):(
           <div>
-            <div style={{padding:14,background:"#080810",border:"1px solid #1a9e6e30",borderRadius:8,marginBottom:14}}>
-              <div style={{color:"#1a9e6e",fontSize:13,marginBottom:8}}>✓ {preview.length} leads parsed</div>
+            <div style={{padding:14,background:"#060e20",border:"1px solid #69f6b830",borderRadius:8,marginBottom:14}}>
+              <div style={{color:"#69f6b8",fontSize:13,marginBottom:8}}>✓ {preview.length} leads parsed</div>
               {preview.slice(0,4).map((l,i)=>(
-                <div key={i} style={{fontSize:11,color:"#6b7194",borderLeft:"2px solid #5b5fef",paddingLeft:8,marginBottom:3}}>
+                <div key={i} style={{fontSize:11,color:"#a3aac4",borderLeft:"2px solid #a3a6ff",paddingLeft:8,marginBottom:3}}>
                   {[l.firstName,l.lastName,l.company,l.phone].filter(Boolean).join(" · ")}
                 </div>
               ))}
-              {preview.length>4&&<div style={{fontSize:11,color:"#2a2d3e"}}>...+{preview.length-4} more</div>}
+              {preview.length>4&&<div style={{fontSize:11,color:"#40485d"}}>…+{preview.length-4} more</div>}
             </div>
             <div className="ff" style={{marginBottom:14,maxWidth:220}}>
               <label>Assign all to (optional)</label>
@@ -615,7 +651,7 @@ function ImportModal({onClose,onDone}){
             </div>
             <div style={{display:"flex",gap:8}}>
               <button className="btn btn-gr" onClick={doImport} disabled={loading}>
-                {loading?"Importing...":"Import "+preview.length+" Leads"}
+                {loading?"Importing…":"Import "+preview.length+" Leads"}
               </button>
               <button className="btn btn-g" onClick={()=>{setPrev(null);if(fileRef.current)fileRef.current.value=""}}>Re-upload</button>
             </div>
@@ -625,6 +661,8 @@ function ImportModal({onClose,onDone}){
     </div>
   )
 }
+
+// ─── ScriptsModal ─────────────────────────────────────────────────────────────
 
 function ScriptsModal({onClose}){
   const [scripts,setScripts]   = useState([])
@@ -644,26 +682,14 @@ function ScriptsModal({onClose}){
   }
 
   function showToast(msg){ setToast(msg); setTimeout(()=>setToast(null),2500) }
-
-  function openNew(){
-    setEditing("new")
-    setForm({name:"",industry:"",script_text:"",objection_handlers:[]})
-  }
-
-  function openEdit(s){
-    setEditing(s.id)
-    setForm({name:s.name,industry:s.industry||"",script_text:s.script_text,objection_handlers:s.objection_handlers||[]})
-  }
-
+  function openNew(){ setEditing("new"); setForm({name:"",industry:"",script_text:"",objection_handlers:[]}) }
+  function openEdit(s){ setEditing(s.id); setForm({name:s.name,industry:s.industry||"",script_text:s.script_text,objection_handlers:s.objection_handlers||[]}) }
   function addObjection(){
     if(!newObj.objection||!newObj.response) return
     setForm(f=>({...f,objection_handlers:[...f.objection_handlers,{...newObj}]}))
     setNewObj({objection:"",response:""})
   }
-
-  function removeObjection(i){
-    setForm(f=>({...f,objection_handlers:f.objection_handlers.filter((_,idx)=>idx!==i)}))
-  }
+  function removeObjection(i){ setForm(f=>({...f,objection_handlers:f.objection_handlers.filter((_,idx)=>idx!==i)})) }
 
   async function save(){
     if(!form.name||!form.script_text){ showToast("Name and script required"); return }
@@ -671,9 +697,7 @@ function ScriptsModal({onClose}){
     try{
       if(editing==="new") await api("/api/scripts",{method:"POST",body:JSON.stringify(form)})
       else await api(`/api/scripts/${editing}`,{method:"PATCH",body:JSON.stringify(form)})
-      showToast("✓ Saved")
-      setEditing(null)
-      fetchScripts()
+      showToast("✓ Saved"); setEditing(null); fetchScripts()
     }catch(ex){ showToast("Error: "+ex.message) }
     finally{ setSaving(false) }
   }
@@ -688,13 +712,12 @@ function ScriptsModal({onClose}){
     <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="modal" style={{maxWidth:680}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
-          <div style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:800}}>CALL SCRIPTS</div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:16,fontWeight:700,color:"#dee5ff"}}>CALL SCRIPTS</div>
           <div style={{display:"flex",gap:8}}>
-            {!editing&&<button className="btn btn-p" style={{fontSize:11}} onClick={openNew}>+ New Script</button>}
+            {!editing&&<button className="btn btn-p" style={{fontSize:12}} onClick={openNew}>+ New Script</button>}
             <button className="btn btn-g" onClick={onClose}>✕</button>
           </div>
         </div>
-
         {editing?(
           <div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
@@ -717,36 +740,36 @@ function ScriptsModal({onClose}){
                 placeholder={"Hi, this is [name] calling from Vision Cleaning Company...\n\nI'm reaching out because we specialize in commercial cleaning for facilities like yours..."}/>
             </div>
             <div style={{marginBottom:14}}>
-              <div style={{fontSize:10,color:"#5b5fef",letterSpacing:".1em",marginBottom:10}}>OBJECTION HANDLERS</div>
+              <div style={{fontSize:10,color:"#a3a6ff",letterSpacing:".1em",marginBottom:10}}>OBJECTION HANDLERS</div>
               {form.objection_handlers.map((obj,i)=>(
-                <div key={i} style={{background:"#080810",border:"1px solid #1e2236",borderRadius:8,padding:10,marginBottom:8}}>
+                <div key={i} style={{background:"#060e20",border:"1px solid #40485d40",borderRadius:8,padding:10,marginBottom:8}}>
                   <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
-                    <div style={{fontSize:11,color:"#f0b429"}}>"{obj.objection}"</div>
-                    <button onClick={()=>removeObjection(i)} style={{background:"none",border:"none",color:"#f0606060",cursor:"pointer",fontSize:12}}>✕</button>
+                    <div style={{fontSize:11,color:"#ffe083"}}>"{obj.objection}"</div>
+                    <button onClick={()=>removeObjection(i)} style={{background:"none",border:"none",color:"#ff6e8060",cursor:"pointer",fontSize:12}}>✕</button>
                   </div>
-                  <div style={{fontSize:11,color:"#a0a3b8"}}>→ {obj.response}</div>
+                  <div style={{fontSize:11,color:"#a3aac4"}}>→ {obj.response}</div>
                 </div>
               ))}
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr auto",gap:8,marginTop:8}}>
                 <input value={newObj.objection} onChange={e=>setNewObj(o=>({...o,objection:e.target.value}))}
                   placeholder="We already have a cleaner..."
-                  style={{background:"#0d0e18",border:"1px solid #1e2236",color:"#dde1f0",padding:"8px 10px",borderRadius:7,fontSize:11}}/>
+                  style={{background:"#060e20",border:"1px solid #40485d40",color:"#dee5ff",padding:"8px 10px",borderRadius:7,fontSize:11,fontFamily:"inherit",outline:"none"}}/>
                 <input value={newObj.response} onChange={e=>setNewObj(o=>({...o,response:e.target.value}))}
                   placeholder="That's great — what I've found is..."
-                  style={{background:"#0d0e18",border:"1px solid #1e2236",color:"#dde1f0",padding:"8px 10px",borderRadius:7,fontSize:11}}/>
+                  style={{background:"#060e20",border:"1px solid #40485d40",color:"#dee5ff",padding:"8px 10px",borderRadius:7,fontSize:11,fontFamily:"inherit",outline:"none"}}/>
                 <button className="btn btn-g" style={{fontSize:11}} onClick={addObjection}>+ Add</button>
               </div>
             </div>
             <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
               <button className="btn btn-g" onClick={()=>setEditing(null)}>Cancel</button>
-              <button className="btn btn-p" onClick={save} disabled={saving}>{saving?"Saving...":"Save Script"}</button>
+              <button className="btn btn-p" onClick={save} disabled={saving}>{saving?"Saving…":"Save Script"}</button>
             </div>
-            {toast&&<div style={{marginTop:10,fontSize:12,color:"#10b981"}}>{toast}</div>}
+            {toast&&<div style={{marginTop:10,fontSize:12,color:"#69f6b8"}}>{toast}</div>}
           </div>
         ):loading?(
-          <div style={{textAlign:"center",padding:40,color:"#525878"}}>Loading...</div>
+          <div style={{textAlign:"center",padding:40,color:"#a3aac4"}}>Loading…</div>
         ):scripts.length===0?(
-          <div style={{textAlign:"center",padding:40,color:"#525878"}}>
+          <div style={{textAlign:"center",padding:40,color:"#a3aac4"}}>
             <div style={{fontSize:32,marginBottom:12}}>📋</div>
             <div style={{fontSize:13,marginBottom:16}}>No scripts yet</div>
             <button className="btn btn-p" onClick={openNew}>Create your first script</button>
@@ -754,12 +777,12 @@ function ScriptsModal({onClose}){
         ):(
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {scripts.map(s=>(
-              <div key={s.id} style={{background:"#080810",border:"1px solid #1e2236",borderRadius:10,padding:14}}>
+              <div key={s.id} style={{background:"#060e20",border:"1px solid #40485d30",borderRadius:10,padding:14}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
                   <div>
-                    <div style={{fontSize:13,fontWeight:600,color:"#dde1f0",marginBottom:3}}>{s.name}</div>
-                    <div style={{display:"flex",gap:8,fontSize:10,color:"#525878"}}>
-                      {s.industry&&<span style={{background:"#5b5fef18",color:"#5b5fef",padding:"1px 6px",borderRadius:4}}>{s.industry}</span>}
+                    <div style={{fontSize:13,fontWeight:600,color:"#dee5ff",marginBottom:3}}>{s.name}</div>
+                    <div style={{display:"flex",gap:8,fontSize:10,color:"#a3aac4"}}>
+                      {s.industry&&<span style={{background:"#a3a6ff18",color:"#a3a6ff",padding:"1px 6px",borderRadius:4}}>{s.industry}</span>}
                       <span>{s.usage_count||0} uses</span>
                       {s.objection_handlers?.length>0&&<span>{s.objection_handlers.length} objection{s.objection_handlers.length!==1?"s":""}</span>}
                     </div>
@@ -769,8 +792,8 @@ function ScriptsModal({onClose}){
                     <button className="btn btn-r" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>del(s.id)}>Del</button>
                   </div>
                 </div>
-                <div style={{fontSize:11,color:"#525878",lineHeight:1.6,maxHeight:60,overflow:"hidden"}}>
-                  {s.script_text.slice(0,150)}{s.script_text.length>150?"...":""}
+                <div style={{fontSize:11,color:"#a3aac4",lineHeight:1.6,maxHeight:60,overflow:"hidden"}}>
+                  {s.script_text.slice(0,150)}{s.script_text.length>150?"…":""}
                 </div>
               </div>
             ))}
@@ -781,28 +804,73 @@ function ScriptsModal({onClose}){
   )
 }
 
+// ─── StatsBar ─────────────────────────────────────────────────────────────────
+
 function StatsBar({stats,onCallbacks}){
   if(!stats) return null
+  const items=[
+    {l:"Calls Today",  v:stats.callsToday||0,              c:"#a3a6ff", border:"#a3a6ff"},
+    {l:"Conversions",  v:stats.converted||0,               c:"#69f6b8", border:"#69f6b8"},
+    {l:"Follow Ups",   v:stats.callbacksDue||0,            c:"#ffe083", border:"#ffe083", onClick:onCallbacks},
+    {l:"Conv. Rate",   v:(stats.conversionRate||0)+"%",    c:"#ff6e84", border:"#ff6e84"},
+  ]
   return(
-    <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:22}}>
-      {[
-        {l:"TOTAL",      v:stats.total,             c:"#5b5fef"},
-        {l:"NEW TODAY",  v:stats.newToday,           c:"#f0b429"},
-        {l:"CALLS TODAY",v:stats.callsToday,         c:"#94a3b8"},
-        {l:"CALLBACKS",  v:stats.callbacksDue,       c:"#8b5cf6",onClick:onCallbacks},
-        {l:"INTERESTED", v:stats.interested,         c:"#10b981"},
-        {l:"CONVERTED",  v:stats.converted,          c:"#059669"},
-        {l:"CONV RATE",  v:stats.conversionRate+"%", c:"#dde1f0"},
-      ].map(s=>(
-        <div key={s.l} className="card" onClick={s.onClick}
-          style={{flex:"1 1 90px",minWidth:90,padding:"14px 16px",cursor:s.onClick?"pointer":"default"}}>
-          <div style={{fontSize:9,letterSpacing:".1em",color:"#525878",marginBottom:6}}>{s.l}</div>
-          <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:28,color:s.c}}>{s.v}</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+      {items.map(s=>(
+        <div key={s.l}
+          onClick={s.onClick}
+          style={{background:"#0f1930",borderRadius:10,padding:"14px 18px",
+            borderLeft:`4px solid ${s.border}`,cursor:s.onClick?"pointer":"default",
+            transition:"background .15s"}}
+          onMouseEnter={e=>{if(s.onClick)e.currentTarget.style.background="#141f38"}}
+          onMouseLeave={e=>{if(s.onClick)e.currentTarget.style.background="#0f1930"}}>
+          <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+            textTransform:"uppercase",marginBottom:6}}>{s.l}</div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,color:s.c}}>{s.v}</div>
         </div>
       ))}
     </div>
   )
 }
+
+// ─── Avatar helpers ───────────────────────────────────────────────────────────
+
+const AVATAR_COLORS=["#a3a6ff","#69f6b8","#ffe083","#ff6e84","#8b5cf6","#06d6a0"]
+function avatarColor(str){
+  let h=0; for(const c of (str||"")) h=(h*31+c.charCodeAt(0))&0xffffffff
+  return AVATAR_COLORS[Math.abs(h)%AVATAR_COLORS.length]
+}
+function getInitials(lead){
+  if(lead.firstName&&lead.lastName) return(lead.firstName[0]+lead.lastName[0]).toUpperCase()
+  if(lead.firstName) return lead.firstName.slice(0,2).toUpperCase()
+  if(lead.company) return lead.company.slice(0,2).toUpperCase()
+  return"??"
+}
+
+// ─── IconButton helper ────────────────────────────────────────────────────────
+
+function IconBtn({onClick,children,title,hoverColor="#dee5ff",baseColor="#a3aac4"}){
+  const [hov,setHov]=useState(false)
+  return(
+    <button onClick={onClick} title={title}
+      onMouseEnter={()=>setHov(true)} onMouseLeave={()=>setHov(false)}
+      style={{padding:8,background:hov?"#192540":"transparent",border:"none",
+        color:hov?hoverColor:baseColor,cursor:"pointer",borderRadius:8,
+        display:"flex",alignItems:"center",justifyContent:"center",transition:"all .15s"}}>
+      {children}
+    </button>
+  )
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+
+const SIDEBAR_NAV = [
+  { key:"dashboard", label:"Dashboard", Icon:IconDashboard },
+  { key:"leads",     label:"Leads",     Icon:IconPeople },
+  { key:"dialer",    label:"Dialer",    Icon:IconPhone },
+  { key:"analytics", label:"Analytics", Icon:IconChart },
+  { key:"history",   label:"History",   Icon:IconHistory },
+]
 
 export default function App(){
   const [user,setUser]             = useState(()=>isLoggedIn()?localStorage.getItem("lf_user"):null)
@@ -819,6 +887,9 @@ export default function App(){
   const [fStatus,setFStatus]       = useState("all")
   const [sortBy,setSort]           = useState("score")
   const [cbOnly,setCbOnly]         = useState(false)
+  const [fIndustry,setFIndustry]   = useState("")
+  const [fState,setFState]         = useState("")
+  const [activeNav,setNav]         = useState("dashboard")
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -836,10 +907,7 @@ export default function App(){
       params.set("sort", sortBy)
       const leadsData = await api(`/api/leads?${params}`)
       setLeads(Array.isArray(leadsData)?leadsData:[])
-      try {
-        const statsData = await api("/api/stats")
-        if(statsData) setStats(statsData)
-      } catch(e) {}
+      try{ const s=await api("/api/stats"); if(s) setStats(s) }catch{}
     }catch(ex){ notify("Error loading leads","error") }
     finally{ setLoad(false) }
   },[search,fStatus,sortBy,cbOnly])
@@ -856,7 +924,7 @@ export default function App(){
     try{
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({status,callbackDate:cbDate,updatedAt:new Date().toISOString()})})
       setLeads(p=>p.map(l=>l.id===lead.id?{...l,status,callbackDate:cbDate}:l))
-      setTimeout(loadLeads, 500)
+      setTimeout(loadLeads,500)
     }catch(ex){ notify("Error updating","error") }
   }
 
@@ -874,127 +942,363 @@ export default function App(){
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
   const today=new Date().toISOString().split("T")[0]
 
+  const displayLeads=leads.filter(l=>{
+    if(fIndustry&&l.industry!==fIndustry) return false
+    if(fState&&l.state!==fState) return false
+    return true
+  })
+
+  function reset(){setSearch("");setFIndustry("");setFState("");setFStatus("all");setCbOnly(false)}
+
   return(
-    <div style={{minHeight:"100vh",background:"#080810"}}>
+    <div style={{minHeight:"100vh",background:"#060e20"}}>
       <style>{CSS}</style>
-      <div style={{borderBottom:"1px solid #181b2e",padding:"14px 28px",display:"flex",alignItems:"center",gap:12}}>
-        <div style={{fontFamily:"'Syne',sans-serif",fontSize:19,fontWeight:800,color:"#fff",letterSpacing:"-.02em"}}>
-          LEAD<span style={{color:"#5b5fef"}}>FLOW</span>
+
+      {/* ── Top Nav ─────────────────────────────────────────────────────── */}
+      <header style={{position:"fixed",top:0,left:0,right:0,height:64,background:"#060e20",
+        borderBottom:"1px solid #40485d25",zIndex:50,display:"flex",alignItems:"center",
+        padding:"0 24px",gap:28}}>
+
+        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,
+          color:"#a3a6ff",letterSpacing:"-.01em",flexShrink:0}}>
+          LeadFlow
         </div>
+
+        <nav className="lg-topnav-tabs" style={{display:"flex",gap:24,alignItems:"center"}}>
+          {["Dashboard","Leads","Analytics"].map(t=>{
+            const key=t.toLowerCase()
+            const isActive=activeNav===key
+            return(
+              <a key={t} href="#" onClick={e=>{e.preventDefault();setNav(key)}}
+                style={{fontSize:14,fontWeight:isActive?700:500,
+                  color:isActive?"#a3a6ff":"#a3aac4",
+                  borderBottom:isActive?"2px solid #a3a6ff":"2px solid transparent",
+                  paddingBottom:4,textDecoration:"none",transition:"color .2s",letterSpacing:"-.01em"}}>
+                {t}
+              </a>
+            )
+          })}
+        </nav>
+
         <div style={{flex:1}}/>
+
+        {/* Search */}
+        <div style={{position:"relative",display:"flex",alignItems:"center"}}>
+          <span style={{position:"absolute",left:12,color:"#40485d",display:"flex"}}>
+            <IconSearch/>
+          </span>
+          <input value={search} onChange={e=>setSearch(e.target.value)}
+            placeholder="Global Search…"
+            style={{background:"#000011",border:"none",borderRadius:12,
+              padding:"8px 16px 8px 36px",color:"#dee5ff",fontSize:13,
+              fontFamily:"'Inter',sans-serif",outline:"none",width:220}}/>
+        </div>
+
+        {/* Callbacks badge */}
         {stats?.callbacksDue>0&&(
-          <button className="btn-amber btn" onClick={()=>setCbOnly(p=>!p)}>
-            🔔 {stats.callbacksDue} callback{stats.callbacksDue!==1?"s":""} due
+          <button className="btn btn-amber" onClick={()=>setCbOnly(p=>!p)}>
+            🔔 {stats.callbacksDue}
           </button>
         )}
-        <button className="btn btn-g" style={{fontSize:11}} onClick={()=>setShowScripts(true)}>📋 Scripts</button>
-        <button className="btn btn-g" style={{fontSize:11}} onClick={()=>setImport(true)}>↑ Import CSV</button>
-        <button className="btn btn-p" style={{fontSize:11}} onClick={()=>setEditModal(true)}>+ Add Lead</button>
-        <div style={{fontSize:11,color:"#525878",borderLeft:"1px solid #181b2e",paddingLeft:12,display:"flex",alignItems:"center",gap:8}}>
-          <span style={{color:"#6b7194"}}>{user}</span>
-          <button onClick={()=>{localStorage.clear();setUser(null)}}
-            style={{background:"none",border:"none",color:"#f0606080",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>
-            sign out
+
+        <IconBtn onClick={()=>{}} title="Notifications"><IconBell/></IconBtn>
+        <IconBtn onClick={()=>setShowScripts(true)} title="Settings / Scripts"><IconSettings/></IconBtn>
+
+        {/* User avatar */}
+        <div
+          onClick={()=>{if(window.confirm("Sign out?")){{localStorage.clear();setUser(null)}}}}
+          title={`${user} — click to sign out`}
+          style={{width:34,height:34,borderRadius:"50%",background:"#a3a6ff25",
+            border:"1px solid #40485d60",display:"flex",alignItems:"center",
+            justifyContent:"center",fontSize:13,fontWeight:700,color:"#a3a6ff",
+            cursor:"pointer",flexShrink:0,fontFamily:"'Space Grotesk',sans-serif"}}>
+          {(user||"?")[0].toUpperCase()}
+        </div>
+      </header>
+
+      {/* ── Sidebar ─────────────────────────────────────────────────────── */}
+      <aside className="lg-sidebar" style={{position:"fixed",left:0,top:64,bottom:0,width:256,
+        background:"#060e20",borderRight:"1px solid #40485d25",zIndex:40,
+        display:"flex",flexDirection:"column",overflowY:"auto"}}>
+
+        <nav style={{flex:1,padding:"8px 0",display:"flex",flexDirection:"column",gap:2}}>
+          {SIDEBAR_NAV.map(({key,label,Icon})=>{
+            const active=activeNav===key
+            return(
+              <a key={key} href="#" onClick={e=>{e.preventDefault();setNav(key)}}
+                style={{display:"flex",alignItems:"center",gap:12,padding:"11px 16px",
+                  fontSize:14,color:active?"#a3a6ff":"#a3aac4",
+                  background:active?"#a3a6ff1a":"transparent",
+                  borderRight:`3px solid ${active?"#a3a6ff":"transparent"}`,
+                  textDecoration:"none",transition:"all .18s"}}>
+                <Icon/>{label}
+              </a>
+            )
+          })}
+        </nav>
+
+        {/* Start Dialing CTA */}
+        <div style={{padding:"0 16px 20px"}}>
+          <button className="btn btn-p"
+            style={{width:"100%",padding:"13px",fontSize:14,
+              fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,
+              boxShadow:"0 8px 32px rgba(163,166,255,.18)"}}
+            onClick={()=>leads.length>0?setCallModal(leads[0]):setEditModal(true)}>
+            Start Dialing
           </button>
         </div>
-      </div>
 
-      <div style={{padding:"22px 28px",maxWidth:1500,margin:"0 auto"}}>
-        <StatsBar stats={stats} onCallbacks={()=>setCbOnly(p=>!p)}/>
-        {industries.length>0&&<LeadFinder onFound={loadLeads} industries={industries}/>}
+        {/* Bottom links */}
+        <div style={{borderTop:"1px solid #40485d25",padding:"8px 0"}}>
+          {[
+            {label:"Import CSV", Icon:IconUpload, action:()=>setImport(true)},
+            {label:"Account",    Icon:IconPerson, action:()=>{if(window.confirm("Sign out?")){{localStorage.clear();setUser(null)}}}},
+          ].map(({label,Icon,action})=>(
+            <a key={label} href="#" onClick={e=>{e.preventDefault();action()}}
+              style={{display:"flex",alignItems:"center",gap:12,padding:"9px 16px",
+                fontSize:14,color:"#a3aac4",textDecoration:"none",transition:"background .15s"}}
+              onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+              onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              <Icon/>{label}
+            </a>
+          ))}
+        </div>
+      </aside>
 
-        <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
-          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search name, company, phone..."
-            style={{background:"#0d0e1a",border:"1px solid #1e2236",color:"#dde1f0",padding:"8px 12px",
-              borderRadius:7,fontSize:12,fontFamily:"inherit",outline:"none",flex:"1 1 200px"}}/>
-          <select className="sel" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
-            <option value="all">All Statuses</option>
-            {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
-          </select>
-          <select className="sel" value={sortBy} onChange={e=>setSort(e.target.value)}>
-            <option value="score">Highest Score</option>
-            <option value="newest">Newest First</option>
-            <option value="company">Company A–Z</option>
-            <option value="callbacks">Callbacks Due</option>
-          </select>
-          <button className="btn" onClick={()=>setCbOnly(p=>!p)}
-            style={{background:cbOnly?"#8b5cf6":"transparent",color:cbOnly?"#fff":"#6b7194",
-              border:"1px solid "+(cbOnly?"#8b5cf6":"#1e2236"),padding:"8px 14px",fontSize:11}}>
-            {cbOnly?"✕ Show All":"🔔 Callbacks Only"}
-          </button>
-          <div style={{fontSize:11,color:"#2a2d3e",marginLeft:"auto"}}>
-            {loading?"loading...":leads.length+" lead"+(leads.length!==1?"s":"")}
+      {/* ── Main Content ─────────────────────────────────────────────────── */}
+      <main className="lg-main" style={{marginLeft:256,paddingTop:64,minHeight:"100vh"}}>
+        <div style={{padding:"32px 28px",maxWidth:1240}}>
+
+          {/* Page header + stats row */}
+          <section style={{display:"flex",flexWrap:"wrap",alignItems:"flex-end",
+            justifyContent:"space-between",gap:20,marginBottom:32}}>
+            <div>
+              <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>
+                Daily Performance
+              </h1>
+              <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Cleaning Prospecting Dashboard</p>
+            </div>
+            <StatsBar stats={stats} onCallbacks={()=>setCbOnly(p=>!p)}/>
+          </section>
+
+          {/* Lead Finder */}
+          {industries.length>0&&<LeadFinder onFound={loadLeads} industries={industries}/>}
+
+          {/* Filter Bar */}
+          <section style={{background:"#141f38",borderRadius:16,padding:"16px 20px",
+            display:"flex",flexWrap:"wrap",alignItems:"center",gap:12,marginBottom:20}}>
+
+            <div style={{flex:"1 1 200px",position:"relative",display:"flex",alignItems:"center"}}>
+              <span style={{position:"absolute",left:12,color:"#40485d",display:"flex"}}>
+                <IconFilter/>
+              </span>
+              <input value={search} onChange={e=>setSearch(e.target.value)}
+                placeholder="Filter by company or contact…"
+                style={{width:"100%",background:"#000011",border:"1px solid #40485d30",
+                  borderRadius:8,padding:"8px 12px 8px 32px",color:"#dee5ff",
+                  fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none"}}/>
+            </div>
+
+            <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+              <select className="sel" value={fIndustry} onChange={e=>setFIndustry(e.target.value)}>
+                <option value="">Industry: All</option>
+                {(industries.length>0?industries:INDUSTRIES).map(i=><option key={i} value={i}>{i}</option>)}
+              </select>
+              <select className="sel" value={fState} onChange={e=>setFState(e.target.value)}>
+                <option value="">State: All States</option>
+                {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
+              </select>
+              <select className="sel" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
+                <option value="all">Status: All</option>
+                {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
+              </select>
+              <select className="sel" value={sortBy} onChange={e=>setSort(e.target.value)}>
+                <option value="score">Highest Score</option>
+                <option value="newest">Newest First</option>
+                <option value="company">Company A–Z</option>
+                <option value="callbacks">Callbacks Due</option>
+              </select>
+              <button className="btn btn-g" style={{fontSize:12,padding:"8px 16px"}} onClick={reset}>
+                Reset
+              </button>
+            </div>
+          </section>
+
+          {/* Lead Table */}
+          <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+
+            {/* Column header row */}
+            <div style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
+              padding:"10px 24px",fontSize:"0.6rem",fontWeight:700,
+              color:"#a3aac4",textTransform:"uppercase",letterSpacing:".1em",
+              opacity:.65,borderBottom:"1px solid #40485d20"}}>
+              <div>Contact &amp; Company</div>
+              <div>Phone Number</div>
+              <div>Lead Score</div>
+              <div>Status</div>
+              <div style={{textAlign:"right"}}>Actions</div>
+            </div>
+
+            {loading?(
+              <div style={{padding:"64px 24px",textAlign:"center",color:"#40485d",fontSize:13}}>
+                Loading leads…
+              </div>
+            ):displayLeads.length===0?(
+              <div style={{padding:"72px 24px",textAlign:"center"}}>
+                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:52,fontWeight:700,
+                  color:"#192540",marginBottom:10}}>0</div>
+                <div style={{fontSize:11,color:"#40485d",letterSpacing:".1em",textTransform:"uppercase"}}>
+                  {cbOnly?"No callbacks due":"Use Find Leads above or import a CSV to get started"}
+                </div>
+              </div>
+            ):(
+              displayLeads.map(lead=>{
+                const info=si(lead.status)
+                const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
+                const score=lead.score||scoreLead(lead)||0
+                const ac=avatarColor(lead.company||lead.firstName||"?")
+                return(
+                  <div key={lead.id}
+                    className={isCb?"lrow-cb":""}
+                    style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
+                      padding:"16px 24px",alignItems:"center",gap:16,
+                      borderBottom:"1px solid #40485d12",transition:"background .12s",cursor:"default"}}
+                    onMouseEnter={e=>e.currentTarget.style.background=isCb?"#8b5cf612":"#192540"}
+                    onMouseLeave={e=>e.currentTarget.style.background=isCb?"#8b5cf608":"transparent"}>
+
+                    {/* Contact & Company */}
+                    <div style={{display:"flex",alignItems:"center",gap:14,minWidth:0}}>
+                      <div style={{width:40,height:40,borderRadius:"50%",flexShrink:0,
+                        background:ac+"22",display:"flex",alignItems:"center",justifyContent:"center",
+                        fontSize:13,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-.01em"}}>
+                        {getInitials(lead)}
+                      </div>
+                      <div style={{minWidth:0}}>
+                        <div style={{fontWeight:700,color:"#dee5ff",
+                          fontFamily:"'Space Grotesk',sans-serif",fontSize:14,
+                          overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                          {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}
+                        </div>
+                        <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>
+                          {lead.company||"—"}
+                        </div>
+                        <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
+                          {lead.source&&<span className="src-tag">{lead.source}</span>}
+                          {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf630"}}>🔔 {lead.callbackDate}</span>}
+                          {lead.contract_value>0&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>${(lead.contract_value||0).toLocaleString()}</span>}
+                          {lead.followUpSequence&&<span style={{fontSize:9,background:"#ffe08312",color:"#ffe083",padding:"2px 7px",borderRadius:4,border:"1px solid #ffe08325"}}>⏱ fu</span>}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Phone */}
+                    <div style={{display:"flex",alignItems:"center",gap:7,fontSize:13,color:"#dee5ff",opacity:.85}}>
+                      {lead.phone?(
+                        <>
+                          <svg width={14} height={14} fill="none" viewBox="0 0 24 24" stroke="#a3a6ff" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/>
+                          </svg>
+                          {lead.phone}
+                        </>
+                      ):<span style={{color:"#40485d"}}>—</span>}
+                    </div>
+
+                    {/* Lead Score */}
+                    <div>
+                      <ScoreRing score={score}/>
+                      {(lead.assignedTo||lead.total_calls>0)&&(
+                        <div style={{marginTop:4,fontSize:11,color:"#40485d"}}>
+                          {lead.assignedTo&&<span>{lead.assignedTo}</span>}
+                          {lead.total_calls>0&&<span style={{marginLeft:4}}>· {lead.total_calls} call{lead.total_calls!==1?"s":""}</span>}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Status */}
+                    <div>
+                      <span className="pill"
+                        style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>
+                        {info.label}
+                      </span>
+                      <div style={{display:"flex",gap:3,marginTop:6,flexWrap:"wrap"}}>
+                        {STATUS_OPTIONS.filter(s=>s.value!==lead.status).slice(0,2).map(s=>(
+                          <button key={s.value} className="qs"
+                            onClick={e=>{e.stopPropagation();quickStatus(lead,s.value)}}
+                            style={{color:s.color,borderColor:s.color+"30",fontSize:"10px"}}>
+                            {s.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Actions */}
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6}}>
+                      <LogCallBtn onClick={e=>{e.stopPropagation();setCallModal(lead)}}/>
+                      <IconBtn onClick={e=>{e.stopPropagation();setEditModal(lead)}} title="Edit lead">
+                        <IconEdit/>
+                      </IconBtn>
+                      <IconBtn onClick={e=>{e.stopPropagation();deleteL(lead.id)}} title="Delete"
+                        hoverColor="#ff6e84" baseColor="#40485d">
+                        <IconTrash/>
+                      </IconBtn>
+                    </div>
+                  </div>
+                )
+              })
+            )}
           </div>
-        </div>
 
-        {!loading&&leads.length===0?(
-          <div style={{textAlign:"center",padding:"60px 0",color:"#2a2d3e"}}>
-            <div style={{fontFamily:"'Syne',sans-serif",fontSize:44,fontWeight:800,marginBottom:8}}>0</div>
-            <div style={{fontSize:11,letterSpacing:".1em"}}>
-              {cbOnly?"NO CALLBACKS DUE":"USE FIND LEADS ABOVE OR IMPORT A CSV TO GET STARTED"}
+          {/* Pagination footer */}
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+            marginTop:24,padding:"0 4px"}}>
+            <p style={{fontSize:14,color:"#a3aac4"}}>
+              {loading?"Loading…":
+                `Showing ${displayLeads.length} of ${leads.length} lead${leads.length!==1?"s":""}`}
+            </p>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
+                border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}>
+                <IconChevLeft/>
+              </button>
+              <span style={{fontSize:14,fontWeight:700,color:"#a3a6ff",padding:"0 12px",
+                fontFamily:"'Space Grotesk',sans-serif"}}>1</span>
+              <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
+                border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}>
+                <IconChevRight/>
+              </button>
             </div>
           </div>
-        ):(
-          <div style={{display:"flex",flexDirection:"column",gap:6}}>
-            {leads.map(lead=>{
-              const info=si(lead.status)
-              const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
-              return(
-                <div key={lead.id} className={`lrow${isCb?" lrow-cb":""}`}
-                  style={{display:"grid",gridTemplateColumns:"auto 1fr auto auto",gap:14,alignItems:"center"}}>
-                  <ScoreRing score={lead.score||0}/>
-                  <div>
-                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3,flexWrap:"wrap"}}>
-                      <span style={{fontFamily:"'Syne',sans-serif",fontSize:13,fontWeight:800,color:"#f0f2ff"}}>
-                        {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}
-                      </span>
-                      {lead.source&&<span className="src-tag">{lead.source}</span>}
-                      {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf635"}}>🔔 {lead.callbackDate}</span>}
-                      {lead.followUpSequence&&<span style={{fontSize:9,background:"#f0b42912",color:"#f0b429",padding:"2px 7px",borderRadius:4,border:"1px solid #f0b42930"}}>⏱ {lead.followUpSequence}</span>}
-                      {lead.contract_value>0&&<span style={{fontSize:9,background:"#059669",color:"#fff",padding:"2px 7px",borderRadius:4}}>${(lead.contract_value||0).toLocaleString()}</span>}
-                    </div>
-                    {lead.company&&(
-                      <div style={{fontSize:11,color:"#6b7194",marginBottom:3}}>
-                        {lead.company}{lead.industry?` · ${lead.industry}`:""}
-                      </div>
-                    )}
-                    <div style={{display:"flex",gap:12,fontSize:11,color:"#525878",flexWrap:"wrap"}}>
-                      {lead.phone&&<span>📞 {lead.phone}</span>}
-                      {lead.email&&<span>✉ {lead.email}</span>}
-                      {(lead.city||lead.state)&&<span>📍 {[lead.city,lead.state].filter(Boolean).join(", ")}</span>}
-                      {lead.assignedTo&&<span>👤 {lead.assignedTo}</span>}
-                      {lead.total_calls>0&&<span>📞 {lead.total_calls} call{lead.total_calls!==1?"s":""}</span>}
-                    </div>
-                    {lead.notes&&<div style={{marginTop:4,fontSize:11,color:"#525878",borderLeft:"2px solid #1e2236",paddingLeft:7,maxWidth:520,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lead.notes}</div>}
-                  </div>
-                  <div style={{display:"flex",flexDirection:"column",gap:6,minWidth:115}}>
-                    <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}35`,textAlign:"center"}}>
-                      {info.label}
-                    </span>
-                    <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
-                      {STATUS_OPTIONS.filter(s=>s.value!==lead.status).slice(0,3).map(s=>(
-                        <button key={s.value} className="qs" onClick={()=>quickStatus(lead,s.value)}
-                          style={{color:s.color,borderColor:s.color+"35"}}>{s.label}</button>
-                      ))}
-                    </div>
-                  </div>
-                  <div style={{display:"flex",flexDirection:"column",gap:5,alignItems:"flex-end"}}>
-                    <div style={{fontSize:9,color:"#2a2d3e"}}>{lead.createdAt?new Date(lead.createdAt).toLocaleDateString():""}</div>
-                    <button onClick={()=>setCallModal(lead)}
-                      style={{background:"#5b5fef18",color:"#5b5fef",border:"1px solid #5b5fef35",padding:"5px 11px",
-                        borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:500}}>
-                      📞 Log Call
-                    </button>
-                    <button className="btn btn-g" style={{fontSize:11,padding:"5px 11px"}} onClick={()=>setEditModal(lead)}>Edit</button>
-                    <button className="btn btn-r" onClick={()=>deleteL(lead.id)}>Delete</button>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        )}
-      </div>
+        </div>
+      </main>
 
+      {/* ── FAB ──────────────────────────────────────────────────────────── */}
+      <FabBtn onClick={()=>setEditModal(true)}/>
+
+      {/* ── Mobile Bottom Nav ────────────────────────────────────────────── */}
+      <nav className="mobile-nav" style={{display:"none",position:"fixed",bottom:0,left:0,right:0,
+        background:"#060e20",height:64,alignItems:"center",justifyContent:"space-around",
+        zIndex:50,borderTop:"1px solid #40485d25",padding:"0 8px"}}>
+        {[
+          {key:"dashboard",label:"Dashboard",Icon:IconDashboard},
+          {key:"leads",    label:"Leads",    Icon:IconPeople},
+          {key:"dialer",   label:"Dialer",   Icon:IconPhone},
+          {key:"history",  label:"History",  Icon:IconHistory},
+          {key:"account",  label:"Account",  Icon:IconPerson},
+        ].map(({key,label,Icon})=>{
+          const active=activeNav===key
+          return(
+            <a key={key} href="#" onClick={e=>{e.preventDefault();setNav(key)}}
+              style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2,
+                color:active?"#a3a6ff":"#a3aac4",textDecoration:"none",minWidth:48,padding:4}}>
+              <Icon/>
+              <span style={{fontSize:"0.6rem",fontWeight:active?700:500}}>{label}</span>
+            </a>
+          )
+        })}
+      </nav>
+
+      {/* ── Modals ───────────────────────────────────────────────────────── */}
       {callModal&&<CallModal lead={callModal} onClose={()=>setCallModal(null)} onSaved={loadLeads}/>}
       {editModal&&(
         <LeadModal lead={editModal===true?null:editModal} onClose={()=>setEditModal(null)}
@@ -1003,11 +1307,50 @@ export default function App(){
       {showImport&&<ImportModal onClose={()=>setImport(false)} onDone={msg=>{notify(msg);loadLeads()}}/>}
       {showScripts&&<ScriptsModal onClose={()=>setShowScripts(false)}/>}
       {toast&&(
-        <div className="toast" style={{borderColor:toast.type==="error"?"#f0606040":"#5b5fef40",color:toast.type==="error"?"#f06060":"#dde1f0"}}>
+        <div className="toast"
+          style={{borderColor:toast.type==="error"?"#ff6e8440":"#a3a6ff40",
+            color:toast.type==="error"?"#ff6e84":"#dee5ff"}}>
           {toast.msg}
         </div>
       )}
     </div>
   )
 }
-// bust Thu Feb 26 17:20:03 PST 2026
+
+// ─── Log Call Button (hover effect with state) ────────────────────────────────
+
+function LogCallBtn({onClick}){
+  const [hov,setHov]=useState(false)
+  return(
+    <button onClick={onClick}
+      onMouseEnter={()=>setHov(true)} onMouseLeave={()=>setHov(false)}
+      style={{display:"flex",alignItems:"center",gap:8,padding:"8px 16px",
+        borderRadius:8,background:hov?"#a3a6ff":"#000011",
+        color:hov?"#000011":"#a3a6ff",
+        border:"1px solid #a3a6ff25",cursor:"pointer",fontFamily:"inherit",
+        fontSize:13,fontWeight:700,transition:"all .15s",whiteSpace:"nowrap"}}>
+      <IconCallFwd/>
+      Log Call
+    </button>
+  )
+}
+
+// ─── FAB ─────────────────────────────────────────────────────────────────────
+
+function FabBtn({onClick}){
+  const [hov,setHov]=useState(false)
+  return(
+    <button onClick={onClick}
+      onMouseEnter={()=>setHov(true)} onMouseLeave={()=>setHov(false)}
+      style={{position:"fixed",bottom:32,right:32,zIndex:50,
+        display:"flex",alignItems:"center",gap:12,
+        background:"#69f6b8",color:"#005a3c",
+        padding:"16px 24px",borderRadius:999,border:"none",cursor:"pointer",
+        fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:15,
+        boxShadow:`0 10px 40px -10px rgba(105,246,184,${hov?".65":".45"})`,
+        transform:hov?"scale(1.04)":"scale(1)",transition:"all .2s"}}>
+      <IconPlus/>
+      New Prospect
+    </button>
+  )
+}
