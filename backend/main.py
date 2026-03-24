@@ -409,6 +409,19 @@ def get_leaderboard(user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/calls/qualified")
+def get_qualified_calls(user: str = Depends(verify_token)):
+    try:
+        # Fetch calls that have any qualification data filled out
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*,leads:leadId(company,firstName,lastName,phone,industry,state,score,status,assignedTo)"
+            f"&or=(budgetFocus.neq.,vendorStatus.neq.,decisionMaker.neq.,timeline.neq.,qualified.neq.)"
+            f"&order=calledAt.desc",
+            headers=SB_HEADERS, timeout=30)
+        return r.json() if r.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── Scripts endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/scripts")

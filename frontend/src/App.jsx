@@ -151,6 +151,8 @@ function IconFilter(){return<svg width={14} height={14} fill="none" viewBox="0 0
 function IconChevLeft(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7"/></svg>}
 function IconChevRight(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7"/></svg>}
 function IconPlus(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4"/></svg>}
+function IconCalendarFar(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>}
+function IconClipCheck(){return<svg width={18} height={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>}
 
 // ─── ScoreRing (redesigned as dot + label) ───────────────────────────────────
 
@@ -867,11 +869,13 @@ function IconBtn({onClick,children,title,hoverColor="#dee5ff",baseColor="#a3aac4
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 const SIDEBAR_NAV = [
-  { key:"dashboard", label:"Dashboard", Icon:IconDashboard },
-  { key:"leads",     label:"Leads",     Icon:IconPeople },
-  { key:"dialer",    label:"Dialer",    Icon:IconPhone },
-  { key:"analytics", label:"Analytics", Icon:IconChart },
-  { key:"history",   label:"History",   Icon:IconHistory },
+  { key:"dashboard", label:"Dashboard",       Icon:IconDashboard },
+  { key:"leads",     label:"Leads",           Icon:IconPeople },
+  { key:"dialer",    label:"Dialer",          Icon:IconPhone },
+  { key:"future",    label:"Future Follow-Ups", Icon:IconCalendarFar },
+  { key:"qualified", label:"Qualified",        Icon:IconClipCheck },
+  { key:"analytics", label:"Analytics",       Icon:IconChart },
+  { key:"history",   label:"History",         Icon:IconHistory },
 ]
 
 export default function App(){
@@ -898,6 +902,8 @@ export default function App(){
   const [dialerIdx,setDialerIdx]   = useState(0)
   const [leaderboard,setLeaderboard] = useState([])
   const [lbLoading,setLbLoading]   = useState(false)
+  const [qualifiedCalls,setQualifiedCalls] = useState([])
+  const [qualLoading,setQualLoading] = useState(false)
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -930,6 +936,12 @@ export default function App(){
     if(activeNav!=="analytics"||!user) return
     setLbLoading(true)
     api("/api/leaderboard").then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+  },[activeNav,user])
+
+  useEffect(()=>{
+    if(activeNav!=="qualified"||!user) return
+    setQualLoading(true)
+    api("/api/calls/qualified").then(r=>setQualifiedCalls(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setQualLoading(false))
   },[activeNav,user])
 
   useEffect(()=>{
@@ -1424,6 +1436,120 @@ export default function App(){
                   </div>
                 )
               })()}
+            </div>
+          )}
+
+          {/* ── QUALIFIED LEADS ──────────────────────────────────────────────── */}
+          {activeNav==="qualified"&&(
+            <div>
+              <div style={{marginBottom:28,display:"flex",alignItems:"flex-end",
+                justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
+                <div>
+                  <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                    color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Qualified Leads</h1>
+                  <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                    Calls with qualification data filled out
+                  </p>
+                </div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  {qualifiedCalls.length>0&&(
+                    <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
+                      color:"#69f6b8"}}>{qualifiedCalls.length}</span>
+                  )}
+                  <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                    onClick={()=>{
+                      setQualLoading(true)
+                      api("/api/calls/qualified").then(r=>setQualifiedCalls(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setQualLoading(false))
+                    }}>Refresh</button>
+                </div>
+              </div>
+
+              {qualLoading?(
+                <div style={{padding:60,textAlign:"center",color:"#40485d"}}>Loading...</div>
+              ):qualifiedCalls.length===0?(
+                <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
+                  <div style={{fontSize:40,marginBottom:12}}>&#x1f4cb;</div>
+                  <div style={{color:"#a3aac4",fontSize:14}}>No qualified leads yet</div>
+                  <div style={{color:"#40485d",fontSize:12,marginTop:6}}>
+                    Use the Qualify tab in the call modal to fill out qualification data
+                  </div>
+                </div>
+              ):(
+                <div style={{display:"flex",flexDirection:"column",gap:16}}>
+                  {qualifiedCalls.map((call,i)=>{
+                    const lead=call.leads||{}
+                    const ac=avatarColor(lead.company||lead.firstName||call.calledBy||"?")
+                    const qualColor=call.qualified==="Hot"?"#ff6e84":call.qualified==="Warm"?"#ffe083":
+                      call.qualified==="Not Yet"?"#a3a6ff":"#40485d"
+                    const qualChips=[
+                      {label:"Focus",val:call.budgetFocus},
+                      {label:"Vendor",val:call.vendorStatus},
+                      {label:"Contact",val:call.decisionMaker},
+                      {label:"Timeline",val:call.timeline},
+                      {label:"Qualified",val:call.qualified},
+                    ].filter(c=>c.val)
+                    return(
+                      <div key={call.id||i} style={{background:"#0f1930",borderRadius:12,
+                        borderLeft:`4px solid ${qualColor}`,overflow:"hidden"}}>
+                        {/* Header row */}
+                        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+                          padding:"16px 20px",gap:16,flexWrap:"wrap"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:12,minWidth:0}}>
+                            <div style={{width:38,height:38,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                              display:"flex",alignItems:"center",justifyContent:"center",
+                              fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                              {(lead.company||lead.firstName||call.calledBy||"?").slice(0,2).toUpperCase()}
+                            </div>
+                            <div style={{minWidth:0}}>
+                              <div style={{fontWeight:600,color:"#dee5ff",fontSize:15,
+                                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company||"Unknown"}
+                              </div>
+                              <div style={{fontSize:12,color:"#a3aac4"}}>
+                                {lead.company}{lead.industry?` \u00b7 ${lead.industry}`:""}{lead.state?` \u00b7 ${lead.state}`:""}
+                              </div>
+                            </div>
+                          </div>
+                          <div style={{display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+                            <span className="pill" style={{background:qualColor+"20",color:qualColor,
+                              border:`1px solid ${qualColor}30`,fontSize:12,fontWeight:700}}>
+                              {call.qualified||"Pending"}
+                            </span>
+                            <div style={{textAlign:"right"}}>
+                              <div style={{fontSize:11,color:"#40485d"}}>
+                                {call.calledBy} \u00b7 {call.calledAt?new Date(call.calledAt).toLocaleDateString():""}
+                              </div>
+                              {lead.phone&&(
+                                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4"}}>{lead.phone}</div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Qual chips */}
+                        <div style={{padding:"0 20px 16px",display:"flex",gap:8,flexWrap:"wrap"}}>
+                          {qualChips.map((c,j)=>(
+                            <div key={j} style={{background:"#141f38",borderRadius:8,padding:"8px 14px",
+                              display:"flex",flexDirection:"column",gap:2}}>
+                              <span style={{fontSize:9,color:"#40485d",textTransform:"uppercase",
+                                letterSpacing:".06em",fontWeight:700}}>{c.label}</span>
+                              <span style={{fontSize:13,color:"#dee5ff",fontWeight:600}}>{c.val}</span>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Notes if any */}
+                        {call.notes&&(
+                          <div style={{padding:"0 20px 16px",fontSize:12,color:"#a3aac4",
+                            borderTop:"1px solid #40485d15",paddingTop:12,marginTop:0}}>
+                            {call.notes}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
 
