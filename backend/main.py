@@ -412,13 +412,27 @@ def get_leaderboard(user: str = Depends(verify_token)):
 @app.get("/api/calls/qualified")
 def get_qualified_calls(user: str = Depends(verify_token)):
     try:
+        # Fetch all calls with lead join, filter client-side for any qual field
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/call_outcomes"
-            f"?select=*,leads:leadId(company,firstName,lastName,phone,industry,state,score,status,assignedTo)"
-            f"&or=(budgetfocus.not.is.null,vendorstatus.not.is.null,decisionmaker.not.is.null,timeline.not.is.null,qualified.not.is.null)"
-            f"&order=calledAt.desc",
+            f"?select=*"
+            f"&order=calledAt.desc&limit=500",
             headers=SB_HEADERS, timeout=30)
-        return r.json() if r.status_code == 200 else []
+        all_calls = r.json() if r.status_code == 200 else []
+        if not isinstance(all_calls, list):
+            return []
+        qual_fields = ["budgetfocus", "vendorstatus", "decisionmaker", "timeline", "qualified"]
+        qualified = [c for c in all_calls if any(c.get(f) for f in qual_fields)]
+        # Now fetch lead data for matched calls
+        for c in qualified:
+            lid = c.get("leadId")
+            if lid:
+                lr = req_lib.get(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lid}&select=company,firstName,lastName,phone,industry,state,score,status,assignedTo",
+                    headers=SB_HEADERS, timeout=10)
+                leads_data = lr.json() if lr.status_code == 200 else []
+                c["leads"] = leads_data[0] if leads_data else None
+        return qualified
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
