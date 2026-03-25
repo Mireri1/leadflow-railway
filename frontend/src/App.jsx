@@ -347,7 +347,7 @@ function CallModal({lead,onClose,onSaved}){
   async function log(){
     setSave(true)
     try{
-      await api("/api/calls",{method:"POST",body:JSON.stringify({
+      const callPayload = {
         leadId:lead.id, outcome, notes,
         duration:duration?parseInt(duration)*60:0,
         callbackDate:outcome==="callback"?cbDate:"",
@@ -358,8 +358,8 @@ function CallModal({lead,onClose,onSaved}){
         followupsequence: followUpSeq||null,
         script_id: scriptId ? parseInt(scriptId) : null,
         converted: outcome === "converted",
-        contract_value: outcome === "converted" && contractValue ? parseFloat(contractValue) : null,
-      })})
+      }
+      await api("/api/calls",{method:"POST",body:JSON.stringify(callPayload)})
       if(scriptId) {
         api(`/api/scripts/${scriptId}/use`,{method:"POST",body:JSON.stringify({})}).catch(()=>{})
       }
