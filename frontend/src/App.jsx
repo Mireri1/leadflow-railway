@@ -329,6 +329,17 @@ function CallModal({lead,onClose,onSaved}){
   const [saving,setSave]          = useState(false)
   const [tab,setTab]              = useState("call")
   const [followUpSeq,setFuSeq]    = useState("")
+  // Auto-timer
+  const [timerStart]              = useState(()=>Date.now())
+  const [timerNow,setTimerNow]    = useState(Date.now())
+  const [timerRunning,setTimerRunning] = useState(true)
+  useEffect(()=>{
+    if(!timerRunning) return
+    const iv=setInterval(()=>setTimerNow(Date.now()),1000)
+    return()=>clearInterval(iv)
+  },[timerRunning])
+  const timerSeconds=Math.floor((timerNow-timerStart)/1000)
+  const timerDisplay=`${Math.floor(timerSeconds/60).toString().padStart(2,"0")}:${(timerSeconds%60).toString().padStart(2,"0")}`
   const [budgetFocus,setBudget]   = useState("")
   const [vendorStatus,setVendor]  = useState("")
   const [decisionMaker,setDM]     = useState("")
@@ -347,9 +358,11 @@ function CallModal({lead,onClose,onSaved}){
   async function log(){
     setSave(true)
     try{
+      setTimerRunning(false)
+      const finalDuration = duration ? parseInt(duration)*60 : timerSeconds
       const callPayload = {
         leadId:lead.id, outcome, notes,
-        duration:duration?parseInt(duration)*60:0,
+        duration:finalDuration,
         callbackDate:outcome==="callback"?cbDate:"",
         calledBy:getUser(), calledAt:new Date().toISOString(),
         budgetfocus: budgetFocus||null, vendorstatus: vendorStatus||null,
@@ -454,8 +467,23 @@ function CallModal({lead,onClose,onSaved}){
                   {CALL_OUTCOMES.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
               </div>
-              <div className="ff"><label>Duration (min)</label>
-                <input type="number" value={duration} onChange={e=>setDur(e.target.value)} placeholder="5" min="0"/>
+              <div className="ff"><label>Duration</label>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,
+                    color:timerRunning?"#69f6b8":"#a3a6ff",letterSpacing:".05em",
+                    background:"#060e20",border:"1px solid #40485d40",borderRadius:6,
+                    padding:"4px 12px",minWidth:70,textAlign:"center"}}>
+                    {timerDisplay}
+                  </div>
+                  <button type="button" onClick={()=>setTimerRunning(r=>!r)}
+                    style={{fontSize:11,padding:"6px 10px",borderRadius:6,border:"1px solid #40485d40",
+                      background:"transparent",color:"#a3aac4",cursor:"pointer",fontFamily:"inherit"}}>
+                    {timerRunning?"Pause":"Resume"}
+                  </button>
+                  <span style={{fontSize:10,color:"#40485d"}}>or</span>
+                  <input type="number" value={duration} onChange={e=>setDur(e.target.value)}
+                    placeholder="min" min="0" style={{width:50,fontSize:12}}/>
+                </div>
               </div>
             </div>
             {outcome==="callback"&&(
@@ -1626,6 +1654,128 @@ export default function App(){
               )}
             </div>
           )}
+
+          {/* ── FUTURE FOLLOW-UPS ───────────────────────────────────────────── */}
+          {activeNav==="future"&&(()=>{
+            const sixMonths=addDays(180)
+            const futureLeads=leads
+              .filter(l=>l.callbackDate&&l.callbackDate>=sixMonths&&l.status!=="converted")
+              .sort((a,b)=>a.callbackDate.localeCompare(b.callbackDate))
+
+            function monthsAway(dateStr){
+              const diff=Math.round((new Date(dateStr)-new Date())/(1000*60*60*24*30))
+              return diff<=1?"~1 month":diff+" months"
+            }
+
+            return(
+              <div>
+                <div style={{marginBottom:28,display:"flex",alignItems:"flex-end",
+                  justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
+                  <div>
+                    <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                      color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Future Follow-Ups</h1>
+                    <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                      Leads scheduled 6+ months out
+                    </p>
+                  </div>
+                  {futureLeads.length>0&&(
+                    <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
+                      color:"#a3a6ff"}}>{futureLeads.length}</div>
+                  )}
+                </div>
+
+                {futureLeads.length===0?(
+                  <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
+                    <div style={{fontSize:40,marginBottom:12}}>&#x1f4c5;</div>
+                    <div style={{color:"#a3aac4",fontSize:14}}>No future follow-ups scheduled</div>
+                    <div style={{color:"#40485d",fontSize:12,marginTop:6}}>
+                      When you log a callback date 6+ months away, it will appear here
+                    </div>
+                  </div>
+                ):(
+                  <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+                    <div style={{display:"grid",gridTemplateColumns:"3fr 2fr 1fr 2fr 2fr",
+                      padding:"10px 24px",fontSize:"0.55rem",fontWeight:700,
+                      color:"#a3aac4",textTransform:"uppercase",letterSpacing:".08em",
+                      borderBottom:"1px solid #40485d20"}}>
+                      <div>Contact &amp; Company</div>
+                      <div>Scheduled</div>
+                      <div>Status</div>
+                      <div>Notes</div>
+                      <div style={{textAlign:"right"}}>Actions</div>
+                    </div>
+                    {futureLeads.map(lead=>{
+                      const ac=avatarColor(lead.company||lead.firstName||"?")
+                      const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
+                      return(
+                        <div key={lead.id}
+                          style={{display:"grid",gridTemplateColumns:"3fr 2fr 1fr 2fr 2fr",
+                            padding:"16px 24px",alignItems:"center",gap:16,
+                            borderBottom:"1px solid #40485d10",transition:"background .12s"}}
+                          onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                          onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                          <div style={{display:"flex",alignItems:"center",gap:12,minWidth:0}}>
+                            <div style={{width:38,height:38,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                              display:"flex",alignItems:"center",justifyContent:"center",
+                              fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                              {getInitials(lead)}</div>
+                            <div style={{minWidth:0}}>
+                              <div style={{fontWeight:600,color:"#dee5ff",fontSize:14,
+                                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                              <div style={{fontSize:12,color:"#a3aac4"}}>{lead.company}</div>
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
+                              fontWeight:700,color:"#a3a6ff"}}>{lead.callbackDate}</div>
+                            <div style={{fontSize:11,color:"#40485d",marginTop:2}}>
+                              {monthsAway(lead.callbackDate)} away
+                            </div>
+                          </div>
+                          <span className="pill" style={{background:info.color+"20",color:info.color,
+                            border:`1px solid ${info.color}30`,width:"fit-content"}}>{info.label}</span>
+                          <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",
+                            display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>
+                            {lead.notes||<span style={{color:"#40485d"}}>{"\u2014"}</span>}
+                          </div>
+                          <div style={{display:"flex",gap:6,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                            <button className="btn btn-g"
+                              style={{fontSize:11,padding:"6px 12px",whiteSpace:"nowrap"}}
+                              onClick={async()=>{
+                                const d=window.prompt(
+                                  `Move follow-up for ${lead.company||lead.firstName} to when?\n(YYYY-MM-DD)`,
+                                  addDays(30)
+                                )
+                                if(d&&d.match(/^\d{4}-\d{2}-\d{2}$/)){
+                                  await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
+                                    callbackDate:d,status:"callback",updatedAt:new Date().toISOString()})})
+                                  setLeads(p=>p.map(l=>l.id===lead.id?{...l,callbackDate:d,status:"callback"}:l))
+                                  notify("Follow-up moved to "+d)
+                                }
+                              }}>
+                              Bring Forward
+                            </button>
+                            <IconBtn onClick={()=>setCallModal(lead)} title="Log call"><IconPhone/></IconBtn>
+                            <IconBtn onClick={()=>setEditModal(lead)} title="Edit"><IconEdit/></IconBtn>
+                          </div>
+                        </div>
+                      )
+                    })}
+                    <div style={{padding:"12px 24px",borderTop:"1px solid #40485d20",
+                      display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontSize:12,color:"#40485d"}}>
+                        Earliest: <span style={{color:"#a3a6ff",fontFamily:"'Space Grotesk',sans-serif",fontWeight:600}}>{futureLeads[0]?.callbackDate}</span>
+                        {" \u00b7 "}Latest: <span style={{color:"#a3a6ff",fontFamily:"'Space Grotesk',sans-serif",fontWeight:600}}>{futureLeads[futureLeads.length-1]?.callbackDate}</span>
+                      </span>
+                      <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
+                        fontWeight:700,color:"#a3a6ff"}}>{futureLeads.length} lead{futureLeads.length!==1?"s":""}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })()}
 
           {/* ── ANALYTICS ───────────────────────────────────────────────────── */}
           {activeNav==="analytics"&&(
