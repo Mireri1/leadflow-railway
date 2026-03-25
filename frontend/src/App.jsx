@@ -900,7 +900,12 @@ export default function App(){
   const [availableOnly,setAvailOnly] = useState(false)
   const [activeNav,setNav]         = useState("dashboard")
   const [callHistory,setCallHistory] = useState([])
+  const [histData,setHistData]       = useState(null)
   const [histLoading,setHistLoading] = useState(false)
+  const [histCaller,setHistCaller]   = useState("")
+  const [histFrom,setHistFrom]       = useState("")
+  const [histTo,setHistTo]           = useState("")
+  const [histRange,setHistRange]     = useState("week")
   const [dialerIdx,setDialerIdx]   = useState(0)
   const [leaderboard,setLeaderboard] = useState([])
   const [lbLoading,setLbLoading]   = useState(false)
@@ -946,10 +951,28 @@ export default function App(){
     api("/api/calls/qualified").then(r=>setQualifiedCalls(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setQualLoading(false))
   },[activeNav,user])
 
+  const loadHistory = useCallback(async(range,caller)=>{
+    setHistLoading(true)
+    const params = new URLSearchParams()
+    const now = new Date()
+    let from = ""
+    if(range==="today"){ from = now.toISOString().split("T")[0] }
+    else if(range==="week"){ const d=new Date(now); d.setDate(d.getDate()-7); from=d.toISOString().split("T")[0] }
+    else if(range==="month"){ const d=new Date(now); d.setMonth(d.getMonth()-1); from=d.toISOString().split("T")[0] }
+    else if(range==="custom"){ if(histFrom) params.set("date_from",histFrom); if(histTo) params.set("date_to",histTo) }
+    if(range!=="custom"&&from) params.set("date_from",from)
+    if(caller) params.set("caller",caller)
+    try{
+      const r=await api(`/api/calls/history?${params}`)
+      setHistData(r)
+      setCallHistory(r.calls||[])
+    }catch(e){ setHistData(null); setCallHistory([]) }
+    setHistLoading(false)
+  },[histFrom,histTo])
+
   useEffect(()=>{
     if(activeNav!=="history"||!user) return
-    setHistLoading(true)
-    api("/api/calls/today").then(r=>setCallHistory(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setHistLoading(false))
+    loadHistory(histRange,histCaller)
   },[activeNav,user])
 
   async function quickStatus(lead,status){
@@ -1748,61 +1771,189 @@ export default function App(){
           {/* ── HISTORY ─────────────────────────────────────────────────────── */}
           {activeNav==="history"&&(
             <div>
-              <div style={{marginBottom:32,display:"flex",alignItems:"flex-end",
-                justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
-                <div>
-                  <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
-                    color:"#dee5ff",letterSpacing:"-.02em"}}>Call History</h1>
-                  <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Calls logged today</p>
-                </div>
-                <button className="btn btn-p" style={{fontSize:13,padding:"10px 20px"}}
-                  onClick={()=>{
-                    setHistLoading(true)
-                    api("/api/calls/today").then(r=>setCallHistory(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setHistLoading(false))
-                  }}>Refresh</button>
+              <div style={{marginBottom:24}}>
+                <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                  color:"#dee5ff",letterSpacing:"-.02em"}}>Call History</h1>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Filter by rep, date range, and view reports</p>
               </div>
+
+              {/* Filters */}
+              <div style={{background:"#0f1930",borderRadius:12,padding:"14px 20px",marginBottom:20,
+                display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+                {/* Range toggles */}
+                {[{k:"today",l:"Today"},{k:"week",l:"This Week"},{k:"month",l:"This Month"},{k:"custom",l:"Custom"}].map(({k,l})=>(
+                  <button key={k} onClick={()=>{setHistRange(k);if(k!=="custom")loadHistory(k,histCaller)}}
+                    style={{padding:"6px 14px",borderRadius:6,fontSize:12,cursor:"pointer",fontFamily:"inherit",
+                      background:histRange===k?"#a3a6ff":"transparent",color:histRange===k?"#000011":"#a3aac4",
+                      border:`1px solid ${histRange===k?"#a3a6ff":"#40485d40"}`}}>{l}</button>
+                ))}
+                <div style={{width:1,height:24,background:"#40485d30",margin:"0 4px"}}/>
+                {/* Caller filter */}
+                <select value={histCaller} onChange={e=>{setHistCaller(e.target.value);loadHistory(histRange,e.target.value)}}
+                  style={{background:"#141f38",color:"#dee5ff",border:"1px solid #40485d40",borderRadius:6,
+                    padding:"6px 10px",fontSize:12,fontFamily:"inherit"}}>
+                  <option value="">All Reps</option>
+                  {(histData?.callers||[]).map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+                {/* Custom date inputs */}
+                {histRange==="custom"&&(
+                  <>
+                    <input type="date" value={histFrom} onChange={e=>setHistFrom(e.target.value)}
+                      style={{background:"#141f38",color:"#dee5ff",border:"1px solid #40485d40",borderRadius:6,
+                        padding:"6px 10px",fontSize:12,fontFamily:"inherit"}}/>
+                    <span style={{color:"#40485d",fontSize:12}}>to</span>
+                    <input type="date" value={histTo} onChange={e=>setHistTo(e.target.value)}
+                      style={{background:"#141f38",color:"#dee5ff",border:"1px solid #40485d40",borderRadius:6,
+                        padding:"6px 10px",fontSize:12,fontFamily:"inherit"}}/>
+                    <button className="btn btn-p" style={{fontSize:11,padding:"6px 12px"}}
+                      onClick={()=>loadHistory("custom",histCaller)}>Apply</button>
+                  </>
+                )}
+                <div style={{flex:1}}/>
+                <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                  onClick={()=>loadHistory(histRange,histCaller)}>Refresh</button>
+              </div>
+
               {histLoading?(
-                <div style={{padding:60,textAlign:"center",color:"#40485d"}}>Loading…</div>
-              ):callHistory.length===0?(
+                <div style={{padding:60,textAlign:"center",color:"#40485d"}}>Loading...</div>
+              ):!histData||callHistory.length===0?(
                 <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
-                  <div style={{fontSize:40,marginBottom:12}}>📞</div>
-                  <div style={{color:"#a3aac4",fontSize:14}}>No calls logged today yet</div>
-                  <div style={{color:"#40485d",fontSize:12,marginTop:6}}>Use "Log Call" on any lead to track activity</div>
+                  <div style={{fontSize:40,marginBottom:12}}>&#x1f4de;</div>
+                  <div style={{color:"#a3aac4",fontSize:14}}>No calls found for this period</div>
                 </div>
               ):(
-                <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
-                  <div style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 1fr",
-                    padding:"10px 24px",fontSize:"0.6rem",fontWeight:700,
-                    color:"#a3aac4",textTransform:"uppercase",letterSpacing:".1em",
-                    borderBottom:"1px solid #40485d20"}}>
-                    <div>Outcome</div><div>Called By</div><div>Time</div><div/>
-                  </div>
-                  {callHistory.map((call,i)=>{
-                    const oc=CALL_OUTCOMES.find(o=>o.value===call.outcome)||{label:call.outcome||"Call"}
-                    const col=call.outcome==="converted"?"#69f6b8":call.outcome==="interested"?"#a3a6ff":
-                      call.outcome==="no_answer"?"#40485d":"#dee5ff"
-                    return(
-                      <div key={i} style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 1fr",
-                        padding:"14px 24px",alignItems:"center",borderBottom:"1px solid #40485d12",
-                        transition:"background .12s"}}
-                        onMouseEnter={e=>e.currentTarget.style.background="#192540"}
-                        onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                        <span className="pill" style={{background:col+"20",color:col,
-                          border:`1px solid ${col}30`,width:"fit-content"}}>{oc.label}</span>
-                        <div style={{fontSize:13,color:"#dee5ff"}}>{call.calledBy||"—"}</div>
-                        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4"}}>
-                          {call.calledAt?new Date(call.calledAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"—"}
-                        </div>
-                        <div/>
+                <>
+                  {/* Summary cards */}
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:20}}>
+                    {[
+                      {label:"Total Calls",val:histData.summary?.total||0,color:"#a3a6ff"},
+                      {label:"Converted",val:histData.summary?.converted||0,color:"#69f6b8"},
+                      {label:"Interested",val:histData.summary?.interested||0,color:"#ffe083"},
+                      {label:"No Answer",val:histData.summary?.no_answer||0,color:"#40485d"},
+                    ].map(({label,val,color})=>(
+                      <div key={label} style={{background:"#0f1930",borderRadius:12,padding:18,
+                        borderLeft:`4px solid ${color}`,textAlign:"center"}}>
+                        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
+                          color,marginBottom:4}}>{val}</div>
+                        <div style={{fontSize:11,color:"#a3aac4"}}>{label}</div>
                       </div>
-                    )
-                  })}
-                  <div style={{padding:"14px 24px",borderTop:"1px solid #40485d20",textAlign:"right"}}>
-                    <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#a3a6ff",fontWeight:700}}>
-                      {callHistory.length} call{callHistory.length!==1?"s":""} today
-                    </span>
+                    ))}
                   </div>
-                </div>
+
+                  {/* Per-rep breakdown */}
+                  {(histData.by_caller||[]).length>1&&(
+                    <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden",marginBottom:20}}>
+                      <div style={{padding:"14px 20px",borderBottom:"1px solid #40485d20",
+                        fontSize:"0.55rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                        Rep Breakdown
+                      </div>
+                      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr",
+                        padding:"8px 20px",fontSize:"0.5rem",fontWeight:700,color:"#a3aac4",
+                        textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d10"}}>
+                        <div>Rep</div><div style={{textAlign:"center"}}>Calls</div>
+                        <div style={{textAlign:"center"}}>Converted</div><div style={{textAlign:"center"}}>Interested</div>
+                        <div style={{textAlign:"center"}}>No Answer</div><div style={{textAlign:"center"}}>Conv %</div>
+                      </div>
+                      {(histData.by_caller||[]).map(rep=>{
+                        const ac=avatarColor(rep.name)
+                        return(
+                          <div key={rep.name} style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr",
+                            padding:"12px 20px",alignItems:"center",borderBottom:"1px solid #40485d08"}}
+                            onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                            onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                            <div style={{display:"flex",alignItems:"center",gap:10}}>
+                              <div style={{width:30,height:30,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                                display:"flex",alignItems:"center",justifyContent:"center",
+                                fontSize:11,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                                {rep.name.slice(0,2).toUpperCase()}
+                              </div>
+                              <span style={{fontWeight:600,color:"#dee5ff",fontSize:13}}>{rep.name}</span>
+                            </div>
+                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:15,fontWeight:700,color:"#a3a6ff"}}>{rep.total}</div>
+                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:700,color:rep.converted>0?"#69f6b8":"#40485d"}}>{rep.converted}</div>
+                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,color:rep.interested>0?"#ffe083":"#40485d"}}>{rep.interested}</div>
+                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#40485d"}}>{rep.no_answer}</div>
+                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                              color:parseFloat(rep.conv_rate)>=10?"#69f6b8":"#a3aac4"}}>{rep.conv_rate}%</div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+
+                  {/* Daily activity */}
+                  {(histData.by_date||[]).length>1&&(
+                    <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden",marginBottom:20}}>
+                      <div style={{padding:"14px 20px",borderBottom:"1px solid #40485d20",
+                        fontSize:"0.55rem",color:"#a3a6ff",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                        Daily Activity
+                      </div>
+                      {(histData.by_date||[]).map(day=>{
+                        const maxCalls=Math.max(...(histData.by_date||[]).map(d=>d.total))
+                        const pct=maxCalls?Math.round(day.total/maxCalls*100):0
+                        return(
+                          <div key={day.date} style={{padding:"10px 20px",display:"flex",alignItems:"center",gap:14,
+                            borderBottom:"1px solid #40485d08"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4",
+                              width:85,flexShrink:0}}>{day.date}</span>
+                            <div style={{flex:1,height:8,background:"#141f38",borderRadius:4,overflow:"hidden"}}>
+                              <div style={{height:"100%",width:`${pct}%`,background:"#a3a6ff",borderRadius:4}}/>
+                            </div>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                              color:"#dee5ff",width:30,textAlign:"right"}}>{day.total}</span>
+                            {day.converted>0&&<span style={{fontSize:10,color:"#69f6b8"}}>{day.converted} conv</span>}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+
+                  {/* Call log table */}
+                  <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+                    <div style={{padding:"14px 20px",borderBottom:"1px solid #40485d20",
+                      fontSize:"0.55rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                      Call Log ({callHistory.length})
+                    </div>
+                    <div style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 3fr",
+                      padding:"8px 20px",fontSize:"0.5rem",fontWeight:700,
+                      color:"#a3aac4",textTransform:"uppercase",letterSpacing:".08em",
+                      borderBottom:"1px solid #40485d15"}}>
+                      <div>Outcome</div><div>Rep</div><div>Date / Time</div><div>Notes</div>
+                    </div>
+                    {callHistory.slice(0,100).map((call,i)=>{
+                      const oc=CALL_OUTCOMES.find(o=>o.value===call.outcome)||{label:call.outcome||"Call"}
+                      const col=call.outcome==="converted"?"#69f6b8":call.outcome==="interested"?"#ffe083":
+                        call.outcome==="callback"?"#8b5cf6":call.outcome==="no_answer"?"#40485d":"#dee5ff"
+                      return(
+                        <div key={call.id||i} style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 3fr",
+                          padding:"12px 20px",alignItems:"center",borderBottom:"1px solid #40485d08",
+                          transition:"background .12s"}}
+                          onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                          onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                          <span className="pill" style={{background:col+"20",color:col,
+                            border:`1px solid ${col}30`,width:"fit-content"}}>{oc.label}</span>
+                          <div style={{fontSize:13,color:"#dee5ff"}}>{call.calledBy||"\u2014"}</div>
+                          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4"}}>
+                            {call.calledAt?new Date(call.calledAt).toLocaleDateString():""}
+                            {" "}
+                            {call.calledAt?new Date(call.calledAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):""}
+                          </div>
+                          <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",textOverflow:"ellipsis",
+                            whiteSpace:"nowrap"}}>{call.notes||"\u2014"}</div>
+                        </div>
+                      )
+                    })}
+                    <div style={{padding:"12px 20px",borderTop:"1px solid #40485d20",
+                      display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontSize:11,color:"#40485d"}}>
+                        Showing {Math.min(callHistory.length,100)} of {callHistory.length}
+                      </span>
+                      <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#a3a6ff",fontWeight:700}}>
+                        {callHistory.length} call{callHistory.length!==1?"s":""}
+                      </span>
+                    </div>
+                  </div>
+                </>
               )}
             </div>
           )}

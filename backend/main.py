@@ -346,6 +346,64 @@ def get_qualified_calls(user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/calls/history")
+def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
+                     user: str = Depends(verify_token)):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*&order=calledAt.desc&limit=1000"
+        if date_from:
+            url += f"&calledAt=gte.{date_from}T00:00:00"
+        if date_to:
+            url += f"&calledAt=lte.{date_to}T23:59:59"
+        if caller:
+            url += f"&calledBy=eq.{caller}"
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=30)
+        calls = r.json() if r.status_code == 200 else []
+        if not isinstance(calls, list):
+            return {"calls": [], "summary": {}, "callers": []}
+
+        # Build summary stats
+        summary = {"total": len(calls), "converted": 0, "interested": 0,
+                   "no_answer": 0, "callback": 0, "voicemail": 0, "answered": 0}
+        by_caller = {}
+        by_date = {}
+        for c in calls:
+            o = c.get("outcome", "")
+            if o in summary: summary[o] += 1
+            name = c.get("calledBy", "Unknown")
+            if name not in by_caller:
+                by_caller[name] = {"name": name, "total": 0, "converted": 0,
+                                   "interested": 0, "no_answer": 0, "callback": 0}
+            by_caller[name]["total"] += 1
+            if o in by_caller[name]: by_caller[name][o] += 1
+            day = (c.get("calledAt") or "")[:10]
+            if day:
+                if day not in by_date:
+                    by_date[day] = {"date": day, "total": 0, "converted": 0, "interested": 0}
+                by_date[day]["total"] += 1
+                if o in ("converted", "interested"):
+                    by_date[day][o] += 1
+
+        # Conversion rate per caller
+        caller_list = sorted(by_caller.values(), key=lambda x: -x["total"])
+        for cl in caller_list:
+            cl["conv_rate"] = f"{(cl['converted']/cl['total']*100):.1f}" if cl["total"] else "0.0"
+
+        date_list = sorted(by_date.values(), key=lambda x: x["date"], reverse=True)
+
+        # Unique callers for dropdown
+        all_callers = sorted(set(c.get("calledBy", "") for c in calls if c.get("calledBy")))
+
+        return {
+            "calls": calls,
+            "summary": summary,
+            "by_caller": caller_list,
+            "by_date": date_list,
+            "callers": all_callers,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/calls/{lead_id}")
 def get_calls(lead_id: str, user: str = Depends(verify_token)):
     try:
