@@ -352,8 +352,10 @@ function CallModal({lead,onClose,onSaved}){
         duration:duration?parseInt(duration)*60:0,
         callbackDate:outcome==="callback"?cbDate:"",
         calledBy:getUser(), calledAt:new Date().toISOString(),
-        budgetFocus, vendorStatus, decisionMaker, timeline, qualified,
-        followUpSequence: followUpSeq,
+        budgetfocus: budgetFocus||null, vendorstatus: vendorStatus||null,
+        decisionmaker: decisionMaker||null, timeline: timeline||null,
+        qualified: qualified||null,
+        followupsequence: followUpSeq||null,
         script_id: scriptId ? parseInt(scriptId) : null,
         converted: outcome === "converted",
         contract_value: outcome === "converted" && contractValue ? parseFloat(contractValue) : null,
@@ -526,9 +528,9 @@ function CallModal({lead,onClose,onSaved}){
                       </div>
                     </div>
                     {c.notes&&<div style={{fontSize:11,color:"#a3aac4",marginBottom:4}}>{c.notes}</div>}
-                    {(c.budgetFocus||c.vendorStatus||c.decisionMaker||c.timeline||c.qualified)&&(
+                    {(c.budgetfocus||c.vendorstatus||c.decisionmaker||c.timeline||c.qualified)&&(
                       <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-                        {[c.budgetFocus,c.vendorStatus,c.decisionMaker,c.timeline,c.qualified].filter(Boolean).map((t,i)=>(
+                        {[c.budgetfocus,c.vendorstatus,c.decisionmaker,c.timeline,c.qualified].filter(Boolean).map((t,i)=>(
                           <span key={i} style={{fontSize:9,background:"#192540",color:"#a3aac4",padding:"2px 6px",borderRadius:4}}>{t}</span>
                         ))}
                       </div>
@@ -1482,9 +1484,9 @@ export default function App(){
                     const qualColor=call.qualified==="Hot"?"#ff6e84":call.qualified==="Warm"?"#ffe083":
                       call.qualified==="Not Yet"?"#a3a6ff":"#40485d"
                     const qualChips=[
-                      {label:"Focus",val:call.budgetFocus},
-                      {label:"Vendor",val:call.vendorStatus},
-                      {label:"Contact",val:call.decisionMaker},
+                      {label:"Focus",val:call.budgetfocus},
+                      {label:"Vendor",val:call.vendorstatus},
+                      {label:"Contact",val:call.decisionmaker},
                       {label:"Timeline",val:call.timeline},
                       {label:"Qualified",val:call.qualified},
                     ].filter(c=>c.val)
