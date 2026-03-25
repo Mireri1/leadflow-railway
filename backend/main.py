@@ -362,21 +362,53 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
         if not isinstance(calls, list):
             return {"calls": [], "summary": {}, "callers": []}
 
+        # Track which leads have been called before for first-call detection
+        lead_first_call = {}  # leadId -> earliest calledAt
+
         # Build summary stats
+        contacted = ["answered", "interested", "converted", "callback"]
         summary = {"total": len(calls), "converted": 0, "interested": 0,
-                   "no_answer": 0, "callback": 0, "voicemail": 0, "answered": 0}
+                   "no_answer": 0, "callback": 0, "voicemail": 0, "answered": 0,
+                   "total_talk_time": 0, "first_calls": 0, "follow_ups": 0}
         by_caller = {}
         by_date = {}
+
+        # First pass: find earliest call per lead for first-call detection
+        for c in calls:
+            lid = c.get("leadId")
+            cat = c.get("calledAt", "")
+            if lid:
+                if lid not in lead_first_call or cat < lead_first_call[lid]:
+                    lead_first_call[lid] = cat
+
         for c in calls:
             o = c.get("outcome", "")
+            dur = c.get("duration") or 0
             if o in summary: summary[o] += 1
+            summary["total_talk_time"] += dur
+
+            # First call vs follow-up
+            lid = c.get("leadId")
+            cat = c.get("calledAt", "")
+            is_first = lid and lead_first_call.get(lid) == cat
+            if is_first: summary["first_calls"] += 1
+            else: summary["follow_ups"] += 1
+
             name = c.get("calledBy", "Unknown")
             if name not in by_caller:
                 by_caller[name] = {"name": name, "total": 0, "converted": 0,
-                                   "interested": 0, "no_answer": 0, "callback": 0}
-            by_caller[name]["total"] += 1
-            if o in by_caller[name]: by_caller[name][o] += 1
-            day = (c.get("calledAt") or "")[:10]
+                                   "interested": 0, "no_answer": 0, "callback": 0,
+                                   "voicemail": 0, "talk_time": 0,
+                                   "first_calls": 0, "follow_ups": 0, "contacted": 0}
+            u = by_caller[name]
+            u["total"] += 1
+            u["talk_time"] += dur
+            if o in u: u[o] += 1
+            if o in contacted: u["contacted"] += 1
+            if is_first: u["first_calls"] += 1
+            else: u["follow_ups"] += 1
+
+            day = (cat)[:10]
             if day:
                 if day not in by_date:
                     by_date[day] = {"date": day, "total": 0, "converted": 0, "interested": 0}
@@ -384,10 +416,18 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
                 if o in ("converted", "interested"):
                     by_date[day][o] += 1
 
-        # Conversion rate per caller
+        # Contact rate = % of calls that reached a person
+        total_contacted = sum(1 for c in calls if c.get("outcome") in contacted)
+        summary["contact_rate"] = f"{(total_contacted/len(calls)*100):.1f}" if calls else "0.0"
+        summary["avg_talk_time"] = round(summary["total_talk_time"] / len(calls)) if calls else 0
+
+        # Per-caller rates
         caller_list = sorted(by_caller.values(), key=lambda x: -x["total"])
         for cl in caller_list:
-            cl["conv_rate"] = f"{(cl['converted']/cl['total']*100):.1f}" if cl["total"] else "0.0"
+            tc = cl["total"]
+            cl["conv_rate"] = f"{(cl['converted']/tc*100):.1f}" if tc else "0.0"
+            cl["contact_rate"] = f"{(cl['contacted']/tc*100):.1f}" if tc else "0.0"
+            cl["avg_talk_time"] = round(cl["talk_time"] / tc) if tc else 0
 
         date_list = sorted(by_date.values(), key=lambda x: x["date"], reverse=True)
 
@@ -401,6 +441,33 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
             "by_date": date_list,
             "callers": all_callers,
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/leads/recycle-stale")
+def recycle_stale_leads(user: str = Depends(verify_token)):
+    """Unassign leads that haven't been touched in 7+ days"""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        # Get assigned leads not updated in 7 days and not converted
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,assignedTo,updatedAt,status"
+            f"&assignedTo=neq.&status=not.in.(converted,interested)"
+            f"&updatedAt=lt.{cutoff}",
+            headers=SB_HEADERS, timeout=30)
+        stale = r.json() if r.status_code == 200 else []
+        if not isinstance(stale, list):
+            return {"recycled": 0}
+        recycled = 0
+        for lead in stale:
+            if lead.get("assignedTo"):
+                req_lib.patch(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead['id']}",
+                    headers=SB_HEADERS,
+                    json={"assignedTo": "", "updatedAt": datetime.utcnow().isoformat()},
+                    timeout=10)
+                recycled += 1
+        return {"recycled": recycled, "total_checked": len(stale)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -432,7 +499,8 @@ def get_stats(user: str = Depends(verify_token)):
             "converted": converted,
             "callbacksDue": len([l for l in sl if l.get("callbackDate","")<=today and l.get("callbackDate") and l.get("status")!="converted"]),
             "callsToday": len(sc),
-            "conversionRate": f"{(converted/total*100):.1f}" if total else "0.0"
+            "conversionRate": f"{(converted/total*100):.1f}" if total else "0.0",
+            "contactRate": f"{(len([c for c in sc if c.get('outcome') in ('answered','interested','converted','callback')])/len(sc)*100):.1f}" if sc else "0.0",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -443,7 +511,7 @@ def get_leaderboard(user: str = Depends(verify_token)):
         today = datetime.utcnow().strftime("%Y-%m-%d")
         # All-time calls
         r1 = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt",
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration",
             headers=SB_HEADERS, timeout=30)
         # Leads for assignment tracking
         r2 = req_lib.get(
@@ -459,12 +527,16 @@ def get_leaderboard(user: str = Depends(verify_token)):
             if name not in users:
                 users[name] = {"name": name, "total_calls": 0, "calls_today": 0,
                                "conversions": 0, "interested": 0, "no_answer": 0,
-                               "voicemail": 0, "callbacks": 0}
+                               "voicemail": 0, "callbacks": 0, "contacted": 0,
+                               "talk_time": 0}
             u = users[name]
             u["total_calls"] += 1
+            u["talk_time"] += c.get("duration") or 0
             if (c.get("calledAt") or "").startswith(today):
                 u["calls_today"] += 1
             outcome = c.get("outcome", "")
+            if outcome in ("answered", "interested", "converted", "callback"):
+                u["contacted"] += 1
             if outcome == "converted":    u["conversions"] += 1
             elif outcome == "interested": u["interested"]  += 1
             elif outcome == "no_answer":  u["no_answer"]   += 1
@@ -478,11 +550,13 @@ def get_leaderboard(user: str = Depends(verify_token)):
                 users[name].setdefault("leads_assigned", 0)
                 users[name]["leads_assigned"] = users[name].get("leads_assigned", 0) + 1
 
-        # Compute conversion rate per user
+        # Compute rates per user
         result = []
         for u in users.values():
             tc = u["total_calls"]
             u["conv_rate"] = f"{(u['conversions']/tc*100):.1f}" if tc else "0.0"
+            u["contact_rate"] = f"{(u['contacted']/tc*100):.1f}" if tc else "0.0"
+            u["avg_talk_time"] = round(u["talk_time"] / tc) if tc else 0
             u["leads_assigned"] = u.get("leads_assigned", 0)
             result.append(u)
 

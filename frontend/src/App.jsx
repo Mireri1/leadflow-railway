@@ -818,10 +818,11 @@ function StatsBar({stats,onCallbacks}){
     {l:"Calls Today",  v:stats.callsToday||0,              c:"#a3a6ff", border:"#a3a6ff"},
     {l:"Conversions",  v:stats.converted||0,               c:"#69f6b8", border:"#69f6b8"},
     {l:"Follow Ups",   v:stats.callbacksDue||0,            c:"#ffe083", border:"#ffe083", onClick:onCallbacks},
+    {l:"Contact Rate",  v:(stats.contactRate||"0.0")+"%",  c:"#8b5cf6", border:"#8b5cf6"},
     {l:"Conv. Rate",   v:(stats.conversionRate||0)+"%",    c:"#ff6e84", border:"#ff6e84"},
   ]
   return(
-    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+    <div style={{display:"grid",gridTemplateColumns:`repeat(${items.length},1fr)`,gap:12}}>
       {items.map(s=>(
         <div key={s.l}
           onClick={s.onClick}
@@ -1139,6 +1140,43 @@ export default function App(){
               </div>
               <StatsBar stats={stats} onCallbacks={()=>{setNav("leads");setCbOnly(p=>!p)}}/>
 
+              {/* Daily Call Target */}
+              {(()=>{
+                const target=50
+                const done=stats?.callsToday||0
+                const pct=Math.min(Math.round(done/target*100),100)
+                return(
+                  <div style={{background:"#0f1930",borderRadius:12,padding:"16px 20px",marginTop:16}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                      <span style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+                        textTransform:"uppercase"}}>Daily Call Target</span>
+                      <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:700,
+                        color:pct>=100?"#69f6b8":pct>=50?"#ffe083":"#a3a6ff"}}>{done} / {target}</span>
+                    </div>
+                    <div style={{height:8,background:"#141f38",borderRadius:4,overflow:"hidden"}}>
+                      <div style={{height:"100%",width:`${pct}%`,borderRadius:4,transition:"width .3s",
+                        background:pct>=100?"#69f6b8":pct>=50?"#ffe083":"#a3a6ff"}}/>
+                    </div>
+                    {pct>=100&&<div style={{fontSize:11,color:"#69f6b8",marginTop:6,fontWeight:600}}>Target hit! Keep going.</div>}
+                  </div>
+                )
+              })()}
+
+              {/* Overdue callbacks */}
+              {leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted").length>0&&(
+                <div style={{background:"#2d0a0a",border:"1px solid #92400e",borderRadius:12,padding:"14px 20px",
+                  marginTop:16,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                  <div>
+                    <span style={{color:"#fca5a5",fontWeight:700,fontSize:13}}>
+                      {leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted").length} overdue callback{leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted").length!==1?"s":""}
+                    </span>
+                    <span style={{color:"#a3aac4",fontSize:12,marginLeft:8}}>— these leads expected a call back</span>
+                  </div>
+                  <button className="btn btn-p" style={{fontSize:12,padding:"7px 14px"}}
+                    onClick={()=>{setNav("leads");setCbOnly(true)}}>View</button>
+                </div>
+              )}
+
               {leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length>0&&(
                 <div style={{marginTop:32}}>
                   <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",
@@ -1380,7 +1418,18 @@ export default function App(){
               <div style={{marginBottom:24}}>
                 <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
                   color:"#dee5ff",letterSpacing:"-.02em"}}>Dialer</h1>
-                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Focused calling mode — only showing unclaimed leads</p>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                Focused calling mode — only showing unclaimed leads
+                {(()=>{
+                  const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                  return overdue.length>0?(
+                    <span style={{marginLeft:12,background:"#ff6e8430",color:"#ff6e84",padding:"3px 10px",
+                      borderRadius:20,fontSize:12,fontWeight:700}}>
+                      {overdue.length} overdue
+                    </span>
+                  ):null
+                })()}
+              </p>
               </div>
               {(()=>{
                 const dialerLeads=leads.filter(l=>!l.assignedTo||l.assignedTo===user)
@@ -1612,8 +1661,8 @@ export default function App(){
                 ):(
                   <>
                     {/* Header row */}
-                    <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
-                      padding:"9px 24px",fontSize:"0.55rem",fontWeight:700,color:"#a3aac4",
+                    <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                      padding:"9px 24px",fontSize:"0.5rem",fontWeight:700,color:"#a3aac4",
                       textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d15"}}>
                       <div>Rep</div>
                       <div style={{textAlign:"center"}}>Today</div>
@@ -1621,6 +1670,8 @@ export default function App(){
                       <div style={{textAlign:"center"}}>Converted</div>
                       <div style={{textAlign:"center"}}>Interested</div>
                       <div style={{textAlign:"center"}}>Conv %</div>
+                      <div style={{textAlign:"center"}}>Contact %</div>
+                      <div style={{textAlign:"center"}}>Avg Talk</div>
                       <div style={{textAlign:"center"}}>No Answer</div>
                       <div style={{textAlign:"center"}}>Callbacks</div>
                     </div>
@@ -1630,7 +1681,7 @@ export default function App(){
                       const convPct=parseFloat(rep.conv_rate)||0
                       return(
                         <div key={rep.name}
-                          style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                          style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                             padding:"14px 24px",alignItems:"center",
                             borderBottom:"1px solid #40485d10",
                             background:i===0?"#ffe08306":i===1?"#ffffff04":"transparent",
@@ -1677,6 +1728,18 @@ export default function App(){
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
                               color:convPct>=10?"#69f6b8":convPct>=5?"#ffe083":"#a3aac4"}}>
                               {rep.conv_rate}%
+                            </span>
+                          </div>
+                          {/* Contact rate */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                              color:parseFloat(rep.contact_rate)>=50?"#8b5cf6":"#a3aac4"}}>{rep.contact_rate}%</span>
+                          </div>
+                          {/* Avg talk time */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
+                              color:rep.avg_talk_time>0?"#dee5ff":"#40485d"}}>
+                              {rep.avg_talk_time>0?`${Math.floor(rep.avg_talk_time/60)}m${rep.avg_talk_time%60?` ${rep.avg_talk_time%60}s`:""}`:"—"}
                             </span>
                           </div>
                           {/* No answer */}
@@ -1811,6 +1874,35 @@ export default function App(){
                 )}
                 <div style={{flex:1}}/>
                 <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                  onClick={()=>{
+                    if(!callHistory.length){notify("No data to export","error");return}
+                    const headers=["Date","Time","Rep","Outcome","Duration (min)","Notes"]
+                    const rows=callHistory.map(c=>[
+                      c.calledAt?new Date(c.calledAt).toLocaleDateString():"",
+                      c.calledAt?new Date(c.calledAt).toLocaleTimeString():"",
+                      c.calledBy||"",
+                      c.outcome||"",
+                      c.duration?Math.round(c.duration/60):"0",
+                      `"${(c.notes||"").replace(/"/g,'""')}"`,
+                    ])
+                    const csv=[headers.join(","),...rows.map(r=>r.join(","))].join("\n")
+                    const blob=new Blob([csv],{type:"text/csv"})
+                    const a=document.createElement("a")
+                    a.href=URL.createObjectURL(blob)
+                    a.download=`call-history-${histRange}-${new Date().toISOString().split("T")[0]}.csv`
+                    a.click()
+                    notify("CSV downloaded")
+                  }}>Export CSV</button>
+                <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                  onClick={async()=>{
+                    if(!window.confirm("Unassign leads untouched for 7+ days?")) return
+                    try{
+                      const r=await api("/api/leads/recycle-stale",{method:"POST",body:"{}"})
+                      notify(`Recycled ${r.recycled} stale lead${r.recycled!==1?"s":""}`)
+                      loadHistory(histRange,histCaller)
+                    }catch(e){notify("Error: "+e.message,"error")}
+                  }}>Recycle Stale</button>
+                <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
                   onClick={()=>loadHistory(histRange,histCaller)}>Refresh</button>
               </div>
 
@@ -1824,12 +1916,27 @@ export default function App(){
               ):(
                 <>
                   {/* Summary cards */}
-                  <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:20}}>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:14}}>
                     {[
                       {label:"Total Calls",val:histData.summary?.total||0,color:"#a3a6ff"},
                       {label:"Converted",val:histData.summary?.converted||0,color:"#69f6b8"},
                       {label:"Interested",val:histData.summary?.interested||0,color:"#ffe083"},
+                      {label:"Contact Rate",val:(histData.summary?.contact_rate||"0.0")+"%",color:"#8b5cf6"},
+                    ].map(({label,val,color})=>(
+                      <div key={label} style={{background:"#0f1930",borderRadius:12,padding:18,
+                        borderLeft:`4px solid ${color}`,textAlign:"center"}}>
+                        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
+                          color,marginBottom:4}}>{val}</div>
+                        <div style={{fontSize:11,color:"#a3aac4"}}>{label}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:20}}>
+                    {[
                       {label:"No Answer",val:histData.summary?.no_answer||0,color:"#40485d"},
+                      {label:"Avg Talk Time",val:(()=>{const s=histData.summary?.avg_talk_time||0;return s>0?`${Math.floor(s/60)}m ${s%60}s`:"0m"})(),color:"#dee5ff"},
+                      {label:"First Calls",val:histData.summary?.first_calls||0,color:"#69f6b8"},
+                      {label:"Follow-Ups",val:histData.summary?.follow_ups||0,color:"#a3a6ff"},
                     ].map(({label,val,color})=>(
                       <div key={label} style={{background:"#0f1930",borderRadius:12,padding:18,
                         borderLeft:`4px solid ${color}`,textAlign:"center"}}>
@@ -1847,17 +1954,18 @@ export default function App(){
                         fontSize:"0.55rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
                         Rep Breakdown
                       </div>
-                      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr",
+                      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                         padding:"8px 20px",fontSize:"0.5rem",fontWeight:700,color:"#a3aac4",
                         textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d10"}}>
                         <div>Rep</div><div style={{textAlign:"center"}}>Calls</div>
                         <div style={{textAlign:"center"}}>Converted</div><div style={{textAlign:"center"}}>Interested</div>
-                        <div style={{textAlign:"center"}}>No Answer</div><div style={{textAlign:"center"}}>Conv %</div>
+                        <div style={{textAlign:"center"}}>Conv %</div><div style={{textAlign:"center"}}>Contact %</div>
+                        <div style={{textAlign:"center"}}>Avg Talk</div><div style={{textAlign:"center"}}>1st / F-Up</div>
                       </div>
                       {(histData.by_caller||[]).map(rep=>{
                         const ac=avatarColor(rep.name)
                         return(
-                          <div key={rep.name} style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr",
+                          <div key={rep.name} style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                             padding:"12px 20px",alignItems:"center",borderBottom:"1px solid #40485d08"}}
                             onMouseEnter={e=>e.currentTarget.style.background="#192540"}
                             onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
@@ -1872,9 +1980,18 @@ export default function App(){
                             <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:15,fontWeight:700,color:"#a3a6ff"}}>{rep.total}</div>
                             <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:700,color:rep.converted>0?"#69f6b8":"#40485d"}}>{rep.converted}</div>
                             <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,color:rep.interested>0?"#ffe083":"#40485d"}}>{rep.interested}</div>
-                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#40485d"}}>{rep.no_answer}</div>
                             <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
                               color:parseFloat(rep.conv_rate)>=10?"#69f6b8":"#a3aac4"}}>{rep.conv_rate}%</div>
+                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                              color:parseFloat(rep.contact_rate)>=50?"#8b5cf6":"#a3aac4"}}>{rep.contact_rate}%</div>
+                            <div style={{textAlign:"center",fontFamily:"'Space Grotesk',sans-serif",fontSize:12,
+                              color:rep.avg_talk_time>0?"#dee5ff":"#40485d"}}>
+                              {rep.avg_talk_time>0?`${Math.floor(rep.avg_talk_time/60)}m`:"—"}</div>
+                            <div style={{textAlign:"center",fontSize:12,color:"#a3aac4"}}>
+                              <span style={{color:"#69f6b8"}}>{rep.first_calls}</span>
+                              <span style={{color:"#40485d"}}> / </span>
+                              <span style={{color:"#a3a6ff"}}>{rep.follow_ups}</span>
+                            </div>
                           </div>
                         )
                       })}
