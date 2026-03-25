@@ -449,7 +449,6 @@ def recycle_stale_leads(user: str = Depends(verify_token)):
     """Unassign leads that haven't been touched in 7+ days"""
     try:
         cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
-        # Get assigned leads not updated in 7 days and not converted
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads?select=id,assignedTo,updatedAt,status"
             f"&assignedTo=neq.&status=not.in.(converted,interested)"
@@ -468,6 +467,84 @@ def recycle_stale_leads(user: str = Depends(verify_token)):
                     timeout=10)
                 recycled += 1
         return {"recycled": recycled, "total_checked": len(stale)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/leads/reassign")
+def reassign_leads(body: dict, user: str = Depends(verify_token)):
+    """Bulk reassign leads from one rep to another (or unassign to pool)"""
+    try:
+        from_rep = body.get("from", "")
+        to_rep = body.get("to", "")  # empty string = back to pool
+        if not from_rep:
+            raise HTTPException(status_code=400, detail="'from' rep is required")
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id&assignedTo=eq.{from_rep}",
+            headers=SB_HEADERS, timeout=30)
+        leads = r.json() if r.status_code == 200 else []
+        if not isinstance(leads, list) or not leads:
+            return {"reassigned": 0, "message": f"No leads assigned to {from_rep}"}
+        count = 0
+        for lead in leads:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead['id']}",
+                headers=SB_HEADERS,
+                json={"assignedTo": to_rep, "updatedAt": datetime.utcnow().isoformat()},
+                timeout=10)
+            count += 1
+        dest = to_rep if to_rep else "unassigned pool"
+        return {"reassigned": count, "from": from_rep, "to": dest}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reps")
+def get_reps(user: str = Depends(verify_token)):
+    """Get all reps with their lead counts and last activity"""
+    try:
+        # All assigned leads
+        r1 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo",
+            headers=SB_HEADERS, timeout=30)
+        leads = r1.json() if r1.status_code == 200 else []
+        # All calls for last activity
+        r2 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=calledBy,calledAt&order=calledAt.desc",
+            headers=SB_HEADERS, timeout=30)
+        calls = r2.json() if r2.status_code == 200 else []
+
+        reps = {}
+        for l in (leads if isinstance(leads, list) else []):
+            name = l.get("assignedTo") or ""
+            if name:
+                reps.setdefault(name, {"name": name, "leads": 0, "last_call": None})
+                reps[name]["leads"] += 1
+        for c in (calls if isinstance(calls, list) else []):
+            name = c.get("calledBy") or ""
+            if name:
+                reps.setdefault(name, {"name": name, "leads": 0, "last_call": None})
+                if not reps[name]["last_call"]:
+                    reps[name]["last_call"] = c.get("calledAt")
+
+        now = datetime.utcnow()
+        result = []
+        for rep in reps.values():
+            lc = rep["last_call"]
+            if lc:
+                try:
+                    last_dt = datetime.fromisoformat(lc.replace("+00:00", "").replace("Z", ""))
+                    days_inactive = (now - last_dt).days
+                except:
+                    days_inactive = 999
+            else:
+                days_inactive = 999
+            rep["days_inactive"] = days_inactive
+            rep["status"] = "active" if days_inactive <= 3 else "idle" if days_inactive <= 7 else "inactive"
+            result.append(rep)
+
+        result.sort(key=lambda x: (-x["leads"], x["name"]))
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

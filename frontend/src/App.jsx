@@ -2076,6 +2076,101 @@ export default function App(){
                   })}
                 </div>
               </div>
+
+              {/* ── Team Management ── */}
+              <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+                <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
+                  display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                  <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                    Team Management
+                  </div>
+                  <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                    onClick={()=>{
+                      api("/api/reps").then(r=>{
+                        if(Array.isArray(r)) setLeaderboard(prev=>{
+                          // Store reps data in a temp state via leaderboard refresh
+                          window.__lf_reps=r; return prev
+                        })
+                        // Force re-render
+                        setLbLoading(l=>!l); setTimeout(()=>setLbLoading(l=>!l),50)
+                      }).catch(()=>{})
+                    }}>Load Reps</button>
+                </div>
+                {(()=>{
+                  const reps=window.__lf_reps||[]
+                  if(!reps.length) return(
+                    <div style={{padding:32,textAlign:"center",color:"#40485d",fontSize:13}}>
+                      Click "Load Reps" to see team status
+                    </div>
+                  )
+                  return(
+                    <div>
+                      {reps.map(rep=>{
+                        const ac=avatarColor(rep.name)
+                        const statusColor=rep.status==="active"?"#69f6b8":rep.status==="idle"?"#ffe083":"#ff6e84"
+                        return(
+                          <div key={rep.name} style={{padding:"14px 24px",borderBottom:"1px solid #40485d10",
+                            display:"flex",alignItems:"center",gap:14}}>
+                            <div style={{width:36,height:36,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                              display:"flex",alignItems:"center",justifyContent:"center",
+                              fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                              {rep.name.slice(0,2).toUpperCase()}
+                            </div>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontWeight:600,color:"#dee5ff",fontSize:14,display:"flex",alignItems:"center",gap:8}}>
+                                {rep.name}
+                                <span style={{fontSize:10,padding:"2px 8px",borderRadius:10,fontWeight:700,
+                                  background:statusColor+"20",color:statusColor,border:`1px solid ${statusColor}30`}}>
+                                  {rep.status}
+                                </span>
+                              </div>
+                              <div style={{fontSize:12,color:"#a3aac4"}}>
+                                {rep.leads} lead{rep.leads!==1?"s":""} assigned
+                                {rep.last_call?` \u00b7 last call ${new Date(rep.last_call).toLocaleDateString()}`:" \u00b7 no calls logged"}
+                                {rep.days_inactive>3&&(
+                                  <span style={{color:"#ff6e84",marginLeft:6}}>({rep.days_inactive}d inactive)</span>
+                                )}
+                              </div>
+                            </div>
+                            <div style={{display:"flex",gap:6,flexShrink:0}}>
+                              <button className="btn btn-g" style={{fontSize:11,padding:"5px 10px"}}
+                                onClick={async()=>{
+                                  const to=window.prompt(`Reassign all of ${rep.name}'s leads to whom?\n(Leave blank to return to pool)`)
+                                  if(to===null) return
+                                  try{
+                                    const r=await api("/api/leads/reassign",{method:"POST",
+                                      body:JSON.stringify({from:rep.name,to:to.trim()})})
+                                    notify(`${r.reassigned} lead${r.reassigned!==1?"s":""} moved to ${to.trim()||"pool"}`)
+                                    // Refresh reps
+                                    api("/api/reps").then(r=>{if(Array.isArray(r))window.__lf_reps=r;setLbLoading(l=>!l);setTimeout(()=>setLbLoading(l=>!l),50)}).catch(()=>{})
+                                    setTimeout(loadLeads,500)
+                                  }catch(e){notify("Error: "+e.message,"error")}
+                                }}>
+                                Reassign
+                              </button>
+                              {rep.status==="inactive"&&rep.leads>0&&(
+                                <button className="btn btn-p" style={{fontSize:11,padding:"5px 10px"}}
+                                  onClick={async()=>{
+                                    if(!window.confirm(`Return all ${rep.leads} of ${rep.name}'s leads to the pool?`)) return
+                                    try{
+                                      const r=await api("/api/leads/reassign",{method:"POST",
+                                        body:JSON.stringify({from:rep.name,to:""})})
+                                      notify(`${r.reassigned} lead${r.reassigned!==1?"s":""} returned to pool`)
+                                      api("/api/reps").then(r=>{if(Array.isArray(r))window.__lf_reps=r;setLbLoading(l=>!l);setTimeout(()=>setLbLoading(l=>!l),50)}).catch(()=>{})
+                                      setTimeout(loadLeads,500)
+                                    }catch(e){notify("Error: "+e.message,"error")}
+                                  }}>
+                                  Release to Pool
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
+                })()}
+              </div>
             </div>
           )}
 
