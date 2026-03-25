@@ -412,14 +412,34 @@ def get_leaderboard(user: str = Depends(verify_token)):
 @app.get("/api/calls/qualified")
 def get_qualified_calls(user: str = Depends(verify_token)):
     try:
-        # Fetch calls that have any qualification data filled out
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*,leads:leadId(company,firstName,lastName,phone,industry,state,score,status,assignedTo)"
-            f"&or=(budgetFocus.not.is.null,vendorStatus.not.is.null,decisionMaker.not.is.null,timeline.not.is.null,qualified.not.is.null)"
-            f"&order=calledAt.desc",
-            headers=SB_HEADERS, timeout=30)
-        return r.json() if r.status_code == 200 else []
+        # First: get ALL calls so we can see what columns exist
+        url = (
+            f"{SUPABASE_URL}/rest/v1/call_outcomes"
+            f"?select=*,leads:leadId(company,firstName,lastName,phone,industry,state,score,status,assignedTo)"
+            f"&order=calledAt.desc&limit=200"
+        )
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=30)
+        print(f"[qualified] status={r.status_code}")
+        all_calls = r.json() if r.status_code == 200 else []
+        if isinstance(all_calls, dict) and "message" in all_calls:
+            print(f"[qualified] Supabase error: {all_calls}")
+            return []
+        print(f"[qualified] total calls={len(all_calls)}")
+        if all_calls:
+            print(f"[qualified] sample keys={list(all_calls[0].keys())}")
+            # Show first call with any qual data
+            for c in all_calls[:5]:
+                print(f"[qualified] call: budgetFocus={c.get('budgetFocus')}, vendorStatus={c.get('vendorStatus')}, decisionMaker={c.get('decisionMaker')}, timeline={c.get('timeline')}, qualified={c.get('qualified')}")
+
+        # Filter client-side — any call with at least one qual field filled
+        qualified = [
+            c for c in all_calls
+            if any(c.get(f) for f in ["budgetFocus", "vendorStatus", "decisionMaker", "timeline", "qualified"])
+        ]
+        print(f"[qualified] matched={len(qualified)}")
+        return qualified
     except Exception as e:
+        print(f"[qualified] error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── Scripts endpoints ──────────────────────────────────────────────────────────
