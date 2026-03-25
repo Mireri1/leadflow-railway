@@ -29,6 +29,28 @@ const CALL_OUTCOMES = [
   { value:"converted",      label:"Converted!" },
 ]
 
+const PRIMARY_OUTCOMES = [
+  { value:"no_answer", label:"No Answer", color:"#40485d", icon:"📵" },
+  { value:"voicemail", label:"Voicemail", color:"#a3aac4", icon:"📨" },
+  { value:"answered",  label:"Answered",  color:"#69f6b8", icon:"📞" },
+]
+
+const SECONDARY_OUTCOMES = [
+  { value:"not_interested", label:"Not Interested", color:"#40485d", icon:"👎", needsQual:false },
+  { value:"interested",     label:"Interested",     color:"#ffe083", icon:"👍", needsQual:true },
+  { value:"callback",       label:"Callback",       color:"#8b5cf6", icon:"📅", needsQual:true },
+  { value:"converted",      label:"Converted!",     color:"#69f6b8", icon:"🎉", needsQual:true },
+]
+
+const CALLBACK_REASONS = [
+  "Decision Maker Unavailable",
+  "Requested Call Back Later",
+  "Needs Internal Approval",
+  "Timing Not Right",
+  "Gatekeeper — Need Direct Line",
+  "Other",
+]
+
 const INDUSTRIES = [
   "Healthcare","Home Health Care","Hospitals","Nursing Facilities","Medical Equipment",
   "Software","IT Services","Consulting","Accounting / CPA","Legal Services",
@@ -331,12 +353,13 @@ function QualChip({label, value, options, onChange}){
 
 function CallModal({lead,onClose,onSaved}){
   const [calls,setCalls]          = useState([])
-  const [outcome,setOutcome]      = useState("answered")
+  const [primary,setPrimary]      = useState("")       // no_answer, voicemail, answered
+  const [secondary,setSecondary]  = useState("")       // interested, not_interested, callback, converted
+  const [cbReason,setCbReason]    = useState("")       // callback reason
   const [notes,setNotes]          = useState("")
   const [cbDate,setCbDate]        = useState("")
   const [duration,setDur]         = useState("")
   const [saving,setSave]          = useState(false)
-  const [tab,setTab]              = useState("call")
   const [followUpSeq,setFuSeq]    = useState("")
   // Auto-timer
   const [timerStart]              = useState(()=>Date.now())
@@ -364,28 +387,30 @@ function CallModal({lead,onClose,onSaved}){
     api("/api/scripts").then(r=>setScripts(Array.isArray(r)?r:[])).catch(()=>{})
   },[lead.id])
 
-  // Outcomes that require qualification data
-  const REQUIRES_QUAL = ["interested", "converted", "callback"]
+  // Derive the flat outcome for storage (backward compatible)
+  const outcome = primary==="answered" ? (secondary||"answered") : primary
+  const secDef = SECONDARY_OUTCOMES.find(s=>s.value===secondary)
+  const needsQual = secDef?.needsQual || false
   const hasQualData = budgetFocus || vendorStatus || decisionMaker || timeline || qualified
 
+  // What step is the user on?
+  const step = !primary ? 1 : primary!=="answered" ? 3 : !secondary ? 2 : needsQual&&!hasQualData ? 2.5 : 3
+
   async function log(){
-    // Enforce qualification for key outcomes
-    if(REQUIRES_QUAL.includes(outcome) && !hasQualData){
-      alert(`"${outcome}" requires qualification data.\n\nSwitch to the Qualify tab and fill out at least one field before saving.`)
-      return
-    }
-    if(outcome==="callback" && !cbDate){
-      alert("Callback requires a date. Please set a callback date.")
-      return
-    }
+    if(!primary){ alert("Select what happened on the call."); return }
+    if(primary==="answered"&&!secondary){ alert("Select the call result."); return }
+    if(needsQual&&!hasQualData){ alert("This outcome requires qualification data. Fill out at least one field below."); return }
+    if(secondary==="callback"&&!cbDate){ alert("Callback requires a date."); return }
+
     setSave(true)
     try{
       setTimerRunning(false)
       const finalDuration = duration ? parseInt(duration)*60 : timerSeconds
+      const fullNotes = cbReason ? `[${cbReason}] ${notes}`.trim() : notes
       const callPayload = {
-        leadId:lead.id, outcome, notes,
+        leadId:lead.id, outcome, notes:fullNotes,
         duration:finalDuration,
-        callbackDate:outcome==="callback"?cbDate:"",
+        callbackDate:secondary==="callback"?cbDate:"",
         calledBy:getUser(), calledAt:new Date().toISOString(),
         budgetfocus: budgetFocus||null, vendorstatus: vendorStatus||null,
         decisionmaker: decisionMaker||null, timeline: timeline||null,
@@ -401,10 +426,10 @@ function CallModal({lead,onClose,onSaved}){
       const statusMap={answered:"called",no_answer:"no_answer",voicemail:"no_answer",
         callback:"callback",interested:"interested",not_interested:"not_interested",converted:"converted"}
       const fuDays = FOLLOW_UP_DAYS[followUpSeq]
-      const nextFollowUp = fuDays ? addDays(fuDays[0]) : (outcome==="callback"?cbDate:"")
+      const nextFollowUp = fuDays ? addDays(fuDays[0]) : (secondary==="callback"?cbDate:"")
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
         status:statusMap[outcome]||"called",
-        callbackDate:outcome==="callback"?cbDate:nextFollowUp||"",
+        callbackDate:secondary==="callback"?cbDate:nextFollowUp||"",
         followupsequence: followUpSeq||null,
         nextfollowup: nextFollowUp||null,
         followupstep: fuDays ? 0 : null,
@@ -469,60 +494,121 @@ function CallModal({lead,onClose,onSaved}){
           </div>
         )}
 
-        <div style={{display:"flex",gap:4,marginBottom:16,borderBottom:"1px solid #40485d30",paddingBottom:12}}>
-          {[["call","📞 Log Call"],["qualify","🎯 Qualify"]].map(([t,l])=>(
-            <button key={t} onClick={()=>setTab(t)}
-              style={{padding:"6px 14px",borderRadius:6,fontSize:12,fontFamily:"inherit",cursor:"pointer",
-                background:tab===t?"#a3a6ff":"transparent",color:tab===t?"#000011":"#a3aac4",
-                border:`1px solid ${tab===t?"#a3a6ff":"#40485d40"}`}}>
-              {l}
-            </button>
-          ))}
+        {/* Timer bar */}
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16,
+          background:"#060e20",borderRadius:8,padding:"10px 14px"}}>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:24,fontWeight:700,
+            color:timerRunning?"#69f6b8":"#a3a6ff",letterSpacing:".05em",minWidth:70}}>
+            {timerDisplay}
+          </div>
+          <button type="button" onClick={()=>setTimerRunning(r=>!r)}
+            style={{fontSize:11,padding:"5px 10px",borderRadius:6,border:"1px solid #40485d40",
+              background:"transparent",color:"#a3aac4",cursor:"pointer",fontFamily:"inherit"}}>
+            {timerRunning?"Pause":"Resume"}
+          </button>
+          <div style={{flex:1}}/>
+          <span style={{fontSize:10,color:"#40485d"}}>Manual:</span>
+          <input type="number" value={duration} onChange={e=>setDur(e.target.value)}
+            placeholder="min" min="0" style={{width:50,fontSize:12}}/>
         </div>
 
-        {tab==="call"&&(
-          <div style={{background:"#060e20",border:"1px solid #a3a6ff20",borderRadius:10,padding:16,marginBottom:16}}>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
-              <div className="ff"><label>Outcome</label>
-                <select value={outcome} onChange={e=>setOutcome(e.target.value)}>
-                  {CALL_OUTCOMES.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-              <div className="ff"><label>Duration</label>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,
-                    color:timerRunning?"#69f6b8":"#a3a6ff",letterSpacing:".05em",
-                    background:"#060e20",border:"1px solid #40485d40",borderRadius:6,
-                    padding:"4px 12px",minWidth:70,textAlign:"center"}}>
-                    {timerDisplay}
-                  </div>
-                  <button type="button" onClick={()=>setTimerRunning(r=>!r)}
-                    style={{fontSize:11,padding:"6px 10px",borderRadius:6,border:"1px solid #40485d40",
-                      background:"transparent",color:"#a3aac4",cursor:"pointer",fontFamily:"inherit"}}>
-                    {timerRunning?"Pause":"Resume"}
-                  </button>
-                  <span style={{fontSize:10,color:"#40485d"}}>or</span>
-                  <input type="number" value={duration} onChange={e=>setDur(e.target.value)}
-                    placeholder="min" min="0" style={{width:50,fontSize:12}}/>
-                </div>
-              </div>
+        {/* Step 1: What happened? */}
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".1em",fontWeight:700,marginBottom:10}}>
+            STEP 1 — WHAT HAPPENED?
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            {PRIMARY_OUTCOMES.map(p=>(
+              <button key={p.value} onClick={()=>{setPrimary(p.value);if(p.value!=="answered"){setSecondary("");setCbReason("")}}}
+                style={{flex:1,padding:"14px 12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",
+                  textAlign:"center",fontSize:13,fontWeight:600,transition:"all .15s",
+                  background:primary===p.value?p.color+"25":"#060e20",
+                  color:primary===p.value?p.color:"#a3aac4",
+                  border:`2px solid ${primary===p.value?p.color:"#40485d30"}`}}>
+                <div style={{fontSize:20,marginBottom:4}}>{p.icon}</div>
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Step 2: If answered — what was the result? */}
+        {primary==="answered"&&(
+          <div style={{marginBottom:16}}>
+            <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".1em",fontWeight:700,marginBottom:10}}>
+              STEP 2 — CALL RESULT
             </div>
-            {outcome==="callback"&&(
-              <div className="ff" style={{marginBottom:10}}>
-                <label>Callback Date</label>
-                <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
-              </div>
-            )}
-            {outcome==="converted"&&(
-              <div className="ff" style={{marginBottom:10}}>
-                <label>Contract Value ($)</label>
-                <input type="number" value={contractValue} onChange={e=>setContractValue(e.target.value)} placeholder="2400" min="0"/>
-              </div>
-            )}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              {SECONDARY_OUTCOMES.map(s=>(
+                <button key={s.value} onClick={()=>setSecondary(s.value)}
+                  style={{padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",
+                    textAlign:"center",fontSize:13,fontWeight:600,transition:"all .15s",
+                    background:secondary===s.value?s.color+"25":"#060e20",
+                    color:secondary===s.value?s.color:"#a3aac4",
+                    border:`2px solid ${secondary===s.value?s.color:"#40485d30"}`}}>
+                  <span style={{marginRight:6}}>{s.icon}</span>{s.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Callback reason */}
+        {secondary==="callback"&&(
+          <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
+            border:"1px solid #8b5cf625"}}>
+            <div style={{fontSize:10,color:"#8b5cf6",letterSpacing:".1em",fontWeight:700,marginBottom:10}}>
+              CALLBACK REASON
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+              {CALLBACK_REASONS.map(r=>(
+                <button key={r} onClick={()=>setCbReason(r)}
+                  style={{padding:"6px 12px",borderRadius:6,fontSize:11,cursor:"pointer",fontFamily:"inherit",
+                    background:cbReason===r?"#8b5cf625":"transparent",
+                    color:cbReason===r?"#8b5cf6":"#a3aac4",
+                    border:`1px solid ${cbReason===r?"#8b5cf6":"#40485d40"}`}}>
+                  {r}
+                </button>
+              ))}
+            </div>
+            <div className="ff">
+              <label>Callback Date</label>
+              <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+            </div>
+          </div>
+        )}
+
+        {/* Qualification — shown when needed */}
+        {needsQual&&(
+          <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
+            border:`1px solid ${hasQualData?"#69f6b825":"#92400e"}`}}>
+            <div style={{fontSize:10,letterSpacing:".1em",fontWeight:700,marginBottom:12,
+              color:hasQualData?"#69f6b8":"#fbbf24"}}>
+              {hasQualData?"✓ QUALIFICATION DATA":"⚠ QUALIFICATION REQUIRED"}
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:12}}>
+              <QualChip label="Focus" value={budgetFocus} onChange={setBudget}
+                options={["Budget Focused","Quality Focused","Value Balanced"]}/>
+              <QualChip label="Vendor Status" value={vendorStatus} onChange={setVendor}
+                options={["Happy with Current","Open to Options","Actively Shopping","No Vendor"]}/>
+              <QualChip label="Contact Type" value={decisionMaker} onChange={setDM}
+                options={["Decision Maker","Influencer","Gatekeeper","Unknown"]}/>
+              <QualChip label="Timeline" value={timeline} onChange={setTimeline}
+                options={["Ready Now","30 Days","90 Days","Just Browsing"]}/>
+              <QualChip label="Qualified?" value={qualified} onChange={setQualified}
+                options={["Hot","Warm","Not Yet","Disqualified"]}/>
+            </div>
+          </div>
+        )}
+
+        {/* Notes + Follow-up + Submit */}
+        {primary&&(step>=2||primary!=="answered")&&(
+          <div style={{background:"#060e20",borderRadius:10,padding:14,marginBottom:16,
+            border:"1px solid #40485d20"}}>
             <div className="ff" style={{marginBottom:12}}>
               <label>Notes</label>
               <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{resize:"vertical"}}
-                placeholder="Spoke to gatekeeper, call back Tuesday..."/>
+                placeholder={secondary==="callback"?"What did they say? When should you call back?":"Any details from the call..."}/>
             </div>
             <div className="ff" style={{marginBottom:12}}>
               <label>Follow-up Sequence</label>
@@ -531,40 +617,25 @@ function CallModal({lead,onClose,onSaved}){
               </select>
             </div>
             {followUpSeq&&(
-              <div style={{fontSize:11,color:"#ffe083",background:"#ffe08310",border:"1px solid #ffe08325",borderRadius:6,padding:"8px 12px",marginBottom:12}}>
-                🔔 Next follow-up: <strong>{addDays(FOLLOW_UP_DAYS[followUpSeq][0])}</strong>
-                {" · then "}
-                {FOLLOW_UP_DAYS[followUpSeq].slice(1).map(d=>"+"+d+"d").join(" · ")}
-              </div>
-            )}
-            {REQUIRES_QUAL.includes(outcome)&&!hasQualData&&(
-              <div style={{background:"#2d1a0a",border:"1px solid #92400e",borderRadius:6,
-                padding:"8px 12px",marginBottom:10,fontSize:12,color:"#fbbf24"}}>
-                ⚠ "{outcome}" requires qualification — fill out the <strong
-                  style={{cursor:"pointer",textDecoration:"underline"}}
-                  onClick={()=>setTab("qualify")}>Qualify tab</strong> first
+              <div style={{fontSize:11,color:"#ffe083",background:"#ffe08310",border:"1px solid #ffe08325",
+                borderRadius:6,padding:"8px 12px",marginBottom:12}}>
+                Next follow-up: <strong>{addDays(FOLLOW_UP_DAYS[followUpSeq][0])}</strong>
+                {" \u00b7 then "}
+                {FOLLOW_UP_DAYS[followUpSeq].slice(1).map(d=>"+"+d+"d").join(" \u00b7 ")}
               </div>
             )}
             <button className="btn btn-p" onClick={log} disabled={saving||
-              (REQUIRES_QUAL.includes(outcome)&&!hasQualData)}>{saving?"Saving…":"Log Call ↵"}</button>
-          </div>
-        )}
-        {tab==="qualify"&&(
-          <div style={{background:"#060e20",border:"1px solid #69f6b825",borderRadius:10,padding:16,marginBottom:16,display:"flex",flexDirection:"column",gap:14}}>
-            <div style={{fontSize:10,color:"#69f6b8",letterSpacing:".1em"}}>QUALIFICATION DATA</div>
-            <QualChip label="Focus" value={budgetFocus} onChange={setBudget}
-              options={["Budget Focused","Quality Focused","Value Balanced"]}/>
-            <QualChip label="Vendor Status" value={vendorStatus} onChange={setVendor}
-              options={["Happy with Current","Open to Options","Actively Shopping","No Vendor"]}/>
-            <QualChip label="Contact Type" value={decisionMaker} onChange={setDM}
-              options={["Decision Maker","Influencer","Gatekeeper","Unknown"]}/>
-            <QualChip label="Timeline" value={timeline} onChange={setTimeline}
-              options={["Ready Now","30 Days","90 Days","Just Browsing"]}/>
-            <QualChip label="Qualified?" value={qualified} onChange={setQualified}
-              options={["Hot","Warm","Not Yet","Disqualified"]}/>
-            <button className="btn btn-p" onClick={log} disabled={saving} style={{alignSelf:"flex-start"}}>
-              {saving?"Saving…":"Save ↵"}
+              (primary==="answered"&&!secondary)||
+              (needsQual&&!hasQualData)||
+              (secondary==="callback"&&!cbDate)}
+              style={{width:"100%",padding:"14px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700}}>
+              {saving?"Saving...":"Log Call"}
             </button>
+            {(needsQual&&!hasQualData)&&(
+              <div style={{fontSize:11,color:"#fbbf24",textAlign:"center",marginTop:8}}>
+                Fill out qualification above to enable logging
+              </div>
+            )}
           </div>
         )}
         {calls.length>0&&(
