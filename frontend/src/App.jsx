@@ -942,6 +942,7 @@ export default function App(){
   const [histTo,setHistTo]           = useState("")
   const [histRange,setHistRange]     = useState("week")
   const [dialerIdx,setDialerIdx]   = useState(0)
+  const [showNotifs,setShowNotifs]  = useState(false)
   const [leaderboard,setLeaderboard] = useState([])
   const [lbLoading,setLbLoading]   = useState(false)
   const [qualifiedCalls,setQualifiedCalls] = useState([])
@@ -1033,6 +1034,35 @@ export default function App(){
 
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
   const today=new Date().toISOString().split("T")[0]
+  const tomorrow=(()=>{const d=new Date();d.setDate(d.getDate()+1);return d.toISOString().split("T")[0]})()
+  const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return d.toISOString().split("T")[0]})()
+
+  // Notification items
+  const notifItems=leads.filter(l=>l.callbackDate&&l.status!=="converted").map(l=>{
+    const d=l.callbackDate
+    if(d<today) return{...l,urgency:"overdue",label:"Overdue",color:"#ff6e84"}
+    if(d===today) return{...l,urgency:"today",label:"Due today",color:"#ffe083"}
+    if(d===tomorrow) return{...l,urgency:"tomorrow",label:"Tomorrow",color:"#a3a6ff"}
+    if(d<=threeDays) return{...l,urgency:"soon",label:`Due ${d}`,color:"#8b5cf6"}
+    return null
+  }).filter(Boolean).sort((a,b)=>{
+    const order={overdue:0,today:1,tomorrow:2,soon:3}
+    return(order[a.urgency]||4)-(order[b.urgency]||4)
+  })
+
+  // Browser notification on load if overdue
+  useEffect(()=>{
+    if(!leads.length) return
+    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+    if(overdue.length>0&&"Notification" in window){
+      if(Notification.permission==="granted"){
+        new Notification(`LeadFlow: ${overdue.length} overdue follow-up${overdue.length>1?"s":""}`,{
+          body:overdue.slice(0,3).map(l=>l.company||l.firstName).join(", "),icon:"/favicon.ico"})
+      }else if(Notification.permission!=="denied"){
+        Notification.requestPermission()
+      }
+    }
+  },[leads.length>0&&today])
 
   const displayLeads=leads.filter(l=>{
     if(fIndustry&&l.industry!==fIndustry) return false
@@ -1094,7 +1124,69 @@ export default function App(){
           </button>
         )}
 
-        <IconBtn onClick={()=>{}} title="Notifications"><IconBell/></IconBtn>
+        <div style={{position:"relative"}}>
+          <button onClick={()=>setShowNotifs(p=>!p)} title="Notifications"
+            style={{padding:8,background:showNotifs?"#192540":"transparent",border:"none",
+              color:notifItems.length>0?"#ffe083":"#a3aac4",cursor:"pointer",borderRadius:8,
+              display:"flex",alignItems:"center",justifyContent:"center",transition:"all .15s",position:"relative"}}>
+            <IconBell/>
+            {notifItems.length>0&&(
+              <span style={{position:"absolute",top:2,right:2,width:18,height:18,borderRadius:"50%",
+                background:"#ff6e84",color:"#fff",fontSize:10,fontWeight:700,
+                display:"flex",alignItems:"center",justifyContent:"center",
+                fontFamily:"'Space Grotesk',sans-serif"}}>{notifItems.length>9?"9+":notifItems.length}</span>
+            )}
+          </button>
+          {showNotifs&&(
+            <div style={{position:"absolute",top:"100%",right:0,marginTop:8,width:360,maxHeight:420,
+              overflowY:"auto",background:"#0f1930",border:"1px solid #40485d40",borderRadius:12,
+              boxShadow:"0 16px 48px rgba(0,0,0,.5)",zIndex:100}}>
+              <div style={{padding:"14px 16px",borderBottom:"1px solid #40485d20",
+                display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:12,fontWeight:700,color:"#dee5ff",letterSpacing:".05em",
+                  textTransform:"uppercase"}}>Notifications</span>
+                <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                  color:"#a3a6ff"}}>{notifItems.length}</span>
+              </div>
+              {notifItems.length===0?(
+                <div style={{padding:32,textAlign:"center",color:"#40485d",fontSize:13}}>
+                  No upcoming follow-ups
+                </div>
+              ):(
+                notifItems.slice(0,20).map((item,i)=>(
+                  <div key={item.id||i}
+                    style={{padding:"12px 16px",borderBottom:"1px solid #40485d10",
+                      display:"flex",alignItems:"center",gap:12,cursor:"pointer",
+                      transition:"background .12s"}}
+                    onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                    onMouseLeave={e=>e.currentTarget.style.background="transparent"}
+                    onClick={()=>{setCallModal(item);setShowNotifs(false)}}>
+                    <div style={{width:8,height:8,borderRadius:"50%",background:item.color,flexShrink:0}}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:13,fontWeight:600,color:"#dee5ff",
+                        overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {[item.firstName,item.lastName].filter(Boolean).join(" ")||item.company}
+                      </div>
+                      <div style={{fontSize:11,color:"#a3aac4"}}>{item.company}</div>
+                    </div>
+                    <div style={{textAlign:"right",flexShrink:0}}>
+                      <span style={{fontSize:11,fontWeight:700,color:item.color}}>{item.label}</span>
+                      <div style={{fontSize:10,color:"#40485d",fontFamily:"'Space Grotesk',sans-serif"}}>{item.callbackDate}</div>
+                    </div>
+                  </div>
+                ))
+              )}
+              {notifItems.length>0&&(
+                <div style={{padding:"10px 16px",borderTop:"1px solid #40485d20"}}>
+                  <button className="btn btn-p" style={{width:"100%",fontSize:12,padding:"8px"}}
+                    onClick={()=>{setNav("leads");setCbOnly(true);setShowNotifs(false)}}>
+                    View All Follow-Ups
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
         <IconBtn onClick={()=>setShowScripts(true)} title="Settings / Scripts"><IconSettings/></IconBtn>
 
         {/* User avatar */}
