@@ -1382,16 +1382,16 @@ export default function App(){
                         {isAdmin()&&(
                           <button className="btn btn-g" style={{fontSize:10,padding:"3px 8px"}}
                             onClick={async()=>{
-                              const v=window.prompt("Set daily call quota for all callers:",target)
+                              const v=window.prompt("Set default daily quota for all callers:",target)
                               if(!v) return
                               const n=parseInt(v)
                               if(isNaN(n)||n<1||n>500){alert("Must be 1-500");return}
                               try{
                                 await api("/api/quota",{method:"PUT",body:JSON.stringify({quota:n})})
                                 setQuota(q=>({...q,quota:n}))
-                                notify(`Quota set to ${n} calls/day`)
+                                notify(`Team quota set to ${n} calls/day`)
                               }catch(e){notify("Error: "+e.message,"error")}
-                            }}>Adjust</button>
+                            }}>Set Default</button>
                         )}
                       </div>
                     </div>
@@ -2256,6 +2256,17 @@ export default function App(){
                               </div>
                             </div>
                             <div style={{display:"flex",gap:6,flexShrink:0}}>
+                              <button className="btn btn-g" style={{fontSize:11,padding:"5px 10px"}}
+                                onClick={async()=>{
+                                  const v=window.prompt(`Set daily quota for ${rep.name}:`,60)
+                                  if(!v) return
+                                  const n=parseInt(v)
+                                  if(isNaN(n)||n<1||n>500){alert("Must be 1-500");return}
+                                  try{
+                                    await api("/api/quota",{method:"PUT",body:JSON.stringify({quota:n,caller:rep.name})})
+                                    notify(`${rep.name}'s quota set to ${n} calls/day`)
+                                  }catch(e){notify("Error: "+e.message,"error")}
+                                }}>Set Quota</button>
                               <button className="btn btn-g" style={{fontSize:11,padding:"5px 10px"}}
                                 onClick={async()=>{
                                   const to=window.prompt(`Reassign all of ${rep.name}'s leads to whom?\n(Leave blank to return to pool)`)

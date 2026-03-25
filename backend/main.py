@@ -383,11 +383,20 @@ DEFAULT_QUOTA = int(os.getenv("DAILY_CALL_QUOTA", "60"))
 @app.get("/api/quota")
 def get_quota(user: str = Depends(verify_token)):
     try:
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.daily_quota&select=value",
+        # Check for per-user quota first, then fall back to team default
+        r_user = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.quota_{user.lower()}&select=value",
             headers=SB_HEADERS, timeout=10)
-        rows = r.json() if r.status_code == 200 else []
-        quota = int(rows[0]["value"]) if isinstance(rows, list) and rows else DEFAULT_QUOTA
+        user_rows = r_user.json() if r_user.status_code == 200 else []
+
+        if isinstance(user_rows, list) and user_rows:
+            quota = int(user_rows[0]["value"])
+        else:
+            r_default = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.daily_quota&select=value",
+                headers=SB_HEADERS, timeout=10)
+            default_rows = r_default.json() if r_default.status_code == 200 else []
+            quota = int(default_rows[0]["value"]) if isinstance(default_rows, list) and default_rows else DEFAULT_QUOTA
 
         # Get this user's calls today
         today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -404,19 +413,43 @@ def get_quota(user: str = Depends(verify_token)):
 
 @app.put("/api/quota")
 def set_quota(body: dict, user: str = Depends(verify_admin)):
+    """Set quota — per-user if 'caller' specified, team default otherwise"""
     try:
         new_quota = int(body.get("quota", DEFAULT_QUOTA))
+        caller = body.get("caller", "").strip()
         if new_quota < 1 or new_quota > 500:
             raise HTTPException(status_code=400, detail="Quota must be 1-500")
-        # Upsert into app_settings
+        key = f"quota_{caller.lower()}" if caller else "daily_quota"
         req_lib.post(
             f"{SUPABASE_URL}/rest/v1/app_settings",
             headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
-            json={"key": "daily_quota", "value": str(new_quota)},
+            json={"key": key, "value": str(new_quota)},
             timeout=10)
-        return {"quota": new_quota}
+        return {"quota": new_quota, "caller": caller or "all"}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/quota/all")
+def get_all_quotas(user: str = Depends(verify_admin)):
+    """Admin-only: get all quota settings"""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=like.quota_*&select=key,value",
+            headers=SB_HEADERS, timeout=10)
+        per_user = r.json() if r.status_code == 200 else []
+        r2 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.daily_quota&select=value",
+            headers=SB_HEADERS, timeout=10)
+        default_rows = r2.json() if r2.status_code == 200 else []
+        team_default = int(default_rows[0]["value"]) if isinstance(default_rows, list) and default_rows else DEFAULT_QUOTA
+        quotas = {}
+        if isinstance(per_user, list):
+            for row in per_user:
+                name = row["key"].replace("quota_", "")
+                quotas[name] = int(row["value"])
+        return {"team_default": team_default, "per_user": quotas}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
