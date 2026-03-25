@@ -364,7 +364,20 @@ function CallModal({lead,onClose,onSaved}){
     api("/api/scripts").then(r=>setScripts(Array.isArray(r)?r:[])).catch(()=>{})
   },[lead.id])
 
+  // Outcomes that require qualification data
+  const REQUIRES_QUAL = ["interested", "converted", "callback"]
+  const hasQualData = budgetFocus || vendorStatus || decisionMaker || timeline || qualified
+
   async function log(){
+    // Enforce qualification for key outcomes
+    if(REQUIRES_QUAL.includes(outcome) && !hasQualData){
+      alert(`"${outcome}" requires qualification data.\n\nSwitch to the Qualify tab and fill out at least one field before saving.`)
+      return
+    }
+    if(outcome==="callback" && !cbDate){
+      alert("Callback requires a date. Please set a callback date.")
+      return
+    }
     setSave(true)
     try{
       setTimerRunning(false)
@@ -392,10 +405,9 @@ function CallModal({lead,onClose,onSaved}){
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
         status:statusMap[outcome]||"called",
         callbackDate:outcome==="callback"?cbDate:nextFollowUp||"",
-        followUpSequence: followUpSeq||null,
-        nextFollowUp: nextFollowUp||null,
-        followUpStep: fuDays ? 0 : null,
-        // Claim the lead for this rep if not already assigned
+        followupsequence: followUpSeq||null,
+        nextfollowup: nextFollowUp||null,
+        followupstep: fuDays ? 0 : null,
         ...(!lead.assignedTo ? {assignedTo: getUser()} : {}),
         updatedAt:new Date().toISOString()
       })})
@@ -525,7 +537,16 @@ function CallModal({lead,onClose,onSaved}){
                 {FOLLOW_UP_DAYS[followUpSeq].slice(1).map(d=>"+"+d+"d").join(" · ")}
               </div>
             )}
-            <button className="btn btn-p" onClick={log} disabled={saving}>{saving?"Saving…":"Log Call ↵"}</button>
+            {REQUIRES_QUAL.includes(outcome)&&!hasQualData&&(
+              <div style={{background:"#2d1a0a",border:"1px solid #92400e",borderRadius:6,
+                padding:"8px 12px",marginBottom:10,fontSize:12,color:"#fbbf24"}}>
+                ⚠ "{outcome}" requires qualification — fill out the <strong
+                  style={{cursor:"pointer",textDecoration:"underline"}}
+                  onClick={()=>setTab("qualify")}>Qualify tab</strong> first
+              </div>
+            )}
+            <button className="btn btn-p" onClick={log} disabled={saving||
+              (REQUIRES_QUAL.includes(outcome)&&!hasQualData)}>{saving?"Saving…":"Log Call ↵"}</button>
           </div>
         )}
         {tab==="qualify"&&(
@@ -1482,7 +1503,7 @@ export default function App(){
                               {lead.source&&<span className="src-tag">{lead.source}</span>}
                               {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf630"}}>🔔 {lead.callbackDate}</span>}
                               {lead.contract_value>0&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>${(lead.contract_value||0).toLocaleString()}</span>}
-                              {lead.followUpSequence&&<span style={{fontSize:9,background:"#ffe08312",color:"#ffe083",padding:"2px 7px",borderRadius:4,border:"1px solid #ffe08325"}}>⏱ fu</span>}
+                              {lead.followupsequence&&<span style={{fontSize:9,background:"#ffe08312",color:"#ffe083",padding:"2px 7px",borderRadius:4,border:"1px solid #ffe08325"}}>⏱ fu</span>}
                             </div>
                           </div>
                         </div>
