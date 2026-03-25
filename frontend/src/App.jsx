@@ -279,15 +279,21 @@ function LeadFinder({onFound, industries}){
 
 const FOLLOW_UP_SEQUENCES = [
   { value:"", label:"No Follow-up Sequence" },
+  { value:"24h-48h-5d", label:"Hot Lead: 24h → 48h → 5 days" },
   { value:"48h-5d-7d", label:"Standard: 48h → 5 days → 7 days" },
   { value:"48h-7d-14d", label:"Slow Burn: 48h → 7 days → 14 days" },
-  { value:"24h-48h-5d", label:"Hot Lead: 24h → 48h → 5 days" },
+  { value:"30d-60d-90d", label:"Long Nurture: 30 → 60 → 90 days" },
+  { value:"90d-180d", label:"Future: 3 months → 6 months" },
+  { value:"180d-365d", label:"Far Future: 6 months → 1 year" },
 ]
 
 const FOLLOW_UP_DAYS = {
+  "24h-48h-5d": [1, 2, 5],
   "48h-5d-7d":  [2, 5, 7],
   "48h-7d-14d": [2, 7, 14],
-  "24h-48h-5d": [1, 2, 5],
+  "30d-60d-90d": [30, 60, 90],
+  "90d-180d":   [90, 180],
+  "180d-365d":  [180, 365],
 }
 
 function addDays(days){
