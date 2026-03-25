@@ -375,6 +375,51 @@ def get_calls_today(user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Quota endpoints ────────────────────────────────────────────────────────────
+
+# Default quota — used if no Supabase row exists yet
+DEFAULT_QUOTA = int(os.getenv("DAILY_CALL_QUOTA", "60"))
+
+@app.get("/api/quota")
+def get_quota(user: str = Depends(verify_token)):
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.daily_quota&select=value",
+            headers=SB_HEADERS, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        quota = int(rows[0]["value"]) if isinstance(rows, list) and rows else DEFAULT_QUOTA
+
+        # Get this user's calls today
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        r2 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=id&calledBy=eq.{user}"
+            f"&calledAt=gte.{today}T00:00:00",
+            headers={**SB_HEADERS, "Prefer": ""}, timeout=10)
+        my_calls = r2.json() if r2.status_code == 200 else []
+        my_count = len(my_calls) if isinstance(my_calls, list) else 0
+
+        return {"quota": quota, "my_calls_today": my_count}
+    except:
+        return {"quota": DEFAULT_QUOTA, "my_calls_today": 0}
+
+@app.put("/api/quota")
+def set_quota(body: dict, user: str = Depends(verify_admin)):
+    try:
+        new_quota = int(body.get("quota", DEFAULT_QUOTA))
+        if new_quota < 1 or new_quota > 500:
+            raise HTTPException(status_code=400, detail="Quota must be 1-500")
+        # Upsert into app_settings
+        req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/app_settings",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
+            json={"key": "daily_quota", "value": str(new_quota)},
+            timeout=10)
+        return {"quota": new_quota}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/calls/qualified")
 def get_qualified_calls(user: str = Depends(verify_token)):
     try:

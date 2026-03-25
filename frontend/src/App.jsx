@@ -1038,6 +1038,7 @@ export default function App(){
   const [histRange,setHistRange]     = useState("week")
   const [dialerIdx,setDialerIdx]   = useState(0)
   const [showNotifs,setShowNotifs]  = useState(false)
+  const [quota,setQuota]            = useState({quota:60,my_calls_today:0})
   const [leaderboard,setLeaderboard] = useState([])
   const [lbLoading,setLbLoading]   = useState(false)
   const [qualifiedCalls,setQualifiedCalls] = useState([])
@@ -1046,7 +1047,10 @@ export default function App(){
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
   useEffect(()=>{
-    if(user) api("/api/industries").then(r=>setIndustries(r.industries||[])).catch(()=>{})
+    if(user){
+      api("/api/industries").then(r=>setIndustries(r.industries||[])).catch(()=>{})
+      api("/api/quota").then(r=>setQuota(r)).catch(()=>{})
+    }
   },[user])
 
   const loadLeads = useCallback(async()=>{
@@ -1060,6 +1064,7 @@ export default function App(){
       const leadsData = await api(`/api/leads?${params}`)
       setLeads(Array.isArray(leadsData)?leadsData:[])
       try{ const s=await api("/api/stats"); if(s) setStats(s) }catch{}
+      try{ const q=await api("/api/quota"); if(q) setQuota(q) }catch{}
     }catch(ex){ notify("Error loading leads","error") }
     finally{ setLoad(false) }
   },[search,fStatus,sortBy,cbOnly])
@@ -1361,24 +1366,41 @@ export default function App(){
               </div>
               <StatsBar stats={stats} onCallbacks={()=>{setNav("leads");setCbOnly(p=>!p)}}/>
 
-              {/* Daily Call Target */}
+              {/* Daily Call Quota */}
               {(()=>{
-                const target=50
-                const done=stats?.callsToday||0
+                const target=quota.quota||60
+                const done=quota.my_calls_today||0
                 const pct=Math.min(Math.round(done/target*100),100)
                 return(
                   <div style={{background:"#0f1930",borderRadius:12,padding:"16px 20px",marginTop:16}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
                       <span style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
-                        textTransform:"uppercase"}}>Daily Call Target</span>
-                      <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:700,
-                        color:pct>=100?"#69f6b8":pct>=50?"#ffe083":"#a3a6ff"}}>{done} / {target}</span>
+                        textTransform:"uppercase"}}>Your Daily Quota</span>
+                      <div style={{display:"flex",alignItems:"center",gap:10}}>
+                        <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:700,
+                          color:pct>=100?"#69f6b8":pct>=50?"#ffe083":"#a3a6ff"}}>{done} / {target}</span>
+                        {isAdmin()&&(
+                          <button className="btn btn-g" style={{fontSize:10,padding:"3px 8px"}}
+                            onClick={async()=>{
+                              const v=window.prompt("Set daily call quota for all callers:",target)
+                              if(!v) return
+                              const n=parseInt(v)
+                              if(isNaN(n)||n<1||n>500){alert("Must be 1-500");return}
+                              try{
+                                await api("/api/quota",{method:"PUT",body:JSON.stringify({quota:n})})
+                                setQuota(q=>({...q,quota:n}))
+                                notify(`Quota set to ${n} calls/day`)
+                              }catch(e){notify("Error: "+e.message,"error")}
+                            }}>Adjust</button>
+                        )}
+                      </div>
                     </div>
                     <div style={{height:8,background:"#141f38",borderRadius:4,overflow:"hidden"}}>
                       <div style={{height:"100%",width:`${pct}%`,borderRadius:4,transition:"width .3s",
                         background:pct>=100?"#69f6b8":pct>=50?"#ffe083":"#a3a6ff"}}/>
                     </div>
-                    {pct>=100&&<div style={{fontSize:11,color:"#69f6b8",marginTop:6,fontWeight:600}}>Target hit! Keep going.</div>}
+                    {pct>=100&&<div style={{fontSize:11,color:"#69f6b8",marginTop:6,fontWeight:600}}>Quota hit! Keep going.</div>}
+                    {pct<50&&done>0&&<div style={{fontSize:11,color:"#a3aac4",marginTop:6}}>{target-done} calls to go</div>}
                   </div>
                 )
               })()}
