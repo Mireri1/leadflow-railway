@@ -12,9 +12,11 @@ from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
 
-SECRET_KEY    = os.getenv("SECRET_KEY",    "leadflow-secret")
-TEAM_PASSWORD = os.getenv("TEAM_PASSWORD", "LeadFlow2024")
-ALGORITHM     = "HS256"
+SECRET_KEY      = os.getenv("SECRET_KEY",      "leadflow-secret")
+TEAM_PASSWORD   = os.getenv("TEAM_PASSWORD",   "LeadFlow2024")
+ADMIN_PASSWORD  = os.getenv("ADMIN_PASSWORD",  "LeadFlowAdmin2024!")
+ADMIN_USERS     = set(u.strip().lower() for u in os.getenv("ADMIN_USERS", "eric").split(",") if u.strip())
+ALGORITHM       = "HS256"
 
 SUPABASE_URL  = os.getenv("SUPABASE_URL",  "https://ucpwpjokyconwzwqvdad.supabase.co")
 SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVjcHdwam9reWNvbnd6d3F2ZGFkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5NjMxMjksImV4cCI6MjA4NzUzOTEyOX0.j1Ibnm3rhOnvdnfS3WPf2RLDH91wopuJbTByQmwVZ7w")
@@ -31,9 +33,9 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 security = HTTPBearer(auto_error=False)
 
-def create_token(username):
+def create_token(username, role="caller"):
     return jwt.encode(
-        {"sub": username, "exp": datetime.utcnow() + timedelta(hours=24)},
+        {"sub": username, "role": role, "exp": datetime.utcnow() + timedelta(hours=24)},
         SECRET_KEY, algorithm=ALGORITHM
     )
 
@@ -46,15 +48,35 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        return payload["sub"]
+    except jwt.exceptions.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 class LoginRequest(BaseModel):
     username: str
     password: str
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
-    if req.password != TEAM_PASSWORD:
-        raise HTTPException(status_code=401, detail="Invalid password")
-    return {"token": create_token(req.username), "username": req.username}
+    is_admin = req.username.strip().lower() in ADMIN_USERS
+    # Admins can use either the admin password or team password
+    if is_admin:
+        if req.password not in (ADMIN_PASSWORD, TEAM_PASSWORD):
+            raise HTTPException(status_code=401, detail="Invalid password")
+        role = "admin"
+    else:
+        if req.password != TEAM_PASSWORD:
+            raise HTTPException(status_code=401, detail="Invalid password")
+        role = "caller"
+    token = create_token(req.username, role)
+    return {"token": token, "username": req.username, "role": role}
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(verify_token)):
@@ -291,11 +313,43 @@ def delete_lead(lead_id: str, user: str = Depends(verify_token)):
 @app.post("/api/calls")
 def log_call(call: dict, user: str = Depends(verify_token)):
     try:
+        lead_id = call.get("leadId")
+        caller  = call.get("calledBy") or user
+        flags = []
+
+        # Anti-gaming: empty form — no notes and no qual data filled out
+        has_notes = bool((call.get("notes") or "").strip())
+        has_qual = any(call.get(f) for f in ["budgetfocus", "vendorstatus", "decisionmaker", "timeline", "qualified"])
+        if not has_notes and not has_qual:
+            flags.append("empty_form")
+
+        # Anti-gaming: duplicate cooldown — same lead within 5 minutes
+        if lead_id:
+            five_min_ago = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+            dup_r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=eq.{lead_id}&calledBy=eq.{caller}"
+                f"&calledAt=gte.{five_min_ago}&select=id",
+                headers=SB_HEADERS, timeout=10)
+            dups = dup_r.json() if dup_r.status_code == 200 else []
+            if isinstance(dups, list) and len(dups) > 0:
+                flags.append("duplicate_cooldown")
+
+        # Anti-gaming: cadence — more than 5 calls in last 5 minutes
+        five_min_ago = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+        cad_r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?calledBy=eq.{caller}"
+            f"&calledAt=gte.{five_min_ago}&select=id",
+            headers={**SB_HEADERS, "Prefer": ""}, timeout=10)
+        recent = cad_r.json() if cad_r.status_code == 200 else []
+        if isinstance(recent, list) and len(recent) >= 5:
+            flags.append("rapid_cadence")
+
+        # Store flags on the call record
+        if flags:
+            call["follow_up_outcome"] = ",".join(flags)  # repurpose unused field for flags
+
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_outcomes",
                         headers=SB_HEADERS, json=call, timeout=30)
-        # Auto-claim the lead for the caller if it isn't already assigned
-        lead_id  = call.get("leadId")
-        caller   = call.get("calledBy") or user
         if lead_id:
             lr = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=assignedTo",
@@ -445,7 +499,7 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/leads/recycle-stale")
-def recycle_stale_leads(user: str = Depends(verify_token)):
+def recycle_stale_leads(user: str = Depends(verify_admin)):
     """Unassign leads that haven't been touched in 7+ days"""
     try:
         cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
@@ -471,7 +525,7 @@ def recycle_stale_leads(user: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/leads/reassign")
-def reassign_leads(body: dict, user: str = Depends(verify_token)):
+def reassign_leads(body: dict, user: str = Depends(verify_admin)):
     """Bulk reassign leads from one rep to another (or unassign to pool)"""
     try:
         from_rep = body.get("from", "")
@@ -499,8 +553,27 @@ def reassign_leads(body: dict, user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/calls/flagged")
+def get_flagged_calls(user: str = Depends(verify_admin)):
+    """Admin-only: get calls with anti-gaming flags"""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes"
+            f"?select=*&follow_up_outcome=neq.&follow_up_outcome=not.is.null"
+            f"&order=calledAt.desc&limit=200",
+            headers=SB_HEADERS, timeout=30)
+        calls = r.json() if r.status_code == 200 else []
+        if not isinstance(calls, list):
+            return []
+        # Only return calls that have our gaming flags
+        gaming_flags = {"empty_form", "duplicate_cooldown", "rapid_cadence"}
+        flagged = [c for c in calls if any(f in (c.get("follow_up_outcome") or "") for f in gaming_flags)]
+        return flagged
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/reps")
-def get_reps(user: str = Depends(verify_token)):
+def get_reps(user: str = Depends(verify_admin)):
     """Get all reps with their lead counts and last activity"""
     try:
         # All assigned leads
@@ -636,6 +709,14 @@ def get_leaderboard(user: str = Depends(verify_token)):
             u["avg_talk_time"] = round(u["talk_time"] / tc) if tc else 0
             u["leads_assigned"] = u.get("leads_assigned", 0)
             result.append(u)
+
+        # Flag suspicious stats
+        for u in result:
+            u["flags"] = []
+            conv = float(u["conv_rate"]) if u["total_calls"] >= 10 else 0
+            contact = float(u["contact_rate"]) if u["total_calls"] >= 10 else 0
+            if conv > 50: u["flags"].append("high_conv_rate")
+            if contact > 95 and u["total_calls"] >= 20: u["flags"].append("perfect_contact")
 
         # Sort by calls today desc, then total calls
         result.sort(key=lambda x: (-x["calls_today"], -x["total_calls"]))

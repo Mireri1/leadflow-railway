@@ -59,7 +59,9 @@ function scoreLabel(s){return s>=75?"Hot":s>=50?"Warm":s>=25?"Cool":"Cold"}
 
 function getUser()  { return localStorage.getItem("lf_user") || "" }
 function getToken() { return localStorage.getItem("lf_token") || "" }
+function getRole()  { return localStorage.getItem("lf_role") || "caller" }
 function isLoggedIn(){ return !!localStorage.getItem("lf_token") }
+function isAdmin()  { return getRole() === "admin" }
 
 async function api(path, opts={}) {
   const token = getToken()
@@ -181,6 +183,7 @@ function Login({onLogin}){
       const res = await api("/api/auth/login",{method:"POST",body:JSON.stringify({username:name,password:pass})})
       localStorage.setItem("lf_token", res.token)
       localStorage.setItem("lf_user",  res.username)
+      localStorage.setItem("lf_role",  res.role || "caller")
       onLogin(res.username)
     } catch(ex){ setErr(ex.message) }
     finally{ setLoad(false) }
@@ -1946,6 +1949,12 @@ export default function App(){
                             <div>
                               <div style={{fontWeight:600,color:"#dee5ff",fontSize:14,display:"flex",alignItems:"center",gap:6}}>
                                 {medal&&<span>{medal}</span>}{rep.name}
+                                {isAdmin()&&rep.flags&&rep.flags.length>0&&(
+                                  <span title={rep.flags.join(", ")} style={{fontSize:10,padding:"1px 6px",borderRadius:8,
+                                    background:"#ff6e8420",color:"#ff6e84",border:"1px solid #ff6e8430",marginLeft:4}}>
+                                    {rep.flags.length} flag{rep.flags.length>1?"s":""}
+                                  </span>
+                                )}
                               </div>
                               {rep.leads_assigned>0&&(
                                 <div style={{fontSize:11,color:"#40485d"}}>{rep.leads_assigned} lead{rep.leads_assigned!==1?"s":""} assigned</div>
@@ -2077,12 +2086,12 @@ export default function App(){
                 </div>
               </div>
 
-              {/* ── Team Management ── */}
-              <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+              {/* ── Team Management (admin only) ── */}
+              {isAdmin()&&<div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
                 <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
                   display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                   <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
-                    Team Management
+                    Team Management <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
                   </div>
                   <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
                     onClick={()=>{
@@ -2170,7 +2179,7 @@ export default function App(){
                     </div>
                   )
                 })()}
-              </div>
+              </div>}
             </div>
           )}
 
@@ -2236,7 +2245,7 @@ export default function App(){
                     a.click()
                     notify("CSV downloaded")
                   }}>Export CSV</button>
-                <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                {isAdmin()&&<button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
                   onClick={async()=>{
                     if(!window.confirm("Unassign leads untouched for 7+ days?")) return
                     try{
@@ -2244,7 +2253,7 @@ export default function App(){
                       notify(`Recycled ${r.recycled} stale lead${r.recycled!==1?"s":""}`)
                       loadHistory(histRange,histCaller)
                     }catch(e){notify("Error: "+e.message,"error")}
-                  }}>Recycle Stale</button>
+                  }}>Recycle Stale</button>}
                 <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
                   onClick={()=>loadHistory(histRange,histCaller)}>Refresh</button>
               </div>
