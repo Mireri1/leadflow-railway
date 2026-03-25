@@ -415,7 +415,7 @@ def get_qualified_calls(user: str = Depends(verify_token)):
         # Fetch calls that have any qualification data filled out
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*,leads:leadId(company,firstName,lastName,phone,industry,state,score,status,assignedTo)"
-            f"&or=(budgetFocus.neq.,vendorStatus.neq.,decisionMaker.neq.,timeline.neq.,qualified.neq.)"
+            f"&or=(budgetFocus.not.is.null,vendorStatus.not.is.null,decisionMaker.not.is.null,timeline.not.is.null,qualified.not.is.null)"
             f"&order=calledAt.desc",
             headers=SB_HEADERS, timeout=30)
         return r.json() if r.status_code == 200 else []
