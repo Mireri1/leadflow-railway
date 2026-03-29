@@ -2201,66 +2201,7 @@ export default function App(){
               </div>
 
               {/* ── Login Activity (admin only) ── */}
-              {isAdmin()&&(()=>{
-                const [logs,setLogs]=useState([])
-                const [showLogs,setShowLogs]=useState(false)
-                return(
-                  <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
-                    <div style={{padding:"18px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",
-                      borderBottom:showLogs?"1px solid #40485d20":"none",cursor:"pointer"}}
-                      onClick={()=>{
-                        setShowLogs(p=>!p)
-                        if(!logs.length) api("/api/auth/login-log").then(r=>setLogs(Array.isArray(r)?r:[])).catch(()=>{})
-                      }}>
-                      <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",
-                        display:"flex",alignItems:"center",gap:8}}>
-                        <span style={{fontSize:14}}>&#x1f512;</span>
-                        Login Activity
-                        <span style={{color:"#ff6e84",fontSize:9}}>ADMIN</span>
-                      </div>
-                      <span style={{color:"#40485d",fontSize:12,transition:"transform .2s",
-                        transform:showLogs?"rotate(180deg)":"rotate(0)"}}>{"\u25BC"}</span>
-                    </div>
-                    {showLogs&&(
-                      <div style={{maxHeight:360,overflowY:"auto"}}>
-                        {logs.length===0?(
-                          <div style={{padding:32,textAlign:"center",color:"#40485d",fontSize:13}}>No login activity yet</div>
-                        ):(
-                          logs.map((log,i)=>{
-                            const isSuccess=log.status==="success"
-                            const isFailed=log.status==="failed"
-                            const isBlocked=log.status==="blocked"
-                            const color=isSuccess?"#69f6b8":isBlocked?"#ff6e84":isFailed?"#ffe083":"#a3aac4"
-                            const icon=isSuccess?"\u2713":isBlocked?"\u2717":isFailed?"!":"\u2022"
-                            return(
-                              <div key={log.id||i} style={{padding:"12px 24px",borderBottom:"1px solid #40485d08",
-                                display:"flex",alignItems:"center",gap:14}}>
-                                <div style={{width:28,height:28,borderRadius:"50%",background:color+"18",flexShrink:0,
-                                  display:"flex",alignItems:"center",justifyContent:"center",
-                                  fontSize:12,fontWeight:700,color}}>{icon}</div>
-                                <div style={{flex:1,minWidth:0}}>
-                                  <div style={{display:"flex",alignItems:"center",gap:8}}>
-                                    <span style={{fontWeight:600,color:"#dee5ff",fontSize:14}}>{log.username}</span>
-                                    <span style={{fontSize:10,padding:"1px 8px",borderRadius:10,fontWeight:600,
-                                      background:color+"18",color,border:`1px solid ${color}30`}}>
-                                      {log.status}
-                                    </span>
-                                    {log.role&&<span style={{fontSize:10,color:"#40485d"}}>{log.role}</span>}
-                                  </div>
-                                  {log.detail&&<div style={{fontSize:11,color:"#40485d",marginTop:2}}>{log.detail}</div>}
-                                </div>
-                                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:11,color:"#40485d",flexShrink:0,textAlign:"right"}}>
-                                  {log.logged_at?new Date(log.logged_at).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""}
-                                </div>
-                              </div>
-                            )
-                          })
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )
-              })()}
+              {isAdmin()&&<LoginActivityPanel/>}
 
               {/* ── Team Management (admin only) ── */}
               {isAdmin()&&<div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
@@ -2697,6 +2638,66 @@ function LogCallBtn({onClick}){
 }
 
 // ─── FAB ─────────────────────────────────────────────────────────────────────
+
+function LoginActivityPanel(){
+  const [logs,setLogs]=useState([])
+  const [showLogs,setShowLogs]=useState(false)
+  return(
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div style={{padding:"18px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",
+        borderBottom:showLogs?"1px solid #40485d20":"none",cursor:"pointer"}}
+        onClick={()=>{
+          setShowLogs(p=>!p)
+          if(!logs.length) api("/api/auth/login-log").then(r=>setLogs(Array.isArray(r)?r:[])).catch(()=>{})
+        }}>
+        <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",
+          display:"flex",alignItems:"center",gap:8}}>
+          Login Activity
+          <span style={{color:"#ff6e84",fontSize:9}}>ADMIN</span>
+        </div>
+        <span style={{color:"#40485d",fontSize:12,transition:"transform .2s",
+          transform:showLogs?"rotate(180deg)":"rotate(0)"}}>{"\u25BC"}</span>
+      </div>
+      {showLogs&&(
+        <div style={{maxHeight:360,overflowY:"auto"}}>
+          {logs.length===0?(
+            <div style={{padding:32,textAlign:"center",color:"#40485d",fontSize:13}}>No login activity yet</div>
+          ):(
+            logs.map((log,i)=>{
+              const isSuccess=log.status==="success"
+              const isFailed=log.status==="failed"
+              const isBlocked=log.status==="blocked"
+              const color=isSuccess?"#69f6b8":isBlocked?"#ff6e84":isFailed?"#ffe083":"#a3aac4"
+              const icon=isSuccess?"\u2713":isBlocked?"\u2717":isFailed?"!":"\u2022"
+              return(
+                <div key={log.id||i} style={{padding:"12px 24px",borderBottom:"1px solid #40485d08",
+                  display:"flex",alignItems:"center",gap:14}}>
+                  <div style={{width:28,height:28,borderRadius:"50%",background:color+"18",flexShrink:0,
+                    display:"flex",alignItems:"center",justifyContent:"center",
+                    fontSize:12,fontWeight:700,color}}>{icon}</div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontWeight:600,color:"#dee5ff",fontSize:14}}>{log.username}</span>
+                      <span style={{fontSize:10,padding:"1px 8px",borderRadius:10,fontWeight:600,
+                        background:color+"18",color,border:`1px solid ${color}30`}}>
+                        {log.status}
+                      </span>
+                      {log.role&&<span style={{fontSize:10,color:"#40485d"}}>{log.role}</span>}
+                    </div>
+                    {log.detail&&<div style={{fontSize:11,color:"#40485d",marginTop:2}}>{log.detail}</div>}
+                  </div>
+                  <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:11,color:"#40485d",flexShrink:0,textAlign:"right"}}>
+                    {log.logged_at?new Date(log.logged_at).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""}
+                  </div>
+                </div>
+              )
+            })
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function FabBtn({onClick}){
   const [hov,setHov]=useState(false)
