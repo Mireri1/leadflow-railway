@@ -2282,7 +2282,7 @@ export default function App(){
                                 }}>
                                 Reassign
                               </button>
-                              {rep.status==="inactive"&&rep.leads>0&&(
+                              {rep.leads>0&&(
                                 <button className="btn btn-p" style={{fontSize:11,padding:"5px 10px"}}
                                   onClick={async()=>{
                                     if(!window.confirm(`Return all ${rep.leads} of ${rep.name}'s leads to the pool?`)) return
@@ -2297,6 +2297,22 @@ export default function App(){
                                   Release to Pool
                                 </button>
                               )}
+                              <button className="btn" style={{fontSize:11,padding:"5px 10px",
+                                background:"#ff6e8415",color:"#ff6e84",border:"1px solid #ff6e8430"}}
+                                onClick={async()=>{
+                                  if(!window.confirm(`Block ${rep.name} from logging in? Their leads will be released to the pool.`)) return
+                                  try{
+                                    await api("/api/auth/block",{method:"POST",body:JSON.stringify({username:rep.name})})
+                                    if(rep.leads>0){
+                                      await api("/api/leads/reassign",{method:"POST",body:JSON.stringify({from:rep.name,to:""})})
+                                    }
+                                    notify(`${rep.name} blocked and ${rep.leads} lead${rep.leads!==1?"s":""} released`)
+                                    api("/api/reps").then(r=>{if(Array.isArray(r))window.__lf_reps=r;setLbLoading(l=>!l);setTimeout(()=>setLbLoading(l=>!l),50)}).catch(()=>{})
+                                    setTimeout(loadLeads,500)
+                                  }catch(e){notify("Error: "+e.message,"error")}
+                                }}>
+                                Block
+                              </button>
                             </div>
                           </div>
                         )

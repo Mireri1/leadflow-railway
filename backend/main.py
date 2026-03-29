@@ -16,6 +16,7 @@ SECRET_KEY      = os.getenv("SECRET_KEY",      "leadflow-secret")
 TEAM_PASSWORD   = os.getenv("TEAM_PASSWORD",   "LeadFlow2024")
 ADMIN_PASSWORD  = os.getenv("ADMIN_PASSWORD",  "LeadFlowAdmin2024!")
 ADMIN_USERS     = set(u.strip().lower() for u in os.getenv("ADMIN_USERS", "eric").split(",") if u.strip())
+BLOCKED_USERS   = set(u.strip().lower() for u in os.getenv("BLOCKED_USERS", "").split(",") if u.strip())
 ALGORITHM       = "HS256"
 
 SUPABASE_URL  = os.getenv("SUPABASE_URL",  "https://ucpwpjokyconwzwqvdad.supabase.co")
@@ -65,8 +66,11 @@ class LoginRequest(BaseModel):
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
-    is_admin = req.username.strip().lower() in ADMIN_USERS
-    # Admins can use either the admin password or team password
+    name_lower = req.username.strip().lower()
+    # Block fired callers
+    if name_lower in BLOCKED_USERS:
+        raise HTTPException(status_code=403, detail="Access revoked. Contact your manager.")
+    is_admin = name_lower in ADMIN_USERS
     if is_admin:
         if req.password not in (ADMIN_PASSWORD, TEAM_PASSWORD):
             raise HTTPException(status_code=401, detail="Invalid password")
@@ -77,6 +81,26 @@ def login(req: LoginRequest):
         role = "caller"
     token = create_token(req.username, role)
     return {"token": token, "username": req.username, "role": role}
+
+@app.post("/api/auth/block")
+def block_user(body: dict, user: str = Depends(verify_admin)):
+    """Admin-only: add a username to the blocklist at runtime"""
+    name = body.get("username", "").strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="Username required")
+    BLOCKED_USERS.add(name)
+    return {"blocked": name, "total_blocked": list(BLOCKED_USERS)}
+
+@app.post("/api/auth/unblock")
+def unblock_user(body: dict, user: str = Depends(verify_admin)):
+    """Admin-only: remove a username from the blocklist"""
+    name = body.get("username", "").strip().lower()
+    BLOCKED_USERS.discard(name)
+    return {"unblocked": name, "total_blocked": list(BLOCKED_USERS)}
+
+@app.get("/api/auth/blocked")
+def get_blocked(user: str = Depends(verify_admin)):
+    return {"blocked": list(BLOCKED_USERS)}
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(verify_token)):
