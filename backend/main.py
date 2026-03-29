@@ -64,21 +64,36 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+def log_login(username, status, role=None, detail=None):
+    """Fire-and-forget login audit to Supabase"""
+    try:
+        req_lib.post(f"{SUPABASE_URL}/rest/v1/login_log",
+            headers=SB_HEADERS,
+            json={"username": username, "status": status, "role": role, "detail": detail,
+                  "logged_at": datetime.utcnow().isoformat()},
+            timeout=5)
+    except:
+        pass
+
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
     name_lower = req.username.strip().lower()
     # Block fired callers
     if name_lower in BLOCKED_USERS:
+        log_login(req.username, "blocked")
         raise HTTPException(status_code=403, detail="Access revoked. Contact your manager.")
     is_admin = name_lower in ADMIN_USERS
     if is_admin:
         if req.password not in (ADMIN_PASSWORD, TEAM_PASSWORD):
+            log_login(req.username, "failed", detail="wrong password (admin)")
             raise HTTPException(status_code=401, detail="Invalid password")
         role = "admin"
     else:
         if req.password != TEAM_PASSWORD:
+            log_login(req.username, "failed", detail="wrong password")
             raise HTTPException(status_code=401, detail="Invalid password")
         role = "caller"
+    log_login(req.username, "success", role=role)
     token = create_token(req.username, role)
     return {"token": token, "username": req.username, "role": role}
 
@@ -101,6 +116,17 @@ def unblock_user(body: dict, user: str = Depends(verify_admin)):
 @app.get("/api/auth/blocked")
 def get_blocked(user: str = Depends(verify_admin)):
     return {"blocked": list(BLOCKED_USERS)}
+
+@app.get("/api/auth/login-log")
+def get_login_log(user: str = Depends(verify_admin)):
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/login_log?select=*&order=logged_at.desc&limit=100",
+            headers=SB_HEADERS, timeout=30)
+        logs = r.json() if r.status_code == 200 else []
+        return logs if isinstance(logs, list) else []
+    except:
+        return []
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(verify_token)):
