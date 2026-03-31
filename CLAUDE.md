@@ -98,6 +98,39 @@ Supabase columns: `budgetfocus`, `vendorstatus`, `decisionmaker`, `timeline`, `q
 - `backend/main.py` — entire API (single file)
 - `Dockerfile` — builds frontend then backend, serves via uvicorn
 
+## Nightly Health Check
+
+Run this diagnostic daily to catch issues. Auto-fix what you can.
+
+### LeadFlow Checks
+1. Login as admin: `POST /api/auth/login` with `{"username":"Eric","password":"LF@dmin2024!Mx"}`
+2. `GET /api/stats` with auth token — verify returns data with `total` field
+3. `GET /api/leaderboard` — verify returns array
+4. `GET /api/calls/qualified` — verify returns array (not error)
+5. `GET /api/quota` — verify returns `quota` field
+6. `GET /api/calls/history` — verify returns `calls` array
+
+### Supabase Direct Access
+- URL: `https://ucpwpjokyconwzwqvdad.supabase.co`
+- Use service role key from LeadFlow's Supabase (in HQ's `.env.local` as `LEADFLOW_SUPABASE_KEY`)
+- Table: `call_outcomes` (NOT `calls`), column: `calledAt` (NOT `created_at`)
+
+### Auto-Fix Rules
+- API returns error → investigate code, fix, build (`cd frontend && npm run build`), commit, push
+- Route ordering issues → `/api/calls/qualified` must be BEFORE `/api/calls/{lead_id}` in main.py
+- Login fails → check ADMIN_PASSWORD env var in Railway
+
+### Report Format
+```
+LEADFLOW:
+- API: OK/FAIL
+- Stats: OK/FAIL
+- Leaderboard: OK/FAIL
+- Qualified: OK/FAIL
+- Quota: OK/FAIL
+ACTIONS TAKEN: [list or "None needed"]
+```
+
 ## Environment Variables (Railway)
 - `SECRET_KEY` — JWT signing key
 - `TEAM_PASSWORD` — shared caller password
