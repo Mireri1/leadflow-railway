@@ -849,11 +849,16 @@ function RepBoard({ stats }) {
   if (!stats?.topReps?.length) return null
   return (
     <div className="card" style={{ marginBottom: 20 }}>
-      <div style={{ fontSize: 10, letterSpacing: ".1em", color: "#525878", marginBottom: 12 }}>TODAY'S REPS</div>
+      <div style={{ fontSize: 10, letterSpacing: ".1em", color: "#525878", marginBottom: 12 }}>TODAY'S SIGN-INS & ACTIVITY</div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         {stats.topReps.map(r => (
-          <div key={r.rep} style={{ background: "#080810", border: "1px solid #181b2e", borderRadius: 8, padding: "10px 14px", minWidth: 140 }}>
+          <div key={r.rep} style={{ background: "#080810", border: "1px solid #181b2e", borderRadius: 8, padding: "10px 14px", minWidth: 160 }}>
             <div style={{ fontSize: 12, color: "#dde1f0", fontWeight: 500, marginBottom: 6 }}>👤 {r.rep}</div>
+            {r.signedInAt && (
+              <div style={{ fontSize: 10, color: "#6b7194", marginBottom: 4 }}>
+                signed in {new Date(r.signedInAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+              </div>
+            )}
             <div style={{ display: "flex", gap: 12, fontSize: 11, color: "#525878" }}>
               <span>{r.calls} call{r.calls!==1?"s":""}</span>
               {r.interested>0&&<span style={{color:"#10b981"}}>+{r.interested} int.</span>}

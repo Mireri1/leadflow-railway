@@ -43,6 +43,8 @@ export const api={
     if(password!==TEAM_PASSWORD)throw new Error("Invalid password")
     localStorage.setItem("lf_user",username.trim())
     localStorage.setItem("lf_token","authenticated")
+    // Record sign-in to user_sessions table
+    try{await sb("user_sessions",{method:"POST",body:JSON.stringify({username:username.trim(),signed_in:new Date().toISOString()})})}catch(e){console.warn("Failed to record sign-in:",e)}
     return{username:username.trim()}
   },
   logout:()=>{localStorage.removeItem("lf_user");localStorage.removeItem("lf_token")},
@@ -133,17 +135,24 @@ export const api={
 
   getStats:async()=>{
     const today=new Date().toISOString().split("T")[0]
-    const[leads,callsToday]=await Promise.all([
+    const[leads,callsToday,sessionsToday]=await Promise.all([
       sb("leads?select=status,score,callbackDate,createdAt,user_id"),
-      sb(`call_outcomes?select=outcome,calledBy,user_id&calledAt=gte.${today}T00:00:00`)
+      sb(`call_outcomes?select=outcome,calledBy,user_id&calledAt=gte.${today}T00:00:00`),
+      sb(`user_sessions?select=username,signed_in&signed_in=gte.${today}T00:00:00&order=signed_in.desc`).catch(()=>[])
     ])
-    const sl=leads||[],sc=callsToday||[]
+    const sl=leads||[],sc=callsToday||[],ss=sessionsToday||[]
     const total=sl.length
     const repMap={}
+    // Add all signed-in users first (so they appear even with 0 calls)
+    for(const s of ss){
+      const rep=s.username
+      if(!rep)continue
+      if(!repMap[rep])repMap[rep]={rep,calls:0,interested:0,converted:0,signedInAt:s.signed_in}
+    }
     for(const c of sc){
       const rep=c.user_id||c.calledBy
       if(!rep)continue
-      if(!repMap[rep])repMap[rep]={rep,calls:0,interested:0,converted:0}
+      if(!repMap[rep])repMap[rep]={rep,calls:0,interested:0,converted:0,signedInAt:null}
       repMap[rep].calls++
       if(c.outcome==="interested")repMap[rep].interested++
       if(c.outcome==="converted")repMap[rep].converted++

@@ -68,3 +68,21 @@ create policy "open_call_outcomes"
   on call_outcomes for all
   using (true)
   with check (true);
+
+-- User sessions table (tracks every sign-in)
+create table if not exists user_sessions (
+  id         bigserial primary key,
+  username   text not null,
+  signed_in  timestamptz default now()
+);
+
+alter table user_sessions enable row level security;
+
+drop policy if exists "open_user_sessions" on user_sessions;
+create policy "open_user_sessions"
+  on user_sessions for all
+  using (true)
+  with check (true);
+
+create index if not exists idx_sessions_user on user_sessions(username);
+create index if not exists idx_sessions_time on user_sessions(signed_in desc);
