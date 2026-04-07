@@ -2,15 +2,16 @@
 LeadFlow Railway Backend — Google Places scraper
 """
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt, os, re, time, requests as req_lib
+import jwt, os, re, time, json as json_lib, requests as req_lib
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
+from urllib.parse import quote as url_quote
 
 SECRET_KEY      = os.getenv("SECRET_KEY",      "leadflow-secret")
 TEAM_PASSWORD   = os.getenv("TEAM_PASSWORD",   "LeadFlow2024")
@@ -46,7 +47,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         return payload["sub"]
-    except:
+    except (jwt.exceptions.InvalidTokenError, KeyError, Exception):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -71,6 +72,19 @@ def log_login(username, status, role=None, detail=None):
             headers=SB_HEADERS,
             json={"username": username, "status": status, "role": role, "detail": detail,
                   "logged_at": datetime.utcnow().isoformat()},
+            timeout=5)
+    except:
+        pass
+
+def audit_log(username, action, resource_type=None, resource_id=None, details=None):
+    """Fire-and-forget action audit to Supabase audit_log table"""
+    try:
+        req_lib.post(f"{SUPABASE_URL}/rest/v1/audit_log",
+            headers=SB_HEADERS,
+            json={"username": username, "action": action,
+                  "resource_type": resource_type, "resource_id": str(resource_id) if resource_id else None,
+                  "details": json_lib.dumps(details) if details else None,
+                  "created_at": datetime.utcnow().isoformat()},
             timeout=5)
     except:
         pass
@@ -108,6 +122,26 @@ def login(req: LoginRequest):
         pass
     token = create_token(req.username, role)
     return {"token": token, "username": req.username, "role": role, "session_id": session_id}
+
+@app.post("/api/auth/logout-beacon")
+async def logout_beacon(request: Request):
+    """Browser beacon for tab/window close — no auth header available"""
+    body = await request.json()
+    session_id = body.get("session_id")
+    token = body.get("token")
+    if not session_id or not token:
+        return {"ok": False}
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        # Token is valid — record sign-out
+        req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{session_id}",
+            headers=SB_HEADERS,
+            json={"signed_out": datetime.utcnow().isoformat()},
+            timeout=5)
+        return {"ok": True}
+    except:
+        return {"ok": False}
 
 @app.post("/api/auth/block")
 def block_user(body: dict, user: str = Depends(verify_admin)):
@@ -329,6 +363,7 @@ def save_to_supabase(leads):
 class ScrapeRequest(BaseModel):
     industry:  str
     state:     Optional[str] = ""
+    cities:    Optional[str] = ""
     limit:     Optional[int] = 25
     source:    Optional[str] = "places"
 
@@ -336,8 +371,27 @@ class ScrapeRequest(BaseModel):
 def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
     keyword = INDUSTRY_MAP.get(body.industry, body.industry.lower())
     limit   = min(max(body.limit or 25, 5), 60)
-    print(f"[SCRAPE] {body.industry} → '{keyword}', state: {body.state}, limit: {limit}")
-    leads = scrape_google_places(keyword=keyword, state=body.state or "", limit=limit)
+
+    if body.cities:
+        city_list = [c.strip() for c in body.cities.split(",") if c.strip()]
+        per_city = max(limit // len(city_list), 5) if city_list else limit
+        print(f"[SCRAPE] {body.industry} → '{keyword}', cities: {city_list}, state: {body.state}, limit: {limit} ({per_city}/city)")
+        all_leads = []
+        seen_phones = set()
+        for city in city_list:
+            location = f"{city}, {body.state}".strip(", ")
+            batch = scrape_google_places(keyword=keyword, state=location, limit=per_city)
+            for lead in batch:
+                if lead.get("phone") and lead["phone"] not in seen_phones:
+                    seen_phones.add(lead["phone"])
+                    all_leads.append(lead)
+                elif not lead.get("phone"):
+                    all_leads.append(lead)
+        leads = all_leads[:limit]
+    else:
+        print(f"[SCRAPE] {body.industry} → '{keyword}', state: {body.state}, limit: {limit}")
+        leads = scrape_google_places(keyword=keyword, state=body.state or "", limit=limit)
+
     saved = save_to_supabase(leads)
     print(f"[SCRAPE] Saved {saved} leads")
     return {"leads": leads, "count": len(leads), "saved": saved}
@@ -369,8 +423,12 @@ def list_leads(status: str = "", search: str = "", sort: str = "score",
 def create_lead(lead: dict, user: str = Depends(verify_token)):
     try:
         lead["score"] = score_lead(lead)
+        lead["createdBy"] = user
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=lead, timeout=30)
-        return r.json()
+        result = r.json()
+        lead_id = result[0].get("id") if isinstance(result, list) and result else None
+        audit_log(user, "create_lead", "lead", lead_id, {"company": lead.get("company"), "source": "manual"})
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -379,9 +437,12 @@ def import_leads(leads: list, user: str = Depends(verify_token)):
     try:
         for lead in leads:
             lead["score"] = score_lead(lead)
+            lead["createdBy"] = user
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=leads, timeout=30)
         saved = r.json()
-        return {"count": len(saved) if isinstance(saved, list) else 0}
+        count = len(saved) if isinstance(saved, list) else 0
+        audit_log(user, "import_leads", "lead", None, {"count": count, "source": "csv"})
+        return {"count": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -397,8 +458,17 @@ def update_lead(lead_id: str, data: dict, user: str = Depends(verify_token)):
 @app.delete("/api/leads/{lead_id}")
 def delete_lead(lead_id: str, user: str = Depends(verify_token)):
     try:
-        req_lib.delete(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+        # Fetch lead details before deleting for audit trail
+        lr = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=company,assignedTo,status",
+                        headers=SB_HEADERS, timeout=10)
+        lead_info = lr.json() if lr.status_code == 200 else []
+        lead_detail = lead_info[0] if isinstance(lead_info, list) and lead_info else {}
+
+        req_lib.delete(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
                       headers={**SB_HEADERS, "Prefer":""}, timeout=30)
+        audit_log(user, "delete_lead", "lead", lead_id, {
+            "company": lead_detail.get("company"), "assignedTo": lead_detail.get("assignedTo"),
+            "status": lead_detail.get("status")})
         return {"deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -683,6 +753,7 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
         if not isinstance(stale, list):
             return {"recycled": 0}
         recycled = 0
+        recycled_ids = []
         for lead in stale:
             if lead.get("assignedTo"):
                 req_lib.patch(
@@ -691,6 +762,8 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
                     json={"assignedTo": "", "updatedAt": datetime.utcnow().isoformat()},
                     timeout=10)
                 recycled += 1
+                recycled_ids.append({"id": lead["id"], "was_assigned_to": lead.get("assignedTo")})
+        audit_log(user, "recycle_stale", "lead", None, {"recycled": recycled, "leads": recycled_ids[:20]})
         return {"recycled": recycled, "total_checked": len(stale)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -718,6 +791,7 @@ def reassign_leads(body: dict, user: str = Depends(verify_admin)):
                 timeout=10)
             count += 1
         dest = to_rep if to_rep else "unassigned pool"
+        audit_log(user, "reassign_leads", "lead", None, {"from": from_rep, "to": dest, "count": count})
         return {"reassigned": count, "from": from_rep, "to": dest}
     except HTTPException:
         raise
@@ -841,7 +915,7 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             since = today
 
         # Calls (filtered by range or all-time)
-        calls_url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration,contract_value"
+        calls_url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration"
         if since:
             calls_url += f"&calledAt=gte.{since}T00:00:00"
         r1 = req_lib.get(calls_url, headers=SB_HEADERS, timeout=30)
@@ -897,7 +971,6 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
                 u["contacted"] += 1
             if outcome == "converted":
                 u["conversions"] += 1
-                u["revenue"] += c.get("contract_value") or 0
             elif outcome == "interested": u["interested"]  += 1
             elif outcome == "no_answer":  u["no_answer"]   += 1
             elif outcome == "voicemail":  u["voicemail"]   += 1
@@ -934,6 +1007,21 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Audit log endpoint ────────────────────────────────────────────────────────
+
+@app.get("/api/audit-log")
+def get_audit_log(days: int = 7, user: str = Depends(verify_admin)):
+    """Admin-only: fetch recent audit log entries"""
+    try:
+        since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log?select=*&created_at=gte.{since}T00:00:00&order=created_at.desc&limit=500",
+            headers=SB_HEADERS, timeout=30)
+        logs = r.json() if r.status_code == 200 else []
+        return logs if isinstance(logs, list) else []
+    except:
+        return []
+
 # ── Scripts endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/scripts")
@@ -952,10 +1040,13 @@ def create_script(script: dict, user: str = Depends(verify_token)):
     try:
         script["is_active"] = True
         script["usage_count"] = 0
+        script["created_by"] = user
         script["created_at"] = datetime.utcnow().isoformat()
         script["updated_at"] = datetime.utcnow().isoformat()
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/scripts", headers=SB_HEADERS, json=script, timeout=30)
-        return r.json()
+        result = r.json()
+        audit_log(user, "create_script", "script", None, {"title": script.get("title"), "industry": script.get("industry")})
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -963,8 +1054,9 @@ def create_script(script: dict, user: str = Depends(verify_token)):
 def update_script(script_id: str, data: dict, user: str = Depends(verify_token)):
     try:
         data["updated_at"] = datetime.utcnow().isoformat()
-        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{script_id}",
+        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{url_quote(script_id)}",
                          headers=SB_HEADERS, json=data, timeout=30)
+        audit_log(user, "update_script", "script", script_id, {"fields_changed": list(data.keys())})
         return r.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -972,8 +1064,9 @@ def update_script(script_id: str, data: dict, user: str = Depends(verify_token))
 @app.delete("/api/scripts/{script_id}")
 def delete_script(script_id: str, user: str = Depends(verify_token)):
     try:
-        req_lib.patch(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{script_id}",
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/scripts?id=eq.{url_quote(script_id)}",
                      headers=SB_HEADERS, json={"is_active": False}, timeout=30)
+        audit_log(user, "delete_script", "script", script_id)
         return {"deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
