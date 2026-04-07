@@ -25,7 +25,12 @@ create table if not exists leads (
   "callbackDate" text default '',
   "createdAt"    timestamptz default now(),
   "updatedAt"    timestamptz default now(),
-  "createdBy"    text default ''
+  "createdBy"    text default '',
+  user_id        text default '',
+  total_calls    int  default 0,
+  last_called_at timestamptz,
+  converted_at   timestamptz,
+  contract_value numeric default 0
 );
 
 -- Call outcomes table
@@ -37,7 +42,11 @@ create table if not exists call_outcomes (
   duration       int  default 0,
   "callbackDate" text default '',
   "calledAt"     timestamptz default now(),
-  "calledBy"     text default ''
+  "calledBy"     text default '',
+  user_id        text default '',
+  converted      boolean default false,
+  contract_value numeric default 0,
+  script_id      bigint
 );
 
 -- Indexes for fast filtering
@@ -48,6 +57,8 @@ create index if not exists idx_leads_callback    on leads("callbackDate");
 create index if not exists idx_leads_created     on leads("createdAt" desc);
 create index if not exists idx_calls_lead        on call_outcomes("leadId");
 create index if not exists idx_calls_at          on call_outcomes("calledAt" desc);
+create index if not exists idx_calls_user       on call_outcomes(user_id);
+create index if not exists idx_leads_user       on leads(user_id);
 
 -- Row Level Security (required by Supabase)
 -- We use a simple shared-password approach, so we open access to anon key
@@ -73,7 +84,8 @@ create policy "open_call_outcomes"
 create table if not exists user_sessions (
   id         bigserial primary key,
   username   text not null,
-  signed_in  timestamptz default now()
+  signed_in  timestamptz default now(),
+  signed_out timestamptz
 );
 
 alter table user_sessions enable row level security;

@@ -830,6 +830,7 @@ function StatsBar({ stats, onCallbacks }) {
         { l: "CONVERTED",      v: stats.converted,        c: "#059669" },
         { l: "CONV RATE",      v: stats.conversionRate+"%", c: "#dde1f0" },
         { l: "AVG SCORE",      v: stats.avgScore,         c: scoreColor(stats.avgScore || 0) },
+        ...(stats.totalRevenue > 0 ? [{ l: "REVENUE", v: "$" + stats.totalRevenue.toLocaleString(), c: "#059669" }] : []),
       ].map(s => (
         <div key={s.l} className="card"
           onClick={s.onClick}
@@ -845,27 +846,90 @@ function StatsBar({ stats, onCallbacks }) {
 
 // ── Rep Leaderboard ────────────────────────────────────────────────────────────
 
-function RepBoard({ stats }) {
+function RepBoard({ stats, statsRange, onRangeChange }) {
+  const [expanded, setExpanded] = useState(null)
   if (!stats?.topReps?.length) return null
+  const rangeLabel = { today: "Today", "7d": "Last 7 Days", "30d": "Last 30 Days" }
   return (
     <div className="card" style={{ marginBottom: 20 }}>
-      <div style={{ fontSize: 10, letterSpacing: ".1em", color: "#525878", marginBottom: 12 }}>TODAY'S SIGN-INS & ACTIVITY</div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div style={{ fontSize: 10, letterSpacing: ".1em", color: "#525878" }}>
+          REP SIGN-INS & PERFORMANCE — {rangeLabel[statsRange] || "Today"}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {["today", "7d", "30d"].map(r => (
+            <button key={r} className="tab" onClick={() => onRangeChange(r)}
+              style={{ background: statsRange === r ? "#5b5fef" : "transparent", color: statsRange === r ? "#fff" : "#525878",
+                border: statsRange === r ? "none" : "1px solid #1e2236", fontSize: 10, padding: "4px 10px" }}>
+              {r === "today" ? "Today" : r === "7d" ? "7 Days" : "30 Days"}
+            </button>
+          ))}
+        </div>
+      </div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-        {stats.topReps.map(r => (
-          <div key={r.rep} style={{ background: "#080810", border: "1px solid #181b2e", borderRadius: 8, padding: "10px 14px", minWidth: 160 }}>
-            <div style={{ fontSize: 12, color: "#dde1f0", fontWeight: 500, marginBottom: 6 }}>👤 {r.rep}</div>
-            {r.signedInAt && (
-              <div style={{ fontSize: 10, color: "#6b7194", marginBottom: 4 }}>
-                signed in {new Date(r.signedInAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+        {stats.topReps.map(r => {
+          const isExpanded = expanded === r.rep
+          return (
+            <div key={r.rep} onClick={() => setExpanded(isExpanded ? null : r.rep)}
+              style={{ background: "#080810", border: `1px solid ${isExpanded ? "#5b5fef35" : "#181b2e"}`, borderRadius: 8,
+                padding: "10px 14px", minWidth: 180, cursor: "pointer", transition: "border-color .15s" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <div style={{ fontSize: 12, color: "#dde1f0", fontWeight: 500 }}>👤 {r.rep}</div>
+                {r.sessions > 0 && <div style={{ fontSize: 9, color: "#6b7194" }}>{r.sessions} session{r.sessions !== 1 ? "s" : ""}</div>}
               </div>
-            )}
-            <div style={{ display: "flex", gap: 12, fontSize: 11, color: "#525878" }}>
-              <span>{r.calls} call{r.calls!==1?"s":""}</span>
-              {r.interested>0&&<span style={{color:"#10b981"}}>+{r.interested} int.</span>}
-              {r.converted>0&&<span style={{color:"#059669"}}>✓{r.converted} conv.</span>}
+              {r.signedInAt && (
+                <div style={{ fontSize: 10, color: "#6b7194", marginBottom: 4 }}>
+                  signed in {new Date(r.signedInAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+                  {r.signedOutAt && <span> — out {new Date(r.signedOutAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span>}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 12, fontSize: 11, color: "#525878" }}>
+                <span>{r.calls} call{r.calls !== 1 ? "s" : ""}</span>
+                {r.interested > 0 && <span style={{ color: "#10b981" }}>+{r.interested} int.</span>}
+                {r.converted > 0 && <span style={{ color: "#059669" }}>✓{r.converted} conv.</span>}
+              </div>
+              {/* Expanded performance detail */}
+              {isExpanded && (
+                <div style={{ marginTop: 10, borderTop: "1px solid #181b2e", paddingTop: 10 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 10 }}>
+                    <div>
+                      <div style={{ color: "#525878", marginBottom: 2 }}>CONV RATE</div>
+                      <div style={{ color: parseFloat(r.convRate) > 0 ? "#059669" : "#525878", fontWeight: 600, fontSize: 14, fontFamily: "'Syne',sans-serif" }}>
+                        {r.convRate}%
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ color: "#525878", marginBottom: 2 }}>INTEREST RATE</div>
+                      <div style={{ color: parseFloat(r.interestRate) > 0 ? "#10b981" : "#525878", fontWeight: 600, fontSize: 14, fontFamily: "'Syne',sans-serif" }}>
+                        {r.interestRate}%
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ color: "#525878", marginBottom: 2 }}>NO-ANSWER</div>
+                      <div style={{ color: parseFloat(r.noAnswerRate) > 30 ? "#f06060" : "#525878", fontWeight: 600, fontSize: 14, fontFamily: "'Syne',sans-serif" }}>
+                        {r.noAnswerRate}%
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ color: "#525878", marginBottom: 2 }}>CALLBACKS</div>
+                      <div style={{ color: r.callbacks > 0 ? "#8b5cf6" : "#525878", fontWeight: 600, fontSize: 14, fontFamily: "'Syne',sans-serif" }}>
+                        {r.callbacks}
+                      </div>
+                    </div>
+                    {r.revenue > 0 && (
+                      <div style={{ gridColumn: "1 / -1" }}>
+                        <div style={{ color: "#525878", marginBottom: 2 }}>REVENUE</div>
+                        <div style={{ color: "#059669", fontWeight: 600, fontSize: 14, fontFamily: "'Syne',sans-serif" }}>
+                          ${r.revenue.toLocaleString()}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
@@ -891,6 +955,7 @@ export default function App() {
   const [fStatus, setFStatus]       = useState("all")
   const [sortBy, setSort]           = useState("newest")
   const [cbOnly, setCbOnly]         = useState(false)
+  const [statsRange, setStatsRange] = useState("today")
 
   function toast_(msg, type = "success") {
     setToast({ msg, type }); setTimeout(() => setToast(null), 3200)
@@ -901,12 +966,12 @@ export default function App() {
     try {
       const [l, s] = await Promise.all([
         api.getLeads({ search, status: fStatus, sortBy, callbacks_only: cbOnly }),
-        api.getStats(),
+        api.getStats(statsRange),
       ])
       setLeads(l || []); setStats(s)
     } catch (ex) { toast_("Error loading — check Supabase config", "error") }
     finally { setLoad(false) }
-  }, [search, fStatus, sortBy, cbOnly])
+  }, [search, fStatus, sortBy, cbOnly, statsRange])
 
   useEffect(() => {
     if (!user) return
@@ -914,8 +979,8 @@ export default function App() {
     return () => clearTimeout(t)
   }, [user, load])
 
-  function logout() {
-    api.logout(); setUser(null)
+  async function logout() {
+    await api.logout(); setUser(null)
   }
 
   async function deleteL(id) {
@@ -973,7 +1038,7 @@ export default function App() {
       <div style={{ padding: "22px 28px", maxWidth: 1500, margin: "0 auto" }}>
 
         <StatsBar stats={stats} onCallbacks={() => setCbOnly(p => !p)} />
-        <RepBoard stats={stats} />
+        <RepBoard stats={stats} statsRange={statsRange} onRangeChange={setStatsRange} />
 
         {/* ── Filters ── */}
         <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>

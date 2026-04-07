@@ -43,11 +43,21 @@ export const api={
     if(password!==TEAM_PASSWORD)throw new Error("Invalid password")
     localStorage.setItem("lf_user",username.trim())
     localStorage.setItem("lf_token","authenticated")
-    // Record sign-in to user_sessions table
-    try{await sb("user_sessions",{method:"POST",body:JSON.stringify({username:username.trim(),signed_in:new Date().toISOString()})})}catch(e){console.warn("Failed to record sign-in:",e)}
+    // Record sign-in and store session id for sign-out tracking
+    try{
+      const sess=await sb("user_sessions",{method:"POST",body:JSON.stringify({username:username.trim(),signed_in:new Date().toISOString()})})
+      if(sess&&sess[0]?.id)localStorage.setItem("lf_session_id",sess[0].id)
+    }catch(e){console.warn("Failed to record sign-in:",e)}
     return{username:username.trim()}
   },
-  logout:()=>{localStorage.removeItem("lf_user");localStorage.removeItem("lf_token")},
+  logout:async()=>{
+    // Record sign-out timestamp
+    const sessId=localStorage.getItem("lf_session_id")
+    if(sessId){
+      try{await sb(`user_sessions?id=eq.${sessId}`,{method:"PATCH",body:JSON.stringify({signed_out:new Date().toISOString()})})}catch(e){console.warn("Failed to record sign-out:",e)}
+    }
+    localStorage.removeItem("lf_user");localStorage.removeItem("lf_token");localStorage.removeItem("lf_session_id")
+  },
   isLoggedIn:()=>localStorage.getItem("lf_token")==="authenticated",
 
   getLeads:async(params={})=>{
@@ -133,41 +143,59 @@ export const api={
     return{ok:true}
   },
 
-  getStats:async()=>{
+  getStats:async(range="today")=>{
     const today=new Date().toISOString().split("T")[0]
-    const[leads,callsToday,sessionsToday]=await Promise.all([
-      sb("leads?select=status,score,callbackDate,createdAt,user_id"),
-      sb(`call_outcomes?select=outcome,calledBy,user_id&calledAt=gte.${today}T00:00:00`),
-      sb(`user_sessions?select=username,signed_in&signed_in=gte.${today}T00:00:00&order=signed_in.desc`).catch(()=>[])
+    // Calculate date range start
+    let rangeStart=today
+    if(range==="7d"){const d=new Date();d.setDate(d.getDate()-7);rangeStart=d.toISOString().split("T")[0]}
+    if(range==="30d"){const d=new Date();d.setDate(d.getDate()-30);rangeStart=d.toISOString().split("T")[0]}
+
+    const[leads,callsRange,sessionsRange]=await Promise.all([
+      sb("leads?select=status,score,callbackDate,createdAt,user_id,contract_value"),
+      sb(`call_outcomes?select=outcome,calledBy,user_id,contract_value,calledAt&calledAt=gte.${rangeStart}T00:00:00`),
+      sb(`user_sessions?select=username,signed_in,signed_out&signed_in=gte.${rangeStart}T00:00:00&order=signed_in.desc`).catch(()=>[])
     ])
-    const sl=leads||[],sc=callsToday||[],ss=sessionsToday||[]
+    const sl=leads||[],sc=callsRange||[],ss=sessionsRange||[]
     const total=sl.length
     const repMap={}
     // Add all signed-in users first (so they appear even with 0 calls)
     for(const s of ss){
       const rep=s.username
       if(!rep)continue
-      if(!repMap[rep])repMap[rep]={rep,calls:0,interested:0,converted:0,signedInAt:s.signed_in}
+      if(!repMap[rep])repMap[rep]={rep,calls:0,interested:0,converted:0,noAnswer:0,callbacks:0,revenue:0,signedInAt:s.signed_in,signedOutAt:s.signed_out,sessions:0}
+      repMap[rep].sessions++
     }
     for(const c of sc){
       const rep=c.user_id||c.calledBy
       if(!rep)continue
-      if(!repMap[rep])repMap[rep]={rep,calls:0,interested:0,converted:0,signedInAt:null}
+      if(!repMap[rep])repMap[rep]={rep,calls:0,interested:0,converted:0,noAnswer:0,callbacks:0,revenue:0,signedInAt:null,signedOutAt:null,sessions:0}
       repMap[rep].calls++
       if(c.outcome==="interested")repMap[rep].interested++
-      if(c.outcome==="converted")repMap[rep].converted++
+      if(c.outcome==="converted"){repMap[rep].converted++;repMap[rep].revenue+=(c.contract_value||0)}
+      if(c.outcome==="no_answer"||c.outcome==="voicemail")repMap[rep].noAnswer++
+      if(c.outcome==="callback")repMap[rep].callbacks++
+    }
+    // Calculate rates for each rep
+    for(const r of Object.values(repMap)){
+      r.convRate=r.calls>0?((r.converted/r.calls)*100).toFixed(1):"0.0"
+      r.noAnswerRate=r.calls>0?((r.noAnswer/r.calls)*100).toFixed(1):"0.0"
+      r.interestRate=r.calls>0?((r.interested/r.calls)*100).toFixed(1):"0.0"
     }
     const converted=sl.filter(l=>l.status==="converted").length
+    const totalRevenue=sl.reduce((a,l)=>a+(l.contract_value||0),0)
     return{
       total,
       newToday:sl.filter(l=>(l.createdAt||"").startsWith(today)).length,
       interested:sl.filter(l=>l.status==="interested").length,
       converted,
       callbacksDue:sl.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length,
-      callsToday:sc.length,
+      callsToday:sc.filter(c=>(c.calledAt||"").startsWith(today)).length,
+      callsRange:sc.length,
       conversionRate:total?((converted/total)*100).toFixed(1):"0.0",
       avgScore:total?Math.round(sl.reduce((a,l)=>a+(l.score||0),0)/total):0,
+      totalRevenue,
       topReps:Object.values(repMap).sort((a,b)=>b.calls-a.calls),
+      range,
     }
   },
 
