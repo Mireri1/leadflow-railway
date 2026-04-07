@@ -206,6 +206,7 @@ function Login({onLogin}){
       localStorage.setItem("lf_token", res.token)
       localStorage.setItem("lf_user",  res.username)
       localStorage.setItem("lf_role",  res.role || "caller")
+      if(res.session_id) localStorage.setItem("lf_session_id", res.session_id)
       onLogin(res.username)
     } catch(ex){ setErr(ex.message) }
     finally{ setLoad(false) }
@@ -1041,10 +1042,20 @@ export default function App(){
   const [quota,setQuota]            = useState({quota:60,my_calls_today:0})
   const [leaderboard,setLeaderboard] = useState([])
   const [lbLoading,setLbLoading]   = useState(false)
+  const [lbRange,setLbRange]       = useState("today")
   const [qualifiedCalls,setQualifiedCalls] = useState([])
   const [qualLoading,setQualLoading] = useState(false)
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
+
+  async function doLogout(){
+    if(!window.confirm("Sign out?")) return
+    const sessId=localStorage.getItem("lf_session_id")
+    if(sessId){
+      try{await api("/api/auth/logout",{method:"POST",body:JSON.stringify({session_id:sessId})})}catch(e){}
+    }
+    localStorage.clear(); setUser(null)
+  }
 
   useEffect(()=>{
     if(user){
@@ -1078,8 +1089,8 @@ export default function App(){
   useEffect(()=>{
     if(activeNav!=="analytics"||!user) return
     setLbLoading(true)
-    api("/api/leaderboard").then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
-  },[activeNav,user])
+    api(`/api/leaderboard?range=${lbRange}`).then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+  },[activeNav,user,lbRange])
 
   useEffect(()=>{
     if(activeNav!=="qualified"||!user) return
@@ -1291,7 +1302,7 @@ export default function App(){
 
         {/* User avatar */}
         <div
-          onClick={()=>{if(window.confirm("Sign out?")){{localStorage.clear();setUser(null)}}}}
+          onClick={doLogout}
           title={`${user} — click to sign out`}
           style={{width:34,height:34,borderRadius:"50%",background:"#a3a6ff25",
             border:"1px solid #40485d60",display:"flex",alignItems:"center",
@@ -2009,36 +2020,47 @@ export default function App(){
                 <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
                   display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                   <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
-                    🏆 Rep Leaderboard — Today
+                    🏆 Rep Leaderboard — {{today:"Today","7d":"Last 7 Days","30d":"Last 30 Days",all:"All Time"}[lbRange]}
                   </div>
-                  <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
-                    onClick={()=>{
-                      setLbLoading(true)
-                      api("/api/leaderboard").then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
-                    }}>Refresh</button>
+                  <div style={{display:"flex",gap:4,alignItems:"center"}}>
+                    {["today","7d","30d","all"].map(r=>(
+                      <button key={r} className="btn btn-g" style={{fontSize:10,padding:"4px 10px",
+                        background:lbRange===r?"#a3a6ff":"transparent",color:lbRange===r?"#000011":"#a3aac4",
+                        border:lbRange===r?"none":"1px solid #40485d50"}}
+                        onClick={()=>setLbRange(r)}>
+                        {r==="today"?"Today":r==="7d"?"7D":r==="30d"?"30D":"All"}
+                      </button>
+                    ))}
+                    <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px",marginLeft:4}}
+                      onClick={()=>{
+                        setLbLoading(true)
+                        api(`/api/leaderboard?range=${lbRange}`).then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+                      }}>Refresh</button>
+                  </div>
                 </div>
                 {lbLoading?(
                   <div style={{padding:48,textAlign:"center",color:"#40485d"}}>Loading…</div>
                 ):leaderboard.length===0?(
                   <div style={{padding:48,textAlign:"center",color:"#40485d",fontSize:13}}>
-                    No call data yet — start logging calls to see rep stats
+                    No activity yet — reps will appear here when they sign in or log calls
                   </div>
                 ):(
                   <>
                     {/* Header row */}
-                    <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                    <div style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                       padding:"9px 24px",fontSize:"0.5rem",fontWeight:700,color:"#a3aac4",
                       textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d15"}}>
                       <div>Rep</div>
-                      <div style={{textAlign:"center"}}>Today</div>
-                      <div style={{textAlign:"center"}}>All-Time</div>
+                      <div style={{textAlign:"center"}}>Sign-In</div>
+                      <div style={{textAlign:"center"}}>Calls</div>
                       <div style={{textAlign:"center"}}>Converted</div>
                       <div style={{textAlign:"center"}}>Interested</div>
                       <div style={{textAlign:"center"}}>Conv %</div>
                       <div style={{textAlign:"center"}}>Contact %</div>
-                      <div style={{textAlign:"center"}}>Avg Talk</div>
                       <div style={{textAlign:"center"}}>No Answer</div>
                       <div style={{textAlign:"center"}}>Callbacks</div>
+                      <div style={{textAlign:"center"}}>Revenue</div>
+                      <div style={{textAlign:"center"}}>Sessions</div>
                     </div>
                     {leaderboard.map((rep,i)=>{
                       const medal=i===0?"🥇":i===1?"🥈":i===2?"🥉":null
@@ -2046,7 +2068,7 @@ export default function App(){
                       const convPct=parseFloat(rep.conv_rate)||0
                       return(
                         <div key={rep.name}
-                          style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                          style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                             padding:"14px 24px",alignItems:"center",
                             borderBottom:"1px solid #40485d10",
                             background:i===0?"#ffe08306":i===1?"#ffffff04":"transparent",
@@ -2075,14 +2097,30 @@ export default function App(){
                               )}
                             </div>
                           </div>
-                          {/* Calls today */}
+                          {/* Sign-in time */}
+                          <div style={{textAlign:"center"}}>
+                            {rep.signed_in_at?(
+                              <div>
+                                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4"}}>
+                                  {new Date(rep.signed_in_at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                                </div>
+                                {rep.signed_out_at&&(
+                                  <div style={{fontSize:10,color:"#40485d"}}>
+                                    out {new Date(rep.signed_out_at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                                  </div>
+                                )}
+                              </div>
+                            ):(
+                              <span style={{fontSize:12,color:"#40485d"}}>—</span>
+                            )}
+                          </div>
+                          {/* Calls */}
                           <div style={{textAlign:"center"}}>
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:18,fontWeight:700,
-                              color:rep.calls_today>0?"#a3a6ff":"#40485d"}}>{rep.calls_today}</span>
-                          </div>
-                          {/* All-time */}
-                          <div style={{textAlign:"center"}}>
-                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:600,color:"#dee5ff"}}>{rep.total_calls}</span>
+                              color:rep.total_calls>0?"#a3a6ff":"#40485d"}}>{rep.total_calls}</span>
+                            {rep.calls_today>0&&rep.calls_today!==rep.total_calls&&(
+                              <div style={{fontSize:10,color:"#40485d"}}>{rep.calls_today} today</div>
+                            )}
                           </div>
                           {/* Converted */}
                           <div style={{textAlign:"center"}}>
@@ -2106,13 +2144,6 @@ export default function App(){
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
                               color:parseFloat(rep.contact_rate)>=50?"#8b5cf6":"#a3aac4"}}>{rep.contact_rate}%</span>
                           </div>
-                          {/* Avg talk time */}
-                          <div style={{textAlign:"center"}}>
-                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
-                              color:rep.avg_talk_time>0?"#dee5ff":"#40485d"}}>
-                              {rep.avg_talk_time>0?`${Math.floor(rep.avg_talk_time/60)}m${rep.avg_talk_time%60?` ${rep.avg_talk_time%60}s`:""}`:"—"}
-                            </span>
-                          </div>
                           {/* No answer */}
                           <div style={{textAlign:"center"}}>
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#40485d"}}>{rep.no_answer}</span>
@@ -2121,6 +2152,18 @@ export default function App(){
                           <div style={{textAlign:"center"}}>
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
                               color:rep.callbacks>0?"#8b5cf6":"#40485d"}}>{rep.callbacks}</span>
+                          </div>
+                          {/* Revenue */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                              color:rep.revenue>0?"#69f6b8":"#40485d"}}>
+                              {rep.revenue>0?`$${rep.revenue.toLocaleString()}`:"—"}
+                            </span>
+                          </div>
+                          {/* Sessions */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
+                              color:rep.sessions>0?"#a3aac4":"#40485d"}}>{rep.sessions||0}</span>
                           </div>
                         </div>
                       )

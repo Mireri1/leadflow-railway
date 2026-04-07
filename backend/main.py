@@ -94,8 +94,20 @@ def login(req: LoginRequest):
             raise HTTPException(status_code=401, detail="Invalid password")
         role = "caller"
     log_login(req.username, "success", role=role)
+    # Record session for sign-in tracking
+    session_id = None
+    try:
+        sess_r = req_lib.post(f"{SUPABASE_URL}/rest/v1/user_sessions",
+            headers=SB_HEADERS,
+            json={"username": req.username.strip(), "signed_in": datetime.utcnow().isoformat()},
+            timeout=5)
+        sess_data = sess_r.json() if sess_r.status_code in (200, 201) else []
+        if isinstance(sess_data, list) and sess_data:
+            session_id = sess_data[0].get("id")
+    except:
+        pass
     token = create_token(req.username, role)
-    return {"token": token, "username": req.username, "role": role}
+    return {"token": token, "username": req.username, "role": role, "session_id": session_id}
 
 @app.post("/api/auth/block")
 def block_user(body: dict, user: str = Depends(verify_admin)):
@@ -125,6 +137,37 @@ def get_login_log(user: str = Depends(verify_admin)):
             headers=SB_HEADERS, timeout=30)
         logs = r.json() if r.status_code == 200 else []
         return logs if isinstance(logs, list) else []
+    except:
+        return []
+
+@app.post("/api/auth/logout")
+def logout_session(body: dict, user: str = Depends(verify_token)):
+    """Record sign-out timestamp for the session"""
+    session_id = body.get("session_id")
+    if session_id:
+        try:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{session_id}",
+                headers=SB_HEADERS,
+                json={"signed_out": datetime.utcnow().isoformat()},
+                timeout=5)
+        except:
+            pass
+    return {"ok": True}
+
+@app.get("/api/auth/sessions")
+def get_sessions(days: int = 0, user: str = Depends(verify_admin)):
+    """Get sign-in sessions. days=0 means today only."""
+    try:
+        if days > 0:
+            since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        else:
+            since = datetime.utcnow().strftime("%Y-%m-%d")
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/user_sessions?select=*&signed_in=gte.{since}T00:00:00&order=signed_in.desc&limit=500",
+            headers=SB_HEADERS, timeout=30)
+        sessions = r.json() if r.status_code == 200 else []
+        return sessions if isinstance(sessions, list) else []
     except:
         return []
 
@@ -784,29 +827,66 @@ def get_stats(user: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/leaderboard")
-def get_leaderboard(user: str = Depends(verify_token)):
+def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
     try:
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        # All-time calls
-        r1 = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration",
-            headers=SB_HEADERS, timeout=30)
+        # Calculate date filter based on range
+        if range == "7d":
+            since = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+        elif range == "30d":
+            since = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        elif range == "all":
+            since = ""
+        else:
+            since = today
+
+        # Calls (filtered by range or all-time)
+        calls_url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration,contract_value"
+        if since:
+            calls_url += f"&calledAt=gte.{since}T00:00:00"
+        r1 = req_lib.get(calls_url, headers=SB_HEADERS, timeout=30)
         # Leads for assignment tracking
         r2 = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo,status,score",
             headers=SB_HEADERS, timeout=30)
+        # Sessions for sign-in tracking
+        sess_url = f"{SUPABASE_URL}/rest/v1/user_sessions?select=username,signed_in,signed_out"
+        if since:
+            sess_url += f"&signed_in=gte.{since}T00:00:00"
+        sess_url += "&order=signed_in.desc"
+        r3 = req_lib.get(sess_url, headers=SB_HEADERS, timeout=30)
+
         calls = r1.json() if r1.status_code == 200 else []
         leads = r2.json() if r2.status_code == 200 else []
+        sessions = r3.json() if r3.status_code == 200 else []
+        if not isinstance(sessions, list):
+            sessions = []
 
         # Build per-user call stats
         users = {}
+        # Add signed-in users first so they appear even with 0 calls
+        for s in sessions:
+            name = s.get("username") or ""
+            if not name:
+                continue
+            if name not in users:
+                users[name] = {"name": name, "total_calls": 0, "calls_today": 0,
+                               "conversions": 0, "interested": 0, "no_answer": 0,
+                               "voicemail": 0, "callbacks": 0, "contacted": 0,
+                               "talk_time": 0, "revenue": 0,
+                               "signed_in_at": s.get("signed_in"),
+                               "signed_out_at": s.get("signed_out"),
+                               "sessions": 0}
+            users[name]["sessions"] = users[name].get("sessions", 0) + 1
+
         for c in calls:
             name = c.get("calledBy") or "Unknown"
             if name not in users:
                 users[name] = {"name": name, "total_calls": 0, "calls_today": 0,
                                "conversions": 0, "interested": 0, "no_answer": 0,
                                "voicemail": 0, "callbacks": 0, "contacted": 0,
-                               "talk_time": 0}
+                               "talk_time": 0, "revenue": 0,
+                               "signed_in_at": None, "signed_out_at": None, "sessions": 0}
             u = users[name]
             u["total_calls"] += 1
             u["talk_time"] += c.get("duration") or 0
@@ -815,7 +895,9 @@ def get_leaderboard(user: str = Depends(verify_token)):
             outcome = c.get("outcome", "")
             if outcome in ("answered", "interested", "converted", "callback"):
                 u["contacted"] += 1
-            if outcome == "converted":    u["conversions"] += 1
+            if outcome == "converted":
+                u["conversions"] += 1
+                u["revenue"] += c.get("contract_value") or 0
             elif outcome == "interested": u["interested"]  += 1
             elif outcome == "no_answer":  u["no_answer"]   += 1
             elif outcome == "voicemail":  u["voicemail"]   += 1
