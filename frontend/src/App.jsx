@@ -206,6 +206,7 @@ function Login({onLogin}){
       localStorage.setItem("lf_token", res.token)
       localStorage.setItem("lf_user",  res.username)
       localStorage.setItem("lf_role",  res.role || "caller")
+      if(res.session_id) localStorage.setItem("lf_session_id", res.session_id)
       onLogin(res.username)
     } catch(ex){ setErr(ex.message) }
     finally{ setLoad(false) }
@@ -245,17 +246,21 @@ function Login({onLogin}){
 function LeadFinder({onFound, industries}){
   const [industry,setIndustry] = useState(industries[0]||"Healthcare")
   const [state,setState]       = useState("")
+  const [cities,setCities]     = useState("")
   const [limit,setLimit]       = useState(25)
   const [loading,setLoad]      = useState(false)
   const [lastResult,setLast]   = useState(null)
+  const [findError,setFindError] = useState("")
 
   async function find(){
+    setFindError("")
+    if(cities.trim() && !state){ setFindError("Please select a state when targeting specific cities."); return }
     setLoad(true); setLast(null)
     try {
-      const res = await api("/api/scrape",{method:"POST",body:JSON.stringify({industry,state,limit,source:"sam"})})
+      const res = await api("/api/scrape",{method:"POST",body:JSON.stringify({industry,state,cities,limit,source:"sam"})})
       setLast(res)
       if(res.saved > 0) onFound()
-    } catch(ex){ alert("Error: "+ex.message) }
+    } catch(ex){ setFindError("Search failed — check your internet and try again.") }
     finally { setLoad(false) }
   }
 
@@ -263,7 +268,7 @@ function LeadFinder({onFound, industries}){
     <div className="finder">
       <div className="finder-title">🔍 Find Leads</div>
       <div className="finder-sub">Pull fresh leads from government databases — no CSV needed</div>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr auto",gap:12,alignItems:"flex-end"}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,alignItems:"flex-end"}}>
         <div className="ff">
           <label>Industry</label>
           <select value={industry} onChange={e=>setIndustry(e.target.value)} className="sel" style={{color:"#dee5ff"}}>
@@ -271,11 +276,20 @@ function LeadFinder({onFound, industries}){
           </select>
         </div>
         <div className="ff">
-          <label>State (optional)</label>
-          <select value={state} onChange={e=>setState(e.target.value)} className="sel" style={{color:state?"#dee5ff":"#a3aac4"}}>
+          <label>{cities.trim()?"State (required for city search)":"State (optional)"}</label>
+          <select value={state} onChange={e=>setState(e.target.value)} className="sel"
+            style={{color:state?"#dee5ff":"#a3aac4",border:cities.trim()&&!state?"1px solid #ff6e84":""}}>
             <option value="">All States</option>
             {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
           </select>
+        </div>
+        <div className="ff" style={{gridColumn:"1 / -1"}}>
+          <label>Cities / Towns (optional)</label>
+          <input value={cities} onChange={e=>setCities(e.target.value)}
+            placeholder="e.g. Stratford, Norwalk, Bridgeport — leave blank for entire state"
+            style={{width:"100%",background:"#000011",border:"1px solid #40485d30",
+              borderRadius:8,padding:"8px 12px",color:"#dee5ff",
+              fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none"}}/>
         </div>
         <div className="range-wrap">
           <label style={{fontSize:10,letterSpacing:".1em",textTransform:"uppercase",color:"#a3aac4",display:"flex",justifyContent:"space-between"}}>
@@ -285,9 +299,11 @@ function LeadFinder({onFound, industries}){
           <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#40485d"}}><span>25</span><span>200</span></div>
         </div>
         <button className="btn btn-p" onClick={find} disabled={loading} style={{padding:"10px 22px",whiteSpace:"nowrap",alignSelf:"flex-end"}}>
-          {loading?"Searching…":"Find Leads →"}
+          {loading?"Searching\u2026":"Find Leads \u2192"}
         </button>
       </div>
+      {findError&&<div style={{marginTop:14,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
+        borderRadius:8,fontSize:12,color:"#ff6e84"}}>{findError}</div>}
       {loading&&<div style={{marginTop:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
         <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#a3a6ff"}}/>Pulling records…
       </div>}
@@ -353,6 +369,7 @@ function QualChip({label, value, options, onChange}){
 
 function CallModal({lead,onClose,onSaved}){
   const [calls,setCalls]          = useState([])
+  const [modalError,setModalError] = useState("")
   const [primary,setPrimary]      = useState("")       // no_answer, voicemail, answered
   const [secondary,setSecondary]  = useState("")       // interested, not_interested, callback, converted
   const [cbReason,setCbReason]    = useState("")       // callback reason
@@ -397,10 +414,11 @@ function CallModal({lead,onClose,onSaved}){
   const step = !primary ? 1 : primary!=="answered" ? 3 : !secondary ? 2 : needsQual&&!hasQualData ? 2.5 : 3
 
   async function log(){
-    if(!primary){ alert("Select what happened on the call."); return }
-    if(primary==="answered"&&!secondary){ alert("Select the call result."); return }
-    if(needsQual&&!hasQualData){ alert("This outcome requires qualification data. Fill out at least one field below."); return }
-    if(secondary==="callback"&&!cbDate){ alert("Callback requires a date."); return }
+    setModalError("")
+    if(!primary){ setModalError("Select what happened on the call."); return }
+    if(primary==="answered"&&!secondary){ setModalError("Select the call result."); return }
+    if(needsQual&&!hasQualData){ setModalError("Fill out at least one qualification field below."); return }
+    if(secondary==="callback"&&!cbDate){ setModalError("Please select a callback date."); return }
 
     setSave(true)
     try{
@@ -437,7 +455,7 @@ function CallModal({lead,onClose,onSaved}){
         updatedAt:new Date().toISOString()
       })})
       onSaved(); onClose()
-    }catch(ex){alert("Error: "+ex.message)}
+    }catch(ex){setModalError("Couldn't save — check your internet and try again.")}
     finally{setSave(false)}
   }
 
@@ -459,6 +477,11 @@ function CallModal({lead,onClose,onSaved}){
           </div>
           <button className="btn btn-g" style={{fontSize:12,padding:"5px 10px"}} onClick={onClose}>✕</button>
         </div>
+
+        {modalError&&<div style={{padding:"10px 14px",marginBottom:12,background:"#ff6e8418",border:"1px solid #ff6e8440",
+          borderRadius:8,fontSize:13,color:"#ff6e84",display:"flex",alignItems:"center",gap:8}}>
+          <span>⚠</span>{modalError}
+        </div>}
 
         {scripts.length>0&&(
           <div style={{marginBottom:16,background:"#060e20",border:"1px solid #a3a6ff25",borderRadius:10,padding:14}}>
@@ -1027,6 +1050,7 @@ export default function App(){
   const [cbOnly,setCbOnly]         = useState(false)
   const [fIndustry,setFIndustry]   = useState("")
   const [fState,setFState]         = useState("")
+  const [fCity,setFCity]           = useState("")
   const [availableOnly,setAvailOnly] = useState(false)
   const [activeNav,setNav]         = useState("dashboard")
   const [callHistory,setCallHistory] = useState([])
@@ -1041,16 +1065,41 @@ export default function App(){
   const [quota,setQuota]            = useState({quota:60,my_calls_today:0})
   const [leaderboard,setLeaderboard] = useState([])
   const [lbLoading,setLbLoading]   = useState(false)
+  const [lbRange,setLbRange]       = useState("today")
   const [qualifiedCalls,setQualifiedCalls] = useState([])
   const [qualLoading,setQualLoading] = useState(false)
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
+
+  async function doLogout(){
+    if(!window.confirm("Sign out?")) return
+    const sessId=localStorage.getItem("lf_session_id")
+    if(sessId){
+      try{await api("/api/auth/logout",{method:"POST",body:JSON.stringify({session_id:sessId})})}catch(e){}
+    }
+    localStorage.clear(); setUser(null)
+  }
 
   useEffect(()=>{
     if(user){
       api("/api/industries").then(r=>setIndustries(r.industries||[])).catch(()=>{})
       api("/api/quota").then(r=>setQuota(r)).catch(()=>{})
     }
+  },[user])
+
+  // Record sign-out on tab/browser close so sessions don't stay open forever
+  useEffect(()=>{
+    if(!user) return
+    const handleUnload = () => {
+      const sessId = localStorage.getItem("lf_session_id")
+      const token = localStorage.getItem("lf_token")
+      if(sessId && token){
+        navigator.sendBeacon(`${API_BASE}/api/auth/logout-beacon`,
+          JSON.stringify({session_id: sessId, token}))
+      }
+    }
+    window.addEventListener("beforeunload", handleUnload)
+    return () => window.removeEventListener("beforeunload", handleUnload)
   },[user])
 
   const loadLeads = useCallback(async()=>{
@@ -1078,8 +1127,8 @@ export default function App(){
   useEffect(()=>{
     if(activeNav!=="analytics"||!user) return
     setLbLoading(true)
-    api("/api/leaderboard").then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
-  },[activeNav,user])
+    api(`/api/leaderboard?range=${lbRange}`).then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+  },[activeNav,user,lbRange])
 
   useEffect(()=>{
     if(activeNav!=="qualified"||!user) return
@@ -1133,9 +1182,10 @@ export default function App(){
   if(!user) return <Login onLogin={u=>setUser(u)}/>
 
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
-  const today=new Date().toISOString().split("T")[0]
-  const tomorrow=(()=>{const d=new Date();d.setDate(d.getDate()+1);return d.toISOString().split("T")[0]})()
-  const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return d.toISOString().split("T")[0]})()
+  const localDate=d=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");return`${y}-${m}-${day}`}
+  const today=localDate(new Date())
+  const tomorrow=(()=>{const d=new Date();d.setDate(d.getDate()+1);return localDate(d)})()
+  const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return localDate(d)})()
 
   // Notification items
   const notifItems=leads.filter(l=>l.callbackDate&&l.status!=="converted").map(l=>{
@@ -1162,16 +1212,22 @@ export default function App(){
         Notification.requestPermission()
       }
     }
-  },[leads.length>0&&today])
+  },[leads.length, today])
 
   const displayLeads=leads.filter(l=>{
     if(fIndustry&&l.industry!==fIndustry) return false
     if(fState&&l.state!==fState) return false
+    if(fCity){
+      const cityLower = l.city?.toLowerCase()||""
+      const filterLower = fCity.toLowerCase().trim()
+      // Match whole city name or exact start — "Strat" matches "Stratford" but "LA" won't match "Dallas"
+      if(!cityLower.startsWith(filterLower) && cityLower !== filterLower) return false
+    }
     if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
     return true
   })
 
-  function reset(){setSearch("");setFIndustry("");setFState("");setFStatus("all");setCbOnly(false);setAvailOnly(false)}
+  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false)}
 
   return(
     <div style={{minHeight:"100vh",background:"#060e20"}}>
@@ -1291,7 +1347,7 @@ export default function App(){
 
         {/* User avatar */}
         <div
-          onClick={()=>{if(window.confirm("Sign out?")){{localStorage.clear();setUser(null)}}}}
+          onClick={doLogout}
           title={`${user} — click to sign out`}
           style={{width:34,height:34,borderRadius:"50%",background:"#a3a6ff25",
             border:"1px solid #40485d60",display:"flex",alignItems:"center",
@@ -1337,7 +1393,7 @@ export default function App(){
         <div style={{borderTop:"1px solid #40485d25",padding:"8px 0"}}>
           {[
             {label:"Import CSV", Icon:IconUpload, action:()=>setImport(true)},
-            {label:"Account",    Icon:IconPerson, action:()=>{if(window.confirm("Sign out?")){{localStorage.clear();setUser(null)}}}},
+            {label:"Account",    Icon:IconPerson, action:doLogout},
           ].map(({label,Icon,action})=>(
             <a key={label} href="#" onClick={e=>{e.preventDefault();action()}}
               style={{display:"flex",alignItems:"center",gap:12,padding:"9px 16px",
@@ -1517,10 +1573,18 @@ export default function App(){
                     <option value="">Industry: All</option>
                     {(industries.length>0?industries:INDUSTRIES).map(i=><option key={i} value={i}>{i}</option>)}
                   </select>
-                  <select className="sel" value={fState} onChange={e=>setFState(e.target.value)}>
+                  <select className="sel" value={fState} onChange={e=>{setFState(e.target.value);if(!e.target.value)setFCity("")}}>
                     <option value="">State: All States</option>
                     {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
                   </select>
+                  <input value={fCity} onChange={e=>setFCity(e.target.value)}
+                    placeholder={fState?"City...":"Select state first"}
+                    disabled={!fState}
+                    title={fState?"":"Select a state first to filter by city"}
+                    style={{background:fState?"#000011":"#0a0f1a",border:"1px solid #40485d30",
+                      borderRadius:8,padding:"6px 10px",color:fState?"#dee5ff":"#40485d",
+                      fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none",width:130,
+                      cursor:fState?"text":"not-allowed"}}/>
                   <select className="sel" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
                     <option value="all">Status: All</option>
                     {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
@@ -1589,7 +1653,7 @@ export default function App(){
                             <div style={{fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,
                               overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                               {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
-                            <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}</div>
+                            <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}{lead.city&&lead.state?` · ${lead.city}, ${lead.state}`:lead.state?` · ${lead.state}`:lead.city?` · ${lead.city}`:""}</div>
                             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
                               {takenBy&&<span style={{fontSize:9,background:"#ff6e8420",color:"#ff6e84",padding:"2px 7px",borderRadius:4,border:"1px solid #ff6e8430"}}>🔒 {takenBy}</span>}
                               {!takenBy&&lead.assignedTo&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>✓ mine</span>}
@@ -1823,7 +1887,7 @@ export default function App(){
                                 {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company||"Unknown"}
                               </div>
                               <div style={{fontSize:12,color:"#a3aac4"}}>
-                                {lead.company}{lead.industry?` \u00b7 ${lead.industry}`:""}{lead.state?` \u00b7 ${lead.state}`:""}
+                                {lead.company}{lead.industry?` \u00b7 ${lead.industry}`:""}{lead.city&&lead.state?` \u00b7 ${lead.city}, ${lead.state}`:lead.state?` \u00b7 ${lead.state}`:lead.city?` \u00b7 ${lead.city}`:""}
                               </div>
                             </div>
                           </div>
@@ -2009,36 +2073,47 @@ export default function App(){
                 <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
                   display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                   <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
-                    🏆 Rep Leaderboard — Today
+                    🏆 Rep Leaderboard — {{today:"Today","7d":"Last 7 Days","30d":"Last 30 Days",all:"All Time"}[lbRange]}
                   </div>
-                  <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
-                    onClick={()=>{
-                      setLbLoading(true)
-                      api("/api/leaderboard").then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
-                    }}>Refresh</button>
+                  <div style={{display:"flex",gap:4,alignItems:"center"}}>
+                    {["today","7d","30d","all"].map(r=>(
+                      <button key={r} className="btn btn-g" style={{fontSize:10,padding:"4px 10px",
+                        background:lbRange===r?"#a3a6ff":"transparent",color:lbRange===r?"#000011":"#a3aac4",
+                        border:lbRange===r?"none":"1px solid #40485d50"}}
+                        onClick={()=>setLbRange(r)}>
+                        {r==="today"?"Today":r==="7d"?"7D":r==="30d"?"30D":"All"}
+                      </button>
+                    ))}
+                    <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px",marginLeft:4}}
+                      onClick={()=>{
+                        setLbLoading(true)
+                        api(`/api/leaderboard?range=${lbRange}`).then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+                      }}>Refresh</button>
+                  </div>
                 </div>
                 {lbLoading?(
                   <div style={{padding:48,textAlign:"center",color:"#40485d"}}>Loading…</div>
                 ):leaderboard.length===0?(
                   <div style={{padding:48,textAlign:"center",color:"#40485d",fontSize:13}}>
-                    No call data yet — start logging calls to see rep stats
+                    No activity yet — reps will appear here when they sign in or log calls
                   </div>
                 ):(
                   <>
                     {/* Header row */}
-                    <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                    <div style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                       padding:"9px 24px",fontSize:"0.5rem",fontWeight:700,color:"#a3aac4",
                       textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d15"}}>
                       <div>Rep</div>
-                      <div style={{textAlign:"center"}}>Today</div>
-                      <div style={{textAlign:"center"}}>All-Time</div>
+                      <div style={{textAlign:"center"}}>Sign-In</div>
+                      <div style={{textAlign:"center"}}>Calls</div>
                       <div style={{textAlign:"center"}}>Converted</div>
                       <div style={{textAlign:"center"}}>Interested</div>
                       <div style={{textAlign:"center"}}>Conv %</div>
                       <div style={{textAlign:"center"}}>Contact %</div>
-                      <div style={{textAlign:"center"}}>Avg Talk</div>
                       <div style={{textAlign:"center"}}>No Answer</div>
                       <div style={{textAlign:"center"}}>Callbacks</div>
+                      <div style={{textAlign:"center"}}>Revenue</div>
+                      <div style={{textAlign:"center"}}>Sessions</div>
                     </div>
                     {leaderboard.map((rep,i)=>{
                       const medal=i===0?"🥇":i===1?"🥈":i===2?"🥉":null
@@ -2046,7 +2121,7 @@ export default function App(){
                       const convPct=parseFloat(rep.conv_rate)||0
                       return(
                         <div key={rep.name}
-                          style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                          style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                             padding:"14px 24px",alignItems:"center",
                             borderBottom:"1px solid #40485d10",
                             background:i===0?"#ffe08306":i===1?"#ffffff04":"transparent",
@@ -2075,14 +2150,30 @@ export default function App(){
                               )}
                             </div>
                           </div>
-                          {/* Calls today */}
+                          {/* Sign-in time */}
+                          <div style={{textAlign:"center"}}>
+                            {rep.signed_in_at?(
+                              <div>
+                                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4"}}>
+                                  {new Date(rep.signed_in_at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                                </div>
+                                {rep.signed_out_at&&(
+                                  <div style={{fontSize:10,color:"#40485d"}}>
+                                    out {new Date(rep.signed_out_at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                                  </div>
+                                )}
+                              </div>
+                            ):(
+                              <span style={{fontSize:12,color:"#40485d"}}>—</span>
+                            )}
+                          </div>
+                          {/* Calls */}
                           <div style={{textAlign:"center"}}>
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:18,fontWeight:700,
-                              color:rep.calls_today>0?"#a3a6ff":"#40485d"}}>{rep.calls_today}</span>
-                          </div>
-                          {/* All-time */}
-                          <div style={{textAlign:"center"}}>
-                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:600,color:"#dee5ff"}}>{rep.total_calls}</span>
+                              color:rep.total_calls>0?"#a3a6ff":"#40485d"}}>{rep.total_calls}</span>
+                            {rep.calls_today>0&&rep.calls_today!==rep.total_calls&&(
+                              <div style={{fontSize:10,color:"#40485d"}}>{rep.calls_today} today</div>
+                            )}
                           </div>
                           {/* Converted */}
                           <div style={{textAlign:"center"}}>
@@ -2106,13 +2197,6 @@ export default function App(){
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
                               color:parseFloat(rep.contact_rate)>=50?"#8b5cf6":"#a3aac4"}}>{rep.contact_rate}%</span>
                           </div>
-                          {/* Avg talk time */}
-                          <div style={{textAlign:"center"}}>
-                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
-                              color:rep.avg_talk_time>0?"#dee5ff":"#40485d"}}>
-                              {rep.avg_talk_time>0?`${Math.floor(rep.avg_talk_time/60)}m${rep.avg_talk_time%60?` ${rep.avg_talk_time%60}s`:""}`:"—"}
-                            </span>
-                          </div>
                           {/* No answer */}
                           <div style={{textAlign:"center"}}>
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,color:"#40485d"}}>{rep.no_answer}</span>
@@ -2121,6 +2205,18 @@ export default function App(){
                           <div style={{textAlign:"center"}}>
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
                               color:rep.callbacks>0?"#8b5cf6":"#40485d"}}>{rep.callbacks}</span>
+                          </div>
+                          {/* Revenue */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,
+                              color:rep.revenue>0?"#69f6b8":"#40485d"}}>
+                              {rep.revenue>0?`$${rep.revenue.toLocaleString()}`:"—"}
+                            </span>
+                          </div>
+                          {/* Sessions */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
+                              color:rep.sessions>0?"#a3aac4":"#40485d"}}>{rep.sessions||0}</span>
                           </div>
                         </div>
                       )
