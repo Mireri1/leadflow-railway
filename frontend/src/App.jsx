@@ -1179,6 +1179,9 @@ export default function App(){
   const [lbRange,setLbRange]       = useState("today")
   const [qualifiedCalls,setQualifiedCalls] = useState([])
   const [qualLoading,setQualLoading] = useState(false)
+  const [expandedCaller,setExpandedCaller] = useState(null)
+  const [callerDetail,setCallerDetail] = useState(null)
+  const [callerDetailLoading,setCallerDetailLoading] = useState(false)
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -2255,15 +2258,28 @@ export default function App(){
                       const medal=i===0?"🥇":i===1?"🥈":i===2?"🥉":null
                       const ac=avatarColor(rep.name)
                       const convPct=parseFloat(rep.conv_rate)||0
+                      const isExpanded=expandedCaller===rep.name
                       return(
-                        <div key={rep.name}
+                        <div key={rep.name}>
+                        <div
                           style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                             padding:"14px 24px",alignItems:"center",
-                            borderBottom:"1px solid #40485d10",
-                            background:i===0?"#ffe08306":i===1?"#ffffff04":"transparent",
-                            transition:"background .12s"}}
-                          onMouseEnter={e=>e.currentTarget.style.background="#192540"}
-                          onMouseLeave={e=>e.currentTarget.style.background=i===0?"#ffe08306":i===1?"#ffffff04":"transparent"}>
+                            borderBottom:isExpanded?"none":"1px solid #40485d10",
+                            background:isExpanded?"#192540":i===0?"#ffe08306":i===1?"#ffffff04":"transparent",
+                            transition:"background .12s",cursor:isAdmin()?"pointer":"default"}}
+                          onMouseEnter={e=>{if(!isExpanded)e.currentTarget.style.background="#192540"}}
+                          onMouseLeave={e=>{if(!isExpanded)e.currentTarget.style.background=i===0?"#ffe08306":i===1?"#ffffff04":"transparent"}}
+                          onClick={()=>{
+                            if(!isAdmin()) return
+                            if(isExpanded){setExpandedCaller(null);setCallerDetail(null);return}
+                            setExpandedCaller(rep.name)
+                            setCallerDetailLoading(true)
+                            setCallerDetail(null)
+                            api(`/api/caller/${encodeURIComponent(rep.name)}/detail`)
+                              .then(r=>{setCallerDetail(r)})
+                              .catch(()=>{notify("Failed to load caller details","error")})
+                              .finally(()=>setCallerDetailLoading(false))
+                          }}>
                           {/* Rep name */}
                           <div style={{display:"flex",alignItems:"center",gap:12}}>
                             <div style={{width:34,height:34,borderRadius:"50%",background:ac+"22",flexShrink:0,
@@ -2274,6 +2290,7 @@ export default function App(){
                             <div>
                               <div style={{fontWeight:600,color:"#dee5ff",fontSize:14,display:"flex",alignItems:"center",gap:6}}>
                                 {medal&&<span>{medal}</span>}{rep.name}
+                                {isAdmin()&&<span style={{fontSize:10,color:"#40485d",marginLeft:4}}>{isExpanded?"▾":"▸"}</span>}
                                 {isAdmin()&&rep.flags&&rep.flags.length>0&&(
                                   <span title={rep.flags.join(", ")} style={{fontSize:10,padding:"1px 6px",borderRadius:8,
                                     background:"#ff6e8420",color:"#ff6e84",border:"1px solid #ff6e8430",marginLeft:4}}>
@@ -2359,6 +2376,127 @@ export default function App(){
                             <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
                               color:rep.sessions>0?"#a3aac4":"#40485d"}}>{rep.sessions||0}</span>
                           </div>
+                        </div>
+                        {/* ── Expanded Caller Detail Panel ── */}
+                        {isAdmin()&&isExpanded&&(
+                          <div style={{background:"#141f38",borderBottom:"1px solid #40485d20",padding:"20px 24px"}}>
+                            {callerDetailLoading?(
+                              <div style={{textAlign:"center",color:"#40485d",padding:24,fontSize:13}}>Loading caller details…</div>
+                            ):callerDetail?(
+                              <div>
+                                {/* Summary cards */}
+                                <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:12,marginBottom:20}}>
+                                  {[
+                                    {label:"Calls Today",val:callerDetail.total_calls,color:"#a3a6ff"},
+                                    {label:"Answered",val:callerDetail.breakdown.answered,color:"#69f6b8"},
+                                    {label:"No Answer",val:callerDetail.breakdown.no_answer,color:"#a3aac4"},
+                                    {label:"Voicemail",val:callerDetail.breakdown.voicemail,color:"#ffe083"},
+                                    {label:"Qualified",val:callerDetail.qualified_count,color:"#8b5cf6"},
+                                    {label:"Avg Talk",val:`${callerDetail.avg_talk_time}s`,color:"#a3aac4"},
+                                  ].map(c=>(
+                                    <div key={c.label} style={{background:"#0f1930",borderRadius:10,padding:"12px 14px",textAlign:"center"}}>
+                                      <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,color:c.color}}>
+                                        {c.val}
+                                      </div>
+                                      <div style={{fontSize:10,color:"#40485d",marginTop:2,textTransform:"uppercase",letterSpacing:".06em"}}>
+                                        {c.label}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                                {/* Outcome breakdown bar */}
+                                <div style={{marginBottom:16}}>
+                                  <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,textTransform:"uppercase",
+                                    letterSpacing:".08em",marginBottom:8}}>Outcome Breakdown</div>
+                                  {callerDetail.total_calls>0?(
+                                    <div style={{display:"flex",height:8,borderRadius:4,overflow:"hidden",background:"#0f1930"}}>
+                                      {[
+                                        {key:"answered",color:"#69f6b8"},
+                                        {key:"interested",color:"#ffe083"},
+                                        {key:"converted",color:"#06d6a0"},
+                                        {key:"callback",color:"#8b5cf6"},
+                                        {key:"not_interested",color:"#ff6e84"},
+                                        {key:"voicemail",color:"#a3aac4"},
+                                        {key:"no_answer",color:"#40485d"},
+                                      ].map(o=>{
+                                        const pct=(callerDetail.breakdown[o.key]||0)/callerDetail.total_calls*100
+                                        return pct>0?<div key={o.key} title={`${o.key}: ${callerDetail.breakdown[o.key]}`}
+                                          style={{width:`${pct}%`,background:o.color,minWidth:pct>0?2:0}}/>:null
+                                      })}
+                                    </div>
+                                  ):(
+                                    <div style={{fontSize:12,color:"#40485d"}}>No calls yet today</div>
+                                  )}
+                                  {callerDetail.total_calls>0&&(
+                                    <div style={{display:"flex",gap:12,marginTop:6,flexWrap:"wrap"}}>
+                                      {[
+                                        {key:"answered",label:"Answered",color:"#69f6b8"},
+                                        {key:"interested",label:"Interested",color:"#ffe083"},
+                                        {key:"converted",label:"Converted",color:"#06d6a0"},
+                                        {key:"callback",label:"Callback",color:"#8b5cf6"},
+                                        {key:"not_interested",label:"Not Int.",color:"#ff6e84"},
+                                        {key:"voicemail",label:"VM",color:"#a3aac4"},
+                                        {key:"no_answer",label:"No Ans.",color:"#40485d"},
+                                      ].filter(o=>(callerDetail.breakdown[o.key]||0)>0).map(o=>(
+                                        <span key={o.key} style={{fontSize:10,color:o.color}}>
+                                          ● {o.label}: {callerDetail.breakdown[o.key]}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                                {/* Call list */}
+                                {callerDetail.calls.length>0&&(
+                                  <div>
+                                    <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,textTransform:"uppercase",
+                                      letterSpacing:".08em",marginBottom:8}}>Today's Call Log</div>
+                                    <div style={{maxHeight:280,overflowY:"auto",borderRadius:8,border:"1px solid #40485d15"}}>
+                                      <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                                        <thead>
+                                          <tr style={{background:"#0f1930"}}>
+                                            <th style={{padding:"8px 12px",textAlign:"left",color:"#a3aac4",fontWeight:600,fontSize:10}}>Time</th>
+                                            <th style={{padding:"8px 12px",textAlign:"left",color:"#a3aac4",fontWeight:600,fontSize:10}}>Company / Lead</th>
+                                            <th style={{padding:"8px 12px",textAlign:"left",color:"#a3aac4",fontWeight:600,fontSize:10}}>Outcome</th>
+                                            <th style={{padding:"8px 12px",textAlign:"right",color:"#a3aac4",fontWeight:600,fontSize:10}}>Duration</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {callerDetail.calls.map((c,ci)=>{
+                                            const outcomeColors={answered:"#69f6b8",interested:"#ffe083",converted:"#06d6a0",
+                                              callback:"#8b5cf6",not_interested:"#ff6e84",voicemail:"#a3aac4",no_answer:"#40485d"}
+                                            return(
+                                              <tr key={c.id||ci} style={{borderBottom:"1px solid #40485d10"}}>
+                                                <td style={{padding:"6px 12px",color:"#a3aac4",fontFamily:"'Space Grotesk',sans-serif",whiteSpace:"nowrap"}}>
+                                                  {c.calledAt?new Date(c.calledAt).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"}):"—"}
+                                                </td>
+                                                <td style={{padding:"6px 12px",color:"#dee5ff"}}>
+                                                  {c.lead_company||"Unknown"}{c.lead_name?` · ${c.lead_name}`:""}
+                                                </td>
+                                                <td style={{padding:"6px 12px"}}>
+                                                  <span style={{fontSize:11,padding:"2px 8px",borderRadius:8,fontWeight:600,
+                                                    background:(outcomeColors[c.outcome]||"#40485d")+"18",
+                                                    color:outcomeColors[c.outcome]||"#40485d"}}>
+                                                    {c.outcome||"—"}
+                                                  </span>
+                                                </td>
+                                                <td style={{padding:"6px 12px",textAlign:"right",color:"#a3aac4",
+                                                  fontFamily:"'Space Grotesk',sans-serif"}}>
+                                                  {c.duration?`${c.duration}s`:"—"}
+                                                </td>
+                                              </tr>
+                                            )
+                                          })}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            ):(
+                              <div style={{textAlign:"center",color:"#40485d",padding:24,fontSize:13}}>No data available</div>
+                            )}
+                          </div>
+                        )}
                         </div>
                       )
                     })}

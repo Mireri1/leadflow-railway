@@ -115,11 +115,17 @@ def login(req: LoginRequest):
             headers=SB_HEADERS,
             json={"username": req.username.strip(), "signed_in": datetime.utcnow().isoformat()},
             timeout=5)
+        print(f"[SESSION] POST user_sessions: HTTP {sess_r.status_code}")
+        if sess_r.status_code not in (200, 201):
+            print(f"[SESSION] Error body: {sess_r.text[:300]}")
         sess_data = sess_r.json() if sess_r.status_code in (200, 201) else []
         if isinstance(sess_data, list) and sess_data:
             session_id = sess_data[0].get("id")
-    except:
-        pass
+            print(f"[SESSION] Created session {session_id} for {req.username}")
+        else:
+            print(f"[SESSION] No session ID returned for {req.username}")
+    except Exception as e:
+        print(f"[SESSION] Exception creating session: {e}")
     token = create_token(req.username, role)
     return {"token": token, "username": req.username, "role": role, "session_id": session_id}
 
@@ -1205,6 +1211,97 @@ def increment_script_usage(script_id: str, user: str = Depends(verify_token)):
         return {"usage_count": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── Caller detail endpoint (admin only) ───────────────────────────────────────
+
+@app.get("/api/caller/{username}/detail")
+def get_caller_detail(username: str, user: str = Depends(verify_admin)):
+    """Admin: get detailed breakdown of a caller's activity today"""
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        # Get today's calls for this caller
+        r_calls = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*&calledBy=eq.{username}"
+            f"&calledAt=gte.{today}T00:00:00&order=calledAt.desc",
+            headers=SB_HEADERS, timeout=30)
+        calls = r_calls.json() if r_calls.status_code == 200 else []
+        if not isinstance(calls, list):
+            calls = []
+
+        # Breakdown by outcome
+        breakdown = {"answered": 0, "no_answer": 0, "voicemail": 0,
+                     "interested": 0, "callback": 0, "converted": 0, "not_interested": 0}
+        total_talk_time = 0
+        for c in calls:
+            o = c.get("outcome", "")
+            if o in breakdown:
+                breakdown[o] += 1
+            total_talk_time += c.get("duration") or 0
+
+        # Get qualified calls (with qual data)
+        qual_fields = ["budgetfocus", "vendorstatus", "decisionmaker", "timeline", "qualified"]
+        qualified = [c for c in calls if any(c.get(f) for f in qual_fields)]
+
+        # Enrich calls with lead info
+        lead_ids = list(set(c.get("leadId") for c in calls if c.get("leadId")))
+        lead_map = {}
+        if lead_ids:
+            # Batch fetch lead info (up to 50)
+            for batch_start in range(0, min(len(lead_ids), 50), 10):
+                batch = lead_ids[batch_start:batch_start+10]
+                ids_filter = ",".join(batch)
+                lr = req_lib.get(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})"
+                    f"&select=id,company,firstName,lastName,phone,industry,city,state,status",
+                    headers=SB_HEADERS, timeout=10)
+                ld = lr.json() if lr.status_code == 200 else []
+                if isinstance(ld, list):
+                    for l in ld:
+                        lead_map[l["id"]] = l
+
+        # Attach lead info to each call
+        call_list = []
+        for c in calls:
+            lid = c.get("leadId")
+            lead_info = lead_map.get(lid) if lid else None
+            call_list.append({
+                "id": c.get("id"),
+                "outcome": c.get("outcome"),
+                "duration": c.get("duration"),
+                "calledAt": c.get("calledAt"),
+                "notes": c.get("notes"),
+                "leadId": lid,
+                "lead_company": lead_info.get("company") if lead_info else None,
+                "lead_name": f"{lead_info.get('firstName','')} {lead_info.get('lastName','')}".strip() if lead_info else None,
+                "lead_phone": lead_info.get("phone") if lead_info else None,
+                "lead_status": lead_info.get("status") if lead_info else None,
+            })
+
+        # Get leads populated today
+        lr_pop = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,company,industry,city,state"
+            f"&createdBy=eq.{username}&createdAt=gte.{today}T00:00:00&order=createdAt.desc&limit=50",
+            headers=SB_HEADERS, timeout=10)
+        leads_populated = lr_pop.json() if lr_pop.status_code == 200 else []
+        if not isinstance(leads_populated, list):
+            leads_populated = []
+
+        return {
+            "username": username,
+            "date": today,
+            "total_calls": len(calls),
+            "total_talk_time": total_talk_time,
+            "avg_talk_time": round(total_talk_time / len(calls)) if calls else 0,
+            "breakdown": breakdown,
+            "qualified_count": len(qualified),
+            "calls": call_list,
+            "leads_populated": len(leads_populated),
+            "leads_populated_list": leads_populated[:20],
+        }
+    except Exception as e:
+        print(f"[CALLER_DETAIL] Error for {username}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.exists(frontend_dist):
