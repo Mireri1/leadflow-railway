@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react"
+import React, { useState, useEffect, useRef, useCallback } from "react"
 
 const API_BASE = ""
 
@@ -244,7 +244,7 @@ function Login({onLogin}){
 // ─── LeadFinder ──────────────────────────────────────────────────────────────
 
 function LeadFinder({onFound, industries}){
-  const [industry,setIndustry] = useState(industries[0]||"Healthcare")
+  const [selIndustries,setSelIndustries] = useState([industries[0]||"Healthcare"])
   const [state,setState]       = useState("")
   const [cities,setCities]     = useState("")
   const [limit,setLimit]       = useState(25)
@@ -252,12 +252,27 @@ function LeadFinder({onFound, industries}){
   const [lastResult,setLast]   = useState(null)
   const [findError,setFindError] = useState("")
 
+  function toggleIndustry(ind){
+    if(ind==="_all_"){
+      setSelIndustries(s=>s.length===industries.length?[]:[...industries])
+      return
+    }
+    setSelIndustries(s=>s.includes(ind)?s.filter(i=>i!==ind):[...s,ind])
+  }
+
   async function find(){
     setFindError("")
     if(cities.trim() && !state){ setFindError("Please select a state when targeting specific cities."); return }
+    if(selIndustries.length===0){ setFindError("Select at least one industry."); return }
     setLoad(true); setLast(null)
     try {
-      const res = await api("/api/scrape",{method:"POST",body:JSON.stringify({industry,state,cities,limit,source:"sam"})})
+      const isAll = selIndustries.length===industries.length
+      const body = {
+        industry: isAll?"_all_":selIndustries[0],
+        industries: selIndustries.length>1&&!isAll?selIndustries.join(","):"",
+        state,cities,limit,source:"sam"
+      }
+      const res = await api("/api/scrape",{method:"POST",body:JSON.stringify(body)})
       setLast(res)
       if(res.saved > 0) onFound()
     } catch(ex){ setFindError("Search failed — check your internet and try again.") }
@@ -269,11 +284,26 @@ function LeadFinder({onFound, industries}){
       <div className="finder-title">🔍 Find Leads</div>
       <div className="finder-sub">Pull fresh leads from government databases — no CSV needed</div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,alignItems:"flex-end"}}>
-        <div className="ff">
-          <label>Industry</label>
-          <select value={industry} onChange={e=>setIndustry(e.target.value)} className="sel" style={{color:"#dee5ff"}}>
-            {industries.map(i=><option key={i} value={i}>{i}</option>)}
-          </select>
+        <div className="ff" style={{gridColumn:"1 / -1"}}>
+          <label style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>Industries ({selIndustries.length===industries.length?"All":selIndustries.length} selected)</span>
+            <button onClick={()=>toggleIndustry("_all_")} style={{background:"none",border:"none",
+              color:"#a3a6ff",fontSize:11,cursor:"pointer",padding:0}}>
+              {selIndustries.length===industries.length?"Clear all":"Select all"}
+            </button>
+          </label>
+          <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:4}}>
+            {industries.map(ind=>(
+              <button key={ind} onClick={()=>toggleIndustry(ind)}
+                style={{padding:"4px 10px",borderRadius:6,fontSize:11,fontFamily:"inherit",cursor:"pointer",
+                  background:selIndustries.includes(ind)?"#a3a6ff":"transparent",
+                  color:selIndustries.includes(ind)?"#000011":"#a3aac4",
+                  border:`1px solid ${selIndustries.includes(ind)?"#a3a6ff":"#40485d40"}`,
+                  transition:"all .1s"}}>
+                {ind}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="ff">
           <label>{cities.trim()?"State (required for city search)":"State (optional)"}</label>
@@ -1220,12 +1250,13 @@ export default function App(){
     if(fCity){
       const cityLower = l.city?.toLowerCase()||""
       const filterLower = fCity.toLowerCase().trim()
-      // Match whole city name or exact start — "Strat" matches "Stratford" but "LA" won't match "Dallas"
       if(!cityLower.startsWith(filterLower) && cityLower !== filterLower) return false
     }
     if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
     return true
   })
+  const newTodayLeads = displayLeads.filter(l=>(l.createdAt||"").startsWith(today))
+  const olderLeads = displayLeads.filter(l=>!(l.createdAt||"").startsWith(today))
 
   function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false)}
 
@@ -1629,7 +1660,20 @@ export default function App(){
                     </div>
                   </div>
                 ):(
-                  displayLeads.map(lead=>{
+                  <div>
+                  {newTodayLeads.length>0&&(
+                    <div style={{padding:"10px 24px",background:"#69f6b808",borderBottom:"1px solid #69f6b820",
+                      display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontSize:11,fontWeight:700,color:"#69f6b8",letterSpacing:".08em",textTransform:"uppercase"}}>
+                        New Today
+                      </span>
+                      <span style={{fontSize:11,color:"#69f6b8",background:"#69f6b818",padding:"2px 8px",borderRadius:10,fontWeight:700}}>
+                        {newTodayLeads.length}
+                      </span>
+                    </div>
+                  )}
+                  {(newTodayLeads.length>0?[...newTodayLeads,...olderLeads]:displayLeads).map((lead,_li)=>{
+                    const isNewSection = newTodayLeads.length>0 && _li===newTodayLeads.length
                     const info=si(lead.status)
                     const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
                     const score=lead.score||scoreLead(lead)||0
@@ -1637,7 +1681,19 @@ export default function App(){
                     const isMine=!lead.assignedTo||lead.assignedTo===user
                     const takenBy=!isMine?lead.assignedTo:null
                     return(
-                      <div key={lead.id} className={isCb?"lrow-cb":""}
+                      <React.Fragment key={lead.id}>
+                      {isNewSection&&(
+                        <div style={{padding:"10px 24px",background:"#141f3850",borderBottom:"1px solid #40485d15",borderTop:"1px solid #40485d15",
+                          display:"flex",alignItems:"center",gap:8}}>
+                          <span style={{fontSize:11,fontWeight:700,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase"}}>
+                            All Leads
+                          </span>
+                          <span style={{fontSize:11,color:"#40485d",background:"#40485d18",padding:"2px 8px",borderRadius:10,fontWeight:700}}>
+                            {olderLeads.length}
+                          </span>
+                        </div>
+                      )}
+                      <div className={isCb?"lrow-cb":""}
                         style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
                           padding:"16px 24px",alignItems:"center",gap:16,
                           borderBottom:"1px solid #40485d12",transition:"background .12s",cursor:"default",
@@ -1698,8 +1754,10 @@ export default function App(){
                             hoverColor="#ff6e84" baseColor="#40485d"><IconTrash/></IconBtn>
                         </div>
                       </div>
+                      </React.Fragment>
                     )
-                  })
+                  })}
+                  </div>
                 )}
               </div>
 
@@ -2100,12 +2158,13 @@ export default function App(){
                 ):(
                   <>
                     {/* Header row */}
-                    <div style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                    <div style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                       padding:"9px 24px",fontSize:"0.5rem",fontWeight:700,color:"#a3aac4",
                       textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d15"}}>
                       <div>Rep</div>
                       <div style={{textAlign:"center"}}>Sign-In</div>
                       <div style={{textAlign:"center"}}>Calls</div>
+                      <div style={{textAlign:"center"}}>Leads Added</div>
                       <div style={{textAlign:"center"}}>Converted</div>
                       <div style={{textAlign:"center"}}>Interested</div>
                       <div style={{textAlign:"center"}}>Conv %</div>
@@ -2121,7 +2180,7 @@ export default function App(){
                       const convPct=parseFloat(rep.conv_rate)||0
                       return(
                         <div key={rep.name}
-                          style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
+                          style={{display:"grid",gridTemplateColumns:"2fr 1.2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",
                             padding:"14px 24px",alignItems:"center",
                             borderBottom:"1px solid #40485d10",
                             background:i===0?"#ffe08306":i===1?"#ffffff04":"transparent",
@@ -2174,6 +2233,11 @@ export default function App(){
                             {rep.calls_today>0&&rep.calls_today!==rep.total_calls&&(
                               <div style={{fontSize:10,color:"#40485d"}}>{rep.calls_today} today</div>
                             )}
+                          </div>
+                          {/* Leads Added */}
+                          <div style={{textAlign:"center"}}>
+                            <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:14,fontWeight:700,
+                              color:rep.leads_populated>0?"#8b5cf6":"#40485d"}}>{rep.leads_populated||0}</span>
                           </div>
                           {/* Converted */}
                           <div style={{textAlign:"center"}}>
