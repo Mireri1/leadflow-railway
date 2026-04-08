@@ -1182,6 +1182,8 @@ export default function App(){
   const [expandedCaller,setExpandedCaller] = useState(null)
   const [callerDetail,setCallerDetail] = useState(null)
   const [callerDetailLoading,setCallerDetailLoading] = useState(false)
+  const [callerDetailDate,setCallerDetailDate] = useState("")
+  const [callerDetailDateTo,setCallerDetailDateTo] = useState("")
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -2275,6 +2277,8 @@ export default function App(){
                             setExpandedCaller(rep.name)
                             setCallerDetailLoading(true)
                             setCallerDetail(null)
+                            setCallerDetailDate("")
+                            setCallerDetailDateTo("")
                             api(`/api/caller/${encodeURIComponent(rep.name)}/detail`)
                               .then(r=>{setCallerDetail(r)})
                               .catch(()=>{notify("Failed to load caller details","error")})
@@ -2379,11 +2383,57 @@ export default function App(){
                         </div>
                         {/* ── Expanded Caller Detail Panel ── */}
                         {isAdmin()&&isExpanded&&(
-                          <div style={{background:"#141f38",borderBottom:"1px solid #40485d20",padding:"20px 24px"}}>
+                          <div style={{background:"#141f38",borderBottom:"1px solid #40485d20",padding:"20px 24px"}}
+                            onClick={e=>e.stopPropagation()}>
                             {callerDetailLoading?(
                               <div style={{textAlign:"center",color:"#40485d",padding:24,fontSize:13}}>Loading caller details…</div>
                             ):callerDetail?(
                               <div>
+                                {/* Date picker */}
+                                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+                                  <span style={{fontSize:11,color:"#a3aac4",fontWeight:600}}>Date:</span>
+                                  <input type="date" value={callerDetailDate||callerDetail.date}
+                                    onChange={e=>setCallerDetailDate(e.target.value)}
+                                    style={{background:"#0f1930",border:"1px solid #40485d30",borderRadius:8,padding:"5px 10px",
+                                      color:"#dee5ff",fontSize:12,fontFamily:"'Space Grotesk',sans-serif"}}/>
+                                  <span style={{fontSize:11,color:"#40485d"}}>to</span>
+                                  <input type="date" value={callerDetailDateTo||(callerDetailDate||callerDetail.date)}
+                                    onChange={e=>setCallerDetailDateTo(e.target.value)}
+                                    style={{background:"#0f1930",border:"1px solid #40485d30",borderRadius:8,padding:"5px 10px",
+                                      color:"#dee5ff",fontSize:12,fontFamily:"'Space Grotesk',sans-serif"}}/>
+                                  <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                                    onClick={e=>{
+                                      e.stopPropagation()
+                                      const d=callerDetailDate||callerDetail.date
+                                      const d2=callerDetailDateTo||d
+                                      setCallerDetailLoading(true)
+                                      api(`/api/caller/${encodeURIComponent(expandedCaller)}/detail?date=${d}&date_to=${d2}`)
+                                        .then(r=>setCallerDetail(r))
+                                        .catch(()=>notify("Failed to load","error"))
+                                        .finally(()=>setCallerDetailLoading(false))
+                                    }}>Load</button>
+                                  {[{label:"Today",d:new Date().toISOString().slice(0,10),d2:""},
+                                    {label:"Yesterday",d:new Date(Date.now()-864e5).toISOString().slice(0,10),d2:""},
+                                    {label:"Last 7d",d:new Date(Date.now()-7*864e5).toISOString().slice(0,10),d2:new Date().toISOString().slice(0,10)},
+                                    {label:"Last 30d",d:new Date(Date.now()-30*864e5).toISOString().slice(0,10),d2:new Date().toISOString().slice(0,10)},
+                                  ].map(p=>(
+                                    <button key={p.label} className="btn btn-g" style={{fontSize:10,padding:"4px 10px"}}
+                                      onClick={e=>{
+                                        e.stopPropagation()
+                                        setCallerDetailDate(p.d)
+                                        setCallerDetailDateTo(p.d2)
+                                        setCallerDetailLoading(true)
+                                        api(`/api/caller/${encodeURIComponent(expandedCaller)}/detail?date=${p.d}${p.d2?`&date_to=${p.d2}`:""}`)
+                                          .then(r=>setCallerDetail(r))
+                                          .catch(()=>notify("Failed to load","error"))
+                                          .finally(()=>setCallerDetailLoading(false))
+                                      }}>{p.label}</button>
+                                  ))}
+                                  <span style={{fontSize:11,color:"#40485d",marginLeft:8}}>
+                                    Showing: {callerDetail.date}{callerDetail.date !== (callerDetailDateTo||callerDetail.date) ? ` → ${callerDetailDateTo}` : ""}
+                                    {" · "}{callerDetail.total_calls} call{callerDetail.total_calls!==1?"s":""}
+                                  </span>
+                                </div>
                                 {/* Summary cards */}
                                 <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:12,marginBottom:20}}>
                                   {[

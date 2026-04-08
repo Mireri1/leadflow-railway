@@ -1215,14 +1215,15 @@ def increment_script_usage(script_id: str, user: str = Depends(verify_token)):
 # ── Caller detail endpoint (admin only) ───────────────────────────────────────
 
 @app.get("/api/caller/{username}/detail")
-def get_caller_detail(username: str, user: str = Depends(verify_admin)):
-    """Admin: get detailed breakdown of a caller's activity today"""
+def get_caller_detail(username: str, date: str = "", date_to: str = "", user: str = Depends(verify_admin)):
+    """Admin: get detailed breakdown of a caller's activity for a date or range"""
     try:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        # Get today's calls for this caller
+        today = date if date else datetime.utcnow().strftime("%Y-%m-%d")
+        end_date = date_to if date_to else today
+        # Get calls for this caller in the date range
         r_calls = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*&calledBy=eq.{username}"
-            f"&calledAt=gte.{today}T00:00:00&order=calledAt.desc",
+            f"&calledAt=gte.{today}T00:00:00&calledAt=lte.{end_date}T23:59:59&order=calledAt.desc",
             headers=SB_HEADERS, timeout=30)
         calls = r_calls.json() if r_calls.status_code == 200 else []
         if not isinstance(calls, list):
@@ -1277,10 +1278,10 @@ def get_caller_detail(username: str, user: str = Depends(verify_admin)):
                 "lead_status": lead_info.get("status") if lead_info else None,
             })
 
-        # Get leads populated today
+        # Get leads populated in the date range
         lr_pop = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads?select=id,company,industry,city,state"
-            f"&createdBy=eq.{username}&createdAt=gte.{today}T00:00:00&order=createdAt.desc&limit=50",
+            f"&createdBy=eq.{username}&createdAt=gte.{today}T00:00:00&createdAt=lte.{end_date}T23:59:59&order=createdAt.desc&limit=50",
             headers=SB_HEADERS, timeout=10)
         leads_populated = lr_pop.json() if lr_pop.status_code == 200 else []
         if not isinstance(leads_populated, list):
