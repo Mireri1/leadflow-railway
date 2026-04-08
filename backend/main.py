@@ -243,15 +243,54 @@ def score_lead(lead):
     if lead.get("address","").strip():  s += 3
     return min(100, max(0, s))
 
+US_STATES_FULL = {
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
+    "CO":"Colorado","CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia",
+    "HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa",
+    "KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland",
+    "MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi","MO":"Missouri",
+    "MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire","NJ":"New Jersey",
+    "NM":"New Mexico","NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio",
+    "OK":"Oklahoma","OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina",
+    "SD":"South Dakota","TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont",
+    "VA":"Virginia","WA":"Washington","WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming"
+}
+US_STATE_ABBREVS = set(US_STATES_FULL.keys())
+US_STATE_NAMES = set(v.lower() for v in US_STATES_FULL.values())
+
+def is_us_address(addr):
+    """Check if a formatted address looks like it's in the USA"""
+    if not addr:
+        return False
+    addr_lower = addr.lower().strip()
+    # Check if it ends with "USA", "US", "United States"
+    if any(addr_lower.endswith(s) for s in ("usa", "us", "united states")):
+        return True
+    # Check if the second-to-last comma segment contains a US state abbreviation + zip
+    parts = [p.strip() for p in addr.split(",")]
+    if len(parts) >= 2:
+        state_part = parts[-2].strip() if not any(c.isdigit() for c in parts[-1][:3]) else parts[-1].strip()
+        # Match patterns like "CT 06614" or "Connecticut"
+        tokens = state_part.split()
+        if tokens:
+            if tokens[0].upper() in US_STATE_ABBREVS:
+                return True
+            if state_part.lower() in US_STATE_NAMES:
+                return True
+    return False
+
 def scrape_google_places(keyword="health clinic", state="", limit=25):
     leads = []
-    query = f"{keyword} {state}".strip() if state else keyword
+    # Force US context in query
+    location_part = state if state else "USA"
+    query = f"{keyword} {location_part}".strip()
     print(f"[PLACES] query: '{query}' limit: {limit}")
 
     params = {
         "query": query,
         "key": GOOGLE_KEY,
         "type": "establishment",
+        "region": "us",
     }
 
     fetched = 0
@@ -283,9 +322,19 @@ def scrape_google_places(keyword="health clinic", state="", limit=25):
                 if fetched >= limit:
                     break
                 addr = place.get("formatted_address", "")
-                parts = addr.split(",")
-                city  = parts[-3].strip() if len(parts) >= 3 else ""
-                st    = parts[-2].strip().split(" ")[0] if len(parts) >= 2 else state
+
+                # Skip non-US results
+                if not is_us_address(addr):
+                    continue
+
+                parts = [p.strip() for p in addr.split(",")]
+                # Parse US address: "123 Main St, City, ST ZIP, USA" or "123 Main St, City, ST ZIP"
+                # Remove trailing "USA"/"US" part if present
+                if parts and parts[-1].strip().lower() in ("usa", "us", "united states"):
+                    parts = parts[:-1]
+                city  = parts[-2].strip() if len(parts) >= 2 else ""
+                st_part = parts[-1].strip() if parts else state
+                st    = st_part.split()[0] if st_part.split() else state
 
                 lead = {
                     "company":     clean(place.get("name", "")),
@@ -327,7 +376,8 @@ def scrape_google_places(keyword="health clinic", state="", limit=25):
                         except:
                             pass
 
-                if lead["company"]:
+                # Final validation: must have a company name and valid US state
+                if lead["company"] and (st.upper() in US_STATE_ABBREVS or not st):
                     leads.append(lead)
                     fetched += 1
 
