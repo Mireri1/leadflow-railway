@@ -362,6 +362,7 @@ def save_to_supabase(leads):
 
 class ScrapeRequest(BaseModel):
     industry:  str
+    industries: Optional[str] = ""   # comma-separated list for multi-industry
     state:     Optional[str] = ""
     cities:    Optional[str] = ""
     limit:     Optional[int] = 25
@@ -369,30 +370,59 @@ class ScrapeRequest(BaseModel):
 
 @app.post("/api/scrape")
 def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
-    keyword = INDUSTRY_MAP.get(body.industry, body.industry.lower())
-    limit   = min(max(body.limit or 25, 5), 60)
+    limit = min(max(body.limit or 25, 5), 60)
 
+    # Build list of keywords to search
+    if body.industries:
+        ind_list = [i.strip() for i in body.industries.split(",") if i.strip()]
+        keywords = [(ind, INDUSTRY_MAP.get(ind, ind.lower())) for ind in ind_list]
+    elif body.industry and body.industry != "_all_":
+        keywords = [(body.industry, INDUSTRY_MAP.get(body.industry, body.industry.lower()))]
+    else:
+        # All industries — use "business" as a broad Google Places term
+        keywords = [("All", "business")]
+
+    # Build list of locations to search
     if body.cities:
         city_list = [c.strip() for c in body.cities.split(",") if c.strip()]
-        per_city = max(limit // len(city_list), 5) if city_list else limit
-        print(f"[SCRAPE] {body.industry} → '{keyword}', cities: {city_list}, state: {body.state}, limit: {limit} ({per_city}/city)")
-        all_leads = []
-        seen_phones = set()
-        for city in city_list:
-            location = f"{city}, {body.state}".strip(", ")
-            batch = scrape_google_places(keyword=keyword, state=location, limit=per_city)
+        locations = [f"{city}, {body.state}".strip(", ") for city in city_list]
+    else:
+        locations = [body.state or ""]
+
+    # Calculate per-combo limit
+    combos = len(keywords) * len(locations)
+    per_combo = max(limit // combos, 3) if combos else limit
+
+    print(f"[SCRAPE] industries: {[k[0] for k in keywords]}, locations: {locations}, limit: {limit} ({per_combo}/combo, {combos} combos)")
+
+    all_leads = []
+    seen_phones = set()
+    for ind_name, keyword in keywords:
+        for location in locations:
+            batch = scrape_google_places(keyword=keyword, state=location, limit=per_combo)
             for lead in batch:
+                # Tag each lead with the industry it was scraped for
+                if ind_name != "All" and not lead.get("industry"):
+                    lead["industry"] = ind_name
                 if lead.get("phone") and lead["phone"] not in seen_phones:
                     seen_phones.add(lead["phone"])
                     all_leads.append(lead)
                 elif not lead.get("phone"):
                     all_leads.append(lead)
-        leads = all_leads[:limit]
-    else:
-        print(f"[SCRAPE] {body.industry} → '{keyword}', state: {body.state}, limit: {limit}")
-        leads = scrape_google_places(keyword=keyword, state=body.state or "", limit=limit)
+            if len(all_leads) >= limit:
+                break
+        if len(all_leads) >= limit:
+            break
+    leads = all_leads[:limit]
+
+    # Tag all scraped leads with the user who ran the search
+    for lead in leads:
+        lead["createdBy"] = user
 
     saved = save_to_supabase(leads)
+    audit_log(user, "scrape_leads", "lead", None, {
+        "industries": [k[0] for k in keywords], "state": body.state,
+        "cities": body.cities, "found": len(leads), "saved": saved})
     print(f"[SCRAPE] Saved {saved} leads")
     return {"leads": leads, "count": len(leads), "saved": saved}
 
@@ -919,9 +949,9 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
         if since:
             calls_url += f"&calledAt=gte.{since}T00:00:00"
         r1 = req_lib.get(calls_url, headers=SB_HEADERS, timeout=30)
-        # Leads for assignment tracking
+        # Leads for assignment + population tracking
         r2 = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo,status,score",
+            f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo,status,score,createdBy,createdAt",
             headers=SB_HEADERS, timeout=30)
         # Sessions for sign-in tracking
         sess_url = f"{SUPABASE_URL}/rest/v1/user_sessions?select=username,signed_in,signed_out"
@@ -976,12 +1006,24 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             elif outcome == "voicemail":  u["voicemail"]   += 1
             elif outcome == "callback":   u["callbacks"]   += 1
 
-        # Add lead assignment counts
+        # Add lead assignment counts + leads populated (created/scraped)
         for l in leads:
             name = l.get("assignedTo") or ""
             if name and name in users:
                 users[name].setdefault("leads_assigned", 0)
                 users[name]["leads_assigned"] = users[name].get("leads_assigned", 0) + 1
+            # Count leads populated by this user in the date range
+            creator = l.get("createdBy") or ""
+            created_at = l.get("createdAt") or ""
+            if creator and creator not in ("system",) and (not since or created_at >= f"{since}T00:00:00"):
+                if creator not in users:
+                    users[creator] = {"name": creator, "total_calls": 0, "calls_today": 0,
+                                      "conversions": 0, "interested": 0, "no_answer": 0,
+                                      "voicemail": 0, "callbacks": 0, "contacted": 0,
+                                      "talk_time": 0, "revenue": 0,
+                                      "signed_in_at": None, "signed_out_at": None, "sessions": 0}
+                users[creator].setdefault("leads_populated", 0)
+                users[creator]["leads_populated"] = users[creator].get("leads_populated", 0) + 1
 
         # Compute rates per user
         result = []
@@ -991,6 +1033,7 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             u["contact_rate"] = f"{(u['contacted']/tc*100):.1f}" if tc else "0.0"
             u["avg_talk_time"] = round(u["talk_time"] / tc) if tc else 0
             u["leads_assigned"] = u.get("leads_assigned", 0)
+            u["leads_populated"] = u.get("leads_populated", 0)
             result.append(u)
 
         # Flag suspicious stats
