@@ -426,6 +426,35 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
     print(f"[SCRAPE] Saved {saved} leads")
     return {"leads": leads, "count": len(leads), "saved": saved}
 
+@app.get("/api/cities/autocomplete")
+def city_autocomplete(q: str = "", state: str = "", user: str = Depends(verify_token)):
+    """Return city suggestions from Google Places Autocomplete"""
+    if not q or len(q) < 2:
+        return {"suggestions": []}
+    try:
+        input_text = f"{q}, {state}" if state else q
+        r = req_lib.get(
+            "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+            params={
+                "input": input_text,
+                "types": "(cities)",
+                "components": "country:us",
+                "key": GOOGLE_KEY,
+            },
+            timeout=5)
+        data = r.json()
+        if data.get("status") != "OK":
+            return {"suggestions": []}
+        cities = []
+        for pred in data.get("predictions", [])[:8]:
+            terms = pred.get("terms", [])
+            city_name = terms[0]["value"] if terms else pred.get("structured_formatting", {}).get("main_text", "")
+            if city_name and city_name not in cities:
+                cities.append(city_name)
+        return {"suggestions": cities}
+    except:
+        return {"suggestions": []}
+
 @app.get("/api/industries")
 def get_industries():
     return {"industries": list(INDUSTRY_MAP.keys())}

@@ -241,6 +241,90 @@ function Login({onLogin}){
   )
 }
 
+// ─── CityAutocomplete ───────────────────────────────────────────────────────
+
+function CityAutocomplete({value, onChange, state, placeholder, style, disabled, multi}){
+  const [suggestions, setSuggestions] = useState([])
+  const [showDrop, setShowDrop] = useState(false)
+  const [inputVal, setInputVal] = useState("")
+  const debounceRef = useRef(null)
+  const wrapRef = useRef(null)
+
+  useEffect(()=>{
+    function handleClick(e){ if(wrapRef.current && !wrapRef.current.contains(e.target)) setShowDrop(false) }
+    document.addEventListener("mousedown", handleClick)
+    return ()=>document.removeEventListener("mousedown", handleClick)
+  },[])
+
+  function handleInput(raw){
+    if(multi){
+      const parts = raw.split(",")
+      const typing = parts.pop().trimStart()
+      setInputVal(typing)
+      onChange(raw)
+      fetchSuggestions(typing)
+    } else {
+      onChange(raw)
+      fetchSuggestions(raw)
+    }
+  }
+
+  function fetchSuggestions(q){
+    clearTimeout(debounceRef.current)
+    if(!q || q.length < 2 || disabled){ setSuggestions([]); return }
+    debounceRef.current = setTimeout(async()=>{
+      try{
+        const params = new URLSearchParams({q, ...(state?{state}:{})})
+        const r = await api(`/api/cities/autocomplete?${params}`)
+        setSuggestions(r.suggestions||[])
+        setShowDrop((r.suggestions||[]).length > 0)
+      }catch{ setSuggestions([]) }
+    }, 250)
+  }
+
+  function pick(city){
+    if(multi){
+      const parts = value.split(",").map(s=>s.trim()).filter(Boolean)
+      parts.pop()
+      parts.push(city)
+      onChange(parts.join(", ") + ", ")
+      setInputVal("")
+    } else {
+      onChange(city)
+    }
+    setShowDrop(false)
+    setSuggestions([])
+  }
+
+  return(
+    <div ref={wrapRef} style={{position:"relative",...(style?.wrapper||{})}}>
+      <input value={value} onChange={e=>handleInput(e.target.value)}
+        onFocus={()=>suggestions.length>0&&setShowDrop(true)}
+        placeholder={placeholder||"Type a city..."}
+        disabled={disabled}
+        style={{width:"100%",background:disabled?"#0a0f1a":"#000011",border:"1px solid #40485d30",
+          borderRadius:8,padding:"8px 12px",color:disabled?"#40485d":"#dee5ff",
+          fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none",
+          cursor:disabled?"not-allowed":"text",...(style?.input||{})}}/>
+      {showDrop&&suggestions.length>0&&(
+        <div style={{position:"absolute",top:"100%",left:0,right:0,zIndex:100,
+          background:"#141f38",border:"1px solid #40485d40",borderRadius:8,
+          marginTop:4,maxHeight:200,overflowY:"auto",boxShadow:"0 8px 32px rgba(0,0,0,.4)"}}>
+          {suggestions.map(city=>(
+            <div key={city} onClick={()=>pick(city)}
+              style={{padding:"8px 14px",fontSize:13,color:"#dee5ff",cursor:"pointer",
+                borderBottom:"1px solid #40485d15"}}
+              onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+              onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              {city}{state?`, ${state}`:""}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── LeadFinder ──────────────────────────────────────────────────────────────
 
 function LeadFinder({onFound, industries}){
@@ -315,11 +399,8 @@ function LeadFinder({onFound, industries}){
         </div>
         <div className="ff" style={{gridColumn:"1 / -1"}}>
           <label>Cities / Towns (optional)</label>
-          <input value={cities} onChange={e=>setCities(e.target.value)}
-            placeholder="e.g. Stratford, Norwalk, Bridgeport — leave blank for entire state"
-            style={{width:"100%",background:"#000011",border:"1px solid #40485d30",
-              borderRadius:8,padding:"8px 12px",color:"#dee5ff",
-              fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none"}}/>
+          <CityAutocomplete value={cities} onChange={setCities} state={state} multi={true}
+            placeholder="e.g. Stratford, Norwalk, Bridgeport — leave blank for entire state"/>
         </div>
         <div className="range-wrap">
           <label style={{fontSize:10,letterSpacing:".1em",textTransform:"uppercase",color:"#a3aac4",display:"flex",justifyContent:"space-between"}}>
@@ -1608,14 +1689,10 @@ export default function App(){
                     <option value="">State: All States</option>
                     {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
                   </select>
-                  <input value={fCity} onChange={e=>setFCity(e.target.value)}
-                    placeholder={fState?"City...":"Select state first"}
+                  <CityAutocomplete value={fCity} onChange={setFCity} state={fState}
                     disabled={!fState}
-                    title={fState?"":"Select a state first to filter by city"}
-                    style={{background:fState?"#000011":"#0a0f1a",border:"1px solid #40485d30",
-                      borderRadius:8,padding:"6px 10px",color:fState?"#dee5ff":"#40485d",
-                      fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none",width:130,
-                      cursor:fState?"text":"not-allowed"}}/>
+                    placeholder={fState?"City...":"Select state first"}
+                    style={{wrapper:{width:140},input:{padding:"6px 10px"}}}/>
                   <select className="sel" value={fStatus} onChange={e=>setFStatus(e.target.value)}>
                     <option value="all">Status: All</option>
                     {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
