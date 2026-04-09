@@ -170,6 +170,7 @@ function IconBell(){return<svg width={20} height={20} fill="none" viewBox="0 0 2
 function IconSettings(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}><path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>}
 function IconEdit(){return<svg width={17} height={17} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>}
 function IconTrash(){return<svg width={16} height={16} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>}
+function IconMail(){return<svg width={16} height={16} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>}
 function IconCallFwd(){return<svg width={16} height={16} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M17 8l4 4m0 0l-4 4m4-4H3"/></svg>}
 function IconFilter(){return<svg width={14} height={14} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M3 4h18M7 8h10M11 12h2"/></svg>}
 function IconChevLeft(){return<svg width={20} height={20} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7"/></svg>}
@@ -809,6 +810,156 @@ function CallModal({lead,onClose,onSaved}){
   )
 }
 
+// ─── EmailModal ──────────────────────────────────────────────────────────────
+
+function EmailModal({lead,onClose,onSent}){
+  const [toEmail,setToEmail]=useState(lead?.email||"")
+  const [toName,setToName]=useState(lead?[lead.firstName,lead.lastName].filter(Boolean).join(" "):"")
+  const [subject,setSubject]=useState(lead?.company?`Following Up — ${lead.company}`:"Following Up")
+  const [body,setBody]=useState(()=>{
+    const name=lead?.firstName||lead?.company||"there"
+    return `<p>Hi ${name},</p>
+<p>Thank you for taking the time to speak with us. As discussed, I wanted to follow up with some additional information about our services.</p>
+<p>Vision Cleaning Company provides professional commercial cleaning solutions tailored to your specific needs. We'd love the opportunity to show you what we can do.</p>
+<p>Please don't hesitate to reach out if you have any questions or would like to schedule a walkthrough.</p>
+<p>Best regards,<br/>Vision Cleaning Company<br/>connect@visioncleaningcompanyllc.com</p>`
+  })
+  const [sending,setSending]=useState(false)
+  const [err,setErr]=useState("")
+  const [sent,setSent]=useState(false)
+  const [emailHistory,setEmailHistory]=useState([])
+  const [showHistory,setShowHistory]=useState(false)
+
+  useEffect(()=>{
+    if(lead?.id){
+      api(`/api/email/history?lead_id=${lead.id}`).then(r=>{
+        if(Array.isArray(r)) setEmailHistory(r)
+      }).catch(()=>{})
+    }
+  },[lead?.id])
+
+  const doSend=async()=>{
+    if(!toEmail||!toEmail.includes("@")){setErr("Valid email address required");return}
+    if(!subject.trim()){setErr("Subject is required");return}
+    if(!body.trim()){setErr("Email body is required");return}
+    setSending(true);setErr("")
+    try{
+      const r=await api("/api/email/send",{method:"POST",body:JSON.stringify({
+        lead_id:lead?.id||null,to_email:toEmail.trim(),to_name:toName.trim(),
+        subject:subject.trim(),body:body,company:lead?.company||""
+      })})
+      if(r.sent){setSent(true);if(onSent)onSent()}
+      else setErr(r.detail||"Failed to send")
+    }catch(e){setErr(e.message||"Failed to send")}
+    finally{setSending(false)}
+  }
+
+  const inputStyle={width:"100%",padding:"10px 14px",background:"#0a1628",border:"1px solid #40485d30",
+    borderRadius:10,color:"#dee5ff",fontSize:14,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}
+
+  return(
+    <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal" style={{maxWidth:680,maxHeight:"90vh",display:"flex",flexDirection:"column"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+          <div>
+            <h3 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,color:"#dee5ff",margin:0}}>
+              Send Email
+            </h3>
+            {lead?.company&&<div style={{fontSize:13,color:"#a3aac4",marginTop:2}}>{lead.company}</div>}
+          </div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#40485d",fontSize:24,
+            cursor:"pointer",padding:4}}>&times;</button>
+        </div>
+
+        {sent?(
+          <div style={{textAlign:"center",padding:"40px 0"}}>
+            <div style={{fontSize:48,marginBottom:12}}>&#9993;</div>
+            <div style={{fontSize:18,fontWeight:700,color:"#69f6b8",marginBottom:8}}>Email Sent!</div>
+            <div style={{fontSize:13,color:"#a3aac4",marginBottom:20}}>
+              Sent to {toEmail}
+            </div>
+            <button className="btn btn-p" onClick={onClose} style={{padding:"10px 32px"}}>Close</button>
+          </div>
+        ):(
+          <div style={{flex:1,overflowY:"auto"}}>
+            {err&&<div style={{padding:"10px 14px",marginBottom:12,background:"#ff6e8418",
+              border:"1px solid #ff6e8440",borderRadius:8,fontSize:13,color:"#ff6e84",
+              display:"flex",alignItems:"center",gap:8}}>
+              <span>&#9888;</span>{err}
+            </div>}
+
+            <div style={{display:"grid",gap:12,marginBottom:16}}>
+              <div>
+                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>To Email *</label>
+                <input value={toEmail} onChange={e=>setToEmail(e.target.value)} placeholder="prospect@company.com"
+                  style={inputStyle}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Recipient Name</label>
+                <input value={toName} onChange={e=>setToName(e.target.value)} placeholder="John Smith"
+                  style={inputStyle}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Subject *</label>
+                <input value={subject} onChange={e=>setSubject(e.target.value)} placeholder="Following Up — Company"
+                  style={inputStyle}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Message *</label>
+                <textarea value={body.replace(/<\/?p>/g,"\n").replace(/<br\/?>/g,"\n").replace(/<[^>]+>/g,"").trim()}
+                  onChange={e=>{
+                    const lines=e.target.value.split("\n").map(l=>`<p>${l}</p>`).join("")
+                    setBody(lines)
+                  }}
+                  placeholder="Hi there, thanks for speaking with us..."
+                  style={{...inputStyle,minHeight:180,resize:"vertical",lineHeight:1.6}}/>
+              </div>
+            </div>
+
+            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+              <button className="btn btn-p" onClick={doSend} disabled={sending}
+                style={{padding:"12px 32px",fontSize:14,fontWeight:700,opacity:sending?.6:1}}>
+                {sending?"Sending...":"Send Email"}
+              </button>
+              <button className="btn btn-g" onClick={onClose} style={{padding:"12px 24px",fontSize:14}}>Cancel</button>
+              <div style={{flex:1,textAlign:"right",fontSize:11,color:"#40485d"}}>
+                From: connect@visioncleaningcompanyllc.com
+              </div>
+            </div>
+
+            {emailHistory.length>0&&(
+              <div style={{borderTop:"1px solid #40485d15",paddingTop:14}}>
+                <div onClick={()=>setShowHistory(p=>!p)}
+                  style={{fontSize:11,color:"#a3aac4",fontWeight:700,letterSpacing:".08em",
+                    textTransform:"uppercase",cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
+                  Previous Emails ({emailHistory.length})
+                  <span style={{fontSize:10,transition:"transform .2s",
+                    transform:showHistory?"rotate(180deg)":"rotate(0)"}}>&#9660;</span>
+                </div>
+                {showHistory&&(
+                  <div style={{marginTop:10,maxHeight:200,overflowY:"auto"}}>
+                    {emailHistory.map((em,i)=>(
+                      <div key={em.id||i} style={{padding:"10px 0",borderBottom:"1px solid #40485d08",fontSize:12}}>
+                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
+                          <span style={{color:"#dee5ff",fontWeight:600}}>{em.subject}</span>
+                          <span style={{color:"#40485d",fontSize:10}}>
+                            {em.sent_at?new Date(em.sent_at).toLocaleDateString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""}
+                          </span>
+                        </div>
+                        <div style={{color:"#40485d"}}>To: {em.to_email} &middot; By: {em.sent_by}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── LeadModal ───────────────────────────────────────────────────────────────
 
 function LeadModal({lead,onClose,onSaved}){
@@ -1187,6 +1338,7 @@ export default function App(){
   const [callerDetailDateTo,setCallerDetailDateTo] = useState("")
   const [warmLeads,setWarmLeads] = useState([])
   const [warmLoading,setWarmLoading] = useState(false)
+  const [emailModal,setEmailModal] = useState(null)
 
   // Auto-load warm leads when switching to warm tab
   useEffect(()=>{
@@ -1844,6 +1996,8 @@ export default function App(){
                         </div>
                         <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6}}>
                           <LogCallBtn onClick={e=>{e.stopPropagation();setCallModal(lead)}}/>
+                          <IconBtn onClick={e=>{e.stopPropagation();setEmailModal(lead)}} title="Send Email"
+                            hoverColor="#69f6b8" baseColor="#40485d"><IconMail/></IconBtn>
                           <IconBtn onClick={e=>{e.stopPropagation();setEditModal(lead)}} title="Edit lead"><IconEdit/></IconBtn>
                           <IconBtn onClick={e=>{e.stopPropagation();deleteL(lead.id)}} title="Delete"
                             hoverColor="#ff6e84" baseColor="#40485d"><IconTrash/></IconBtn>
@@ -1994,6 +2148,8 @@ export default function App(){
                         {/* Actions */}
                         <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6}}>
                           <LogCallBtn onClick={e=>{e.stopPropagation();setCallModal(lead)}}/>
+                          <IconBtn onClick={e=>{e.stopPropagation();setEmailModal(lead)}} title="Send Email"
+                            hoverColor="#69f6b8" baseColor="#40485d"><IconMail/></IconBtn>
                           <IconBtn onClick={e=>{e.stopPropagation();setEditModal(lead)}} title="Edit"><IconEdit/></IconBtn>
                         </div>
                       </div>
@@ -2082,6 +2238,12 @@ export default function App(){
                           fontWeight:700,boxShadow:"0 8px 32px rgba(163,166,255,.25)"}}
                         onClick={()=>setCallModal(lead)}>
                         📞 Log Call
+                      </button>
+                      <button className="btn btn-g"
+                        style={{width:"100%",padding:"13px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",
+                          fontWeight:600,marginTop:8,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}
+                        onClick={()=>setEmailModal(lead)}>
+                        <IconMail/> Send Email
                       </button>
                     </div>
                     <div style={{display:"flex",gap:12}}>
@@ -3172,6 +3334,7 @@ export default function App(){
 
       {/* ── Modals ───────────────────────────────────────────────────────── */}
       {callModal&&<CallModal lead={callModal} onClose={()=>setCallModal(null)} onSaved={loadLeads}/>}
+      {emailModal&&<EmailModal lead={emailModal} onClose={()=>setEmailModal(null)} onSent={()=>notify("Email sent!")}/>}
       {editModal&&(
         <LeadModal lead={editModal===true?null:editModal} onClose={()=>setEditModal(null)}
           onSaved={()=>{loadLeads();notify(editModal===true?"Lead added!":"Lead updated")}}/>
