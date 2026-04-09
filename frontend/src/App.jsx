@@ -3211,8 +3211,87 @@ function LogCallBtn({onClick}){
 
 function LoginActivityPanel(){
   const [logs,setLogs]=useState([])
+  const [sessions,setSessions]=useState([])
   const [showLogs,setShowLogs]=useState(false)
+  const [showSessions,setShowSessions]=useState(false)
+  const [sessDays,setSessDays]=useState(0)
+
+  const loadSessions=(days)=>{
+    api(`/api/auth/sessions?days=${days}`).then(r=>setSessions(Array.isArray(r)?r:[])).catch(()=>{})
+  }
+
+  const fmtTime=(iso)=>iso?new Date(iso).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""
+  const fmtDuration=(inTime,outTime)=>{
+    if(!inTime||!outTime) return null
+    const ms=new Date(outTime)-new Date(inTime)
+    if(ms<0) return null
+    const mins=Math.floor(ms/60000)
+    if(mins<60) return `${mins}m`
+    const hrs=Math.floor(mins/60)
+    return `${hrs}h ${mins%60}m`
+  }
+
   return(
+    <>
+    {/* ── Session Tracking (admin only) ── */}
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div style={{padding:"18px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",
+        borderBottom:showSessions?"1px solid #40485d20":"none",cursor:"pointer"}}
+        onClick={()=>{
+          setShowSessions(p=>!p)
+          if(!sessions.length) loadSessions(sessDays)
+        }}>
+        <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",
+          display:"flex",alignItems:"center",gap:8}}>
+          User Sessions
+          <span style={{color:"#ff6e84",fontSize:9}}>ADMIN</span>
+        </div>
+        <span style={{color:"#40485d",fontSize:12,transition:"transform .2s",
+          transform:showSessions?"rotate(180deg)":"rotate(0)"}}>{"\u25BC"}</span>
+      </div>
+      {showSessions&&(
+        <div>
+          <div style={{padding:"10px 24px",display:"flex",gap:8,borderBottom:"1px solid #40485d10"}}>
+            {[{label:"Today",d:0},{label:"7 Days",d:7},{label:"30 Days",d:30}].map(p=>(
+              <button key={p.d} className="btn" style={{fontSize:11,padding:"4px 12px",
+                background:sessDays===p.d?"#a3a6ff22":"transparent",color:sessDays===p.d?"#a3a6ff":"#40485d",
+                border:`1px solid ${sessDays===p.d?"#a3a6ff30":"#40485d20"}`,borderRadius:8}}
+                onClick={()=>{setSessDays(p.d);loadSessions(p.d)}}>{p.label}</button>
+            ))}
+          </div>
+          <div style={{maxHeight:400,overflowY:"auto"}}>
+            {sessions.length===0?(
+              <div style={{padding:32,textAlign:"center",color:"#40485d",fontSize:13}}>No sessions found</div>
+            ):(
+              sessions.map((s,i)=>{
+                const isOnline=!s.signed_out
+                const dur=fmtDuration(s.signed_in,s.signed_out)
+                return(
+                  <div key={s.id||i} style={{padding:"12px 24px",borderBottom:"1px solid #40485d08",
+                    display:"flex",alignItems:"center",gap:14}}>
+                    <div style={{width:8,height:8,borderRadius:"50%",flexShrink:0,
+                      background:isOnline?"#69f6b8":"#40485d"}}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <span style={{fontWeight:600,color:"#dee5ff",fontSize:14}}>{s.username}</span>
+                        {isOnline&&<span style={{fontSize:9,padding:"1px 8px",borderRadius:10,fontWeight:600,
+                          background:"#69f6b818",color:"#69f6b8",border:"1px solid #69f6b830"}}>ONLINE</span>}
+                        {dur&&<span style={{fontSize:10,color:"#40485d"}}>{dur}</span>}
+                      </div>
+                      <div style={{fontSize:11,color:"#40485d",marginTop:2}}>
+                        In: {fmtTime(s.signed_in)}{s.signed_out?` · Out: ${fmtTime(s.signed_out)}`:""}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+
+    {/* ── Login Activity (admin only) ── */}
     <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
       <div style={{padding:"18px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",
         borderBottom:showLogs?"1px solid #40485d20":"none",cursor:"pointer"}}
@@ -3266,6 +3345,7 @@ function LoginActivityPanel(){
         </div>
       )}
     </div>
+    </>
   )
 }
 

@@ -22,11 +22,20 @@ ALGORITHM       = "HS256"
 
 SUPABASE_URL  = os.getenv("SUPABASE_URL",  "https://ucpwpjokyconwzwqvdad.supabase.co")
 SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVjcHdwam9reWNvbnd6d3F2ZGFkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5NjMxMjksImV4cCI6MjA4NzUzOTEyOX0.j1Ibnm3rhOnvdnfS3WPf2RLDH91wopuJbTByQmwVZ7w")
+# Service role key bypasses RLS — needed for login_log, audit_log, user_sessions
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_KEY", SUPABASE_KEY))
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "AIzaSyAqWVfEpEgbtyraNvE-MR_FEG_qPqyMHWU")
 
 SB_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=ignore-duplicates,return=representation"
+}
+# Admin headers use service role key to bypass RLS for login_log, sessions, etc.
+SB_ADMIN_HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "resolution=ignore-duplicates,return=representation"
 }
@@ -66,10 +75,10 @@ class LoginRequest(BaseModel):
     password: str
 
 def log_login(username, status, role=None, detail=None):
-    """Fire-and-forget login audit to Supabase"""
+    """Fire-and-forget login audit to Supabase (uses service role key to bypass RLS)"""
     try:
         req_lib.post(f"{SUPABASE_URL}/rest/v1/login_log",
-            headers=SB_HEADERS,
+            headers=SB_ADMIN_HEADERS,
             json={"username": username, "status": status, "role": role, "detail": detail,
                   "logged_at": datetime.utcnow().isoformat()},
             timeout=5)
@@ -80,7 +89,7 @@ def audit_log(username, action, resource_type=None, resource_id=None, details=No
     """Fire-and-forget action audit to Supabase audit_log table"""
     try:
         req_lib.post(f"{SUPABASE_URL}/rest/v1/audit_log",
-            headers=SB_HEADERS,
+            headers=SB_ADMIN_HEADERS,
             json={"username": username, "action": action,
                   "resource_type": resource_type, "resource_id": str(resource_id) if resource_id else None,
                   "details": json_lib.dumps(details) if details else None,
@@ -112,7 +121,7 @@ def login(req: LoginRequest):
     session_id = None
     try:
         sess_r = req_lib.post(f"{SUPABASE_URL}/rest/v1/user_sessions",
-            headers=SB_HEADERS,
+            headers=SB_ADMIN_HEADERS,
             json={"username": req.username.strip(), "signed_in": datetime.utcnow().isoformat()},
             timeout=5)
         print(f"[SESSION] POST user_sessions: HTTP {sess_r.status_code}")
@@ -142,7 +151,7 @@ async def logout_beacon(request: Request):
         # Token is valid — record sign-out
         req_lib.patch(
             f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{session_id}",
-            headers=SB_HEADERS,
+            headers=SB_ADMIN_HEADERS,
             json={"signed_out": datetime.utcnow().isoformat()},
             timeout=5)
         return {"ok": True}
@@ -174,7 +183,7 @@ def get_login_log(user: str = Depends(verify_admin)):
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/login_log?select=*&order=logged_at.desc&limit=100",
-            headers=SB_HEADERS, timeout=30)
+            headers=SB_ADMIN_HEADERS, timeout=30)
         logs = r.json() if r.status_code == 200 else []
         return logs if isinstance(logs, list) else []
     except:
@@ -188,7 +197,7 @@ def logout_session(body: dict, user: str = Depends(verify_token)):
         try:
             req_lib.patch(
                 f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{session_id}",
-                headers=SB_HEADERS,
+                headers=SB_ADMIN_HEADERS,
                 json={"signed_out": datetime.utcnow().isoformat()},
                 timeout=5)
         except:
@@ -205,7 +214,7 @@ def get_sessions(days: int = 0, user: str = Depends(verify_admin)):
             since = datetime.utcnow().strftime("%Y-%m-%d")
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/user_sessions?select=*&signed_in=gte.{since}T00:00:00&order=signed_in.desc&limit=500",
-            headers=SB_HEADERS, timeout=30)
+            headers=SB_ADMIN_HEADERS, timeout=30)
         sessions = r.json() if r.status_code == 200 else []
         return sessions if isinstance(sessions, list) else []
     except:
