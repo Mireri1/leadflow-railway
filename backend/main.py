@@ -7,11 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt, os, re, time, json as json_lib, requests as req_lib
+import jwt, os, re, time, json as json_lib, requests as req_lib, smtplib
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
 from urllib.parse import quote as url_quote
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 SECRET_KEY      = os.getenv("SECRET_KEY",      "leadflow-secret")
 TEAM_PASSWORD   = os.getenv("TEAM_PASSWORD",   "LeadFlow2024")
@@ -20,11 +22,17 @@ ADMIN_USERS     = set(u.strip().lower() for u in os.getenv("ADMIN_USERS", "eric"
 BLOCKED_USERS   = set(u.strip().lower() for u in os.getenv("BLOCKED_USERS", "").split(",") if u.strip())
 ALGORITHM       = "HS256"
 
-SUPABASE_URL  = os.getenv("SUPABASE_URL",  "https://ucpwpjokyconwzwqvdad.supabase.co")
-SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVjcHdwam9reWNvbnd6d3F2ZGFkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5NjMxMjksImV4cCI6MjA4NzUzOTEyOX0.j1Ibnm3rhOnvdnfS3WPf2RLDH91wopuJbTByQmwVZ7w")
+SUPABASE_URL  = os.getenv("SUPABASE_URL",  "")
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "")
 # Service role key bypasses RLS — needed for login_log, audit_log, user_sessions
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_KEY", SUPABASE_KEY))
-GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "AIzaSyAqWVfEpEgbtyraNvE-MR_FEG_qPqyMHWU")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
+GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
+
+# ── Email config (Gmail SMTP for outreach) ──────────────────────────────────────
+OUTREACH_EMAIL     = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompanyllc.com")
+OUTREACH_EMAIL_PWD = os.getenv("OUTREACH_EMAIL_PASSWORD", "")  # Gmail app password
+SMTP_HOST          = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT          = int(os.getenv("SMTP_PORT", "587"))
 
 SB_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -41,7 +49,8 @@ SB_ADMIN_HEADERS = {
 }
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "https://leadflow-railway-production.up.railway.app,http://localhost:5173,http://localhost:3000").split(",")
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 security = HTTPBearer(auto_error=False)
 
 def create_token(username, role="caller"):
@@ -783,14 +792,20 @@ def get_qualified_calls(user: str = Depends(verify_token)):
             return []
         qual_fields = ["budgetfocus", "vendorstatus", "decisionmaker", "timeline", "qualified"]
         qualified = [c for c in all_calls if any(c.get(f) for f in qual_fields)]
+        # Batch-fetch all lead data in one request instead of N+1
+        lead_ids = list(set(c.get("leadId") for c in qualified if c.get("leadId")))
+        leads_map = {}
+        if lead_ids:
+            ids_filter = ",".join(str(lid) for lid in lead_ids)
+            lr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})"
+                f"&select=id,company,firstName,lastName,phone,industry,state,score,status,assignedTo",
+                headers=SB_HEADERS, timeout=30)
+            leads_data = lr.json() if lr.status_code == 200 else []
+            if isinstance(leads_data, list):
+                leads_map = {l["id"]: l for l in leads_data}
         for c in qualified:
-            lid = c.get("leadId")
-            if lid:
-                lr = req_lib.get(
-                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lid}&select=company,firstName,lastName,phone,industry,state,score,status,assignedTo",
-                    headers=SB_HEADERS, timeout=10)
-                leads_data = lr.json() if lr.status_code == 200 else []
-                c["leads"] = leads_data[0] if leads_data else None
+            c["leads"] = leads_map.get(c.get("leadId"))
         return qualified
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -906,17 +921,18 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
         stale = r.json() if r.status_code == 200 else []
         if not isinstance(stale, list):
             return {"recycled": 0}
+        recycled_ids = [{"id": l["id"], "was_assigned_to": l.get("assignedTo")} for l in stale if l.get("assignedTo")]
+        stale_ids = [item["id"] for item in recycled_ids]
         recycled = 0
-        recycled_ids = []
-        for lead in stale:
-            if lead.get("assignedTo"):
-                req_lib.patch(
-                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead['id']}",
-                    headers=SB_HEADERS,
-                    json={"assignedTo": "", "updatedAt": datetime.utcnow().isoformat()},
-                    timeout=10)
-                recycled += 1
-                recycled_ids.append({"id": lead["id"], "was_assigned_to": lead.get("assignedTo")})
+        if stale_ids:
+            # Bulk update in one request
+            ids_filter = ",".join(str(i) for i in stale_ids)
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})",
+                headers=SB_HEADERS,
+                json={"assignedTo": "", "updatedAt": datetime.utcnow().isoformat()},
+                timeout=30)
+            recycled = len(stale_ids)
         audit_log(user, "recycle_stale", "lead", None, {"recycled": recycled, "leads": recycled_ids[:20]})
         return {"recycled": recycled, "total_checked": len(stale)}
     except Exception as e:
@@ -936,14 +952,14 @@ def reassign_leads(body: dict, user: str = Depends(verify_admin)):
         leads = r.json() if r.status_code == 200 else []
         if not isinstance(leads, list) or not leads:
             return {"reassigned": 0, "message": f"No leads assigned to {from_rep}"}
-        count = 0
-        for lead in leads:
-            req_lib.patch(
-                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead['id']}",
-                headers=SB_HEADERS,
-                json={"assignedTo": to_rep, "updatedAt": datetime.utcnow().isoformat()},
-                timeout=10)
-            count += 1
+        # Bulk reassign in one request
+        ids_filter = ",".join(str(l["id"]) for l in leads)
+        req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})",
+            headers=SB_HEADERS,
+            json={"assignedTo": to_rep, "updatedAt": datetime.utcnow().isoformat()},
+            timeout=30)
+        count = len(leads)
         dest = to_rep if to_rep else "unassigned pool"
         audit_log(user, "reassign_leads", "lead", None, {"from": from_rep, "to": dest, "count": count})
         return {"reassigned": count, "from": from_rep, "to": dest}
@@ -1342,6 +1358,113 @@ def get_caller_detail(username: str, date: str = "", date_to: str = "", user: st
         print(f"[CALLER_DETAIL] Error for {username}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Email Sending ────────────────────────────────────────────────────────────────
+
+class SendEmailRequest(BaseModel):
+    lead_id: Optional[int] = None
+    to_email: str
+    to_name: Optional[str] = ""
+    subject: str
+    body: str
+    company: Optional[str] = ""
+
+def send_smtp_email(to_email: str, to_name: str, subject: str, body_html: str, reply_to: str = ""):
+    """Send an email via SMTP (Gmail). Returns (success, error_message)."""
+    if not OUTREACH_EMAIL_PWD:
+        return False, "Email not configured. Set OUTREACH_EMAIL_PASSWORD env var."
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"Vision Cleaning Company <{OUTREACH_EMAIL}>"
+    msg["To"] = f"{to_name} <{to_email}>" if to_name else to_email
+    msg["Subject"] = subject
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    # Plain text fallback
+    plain = re.sub(r"<[^>]+>", "", body_html).strip()
+    msg.attach(MIMEText(plain, "plain"))
+    msg.attach(MIMEText(body_html, "html"))
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(OUTREACH_EMAIL, OUTREACH_EMAIL_PWD)
+            server.send_message(msg)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+@app.post("/api/email/send")
+def send_email(req: SendEmailRequest, user: str = Depends(verify_token)):
+    """Send a follow-up email to a prospect and log it."""
+    if not req.to_email or "@" not in req.to_email:
+        raise HTTPException(status_code=400, detail="Valid email address required")
+    if not req.subject or not req.body:
+        raise HTTPException(status_code=400, detail="Subject and body required")
+
+    # Send the email
+    success, err = send_smtp_email(req.to_email, req.to_name, req.subject, req.body)
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to send: {err}")
+
+    # Log to email_log table
+    log_entry = {
+        "lead_id": req.lead_id,
+        "sent_by": user,
+        "to_email": req.to_email,
+        "to_name": req.to_name or "",
+        "subject": req.subject,
+        "body": req.body,
+        "company": req.company or "",
+        "status": "sent",
+        "sent_at": datetime.utcnow().isoformat(),
+    }
+    try:
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/email_log",
+            headers=SB_ADMIN_HEADERS, json=log_entry, timeout=10)
+        log_data = r.json() if r.status_code in (200, 201) else []
+        log_id = log_data[0]["id"] if isinstance(log_data, list) and log_data else None
+    except:
+        log_id = None
+
+    audit_log(user, "send_email", "lead", req.lead_id, {
+        "to": req.to_email, "subject": req.subject, "company": req.company})
+
+    return {"sent": True, "log_id": log_id}
+
+@app.get("/api/email/history")
+def get_email_history(lead_id: int = 0, user: str = Depends(verify_token)):
+    """Get email history for a specific lead or all recent emails."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/email_log?select=*&order=sent_at.desc"
+        if lead_id:
+            url += f"&lead_id=eq.{lead_id}"
+        url += "&limit=100"
+        r = req_lib.get(url, headers=SB_ADMIN_HEADERS, timeout=30)
+        emails = r.json() if r.status_code == 200 else []
+        return emails if isinstance(emails, list) else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/email/stats")
+def get_email_stats(user: str = Depends(verify_admin)):
+    """Admin: email sending stats."""
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/email_log?select=id,sent_by,sent_at,status&order=sent_at.desc&limit=500",
+            headers=SB_ADMIN_HEADERS, timeout=30)
+        emails = r.json() if r.status_code == 200 else []
+        if not isinstance(emails, list):
+            emails = []
+        today_count = len([e for e in emails if (e.get("sent_at") or "").startswith(today)])
+        by_user = {}
+        for e in emails:
+            u = e.get("sent_by", "unknown")
+            by_user[u] = by_user.get(u, 0) + 1
+        return {"total": len(emails), "today": today_count, "by_user": by_user}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── End Email ────────────────────────────────────────────────────────────────────
 
 frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.exists(frontend_dist):
