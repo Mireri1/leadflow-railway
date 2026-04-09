@@ -1464,6 +1464,67 @@ def get_email_stats(user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Email Templates (CRUD — same pattern as call scripts) ────────────────────────
+
+@app.get("/api/email-templates")
+def get_email_templates(industry: str = "", user: str = Depends(verify_token)):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/email_templates?is_active=eq.true&order=usage_count.desc"
+        if industry:
+            url += f"&industry=eq.{industry}"
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=30)
+        return r.json() if r.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/email-templates")
+def create_email_template(template: dict, user: str = Depends(verify_token)):
+    try:
+        template["is_active"] = True
+        template["usage_count"] = 0
+        template["created_by"] = user
+        template["created_at"] = datetime.utcnow().isoformat()
+        template["updated_at"] = datetime.utcnow().isoformat()
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/email_templates", headers=SB_HEADERS, json=template, timeout=30)
+        audit_log(user, "create_email_template", "email_template", None, {"name": template.get("name")})
+        return r.json() if r.status_code in (200, 201) else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/email-templates/{template_id}")
+def update_email_template(template_id: str, data: dict, user: str = Depends(verify_token)):
+    try:
+        data["updated_at"] = datetime.utcnow().isoformat()
+        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/email_templates?id=eq.{url_quote(template_id)}",
+                         headers=SB_HEADERS, json=data, timeout=30)
+        audit_log(user, "update_email_template", "email_template", template_id)
+        return r.json() if r.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/email-templates/{template_id}")
+def delete_email_template(template_id: str, user: str = Depends(verify_token)):
+    try:
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/email_templates?id=eq.{url_quote(template_id)}",
+                     headers=SB_HEADERS, json={"is_active": False}, timeout=30)
+        audit_log(user, "delete_email_template", "email_template", template_id)
+        return {"deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/email-templates/{template_id}/use")
+def increment_template_usage(template_id: str, user: str = Depends(verify_token)):
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/email_templates?id=eq.{template_id}&select=usage_count",
+                       headers=SB_HEADERS, timeout=30)
+        templates = r.json() if r.status_code == 200 else []
+        count = templates[0].get("usage_count", 0) + 1 if templates else 1
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/email_templates?id=eq.{template_id}",
+                     headers=SB_HEADERS, json={"usage_count": count, "last_used": datetime.utcnow().isoformat()}, timeout=30)
+        return {"usage_count": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── End Email ────────────────────────────────────────────────────────────────────
 
 frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
