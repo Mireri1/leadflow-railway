@@ -2822,7 +2822,7 @@ export default function App(){
                               </div>
                               <div style={{fontSize:12,color:"#a3aac4"}}>
                                 {rep.leads} lead{rep.leads!==1?"s":""} assigned
-                                {rep.last_call?` \u00b7 last call ${new Date(rep.last_call).toLocaleDateString()}`:" \u00b7 no calls logged"}
+                                {rep.last_call?` \u00b7 last call ${new Date(rep.last_call).toLocaleDateString()} at ${new Date(rep.last_call).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}`:" \u00b7 no calls logged"}
                                 {rep.days_inactive>3&&(
                                   <span style={{color:"#ff6e84",marginLeft:6}}>({rep.days_inactive}d inactive)</span>
                                 )}
