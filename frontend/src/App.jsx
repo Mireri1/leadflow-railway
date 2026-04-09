@@ -813,24 +813,23 @@ function CallModal({lead,onClose,onSaved}){
 // ─── EmailModal ──────────────────────────────────────────────────────────────
 
 function EmailModal({lead,onClose,onSent}){
+  const defaultBody=(name)=>`Hi ${name},\n\nThank you for taking the time to speak with us. As discussed, I wanted to follow up with some additional information about our services.\n\nVision Cleaning Company provides professional commercial cleaning solutions tailored to your specific needs. We'd love the opportunity to show you what we can do.\n\nPlease don't hesitate to reach out if you have any questions or would like to schedule a walkthrough.\n\nBest regards,\nVision Cleaning Company\nconnect@visioncleaningcompanyllc.com`
+
   const [toEmail,setToEmail]=useState(lead?.email||"")
   const [toName,setToName]=useState(lead?[lead.firstName,lead.lastName].filter(Boolean).join(" "):"")
   const [subject,setSubject]=useState(lead?.company?`Following Up — ${lead.company}`:"Following Up")
-  const [body,setBody]=useState(()=>{
-    const name=lead?.firstName||lead?.company||"there"
-    return `<p>Hi ${name},</p>
-<p>Thank you for taking the time to speak with us. As discussed, I wanted to follow up with some additional information about our services.</p>
-<p>Vision Cleaning Company provides professional commercial cleaning solutions tailored to your specific needs. We'd love the opportunity to show you what we can do.</p>
-<p>Please don't hesitate to reach out if you have any questions or would like to schedule a walkthrough.</p>
-<p>Best regards,<br/>Vision Cleaning Company<br/>connect@visioncleaningcompanyllc.com</p>`
-  })
+  const [body,setBody]=useState(()=>defaultBody(lead?.firstName||lead?.company||"there"))
   const [sending,setSending]=useState(false)
   const [err,setErr]=useState("")
   const [sent,setSent]=useState(false)
   const [emailHistory,setEmailHistory]=useState([])
   const [showHistory,setShowHistory]=useState(false)
+  const [templates,setTemplates]=useState([])
+  const [selectedTpl,setSelectedTpl]=useState("")
+  const [showManage,setShowManage]=useState(false)
 
   useEffect(()=>{
+    api("/api/email-templates").then(r=>{if(Array.isArray(r))setTemplates(r)}).catch(()=>{})
     if(lead?.id){
       api(`/api/email/history?lead_id=${lead.id}`).then(r=>{
         if(Array.isArray(r)) setEmailHistory(r)
@@ -838,15 +837,30 @@ function EmailModal({lead,onClose,onSent}){
     }
   },[lead?.id])
 
+  const applyTemplate=(tplId)=>{
+    const tpl=templates.find(t=>t.id===parseInt(tplId))
+    if(!tpl){setSelectedTpl("");return}
+    setSelectedTpl(tplId)
+    // Personalize: replace {{name}}, {{company}}, {{firstName}}
+    const name=lead?.firstName||lead?.company||"there"
+    const co=lead?.company||"your company"
+    let s=tpl.subject.replace(/\{\{name\}\}/gi,name).replace(/\{\{company\}\}/gi,co).replace(/\{\{firstName\}\}/gi,lead?.firstName||"there")
+    let b=tpl.body.replace(/\{\{name\}\}/gi,name).replace(/\{\{company\}\}/gi,co).replace(/\{\{firstName\}\}/gi,lead?.firstName||"there")
+    setSubject(s)
+    setBody(b)
+    api(`/api/email-templates/${tpl.id}/use`,{method:"POST",body:JSON.stringify({})}).catch(()=>{})
+  }
+
   const doSend=async()=>{
     if(!toEmail||!toEmail.includes("@")){setErr("Valid email address required");return}
     if(!subject.trim()){setErr("Subject is required");return}
     if(!body.trim()){setErr("Email body is required");return}
     setSending(true);setErr("")
     try{
+      const htmlBody=body.split("\n").map(l=>`<p>${l}</p>`).join("")
       const r=await api("/api/email/send",{method:"POST",body:JSON.stringify({
         lead_id:lead?.id||null,to_email:toEmail.trim(),to_name:toName.trim(),
-        subject:subject.trim(),body:body,company:lead?.company||""
+        subject:subject.trim(),body:htmlBody,company:lead?.company||""
       })})
       if(r.sent){setSent(true);if(onSent)onSent()}
       else setErr(r.detail||"Failed to send")
@@ -856,6 +870,11 @@ function EmailModal({lead,onClose,onSent}){
 
   const inputStyle={width:"100%",padding:"10px 14px",background:"#0a1628",border:"1px solid #40485d30",
     borderRadius:10,color:"#dee5ff",fontSize:14,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}
+
+  if(showManage) return <EmailTemplatesModal onClose={()=>{
+    setShowManage(false)
+    api("/api/email-templates").then(r=>{if(Array.isArray(r))setTemplates(r)}).catch(()=>{})
+  }}/>
 
   return(
     <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
@@ -888,16 +907,29 @@ function EmailModal({lead,onClose,onSent}){
               <span>&#9888;</span>{err}
             </div>}
 
+            {/* Template selector */}
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+              <select value={selectedTpl} onChange={e=>applyTemplate(e.target.value)}
+                style={{...inputStyle,flex:1,cursor:"pointer"}}>
+                <option value="">-- Select a template --</option>
+                {templates.map(t=><option key={t.id} value={t.id}>{t.name}{t.industry?` (${t.industry})`:""}</option>)}
+              </select>
+              <button className="btn btn-g" style={{fontSize:11,padding:"10px 14px",whiteSpace:"nowrap"}}
+                onClick={()=>setShowManage(true)}>Manage Templates</button>
+            </div>
+
             <div style={{display:"grid",gap:12,marginBottom:16}}>
-              <div>
-                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>To Email *</label>
-                <input value={toEmail} onChange={e=>setToEmail(e.target.value)} placeholder="prospect@company.com"
-                  style={inputStyle}/>
-              </div>
-              <div>
-                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Recipient Name</label>
-                <input value={toName} onChange={e=>setToName(e.target.value)} placeholder="John Smith"
-                  style={inputStyle}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                <div>
+                  <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>To Email *</label>
+                  <input value={toEmail} onChange={e=>setToEmail(e.target.value)} placeholder="prospect@company.com"
+                    style={inputStyle}/>
+                </div>
+                <div>
+                  <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Recipient Name</label>
+                  <input value={toName} onChange={e=>setToName(e.target.value)} placeholder="John Smith"
+                    style={inputStyle}/>
+                </div>
               </div>
               <div>
                 <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Subject *</label>
@@ -905,13 +937,12 @@ function EmailModal({lead,onClose,onSent}){
                   style={inputStyle}/>
               </div>
               <div>
-                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Message *</label>
-                <textarea value={body.replace(/<\/?p>/g,"\n").replace(/<br\/?>/g,"\n").replace(/<[^>]+>/g,"").trim()}
-                  onChange={e=>{
-                    const lines=e.target.value.split("\n").map(l=>`<p>${l}</p>`).join("")
-                    setBody(lines)
-                  }}
-                  placeholder="Hi there, thanks for speaking with us..."
+                <label style={{fontSize:11,color:"#a3aac4",fontWeight:600,marginBottom:4,display:"block"}}>Message *
+                  <span style={{fontWeight:400,color:"#40485d",marginLeft:8}}>Use {"{{name}}"}, {"{{company}}"}, {"{{firstName}}"} for personalization</span>
+                </label>
+                <textarea value={body}
+                  onChange={e=>setBody(e.target.value)}
+                  placeholder="Hi {{name}}, thanks for speaking with us..."
                   style={{...inputStyle,minHeight:180,resize:"vertical",lineHeight:1.6}}/>
               </div>
             </div>
@@ -953,6 +984,125 @@ function EmailModal({lead,onClose,onSent}){
                 )}
               </div>
             )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── EmailTemplatesModal (manage templates — same UX as ScriptsModal) ────────
+
+function EmailTemplatesModal({onClose}){
+  const [templates,setTemplates]=useState([])
+  const [loading,setLoad]=useState(true)
+  const [editing,setEditing]=useState(null)
+  const [form,setForm]=useState({name:"",industry:"",subject:"",body:""})
+  const [saving,setSaving]=useState(false)
+  const [toast,setToast]=useState(null)
+
+  useEffect(()=>{ fetchTemplates() },[])
+
+  async function fetchTemplates(){
+    setLoad(true)
+    try{ const r=await api("/api/email-templates"); setTemplates(Array.isArray(r)?r:[]) }catch{}
+    finally{ setLoad(false) }
+  }
+
+  function showToast(msg){ setToast(msg); setTimeout(()=>setToast(null),2500) }
+  function openNew(){ setEditing("new"); setForm({name:"",industry:"",subject:"",body:""}) }
+  function openEdit(t){ setEditing(t.id); setForm({name:t.name,industry:t.industry||"",subject:t.subject,body:t.body}) }
+
+  async function save(){
+    if(!form.name||!form.subject||!form.body){ showToast("Name, subject, and body required"); return }
+    setSaving(true)
+    try{
+      if(editing==="new") await api("/api/email-templates",{method:"POST",body:JSON.stringify(form)})
+      else await api(`/api/email-templates/${editing}`,{method:"PATCH",body:JSON.stringify(form)})
+      showToast("Saved"); setEditing(null); fetchTemplates()
+    }catch(ex){ showToast("Error: "+ex.message) }
+    finally{ setSaving(false) }
+  }
+
+  async function del(id){
+    if(!window.confirm("Delete this template?")) return
+    await api(`/api/email-templates/${id}`,{method:"DELETE"})
+    fetchTemplates()
+  }
+
+  return(
+    <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal" style={{maxWidth:680}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:16,fontWeight:700,color:"#dee5ff"}}>EMAIL TEMPLATES</div>
+          <div style={{display:"flex",gap:8}}>
+            {!editing&&<button className="btn btn-p" style={{fontSize:12}} onClick={openNew}>+ New Template</button>}
+            <button className="btn btn-g" onClick={onClose}>&times;</button>
+          </div>
+        </div>
+        {editing?(
+          <div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+              <div className="ff">
+                <label>Template Name</label>
+                <input value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Post-call follow up"/>
+              </div>
+              <div className="ff">
+                <label>Industry (optional)</label>
+                <select value={form.industry} onChange={e=>setForm(f=>({...f,industry:e.target.value}))}>
+                  <option value="">All Industries</option>
+                  {INDUSTRIES.map(i=><option key={i} value={i}>{i}</option>)}
+                </select>
+              </div>
+            </div>
+            <div className="ff" style={{marginBottom:12}}>
+              <label>Subject Line</label>
+              <input value={form.subject} onChange={e=>setForm(f=>({...f,subject:e.target.value}))}
+                placeholder="Following Up — {{company}}"/>
+            </div>
+            <div className="ff" style={{marginBottom:14}}>
+              <label>Email Body</label>
+              <textarea value={form.body} onChange={e=>setForm(f=>({...f,body:e.target.value}))}
+                rows={10} style={{resize:"vertical"}}
+                placeholder={"Hi {{name}},\n\nThank you for taking the time to speak with us...\n\nUse {{name}}, {{company}}, {{firstName}} for personalization."}/>
+            </div>
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <button className="btn btn-g" onClick={()=>setEditing(null)}>Cancel</button>
+              <button className="btn btn-p" onClick={save} disabled={saving}>{saving?"Saving...":"Save Template"}</button>
+            </div>
+            {toast&&<div style={{marginTop:10,fontSize:12,color:"#69f6b8"}}>{toast}</div>}
+          </div>
+        ):loading?(
+          <div style={{textAlign:"center",padding:40,color:"#a3aac4"}}>Loading...</div>
+        ):templates.length===0?(
+          <div style={{textAlign:"center",padding:40,color:"#a3aac4"}}>
+            <div style={{fontSize:32,marginBottom:12}}>&#9993;</div>
+            <div style={{fontSize:13,marginBottom:16}}>No email templates yet</div>
+            <button className="btn btn-p" onClick={openNew}>Create your first template</button>
+          </div>
+        ):(
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {templates.map(t=>(
+              <div key={t.id} style={{background:"#060e20",border:"1px solid #40485d30",borderRadius:10,padding:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:600,color:"#dee5ff",marginBottom:3}}>{t.name}</div>
+                    <div style={{display:"flex",gap:8,fontSize:10,color:"#a3aac4"}}>
+                      {t.industry&&<span style={{background:"#a3a6ff18",color:"#a3a6ff",padding:"1px 6px",borderRadius:4}}>{t.industry}</span>}
+                      <span>{t.usage_count||0} uses</span>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button className="btn btn-g" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>openEdit(t)}>Edit</button>
+                    <button className="btn btn-r" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>del(t.id)}>Del</button>
+                  </div>
+                </div>
+                <div style={{fontSize:11,color:"#a3aac4",marginBottom:4,fontWeight:600}}>Subject: {t.subject}</div>
+                <div style={{fontSize:11,color:"#40485d",lineHeight:1.5,maxHeight:48,overflow:"hidden"}}>
+                  {t.body.slice(0,120)}{t.body.length>120?"...":""}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </div>
