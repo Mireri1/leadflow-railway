@@ -270,19 +270,20 @@ def is_us_address(addr):
         return False
     addr_lower = addr.lower().strip()
     # Check if it ends with "USA", "US", "United States"
-    if any(addr_lower.endswith(s) for s in ("usa", "us", "united states")):
+    if any(addr_lower.endswith(s) for s in ("usa", "us", "united states", "united states of america")):
         return True
-    # Check if the second-to-last comma segment contains a US state abbreviation + zip
+    # Check ALL comma segments for a US state abbreviation (with or without zip)
+    # Google Places US format: "123 Main St, City, ST 06457" or "123 Main St, City, ST 06457, USA"
     parts = [p.strip() for p in addr.split(",")]
-    if len(parts) >= 2:
-        state_part = parts[-2].strip() if not any(c.isdigit() for c in parts[-1][:3]) else parts[-1].strip()
-        # Match patterns like "CT 06614" or "Connecticut"
-        tokens = state_part.split()
-        if tokens:
-            if tokens[0].upper() in US_STATE_ABBREVS:
-                return True
-            if state_part.lower() in US_STATE_NAMES:
-                return True
+    for part in parts:
+        tokens = part.split()
+        if not tokens:
+            continue
+        # Match "CT 06457" or "CT" or "Connecticut"
+        if tokens[0].upper() in US_STATE_ABBREVS and (len(tokens) == 1 or (len(tokens) == 2 and tokens[1][:1].isdigit())):
+            return True
+        if part.lower() in US_STATE_NAMES:
+            return True
     return False
 
 def scrape_google_places(keyword="health clinic", state="", limit=25):
