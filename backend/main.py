@@ -518,10 +518,11 @@ def get_industries():
 
 @app.get("/api/leads")
 def list_leads(status: str = "", search: str = "", sort: str = "score",
-               callbacks: str = "", user: str = Depends(verify_token)):
+               callbacks: str = "", source: str = "", user: str = Depends(verify_token)):
     try:
         url = f"{SUPABASE_URL}/rest/v1/leads?select=*"
         if status:   url += f"&status=eq.{status}"
+        if source:   url += f"&source=eq.{url_quote(source)}"
         if callbacks == "true":
             today = datetime.utcnow().strftime("%Y-%m-%d")
             url += f"&callbackDate=lte.{today}&callbackDate=neq.&status=neq.converted"

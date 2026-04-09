@@ -1137,6 +1137,7 @@ function IconBtn({onClick,children,title,hoverColor="#dee5ff",baseColor="#a3aac4
 const SIDEBAR_NAV = [
   { key:"dashboard", label:"Dashboard",       Icon:IconDashboard },
   { key:"leads",     label:"Leads",           Icon:IconPeople },
+  { key:"warm",      label:"Warm Leads",      Icon:IconChart },
   { key:"dialer",    label:"Dialer",          Icon:IconPhone },
   { key:"future",    label:"Future Follow-Ups", Icon:IconCalendarFar },
   { key:"qualified", label:"Qualified",        Icon:IconClipCheck },
@@ -1184,6 +1185,18 @@ export default function App(){
   const [callerDetailLoading,setCallerDetailLoading] = useState(false)
   const [callerDetailDate,setCallerDetailDate] = useState("")
   const [callerDetailDateTo,setCallerDetailDateTo] = useState("")
+  const [warmLeads,setWarmLeads] = useState([])
+  const [warmLoading,setWarmLoading] = useState(false)
+
+  // Auto-load warm leads when switching to warm tab
+  useEffect(()=>{
+    if(activeNav==="warm"&&user&&warmLeads.length===0){
+      setWarmLoading(true)
+      api("/api/leads?source=VCC+Outreach").then(r=>{
+        setWarmLeads(Array.isArray(r)?r:[])
+      }).catch(()=>{}).finally(()=>setWarmLoading(false))
+    }
+  },[activeNav])
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -1856,6 +1869,138 @@ export default function App(){
                     border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}><IconChevRight/></button>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* ── WARM LEADS (from VCC Outreach) ──────────────────────────── */}
+          {activeNav==="warm"&&(
+            <div>
+              <div style={{marginBottom:28,display:"flex",alignItems:"flex-end",justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
+                <div>
+                  <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                    color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>
+                    Warm Leads <span style={{fontSize:16,color:"#ffe083",marginLeft:8}}>from VCC Outreach</span>
+                  </h1>
+                  <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                    These companies opened our outreach emails — they already know who we are
+                  </p>
+                </div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  {warmLeads.length>0&&(
+                    <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
+                      color:"#ffe083"}}>{warmLeads.length}</span>
+                  )}
+                  <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                    onClick={()=>{
+                      setWarmLoading(true)
+                      api("/api/leads?source=VCC+Outreach").then(r=>{
+                        const list = Array.isArray(r)?r:[]
+                        setWarmLeads(list)
+                      }).catch(()=>{}).finally(()=>setWarmLoading(false))
+                    }}>Refresh</button>
+                </div>
+              </div>
+
+              {warmLoading?(
+                <div style={{padding:60,textAlign:"center",color:"#40485d"}}>Loading...</div>
+              ):warmLeads.length===0?(
+                <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
+                  <div style={{fontSize:40,marginBottom:12}}>📭</div>
+                  <div style={{color:"#a3aac4",fontSize:14}}>No warm leads yet</div>
+                  <div style={{color:"#40485d",fontSize:12,marginTop:6}}>
+                    Engaged VCC companies will auto-populate here once they open outreach emails
+                  </div>
+                </div>
+              ):(
+                <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden"}}>
+                  {/* Header row */}
+                  <div style={{display:"grid",gridTemplateColumns:"2.5fr 1.5fr 1.5fr 1fr 1fr 2fr 1.5fr",
+                    padding:"12px 24px",fontSize:"0.5rem",fontWeight:700,color:"#a3aac4",
+                    textTransform:"uppercase",letterSpacing:".08em",borderBottom:"1px solid #40485d15"}}>
+                    <div>Company</div>
+                    <div>Contact</div>
+                    <div>Phone</div>
+                    <div style={{textAlign:"center"}}>Score</div>
+                    <div style={{textAlign:"center"}}>Status</div>
+                    <div>Notes</div>
+                    <div style={{textAlign:"right"}}>Actions</div>
+                  </div>
+                  {warmLeads.map(lead=>{
+                    const info=si(lead.status)
+                    const score=lead.score||scoreLead(lead)||0
+                    const ac=avatarColor(lead.company||"?")
+                    // Parse engagement info from notes
+                    const engMatch=(lead.notes||"").match(/Engagement score: (\d+)/)
+                    const engScore=engMatch?parseInt(engMatch[1]):0
+                    const opensMatch=(lead.notes||"").match(/(\d+) email opens/)
+                    const opens=opensMatch?parseInt(opensMatch[1]):0
+                    return(
+                      <div key={lead.id}
+                        style={{display:"grid",gridTemplateColumns:"2.5fr 1.5fr 1.5fr 1fr 1fr 2fr 1.5fr",
+                          padding:"14px 24px",alignItems:"center",gap:8,
+                          borderBottom:"1px solid #40485d10",transition:"background .12s"}}
+                        onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                        onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                        {/* Company */}
+                        <div style={{display:"flex",alignItems:"center",gap:12,minWidth:0}}>
+                          <div style={{width:36,height:36,borderRadius:"50%",flexShrink:0,background:ac+"22",
+                            display:"flex",alignItems:"center",justifyContent:"center",
+                            fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                            {(lead.company||"?").slice(0,2).toUpperCase()}
+                          </div>
+                          <div style={{minWidth:0}}>
+                            <div style={{fontWeight:700,color:"#dee5ff",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",
+                              overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lead.company||"—"}</div>
+                            <div style={{fontSize:11,color:"#a3aac4"}}>
+                              {lead.city&&lead.state?`${lead.city}, ${lead.state}`:lead.state||lead.city||""}
+                              {lead.industry?` · ${lead.industry}`:""}
+                            </div>
+                            <div style={{display:"flex",gap:4,marginTop:3}}>
+                              <span style={{fontSize:9,background:"#ffe08318",color:"#ffe083",padding:"2px 7px",
+                                borderRadius:4,border:"1px solid #ffe08330"}}>VCC Outreach</span>
+                              {engScore>=70&&<span style={{fontSize:9,background:"#ff6e8418",color:"#ff6e84",
+                                padding:"2px 7px",borderRadius:4,border:"1px solid #ff6e8430"}}>🔥 Hot</span>}
+                              {engScore>=40&&engScore<70&&<span style={{fontSize:9,background:"#ffe08318",color:"#ffe083",
+                                padding:"2px 7px",borderRadius:4,border:"1px solid #ffe08330"}}>Warm</span>}
+                              {opens>0&&<span style={{fontSize:9,background:"#a3a6ff18",color:"#a3a6ff",
+                                padding:"2px 7px",borderRadius:4}}>{opens} opens</span>}
+                            </div>
+                          </div>
+                        </div>
+                        {/* Contact */}
+                        <div>
+                          <div style={{fontSize:13,color:"#dee5ff"}}>
+                            {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||"—"}
+                          </div>
+                          {lead.email&&<div style={{fontSize:11,color:"#a3a6ff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lead.email}</div>}
+                          {lead.title&&<div style={{fontSize:10,color:"#40485d"}}>{lead.title}</div>}
+                        </div>
+                        {/* Phone */}
+                        <div style={{fontSize:13,color:lead.phone?"#dee5ff":"#40485d",fontFamily:"'Space Grotesk',sans-serif"}}>
+                          {lead.phone||"No phone"}
+                        </div>
+                        {/* Score */}
+                        <div style={{textAlign:"center"}}>
+                          <ScoreRing score={score}/>
+                        </div>
+                        {/* Status */}
+                        <div style={{textAlign:"center"}}>
+                          <span className="pill" style={{background:info.color+"20",color:info.color,
+                            border:`1px solid ${info.color}30`}}>{info.label}</span>
+                        </div>
+                        {/* Notes */}
+                        <div style={{fontSize:11,color:"#a3aac4",overflow:"hidden",textOverflow:"ellipsis",
+                          whiteSpace:"nowrap"}}>{lead.notes||"—"}</div>
+                        {/* Actions */}
+                        <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6}}>
+                          <LogCallBtn onClick={e=>{e.stopPropagation();setCallModal(lead)}}/>
+                          <IconBtn onClick={e=>{e.stopPropagation();setEditModal(lead)}} title="Edit"><IconEdit/></IconBtn>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
 
