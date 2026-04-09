@@ -22,8 +22,8 @@ ADMIN_USERS     = set(u.strip().lower() for u in os.getenv("ADMIN_USERS", "eric"
 BLOCKED_USERS   = set(u.strip().lower() for u in os.getenv("BLOCKED_USERS", "").split(",") if u.strip())
 ALGORITHM       = "HS256"
 
-SUPABASE_URL  = os.getenv("SUPABASE_URL",  "")
-SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "")
+SUPABASE_URL  = os.getenv("SUPABASE_URL", os.getenv("VITE_SUPABASE_URL", ""))
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY", os.getenv("VITE_SUPABASE_KEY", ""))
 # Service role key bypasses RLS — needed for login_log, audit_log, user_sessions
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
