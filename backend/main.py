@@ -206,17 +206,45 @@ def logout_session(body: dict, user: str = Depends(verify_token)):
 
 @app.get("/api/auth/sessions")
 def get_sessions(days: int = 0, user: str = Depends(verify_admin)):
-    """Get sign-in sessions. days=0 means today only."""
+    """Get sign-in sessions. days=0 means today only.
+    Includes sessions that started OR were active during the window
+    (e.g. signed in yesterday but still online today)."""
     try:
         if days > 0:
             since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
         else:
             since = datetime.utcnow().strftime("%Y-%m-%d")
-        r = req_lib.get(
+        # Get sessions that started in the window
+        r1 = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/user_sessions?select=*&signed_in=gte.{since}T00:00:00&order=signed_in.desc&limit=500",
             headers=SB_ADMIN_HEADERS, timeout=30)
-        sessions = r.json() if r.status_code == 200 else []
-        return sessions if isinstance(sessions, list) else []
+        started = r1.json() if r1.status_code == 200 else []
+        if not isinstance(started, list):
+            started = []
+        # Also get sessions still active (no sign_out) that started before the window
+        r2 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/user_sessions?select=*&signed_in=lt.{since}T00:00:00&signed_out=is.null&order=signed_in.desc&limit=100",
+            headers=SB_ADMIN_HEADERS, timeout=30)
+        still_active = r2.json() if r2.status_code == 200 else []
+        if not isinstance(still_active, list):
+            still_active = []
+        # Also get sessions that signed out during the window but started before
+        r3 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/user_sessions?select=*&signed_in=lt.{since}T00:00:00&signed_out=gte.{since}T00:00:00&order=signed_in.desc&limit=100",
+            headers=SB_ADMIN_HEADERS, timeout=30)
+        signed_out_during = r3.json() if r3.status_code == 200 else []
+        if not isinstance(signed_out_during, list):
+            signed_out_during = []
+        # Merge and deduplicate by id
+        seen = set()
+        merged = []
+        for s in started + still_active + signed_out_during:
+            sid = s.get("id")
+            if sid not in seen:
+                seen.add(sid)
+                merged.append(s)
+        merged.sort(key=lambda x: x.get("signed_in", ""), reverse=True)
+        return merged
     except:
         return []
 
