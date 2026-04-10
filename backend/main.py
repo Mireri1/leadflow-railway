@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt, os, re, time, json as json_lib, requests as req_lib, smtplib
+import jwt, os, re, time, json as json_lib, requests as req_lib, smtplib, socket, ssl
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
@@ -1383,12 +1383,37 @@ def send_smtp_email(to_email: str, to_name: str, subject: str, body_html: str, r
     plain = re.sub(r"<[^>]+>", "", body_html).strip()
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(body_html, "html"))
+    # Railway containers can't reach Gmail SMTP over IPv6 (ENETUNREACH).
+    # Resolve to IPv4 explicitly and connect to the IP, but keep the hostname for TLS SNI.
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-            server.starttls()
-            server.login(OUTREACH_EMAIL, OUTREACH_EMAIL_PWD)
-            server.send_message(msg)
-        return True, None
+        ipv4_addrs = [ai[4][0] for ai in socket.getaddrinfo(SMTP_HOST, SMTP_PORT, socket.AF_INET, socket.SOCK_STREAM)]
+        if not ipv4_addrs:
+            return False, f"No IPv4 address resolved for {SMTP_HOST}"
+        last_err = None
+        for ip in ipv4_addrs:
+            try:
+                # Use SMTP_SSL on 465 if configured, else STARTTLS
+                if SMTP_PORT == 465:
+                    ctx = ssl.create_default_context()
+                    server = smtplib.SMTP_SSL(ip, SMTP_PORT, timeout=30, context=ctx)
+                    server._host = SMTP_HOST  # for SNI
+                else:
+                    server = smtplib.SMTP(ip, SMTP_PORT, timeout=30)
+                    server._host = SMTP_HOST  # SNI for starttls
+                    server.ehlo()
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                try:
+                    server.login(OUTREACH_EMAIL, OUTREACH_EMAIL_PWD)
+                    server.send_message(msg)
+                    return True, None
+                finally:
+                    try: server.quit()
+                    except: pass
+            except Exception as e:
+                last_err = e
+                continue
+        return False, f"All IPv4 attempts failed: {last_err}"
     except Exception as e:
         return False, str(e)
 

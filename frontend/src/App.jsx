@@ -813,7 +813,7 @@ function CallModal({lead,onClose,onSaved}){
 // ─── EmailModal ──────────────────────────────────────────────────────────────
 
 function EmailModal({lead,onClose,onSent}){
-  const defaultBody=(name)=>`Hi ${name},\n\nThank you for taking the time to speak with us. As discussed, I wanted to follow up with some additional information about our services.\n\nVision Cleaning Company provides professional commercial cleaning solutions tailored to your specific needs. We'd love the opportunity to show you what we can do.\n\nPlease don't hesitate to reach out if you have any questions or would like to schedule a walkthrough.\n\nBest regards,\nVision Cleaning Company\nconnect@visioncleaningcompanyllc.com`
+  const defaultBody=(name)=>`Hi ${name},\n\nThank you for taking our call today. It was great connecting with you.\n\nIf you'd like a free, no obligation estimate, simply reply to this email with your approximate square footage and how often you'd like service (daily, weekly, bi weekly, monthly) and we'll send a custom quote your way as soon as possible.\n\nYou can also learn more about Vision Cleaning Company and the services we offer at https://visioncleaningcompanyllc.com. Feel free to request your quote directly through our site any time.\n\nWe appreciate the opportunity and look forward to the chance to work with you.\n\nBest regards,\nVision Cleaning Company\nconnect@visioncleaningcompanyllc.com\nhttps://visioncleaningcompanyllc.com`
 
   const [toEmail,setToEmail]=useState(lead?.email||"")
   const [toName,setToName]=useState(lead?[lead.firstName,lead.lastName].filter(Boolean).join(" "):"")
