@@ -7,13 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt, os, re, time, json as json_lib, requests as req_lib, smtplib, socket, ssl
+import jwt, os, re, time, json as json_lib, requests as req_lib
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
 from urllib.parse import quote as url_quote
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 SECRET_KEY      = os.getenv("SECRET_KEY",      "leadflow-secret")
 TEAM_PASSWORD   = os.getenv("TEAM_PASSWORD",   "LeadFlow2024")
@@ -28,11 +26,11 @@ SUPABASE_KEY  = os.getenv("SUPABASE_KEY", os.getenv("VITE_SUPABASE_KEY", ""))
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
 
-# ── Email config (Gmail SMTP for outreach) ──────────────────────────────────────
-OUTREACH_EMAIL     = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompanyllc.com")
-OUTREACH_EMAIL_PWD = os.getenv("OUTREACH_EMAIL_PASSWORD", "")  # Gmail app password
-SMTP_HOST          = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT          = int(os.getenv("SMTP_PORT", "587"))
+# ── Email config (Resend HTTP API for outreach) ─────────────────────────────────
+# Railway blocks outbound SMTP, so we use Resend's HTTP API instead.
+OUTREACH_EMAIL    = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompanyllc.com")
+OUTREACH_NAME     = os.getenv("OUTREACH_NAME", "Vision Cleaning Company")
+RESEND_API_KEY    = os.getenv("RESEND_API_KEY", "")
 
 SB_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -1370,50 +1368,39 @@ class SendEmailRequest(BaseModel):
     company: Optional[str] = ""
 
 def send_smtp_email(to_email: str, to_name: str, subject: str, body_html: str, reply_to: str = ""):
-    """Send an email via SMTP (Gmail). Returns (success, error_message)."""
-    if not OUTREACH_EMAIL_PWD:
-        return False, "Email not configured. Set OUTREACH_EMAIL_PASSWORD env var."
-    msg = MIMEMultipart("alternative")
-    msg["From"] = f"Vision Cleaning Company <{OUTREACH_EMAIL}>"
-    msg["To"] = f"{to_name} <{to_email}>" if to_name else to_email
-    msg["Subject"] = subject
-    if reply_to:
-        msg["Reply-To"] = reply_to
-    # Plain text fallback
+    """Send an email via Resend HTTP API (function name kept for backwards compat).
+    Railway blocks outbound SMTP, so we use Resend's HTTP API instead.
+    Returns (success, error_message)."""
+    if not RESEND_API_KEY:
+        return False, "Email not configured. Set RESEND_API_KEY env var."
+    # Plain text fallback derived from HTML
     plain = re.sub(r"<[^>]+>", "", body_html).strip()
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(body_html, "html"))
-    # Railway containers can't reach Gmail SMTP over IPv6 (ENETUNREACH).
-    # Resolve to IPv4 explicitly and connect to the IP, but keep the hostname for TLS SNI.
+    payload = {
+        "from": f"{OUTREACH_NAME} <{OUTREACH_EMAIL}>",
+        "to": [f"{to_name} <{to_email}>"] if to_name else [to_email],
+        "subject": subject,
+        "html": body_html,
+        "text": plain,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
     try:
-        ipv4_addrs = [ai[4][0] for ai in socket.getaddrinfo(SMTP_HOST, SMTP_PORT, socket.AF_INET, socket.SOCK_STREAM)]
-        if not ipv4_addrs:
-            return False, f"No IPv4 address resolved for {SMTP_HOST}"
-        last_err = None
-        for ip in ipv4_addrs:
-            try:
-                # Use SMTP_SSL on 465 if configured, else STARTTLS
-                if SMTP_PORT == 465:
-                    ctx = ssl.create_default_context()
-                    server = smtplib.SMTP_SSL(ip, SMTP_PORT, timeout=30, context=ctx)
-                    server._host = SMTP_HOST  # for SNI
-                else:
-                    server = smtplib.SMTP(ip, SMTP_PORT, timeout=30)
-                    server._host = SMTP_HOST  # SNI for starttls
-                    server.ehlo()
-                    server.starttls(context=ssl.create_default_context())
-                    server.ehlo()
-                try:
-                    server.login(OUTREACH_EMAIL, OUTREACH_EMAIL_PWD)
-                    server.send_message(msg)
-                    return True, None
-                finally:
-                    try: server.quit()
-                    except: pass
-            except Exception as e:
-                last_err = e
-                continue
-        return False, f"All IPv4 attempts failed: {last_err}"
+        r = req_lib.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code in (200, 201, 202):
+            return True, None
+        try:
+            err = r.json().get("message") or r.text
+        except Exception:
+            err = r.text
+        return False, f"Resend {r.status_code}: {err}"
     except Exception as e:
         return False, str(e)
 
