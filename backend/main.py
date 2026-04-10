@@ -28,8 +28,9 @@ GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
 
 # ── Email config (Resend HTTP API for outreach) ─────────────────────────────────
 # Railway blocks outbound SMTP, so we use Resend's HTTP API instead.
-OUTREACH_EMAIL    = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompanyllc.com")
+OUTREACH_EMAIL    = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompany.com")
 OUTREACH_NAME     = os.getenv("OUTREACH_NAME", "Vision Cleaning Company")
+OUTREACH_REPLY_TO = os.getenv("OUTREACH_REPLY_TO", "")
 RESEND_API_KEY    = os.getenv("RESEND_API_KEY", "")
 
 SB_HEADERS = {
@@ -1413,7 +1414,7 @@ def send_email(req: SendEmailRequest, user: str = Depends(verify_token)):
         raise HTTPException(status_code=400, detail="Subject and body required")
 
     # Send the email
-    success, err = send_smtp_email(req.to_email, req.to_name, req.subject, req.body)
+    success, err = send_smtp_email(req.to_email, req.to_name, req.subject, req.body, reply_to=OUTREACH_REPLY_TO)
     if not success:
         raise HTTPException(status_code=500, detail=f"Failed to send: {err}")
 
