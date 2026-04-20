@@ -26,6 +26,29 @@ SUPABASE_KEY  = os.getenv("SUPABASE_KEY", os.getenv("VITE_SUPABASE_KEY", ""))
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
 
+# ── Google Places cost controls ─────────────────────────────────────────────
+# PLACES_KILL_SWITCH=1 halts every Places call instantly (same env name as
+# vlm/recruitnil scrapers so one flip stops the bleeding across all repos).
+PLACES_KILL_SWITCH = os.getenv("PLACES_KILL_SWITCH", "0") == "1"
+# Non-admin daily scrape cap. UTC midnight reset. Eric (in ADMIN_USERS) is
+# unlimited. Silently no-ops if usage_events table isn't migrated yet.
+NON_ADMIN_DAILY_SCRAPE_CAP = int(os.getenv("NON_ADMIN_DAILY_SCRAPE_CAP", "3"))
+# Hard cap per scrape in dollars. Refuses the run if predicted spend exceeds.
+PLACES_MAX_SPEND_PER_RUN = float(os.getenv("PLACES_MAX_SPEND_PER_RUN", "2.0"))
+# Text Search cache TTL, days. Keyed on (pipeline='leadflow', city, keyword).
+PLACES_CACHE_TTL_DAYS = int(os.getenv("PLACES_CACHE_TTL_DAYS", "14"))
+# Autocomplete in-memory cache TTL, seconds.
+AUTOCOMPLETE_CACHE_TTL_SECONDS = int(os.getenv("AUTOCOMPLETE_CACHE_TTL_SECONDS", "3600"))
+
+# Google Places pricing (May 2025) — used for usage_events cost tracking
+# AND run-level spend prediction.
+GOOGLE_COSTS_CENTS = {
+    "google_text_search":  3.2,    # $0.032 per call
+    "google_details":      1.7,    # $0.017 per call
+    "google_autocomplete": 0.283,  # $2.83 / 1000 requests (no session token)
+    "scrape_call":         0.0,    # aggregate row; children carry the cost
+}
+
 # ── Email config (Resend HTTP API for outreach) ─────────────────────────────────
 # Railway blocks outbound SMTP, so we use Resend's HTTP API instead.
 OUTREACH_EMAIL    = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompany.com")
@@ -258,7 +281,135 @@ def get_sessions(days: int = 0, user: str = Depends(verify_admin)):
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(verify_token)):
-    return {"username": user}
+    admin = is_admin(user)
+    return {
+        "username":       user,
+        "isAdmin":        admin,
+        # null = unlimited for admins; number = caller's daily cap for UI display
+        "dailyScrapeCap": None if admin else NON_ADMIN_DAILY_SCRAPE_CAP,
+    }
+
+# ── Cost-control helpers ────────────────────────────────────────────────────
+def is_admin(username: str) -> bool:
+    return (username or "").strip().lower() in ADMIN_USERS
+
+def scrapes_today(username: str) -> int:
+    """Count a user's scrape_call events since UTC midnight. Returns 0 if
+    usage_events isn't set up yet (so the cap silently doesn't apply)."""
+    try:
+        midnight = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/usage_events"
+            f"?select=id&username=eq.{url_quote(username)}"
+            f"&event_type=eq.scrape_call&created_at=gte.{midnight}"
+        )
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            return len(data) if isinstance(data, list) else 0
+        return 0
+    except Exception as e:
+        print(f"[RATE-LIMIT] count failed: {e}")
+        return 0
+
+def log_usage(username: str, event_type: str, metadata: Optional[dict] = None):
+    """Fire-and-forget usage logger. Never raises — never blocks a scrape."""
+    try:
+        cost = GOOGLE_COSTS_CENTS.get(event_type, 0)
+        r = req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/usage_events",
+            headers=SB_HEADERS,
+            json={
+                "username":   username or "unknown",
+                "event_type": event_type,
+                "cost_cents": cost,
+                "metadata":   metadata or {},
+            },
+            timeout=5,
+        )
+        if r.status_code not in (200, 201):
+            # Usually means the table isn't migrated yet — we don't block.
+            print(f"[USAGE] Supabase {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[USAGE] Exception: {e}")
+
+# ── Places Text Search cache ────────────────────────────────────────────────
+# Shared pattern with vlm/recruitnil scrapers: cache (pipeline='leadflow',
+# city, keyword) -> place_ids with a TTL. A fresh cache row means we already
+# made that Text Search call within PLACES_CACHE_TTL_DAYS, so we skip it.
+# DB errors are best-effort — a cache outage falls through to a live API
+# call, never blocks a scrape.
+def places_cache_load(combos):
+    """combos: list[(city, keyword)]. Returns set of 'city||keyword' cache hits."""
+    if not combos:
+        return set()
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=PLACES_CACHE_TTL_DAYS)).isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/places_search_cache"
+            f"?select=city,keyword"
+            f"&pipeline=eq.leadflow"
+            f"&last_searched_at=gte.{cutoff}"
+            f"&limit=5000"
+        )
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=5)
+        if r.status_code != 200:
+            return set()
+        rows = r.json() if isinstance(r.json(), list) else []
+        want = {f"{c}||{k}" for c, k in combos}
+        got  = {f"{row.get('city','')}||{row.get('keyword','')}" for row in rows}
+        return want & got
+    except Exception as e:
+        print(f"[PLACES-CACHE] load failed: {e}")
+        return set()
+
+def places_cache_write(entries):
+    """entries: list[dict(city, keyword, place_ids)]. Upserts pipeline='leadflow'."""
+    if not entries:
+        return
+    try:
+        now_iso = datetime.utcnow().isoformat()
+        payload = [{
+            "pipeline":         "leadflow",
+            "city":             e["city"],
+            "keyword":          e["keyword"],
+            "last_searched_at": now_iso,
+            "place_ids":        e.get("place_ids") or [],
+            "result_count":     len(e.get("place_ids") or []),
+        } for e in entries]
+        r = req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/places_search_cache"
+            f"?on_conflict=pipeline,city,keyword",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=payload, timeout=10,
+        )
+        if r.status_code not in (200, 201, 204):
+            print(f"[PLACES-CACHE] upsert {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[PLACES-CACHE] write failed: {e}")
+
+# ── Autocomplete in-memory cache ────────────────────────────────────────────
+# Every keystroke hits /api/cities/autocomplete. Places Autocomplete is
+# pay-per-request without session tokens. Process-wide TTL cache dedups the
+# "user backspaces and retypes the same 4 chars" pattern that dominates
+# real typing traffic. Cache key is (q.lower(), state.lower()).
+_autocomplete_cache = {}  # { key: (expires_ts, suggestions_list) }
+
+def autocomplete_cache_get(key):
+    hit = _autocomplete_cache.get(key)
+    if not hit:
+        return None
+    expires, suggestions = hit
+    if expires < time.time():
+        _autocomplete_cache.pop(key, None)
+        return None
+    return suggestions
+
+def autocomplete_cache_set(key, suggestions):
+    # Soft cap — prevent unbounded memory on a long-lived process.
+    if len(_autocomplete_cache) > 5000:
+        _autocomplete_cache.clear()
+    _autocomplete_cache[key] = (time.time() + AUTOCOMPLETE_CACHE_TTL_SECONDS, suggestions)
 
 INDUSTRY_MAP = {
     "Healthcare":         "health clinic",
@@ -331,12 +482,19 @@ def is_us_address(addr):
             return True
     return False
 
-def scrape_google_places(keyword="health clinic", state="", limit=25):
+def scrape_google_places(keyword="health clinic", state="", limit=25, username="unknown"):
+    # Emergency brake. Shared env with vlm/recruitnil so PLACES_KILL_SWITCH=1
+    # halts every Places call across all repos in one flip.
+    if PLACES_KILL_SWITCH:
+        print("[PLACES] PLACES_KILL_SWITCH=1 — returning [] without calling API")
+        return []
+
     leads = []
+    place_ids_found = []  # Collected for cache write below
     # Force US context in query
     location_part = state if state else "USA"
     query = f"{keyword} {location_part}".strip()
-    print(f"[PLACES] query: '{query}' limit: {limit}")
+    print(f"[PLACES] query: '{query}' limit: {limit} user: {username}")
 
     params = {
         "query": query,
@@ -358,6 +516,8 @@ def scrape_google_places(keyword="health clinic", state="", limit=25):
                 "https://maps.googleapis.com/maps/api/place/textsearch/json",
                 params=params, timeout=30
             )
+            # Every text-search call = one billable unit. Log who triggered it.
+            log_usage(username, "google_text_search", {"query": query, "state": state})
             print(f"[PLACES] HTTP {r.status_code}")
             data = r.json()
             status = data.get("status")
@@ -411,6 +571,11 @@ def scrape_google_places(keyword="health clinic", state="", limit=25):
                 }
                 lead["score"] = score_lead(lead)
 
+                # Track place_id for the cache write regardless of phone enrichment.
+                pid = place.get("place_id")
+                if pid:
+                    place_ids_found.append(pid)
+
                 # Get phone via place details if missing
                 if not lead["phone"]:
                     place_id = place.get("place_id")
@@ -421,6 +586,8 @@ def scrape_google_places(keyword="health clinic", state="", limit=25):
                                 params={"place_id": place_id, "fields": "formatted_phone_number,website", "key": GOOGLE_KEY},
                                 timeout=10
                             ).json()
+                            # Details call = one billable unit. Log it.
+                            log_usage(username, "google_details", {"place_id": place_id})
                             result = det.get("result", {})
                             lead["phone"]   = clean(result.get("formatted_phone_number", ""))
                             lead["website"] = clean(result.get("website", "")) or lead["website"]
@@ -442,7 +609,17 @@ def scrape_google_places(keyword="health clinic", state="", limit=25):
             break
 
     print(f"[PLACES] Returning {len(leads)} leads")
+    # Attach place_ids to the return so run_scrape can feed the cache write.
+    # Using an attribute on the list would be weird; instead, return a dict-ish
+    # wrapper via a tuple is too invasive — leads[0]._place_ids etc even worse.
+    # Simplest: stash on a module-level dict keyed by (keyword, state), read
+    # once by the caller. Keeps the signature backward-compatible.
+    _LAST_SCRAPE_PLACE_IDS[(keyword, state)] = place_ids_found
     return leads[:limit]
+
+# Module-level hand-off for cache writes. scrape_google_places stashes the
+# list of place_ids it saw for (keyword, state); run_scrape reads then clears.
+_LAST_SCRAPE_PLACE_IDS = {}
 
 def save_to_supabase(leads):
     if not leads:
@@ -472,6 +649,21 @@ class ScrapeRequest(BaseModel):
 
 @app.post("/api/scrape")
 def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
+    # Kill switch first — reject cheap, reject early.
+    if PLACES_KILL_SWITCH:
+        raise HTTPException(status_code=503, detail="Google Places scraping is temporarily disabled (PLACES_KILL_SWITCH).")
+
+    # Non-admin daily cap. UTC midnight reset. Eric (in ADMIN_USERS) is
+    # unlimited. Silently no-ops if usage_events table isn't migrated yet
+    # (scrapes_today returns 0 on any DB error).
+    if not is_admin(user):
+        used = scrapes_today(user)
+        if used >= NON_ADMIN_DAILY_SCRAPE_CAP:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily scrape limit reached ({used}/{NON_ADMIN_DAILY_SCRAPE_CAP}). Resets at UTC midnight.",
+            )
+
     limit = min(max(body.limit or 25, 5), 60)
 
     # Build list of keywords to search
@@ -495,13 +687,61 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
     combos = len(keywords) * len(locations)
     per_combo = max(limit // combos, 3) if combos else limit
 
-    print(f"[SCRAPE] industries: {[k[0] for k in keywords]}, locations: {locations}, limit: {limit} ({per_combo}/combo, {combos} combos)")
+    # Cache check — skip (location, keyword) pairs we already fetched fresh.
+    # Cache key matches what scrape_google_places actually queries: the full
+    # location string (e.g. "Phoenix, AZ" or just "AZ").
+    all_combos = [(loc, kw) for _, kw in keywords for loc in locations]
+    cache_hits = places_cache_load(all_combos)
+    if cache_hits:
+        print(f"[SCRAPE] cache hits: {len(cache_hits)}/{len(all_combos)} combos — skipping Text Search for those")
+
+    # Cost prediction + hard cap. Text Search $0.032/call, Details $0.017/call.
+    # Assume 1 Text Search per uncached combo (text search pagination is rare
+    # at default per_combo=3), plus Details calls for ~60% of results (rough
+    # hit rate when phone missing). Err generous.
+    uncached = len(all_combos) - len(cache_hits)
+    predicted_cents = uncached * GOOGLE_COSTS_CENTS["google_text_search"] + \
+                      uncached * per_combo * 0.6 * GOOGLE_COSTS_CENTS["google_details"]
+    max_spend_cents = PLACES_MAX_SPEND_PER_RUN * 100
+    print(f"[SCRAPE] user={user} industries={[k[0] for k in keywords]} locations={locations} "
+          f"limit={limit} ({per_combo}/combo, {combos} combos, {uncached} uncached) "
+          f"predicted ${predicted_cents/100:.2f} (cap ${PLACES_MAX_SPEND_PER_RUN})")
+    if predicted_cents > max_spend_cents:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Predicted spend ${predicted_cents/100:.2f} exceeds cap ${PLACES_MAX_SPEND_PER_RUN}. "
+                   f"Narrow industries/cities or raise PLACES_MAX_SPEND_PER_RUN.",
+        )
+
+    # Aggregate "scrape_call" row — makes per-scrape rollups easy in /api/usage.
+    log_usage(user, "scrape_call", {
+        "industries": [k[0] for k in keywords],
+        "state":      body.state or "",
+        "cities":     body.cities or "",
+        "limit":      limit,
+        "combos":     combos,
+        "uncached":   uncached,
+    })
 
     all_leads = []
     seen_phones = set()
+    cache_entries_to_write = []
     for ind_name, keyword in keywords:
         for location in locations:
-            batch = scrape_google_places(keyword=keyword, state=location, limit=per_combo)
+            combo_key = f"{location}||{keyword}"
+            if combo_key in cache_hits:
+                # Fresh cache hit — already searched this within TTL. Same
+                # Google result set is expected, and any new leads would have
+                # been saved then. Skip the paid call.
+                continue
+            batch = scrape_google_places(
+                keyword=keyword, state=location, limit=per_combo, username=user,
+            )
+            # Capture place_ids for the cache write (stashed by scrape_google_places).
+            pids = _LAST_SCRAPE_PLACE_IDS.pop((keyword, location), [])
+            cache_entries_to_write.append({
+                "city": location, "keyword": keyword, "place_ids": pids,
+            })
             for lead in batch:
                 # Tag each lead with the industry it was scraped for
                 if ind_name != "All" and not lead.get("industry"):
@@ -517,6 +757,10 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
             break
     leads = all_leads[:limit]
 
+    # Write every combo we actually queried back to the cache (even empty
+    # ones — a ZERO_RESULTS hit is worth caching so we don't retry it).
+    places_cache_write(cache_entries_to_write)
+
     # Tag all scraped leads with the user who ran the search
     for lead in leads:
         lead["createdBy"] = user
@@ -524,15 +768,108 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
     saved = save_to_supabase(leads)
     audit_log(user, "scrape_leads", "lead", None, {
         "industries": [k[0] for k in keywords], "state": body.state,
-        "cities": body.cities, "found": len(leads), "saved": saved})
-    print(f"[SCRAPE] Saved {saved} leads")
-    return {"leads": leads, "count": len(leads), "saved": saved}
+        "cities": body.cities, "found": len(leads), "saved": saved,
+        "cache_hits": len(cache_hits), "uncached_combos": uncached})
+    print(f"[SCRAPE] Saved {saved} leads (cache_hits={len(cache_hits)}/{len(all_combos)})")
+    return {
+        "leads": leads,
+        "count": len(leads),
+        "saved": saved,
+        "cacheHits": len(cache_hits),
+        "combos":    len(all_combos),
+    }
+
+@app.get("/api/usage")
+def get_usage(days: int = 7, user: str = Depends(verify_token)):
+    """Admin-only Places-API cost rollup. Shows who ran which queries and
+    how much it cost. Reads from usage_events; returns a clear error if the
+    table isn't migrated yet (so the admin knows to run the migration)."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        since = (datetime.utcnow() - timedelta(days=max(1, min(days, 90)))).isoformat()
+        url = (
+            f"{SUPABASE_URL}/rest/v1/usage_events"
+            f"?select=created_at,username,event_type,cost_cents,metadata"
+            f"&created_at=gte.{since}"
+            f"&order=created_at.desc&limit=5000"
+        )
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return {
+                "error":   "usage_events table missing — run backend/migrations/001_usage_events.sql in Supabase",
+                "byUser":  [], "byDay": [], "recent": [],
+                "totals":  {"cost_cents": 0, "events": 0, "days": days},
+            }
+        rows = r.json() if isinstance(r.json(), list) else []
+
+        by_user, by_day = {}, {}
+        total_cost = 0.0
+        for row in rows:
+            u  = row.get("username") or "unknown"
+            et = row.get("event_type") or ""
+            cost = float(row.get("cost_cents") or 0)
+            total_cost += cost
+
+            if u not in by_user:
+                by_user[u] = {"username": u, "events": 0, "cost_cents": 0.0,
+                              "text_searches": 0, "details": 0,
+                              "autocompletes": 0, "scrapes": 0}
+            by_user[u]["events"]     += 1
+            by_user[u]["cost_cents"] += cost
+            if   et == "google_text_search":  by_user[u]["text_searches"] += 1
+            elif et == "google_details":      by_user[u]["details"]       += 1
+            elif et == "google_autocomplete": by_user[u]["autocompletes"] += 1
+            elif et == "scrape_call":         by_user[u]["scrapes"]       += 1
+
+            day = (row.get("created_at") or "")[:10]
+            if day:
+                if day not in by_day:
+                    by_day[day] = {"date": day, "cost_cents": 0.0, "events": 0}
+                by_day[day]["cost_cents"] += cost
+                by_day[day]["events"]     += 1
+
+        window_days = max(1, days)
+        daily_avg_cents = total_cost / window_days
+        return {
+            "byUser":    sorted(by_user.values(), key=lambda x: x["cost_cents"], reverse=True),
+            "byDay":     sorted(by_day.values(),  key=lambda x: x["date"]),
+            "recent":    rows[:50],
+            "totals":    {"cost_cents": round(total_cost, 2), "events": len(rows), "days": days},
+            "projection": {
+                "dailyAverage_cents":    round(daily_avg_cents, 2),
+                "weeklyEstimate_cents":  round(daily_avg_cents * 7, 2),
+                "monthlyEstimate_cents": round(daily_avg_cents * 30, 2),
+            },
+            "limits": {
+                "nonAdminDailyScrapeCap": NON_ADMIN_DAILY_SCRAPE_CAP,
+                "maxSpendPerRun":         PLACES_MAX_SPEND_PER_RUN,
+                "cacheTtlDays":           PLACES_CACHE_TTL_DAYS,
+                "killSwitch":             PLACES_KILL_SWITCH,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/cities/autocomplete")
 def city_autocomplete(q: str = "", state: str = "", user: str = Depends(verify_token)):
-    """Return city suggestions from Google Places Autocomplete"""
+    """Return city suggestions from Google Places Autocomplete.
+
+    Process-wide TTL cache (AUTOCOMPLETE_CACHE_TTL_SECONDS, default 1h) keyed
+    on (q.lower(), state.lower()). Real typing traffic repeats prefixes
+    constantly — backspacing, retyping, multiple callers typing the same
+    metros — so this kills 80%+ of paid calls with no UX change."""
     if not q or len(q) < 2:
         return {"suggestions": []}
+    # Kill switch respects the same env as the scraper.
+    if PLACES_KILL_SWITCH:
+        return {"suggestions": []}
+
+    cache_key = (q.strip().lower(), (state or "").strip().lower())
+    cached = autocomplete_cache_get(cache_key)
+    if cached is not None:
+        return {"suggestions": cached, "cached": True}
+
     try:
         input_text = f"{q}, {state}" if state else q
         r = req_lib.get(
@@ -544,8 +881,12 @@ def city_autocomplete(q: str = "", state: str = "", user: str = Depends(verify_t
                 "key": GOOGLE_KEY,
             },
             timeout=5)
+        # Live call — log + increment usage. Cached calls are free.
+        log_usage(user, "google_autocomplete", {"q": q, "state": state})
         data = r.json()
         if data.get("status") != "OK":
+            # Cache empty result too — user's next keystroke shouldn't re-hit.
+            autocomplete_cache_set(cache_key, [])
             return {"suggestions": []}
         cities = []
         for pred in data.get("predictions", [])[:8]:
@@ -553,6 +894,7 @@ def city_autocomplete(q: str = "", state: str = "", user: str = Depends(verify_t
             city_name = terms[0]["value"] if terms else pred.get("structured_formatting", {}).get("main_text", "")
             if city_name and city_name not in cities:
                 cities.append(city_name)
+        autocomplete_cache_set(cache_key, cities)
         return {"suggestions": cities}
     except:
         return {"suggestions": []}
