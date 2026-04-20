@@ -3532,6 +3532,8 @@ function UsageDashboard(){
   const [days,setDays]=useState(7)
   const [show,setShow]=useState(false)
   const [loading,setLoading]=useState(false)
+  const [ks,setKs]=useState(null)          // { on, source, envLocked }
+  const [ksBusy,setKsBusy]=useState(false)
 
   const load=(d)=>{
     setLoading(true)
@@ -3539,6 +3541,24 @@ function UsageDashboard(){
       .then(r=>setData(r))
       .catch(e=>setData({error:String(e.message||e)}))
       .finally(()=>setLoading(false))
+  }
+
+  const loadKs=()=>{
+    api("/api/admin/kill-switch").then(setKs).catch(()=>{})
+  }
+
+  const toggleKs=()=>{
+    if(!ks) return
+    const turnOn=!ks.on
+    const msg=turnOn
+      ?"KILL the Google Places scraper? Callers will get 503s until you re-enable. Autocomplete also stops."
+      :"Re-enable scraping? Callers can resume pulling leads."
+    if(!window.confirm(msg)) return
+    setKsBusy(true)
+    api("/api/admin/kill-switch",{method:"POST",body:JSON.stringify({on:turnOn})})
+      .then(r=>setKs(r))
+      .catch(e=>alert(e.message||e))
+      .finally(()=>setKsBusy(false))
   }
 
   const money=(c)=>c==null?"—":`$${(Number(c)/100).toFixed(2)}`
@@ -3550,11 +3570,14 @@ function UsageDashboard(){
         onClick={()=>{
           setShow(p=>!p)
           if(!data) load(days)
+          if(!ks) loadKs()
         }}>
         <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",
           display:"flex",alignItems:"center",gap:8}}>
           Google Places Usage & Leads Pulled
           <span style={{color:"#ff6e84",fontSize:9}}>ADMIN</span>
+          {ks?.on&&<span style={{color:"#ff6e84",fontSize:10,padding:"2px 8px",borderRadius:10,
+            background:"#ff6e8418",border:"1px solid #ff6e8440",letterSpacing:".05em"}}>SCRAPING KILLED</span>}
         </div>
         <span style={{color:"#40485d",fontSize:12,transition:"transform .2s",
           transform:show?"rotate(180deg)":"rotate(0)"}}>{"\u25BC"}</span>
@@ -3562,6 +3585,42 @@ function UsageDashboard(){
 
       {show&&(
         <div>
+          {/* Kill switch strip — always visible, alerts when ON */}
+          {ks&&(
+            <div style={{padding:"12px 24px",borderBottom:"1px solid #40485d10",
+              background:ks.on?"#ff6e8410":"transparent",
+              display:"flex",alignItems:"center",gap:12,justifyContent:"space-between"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,flex:1,minWidth:0}}>
+                <div style={{width:10,height:10,borderRadius:"50%",flexShrink:0,
+                  background:ks.on?"#ff6e84":"#69f6b8",boxShadow:ks.on?"0 0 8px #ff6e8480":"none"}}/>
+                <div style={{minWidth:0}}>
+                  <div style={{fontSize:13,color:ks.on?"#ff6e84":"#dee5ff",fontWeight:600}}>
+                    {ks.on?"Scraping is KILLED":"Scraping is live"}
+                  </div>
+                  <div style={{fontSize:11,color:"#40485d",marginTop:2}}>
+                    {ks.envLocked
+                      ?"PLACES_KILL_SWITCH env var is active — unset in Railway to unlock the toggle."
+                      :ks.on
+                        ?"All /api/scrape + autocomplete calls return 503 / empty."
+                        :"Flip to pause every Google Places call instantly — no redeploy needed."}
+                  </div>
+                </div>
+              </div>
+              <button
+                disabled={ksBusy||ks.envLocked}
+                onClick={toggleKs}
+                style={{
+                  padding:"8px 16px",borderRadius:8,fontSize:12,fontWeight:700,
+                  letterSpacing:".05em",textTransform:"uppercase",cursor:ks.envLocked?"not-allowed":"pointer",
+                  border:"none",opacity:ksBusy?0.5:1,
+                  background:ks.on?"#69f6b8":"#ff6e84",
+                  color:ks.on?"#001a0e":"#1a0004",
+                }}>
+                {ksBusy?"…":ks.on?"Resume":"Kill Switch"}
+              </button>
+            </div>
+          )}
+
           {/* Window picker */}
           <div style={{padding:"10px 24px",display:"flex",gap:8,alignItems:"center",borderBottom:"1px solid #40485d10"}}>
             {[{label:"Today",d:1},{label:"7 Days",d:7},{label:"30 Days",d:30},{label:"90 Days",d:90}].map(p=>(
@@ -3693,18 +3752,13 @@ function UsageDashboard(){
                 </>
               )}
 
-              {/* Limits summary */}
+              {/* Limits summary (kill switch lives in its own strip at the top) */}
               {data.limits&&(
                 <div style={{padding:"10px 24px 18px",fontSize:11,color:"#40485d",
                   borderTop:"1px solid #40485d10",display:"flex",flexWrap:"wrap",gap:16}}>
                   <span>Non-admin cap: <span style={{color:"#a3aac4"}}>{data.limits.nonAdminDailyScrapeCap}/day</span></span>
                   <span>Max spend/run: <span style={{color:"#a3aac4"}}>${data.limits.maxSpendPerRun}</span></span>
                   <span>Cache TTL: <span style={{color:"#a3aac4"}}>{data.limits.cacheTtlDays}d</span></span>
-                  <span>Kill switch:{" "}
-                    <span style={{color:data.limits.killSwitch?"#ff6e84":"#69f6b8",fontWeight:600}}>
-                      {data.limits.killSwitch?"ON":"off"}
-                    </span>
-                  </span>
                 </div>
               )}
             </>

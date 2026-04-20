@@ -49,6 +49,12 @@ GOOGLE_COSTS_CENTS = {
     "scrape_call":         0.0,    # aggregate row; children carry the cost
 }
 
+# Kill switch state cache. Refreshed from app_settings every KILL_SWITCH_CACHE_SECONDS.
+# Env PLACES_KILL_SWITCH=1 is an absolute override — always wins, for those
+# "something is horribly wrong and I cannot get into the UI" moments.
+KILL_SWITCH_CACHE_SECONDS = 30
+_kill_switch_cache = {"value": False, "source": "off", "expires": 0.0}
+
 # ── Email config (Resend HTTP API for outreach) ─────────────────────────────────
 # Railway blocks outbound SMTP, so we use Resend's HTTP API instead.
 OUTREACH_EMAIL    = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompany.com")
@@ -293,6 +299,47 @@ def me(user: str = Depends(verify_token)):
 def is_admin(username: str) -> bool:
     return (username or "").strip().lower() in ADMIN_USERS
 
+def is_kill_switch_on():
+    """Two-layer check. Env var PLACES_KILL_SWITCH=1 always wins (absolute
+    override). Otherwise reads app_settings.places_kill_switch with a 30s
+    cache so per-request overhead is near-zero. Returns (bool, source)."""
+    if PLACES_KILL_SWITCH:
+        return True, "env"
+    now = time.time()
+    if _kill_switch_cache["expires"] > now:
+        return _kill_switch_cache["value"], _kill_switch_cache["source"]
+    # Cache miss — refresh from DB. On any error, fail OPEN (scraping allowed)
+    # so a Supabase outage doesn't kill outreach; the env var is the reliable
+    # override for true emergencies.
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.places_kill_switch&select=value",
+            headers=SB_HEADERS, timeout=3,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        val = (rows[0]["value"] if isinstance(rows, list) and rows else "0")
+        on  = str(val).strip().lower() in ("1", "true", "yes", "on")
+        _kill_switch_cache["value"]   = on
+        _kill_switch_cache["source"]  = "db" if on else "off"
+        _kill_switch_cache["expires"] = now + KILL_SWITCH_CACHE_SECONDS
+        return on, _kill_switch_cache["source"]
+    except Exception as e:
+        print(f"[KILL-SWITCH] refresh failed, failing open: {e}")
+        _kill_switch_cache["expires"] = now + KILL_SWITCH_CACHE_SECONDS
+        return False, "off"
+
+def set_kill_switch(on: bool):
+    """Admin-write. Upserts app_settings and invalidates the cache."""
+    req_lib.post(
+        f"{SUPABASE_URL}/rest/v1/app_settings",
+        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
+        json={"key": "places_kill_switch", "value": "1" if on else "0"},
+        timeout=10,
+    )
+    # Force next caller to refetch (don't set cached value from this side —
+    # keeps the DB as the single source of truth across multiple workers).
+    _kill_switch_cache["expires"] = 0.0
+
 def scrapes_today(username: str) -> int:
     """Count a user's scrape_call events since UTC midnight. Returns 0 if
     usage_events isn't set up yet (so the cap silently doesn't apply)."""
@@ -483,10 +530,12 @@ def is_us_address(addr):
     return False
 
 def scrape_google_places(keyword="health clinic", state="", limit=25, username="unknown"):
-    # Emergency brake. Shared env with vlm/recruitnil so PLACES_KILL_SWITCH=1
-    # halts every Places call across all repos in one flip.
-    if PLACES_KILL_SWITCH:
-        print("[PLACES] PLACES_KILL_SWITCH=1 — returning [] without calling API")
+    # Emergency brake. Env PLACES_KILL_SWITCH=1 is an absolute override;
+    # app_settings.places_kill_switch lets Eric flip it from the admin UI
+    # without a Railway redeploy.
+    on, _src = is_kill_switch_on()
+    if on:
+        print("[PLACES] kill switch active — returning [] without calling API")
         return []
 
     leads = []
@@ -649,9 +698,14 @@ class ScrapeRequest(BaseModel):
 
 @app.post("/api/scrape")
 def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
-    # Kill switch first — reject cheap, reject early.
-    if PLACES_KILL_SWITCH:
-        raise HTTPException(status_code=503, detail="Google Places scraping is temporarily disabled (PLACES_KILL_SWITCH).")
+    # Kill switch first — reject cheap, reject early. Checks env var first,
+    # then DB flag via is_kill_switch_on().
+    on, src = is_kill_switch_on()
+    if on:
+        detail = ("Google Places scraping is disabled from the admin dashboard."
+                  if src == "db" else
+                  "Google Places scraping is disabled (PLACES_KILL_SWITCH env).")
+        raise HTTPException(status_code=503, detail=detail)
 
     # Non-admin daily cap. UTC midnight reset. Eric (in ADMIN_USERS) is
     # unlimited. Silently no-ops if usage_events table isn't migrated yet
@@ -891,9 +945,42 @@ def get_usage(days: int = 7, user: str = Depends(verify_token)):
                 "nonAdminDailyScrapeCap": NON_ADMIN_DAILY_SCRAPE_CAP,
                 "maxSpendPerRun":         PLACES_MAX_SPEND_PER_RUN,
                 "cacheTtlDays":           PLACES_CACHE_TTL_DAYS,
-                "killSwitch":             PLACES_KILL_SWITCH,
+                "killSwitch":             is_kill_switch_on()[0],
+                "killSwitchSource":       is_kill_switch_on()[1],
             },
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── Admin kill-switch toggle ────────────────────────────────────────────────
+# Big red button for the admin UI. Writes app_settings.places_kill_switch
+# and busts the 30-second cache. Env PLACES_KILL_SWITCH=1 still wins, so if
+# Eric has flipped the env var the UI will say "source: env" and show the
+# toggle as uncontrollable (the endpoint refuses to write "off" if env is on).
+@app.get("/api/admin/kill-switch")
+def get_kill_switch(user: str = Depends(verify_token)):
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    on, src = is_kill_switch_on()
+    return {"on": on, "source": src, "envLocked": PLACES_KILL_SWITCH}
+
+@app.post("/api/admin/kill-switch")
+def post_kill_switch(body: dict, user: str = Depends(verify_token)):
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    want_on = bool(body.get("on"))
+    # If the env var is locking it ON, refuse to flip OFF from the DB —
+    # the UI would lie about the state otherwise.
+    if PLACES_KILL_SWITCH and not want_on:
+        raise HTTPException(
+            status_code=409,
+            detail="PLACES_KILL_SWITCH=1 env var is active — unset it in Railway to re-enable scraping.",
+        )
+    try:
+        set_kill_switch(want_on)
+        audit_log(user, "kill_switch_toggle", "config", "places_kill_switch", {"on": want_on})
+        on, src = is_kill_switch_on()
+        return {"on": on, "source": src, "envLocked": PLACES_KILL_SWITCH}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -907,8 +994,9 @@ def city_autocomplete(q: str = "", state: str = "", user: str = Depends(verify_t
     metros — so this kills 80%+ of paid calls with no UX change."""
     if not q or len(q) < 2:
         return {"suggestions": []}
-    # Kill switch respects the same env as the scraper.
-    if PLACES_KILL_SWITCH:
+    # Kill switch respects both env var and admin-toggled DB flag.
+    on, _src = is_kill_switch_on()
+    if on:
         return {"suggestions": []}
 
     cache_key = (q.strip().lower(), (state or "").strip().lower())
