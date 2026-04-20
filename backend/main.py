@@ -831,11 +831,57 @@ def get_usage(days: int = 7, user: str = Depends(verify_token)):
 
         window_days = max(1, days)
         daily_avg_cents = total_cost / window_days
+
+        # ── Leads pulled per rep ─────────────────────────────────────────────
+        # Queries the leads table directly (not usage_events) so it counts
+        # actual rows created, not just scrape_call events. Today's counts
+        # are the headline; the window total is in byRep for context.
+        today_date = datetime.utcnow().strftime("%Y-%m-%d")
+        leads_by_rep_today  = {}  # {username: int}
+        leads_by_rep_window = {}  # {username: int}
+        try:
+            leads_url = (
+                f"{SUPABASE_URL}/rest/v1/leads"
+                f"?select=createdBy,createdAt"
+                f"&createdAt=gte.{since}"
+                f"&limit=10000"
+            )
+            lr = req_lib.get(leads_url, headers=SB_HEADERS, timeout=15)
+            if lr.status_code == 200:
+                lead_rows = lr.json() if isinstance(lr.json(), list) else []
+                for lrow in lead_rows:
+                    rep = lrow.get("createdBy") or "unknown"
+                    leads_by_rep_window[rep] = leads_by_rep_window.get(rep, 0) + 1
+                    if (lrow.get("createdAt") or "")[:10] == today_date:
+                        leads_by_rep_today[rep] = leads_by_rep_today.get(rep, 0) + 1
+        except Exception as e:
+            print(f"[USAGE] leads aggregation failed: {e}")
+
+        # Merge today + window counts onto one list, sorted by today desc
+        # (so the admin sees who pulled most TODAY first), then window desc.
+        all_reps = set(leads_by_rep_today) | set(leads_by_rep_window) | set(by_user)
+        leads_by_rep = [
+            {
+                "username":    rep,
+                "leadsToday":  leads_by_rep_today.get(rep, 0),
+                "leadsWindow": leads_by_rep_window.get(rep, 0),
+            }
+            for rep in all_reps
+        ]
+        leads_by_rep.sort(key=lambda x: (x["leadsToday"], x["leadsWindow"]), reverse=True)
+
         return {
-            "byUser":    sorted(by_user.values(), key=lambda x: x["cost_cents"], reverse=True),
-            "byDay":     sorted(by_day.values(),  key=lambda x: x["date"]),
-            "recent":    rows[:50],
-            "totals":    {"cost_cents": round(total_cost, 2), "events": len(rows), "days": days},
+            "byUser":     sorted(by_user.values(), key=lambda x: x["cost_cents"], reverse=True),
+            "byDay":      sorted(by_day.values(),  key=lambda x: x["date"]),
+            "recent":     rows[:50],
+            "leadsByRep": leads_by_rep,
+            "totals":     {
+                "cost_cents":  round(total_cost, 2),
+                "events":      len(rows),
+                "days":        days,
+                "leadsToday":  sum(leads_by_rep_today.values()),
+                "leadsWindow": sum(leads_by_rep_window.values()),
+            },
             "projection": {
                 "dailyAverage_cents":    round(daily_avg_cents, 2),
                 "weeklyEstimate_cents":  round(daily_avg_cents * 7, 2),

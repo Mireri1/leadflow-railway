@@ -3082,6 +3082,9 @@ export default function App(){
                 </div>
               </div>
 
+              {/* ── Google Places Usage + Leads Pulled (admin only) ── */}
+              {isAdmin()&&<UsageDashboard/>}
+
               {/* ── Login Activity (admin only) ── */}
               {isAdmin()&&<LoginActivityPanel/>}
 
@@ -3521,6 +3524,208 @@ function LogCallBtn({onClick}){
 }
 
 // ─── FAB ─────────────────────────────────────────────────────────────────────
+
+// Admin-only: Google Places spend + leads-pulled-per-rep dashboard.
+// Mirrors LoginActivityPanel visual style — collapsible card, dark theme.
+function UsageDashboard(){
+  const [data,setData]=useState(null)
+  const [days,setDays]=useState(7)
+  const [show,setShow]=useState(false)
+  const [loading,setLoading]=useState(false)
+
+  const load=(d)=>{
+    setLoading(true)
+    api(`/api/usage?days=${d}`)
+      .then(r=>setData(r))
+      .catch(e=>setData({error:String(e.message||e)}))
+      .finally(()=>setLoading(false))
+  }
+
+  const money=(c)=>c==null?"—":`$${(Number(c)/100).toFixed(2)}`
+
+  return(
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div style={{padding:"18px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",
+        borderBottom:show?"1px solid #40485d20":"none",cursor:"pointer"}}
+        onClick={()=>{
+          setShow(p=>!p)
+          if(!data) load(days)
+        }}>
+        <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",
+          display:"flex",alignItems:"center",gap:8}}>
+          Google Places Usage & Leads Pulled
+          <span style={{color:"#ff6e84",fontSize:9}}>ADMIN</span>
+        </div>
+        <span style={{color:"#40485d",fontSize:12,transition:"transform .2s",
+          transform:show?"rotate(180deg)":"rotate(0)"}}>{"\u25BC"}</span>
+      </div>
+
+      {show&&(
+        <div>
+          {/* Window picker */}
+          <div style={{padding:"10px 24px",display:"flex",gap:8,alignItems:"center",borderBottom:"1px solid #40485d10"}}>
+            {[{label:"Today",d:1},{label:"7 Days",d:7},{label:"30 Days",d:30},{label:"90 Days",d:90}].map(p=>(
+              <button key={p.d} className="btn" style={{fontSize:11,padding:"4px 12px",
+                background:days===p.d?"#a3a6ff22":"transparent",color:days===p.d?"#a3a6ff":"#40485d",
+                border:`1px solid ${days===p.d?"#a3a6ff30":"#40485d20"}`,borderRadius:8}}
+                onClick={()=>{setDays(p.d);load(p.d)}}>{p.label}</button>
+            ))}
+            <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px",marginLeft:"auto"}}
+              onClick={()=>load(days)}>Refresh</button>
+          </div>
+
+          {loading?(
+            <div style={{padding:48,textAlign:"center",color:"#40485d"}}>Loading…</div>
+          ):!data?(
+            <div style={{padding:48,textAlign:"center",color:"#40485d",fontSize:13}}>No data yet</div>
+          ):data.error?(
+            <div style={{padding:"24px 24px",color:"#ff6e84",fontSize:13,whiteSpace:"pre-wrap"}}>
+              {data.error}
+            </div>
+          ):(
+            <>
+              {/* Summary tiles */}
+              <div style={{padding:"16px 24px",display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",
+                gap:12,borderBottom:"1px solid #40485d10"}}>
+                <Tile label="Spend (window)"   value={money(data.totals?.cost_cents)}      accent="#ffe083"/>
+                <Tile label="Daily avg"        value={money(data.projection?.dailyAverage_cents)}  accent="#a3a6ff"/>
+                <Tile label="Monthly proj."    value={money(data.projection?.monthlyEstimate_cents)} accent="#ff6e84"/>
+                <Tile label="Leads today"      value={data.totals?.leadsToday||0}          accent="#69f6b8"/>
+                <Tile label="Leads (window)"   value={data.totals?.leadsWindow||0}         accent="#69f6b8"/>
+                <Tile label="Events (window)"  value={data.totals?.events||0}              accent="#a3aac4"/>
+              </div>
+
+              {/* Leads pulled per rep */}
+              <div style={{padding:"14px 24px 6px",fontSize:"0.6rem",color:"#a3aac4",
+                fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                Leads pulled per rep
+              </div>
+              {(data.leadsByRep||[]).length===0?(
+                <div style={{padding:"8px 24px 20px",color:"#40485d",fontSize:13}}>No leads pulled yet in this window</div>
+              ):(
+                <div style={{padding:"0 12px 14px"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+                    <thead>
+                      <tr style={{color:"#a3aac4",textAlign:"left"}}>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11}}>Rep</th>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11,textAlign:"right"}}>Today</th>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11,textAlign:"right"}}>{days===1?"24h":`${days}d`}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.leadsByRep.map(rep=>(
+                        <tr key={rep.username} style={{borderTop:"1px solid #40485d10"}}>
+                          <td style={{padding:"8px 12px",color:"#dee5ff"}}>{rep.username}</td>
+                          <td style={{padding:"8px 12px",textAlign:"right",color:rep.leadsToday>0?"#69f6b8":"#40485d",fontWeight:600}}>
+                            {rep.leadsToday}
+                          </td>
+                          <td style={{padding:"8px 12px",textAlign:"right",color:"#a3aac4"}}>{rep.leadsWindow}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Per-rep spend breakdown */}
+              <div style={{padding:"14px 24px 6px",fontSize:"0.6rem",color:"#a3aac4",
+                fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                Spend per rep ({days}d)
+              </div>
+              {(data.byUser||[]).length===0?(
+                <div style={{padding:"8px 24px 20px",color:"#40485d",fontSize:13}}>No paid API calls recorded</div>
+              ):(
+                <div style={{padding:"0 12px 14px"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+                    <thead>
+                      <tr style={{color:"#a3aac4",textAlign:"left"}}>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11}}>Rep</th>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11,textAlign:"right"}}>Scrapes</th>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11,textAlign:"right"}}>Text Search</th>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11,textAlign:"right"}}>Details</th>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11,textAlign:"right"}}>Autocomplete</th>
+                        <th style={{padding:"8px 12px",fontWeight:600,fontSize:11,textAlign:"right"}}>Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.byUser.map(u=>(
+                        <tr key={u.username} style={{borderTop:"1px solid #40485d10"}}>
+                          <td style={{padding:"8px 12px",color:"#dee5ff"}}>{u.username}</td>
+                          <td style={{padding:"8px 12px",textAlign:"right",color:"#a3aac4"}}>{u.scrapes}</td>
+                          <td style={{padding:"8px 12px",textAlign:"right",color:"#a3aac4"}}>{u.text_searches}</td>
+                          <td style={{padding:"8px 12px",textAlign:"right",color:"#a3aac4"}}>{u.details}</td>
+                          <td style={{padding:"8px 12px",textAlign:"right",color:"#a3aac4"}}>{u.autocompletes||0}</td>
+                          <td style={{padding:"8px 12px",textAlign:"right",color:"#ffe083",fontWeight:600}}>{money(u.cost_cents)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Daily spend series */}
+              {(data.byDay||[]).length>0&&(
+                <>
+                  <div style={{padding:"14px 24px 6px",fontSize:"0.6rem",color:"#a3aac4",
+                    fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+                    Daily spend
+                  </div>
+                  <div style={{padding:"0 24px 14px"}}>
+                    {data.byDay.map(d=>{
+                      const maxCents=Math.max(...data.byDay.map(x=>x.cost_cents||0),1)
+                      const pct=Math.min(100,(d.cost_cents/maxCents)*100)
+                      return(
+                        <div key={d.date} style={{display:"flex",alignItems:"center",gap:12,padding:"4px 0"}}>
+                          <div style={{width:80,color:"#40485d",fontSize:11}}>{d.date}</div>
+                          <div style={{flex:1,height:6,background:"#40485d15",borderRadius:3,overflow:"hidden"}}>
+                            <div style={{width:`${pct}%`,height:"100%",background:"#ffe083",transition:"width .3s"}}/>
+                          </div>
+                          <div style={{width:70,textAlign:"right",color:"#ffe083",fontSize:12,fontWeight:600}}>
+                            {money(d.cost_cents)}
+                          </div>
+                          <div style={{width:50,textAlign:"right",color:"#40485d",fontSize:11}}>
+                            {d.events}ev
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </>
+              )}
+
+              {/* Limits summary */}
+              {data.limits&&(
+                <div style={{padding:"10px 24px 18px",fontSize:11,color:"#40485d",
+                  borderTop:"1px solid #40485d10",display:"flex",flexWrap:"wrap",gap:16}}>
+                  <span>Non-admin cap: <span style={{color:"#a3aac4"}}>{data.limits.nonAdminDailyScrapeCap}/day</span></span>
+                  <span>Max spend/run: <span style={{color:"#a3aac4"}}>${data.limits.maxSpendPerRun}</span></span>
+                  <span>Cache TTL: <span style={{color:"#a3aac4"}}>{data.limits.cacheTtlDays}d</span></span>
+                  <span>Kill switch:{" "}
+                    <span style={{color:data.limits.killSwitch?"#ff6e84":"#69f6b8",fontWeight:600}}>
+                      {data.limits.killSwitch?"ON":"off"}
+                    </span>
+                  </span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Tile({label,value,accent}){
+  return(
+    <div style={{background:"#00001133",borderRadius:10,padding:"12px 14px",
+      border:`1px solid ${accent}22`}}>
+      <div style={{fontSize:10,color:"#40485d",fontWeight:700,letterSpacing:".08em",textTransform:"uppercase"}}>{label}</div>
+      <div style={{fontSize:20,color:accent,fontWeight:700,marginTop:4,fontFamily:"'Space Grotesk',sans-serif"}}>
+        {value}
+      </div>
+    </div>
+  )
+}
 
 function LoginActivityPanel(){
   const [logs,setLogs]=useState([])
