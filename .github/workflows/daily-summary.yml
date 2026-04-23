@@ -1,0 +1,23 @@
+name: LeadFlow Daily Summary
+
+on:
+  schedule:
+    # 11 PM MT (UTC-7) = 6 AM UTC next day. End-of-business summary.
+    - cron: '0 6 * * *'
+  workflow_dispatch: # manual trigger
+
+jobs:
+  send-summary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send daily summary to Slack
+        run: |
+          echo "Triggering LeadFlow daily summary..."
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.APP_URL }}/api/daily-summary")
+          echo "HTTP status: $status"
+          if [ "$status" != "200" ]; then
+            echo "Daily summary endpoint returned $status"
+            exit 1
+          fi
+          echo "Summary sent to Slack!"
