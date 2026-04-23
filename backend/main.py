@@ -1586,6 +1586,74 @@ def get_stats(user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/daily-summary")
+def daily_summary():
+    """Send end-of-day summary to Slack. Triggered by Railway cron or manually."""
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Calls today
+        r_calls = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{today}T00:00:00",
+            headers=SB_HEADERS, timeout=30)
+        calls = r_calls.json() if r_calls.status_code == 200 else []
+
+        # Leads created today
+        r_leads = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,createdBy&createdAt=gte.{today}T00:00:00",
+            headers=SB_HEADERS, timeout=30)
+        new_leads = r_leads.json() if r_leads.status_code == 200 else []
+
+        # Emails sent today
+        r_emails = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/email_log?select=id,sent_by&sent_at=gte.{today}T00:00:00",
+            headers=SB_HEADERS, timeout=30)
+        emails = r_emails.json() if r_emails.status_code == 200 else []
+
+        # Callbacks due
+        r_cb = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id&callbackDate=lte.{today}&status=not.in.(converted)",
+            headers=SB_HEADERS, timeout=30)
+        callbacks = r_cb.json() if r_cb.status_code == 200 else []
+
+        total_calls = len(calls) if isinstance(calls, list) else 0
+        total_leads = len(new_leads) if isinstance(new_leads, list) else 0
+        total_emails = len(emails) if isinstance(emails, list) else 0
+        total_callbacks = len(callbacks) if isinstance(callbacks, list) else 0
+
+        # Per-caller breakdown
+        caller_calls = {}
+        for c in (calls if isinstance(calls, list) else []):
+            name = c.get("calledBy", "Unknown")
+            caller_calls[name] = caller_calls.get(name, 0) + 1
+        leaderboard = sorted(caller_calls.items(), key=lambda x: -x[1])
+        lb_text = "\n".join(f"  {name}: *{count}* calls" for name, count in leaderboard[:5]) if leaderboard else "  No calls logged"
+
+        interested = len([c for c in (calls if isinstance(calls, list) else []) if c.get("outcome") in ("interested", "converted", "callback")])
+
+        app_url = os.getenv("APP_URL", "https://leadflow-production.up.railway.app")
+
+        send_slack(
+            "📊 LeadFlow Daily Summary",
+            f"Here's what your team did today ({today}):",
+            fields=[
+                {"label": "Calls Made", "value": f":telephone_receiver: *{total_calls}*"},
+                {"label": "Interested/Callback", "value": f":fire: *{interested}*"},
+                {"label": "Leads Scraped", "value": f":busts_in_silhouette: *{total_leads}*"},
+                {"label": "Emails Sent", "value": f":email: *{total_emails}*"},
+                {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
+                {"label": "Top Callers", "value": lb_text},
+            ],
+            actions=[
+                {"label": "Open LeadFlow", "url": app_url, "style": "primary"},
+            ],
+        )
+
+        return {"sent": True, "calls": total_calls, "leads": total_leads, "emails": total_emails}
+    except Exception as e:
+        print(f"[daily-summary] error: {e}")
+        return {"error": str(e)}
+
 @app.get("/api/leaderboard")
 def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
     try:
