@@ -61,6 +61,31 @@ OUTREACH_EMAIL    = os.getenv("OUTREACH_EMAIL", "connect@visioncleaningcompany.c
 OUTREACH_NAME     = os.getenv("OUTREACH_NAME", "Vision Cleaning Company")
 OUTREACH_REPLY_TO = os.getenv("OUTREACH_REPLY_TO", "")
 RESEND_API_KEY    = os.getenv("RESEND_API_KEY", "")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+
+def send_slack(title, summary, fields=None, actions=None):
+    """Fire-and-forget Slack notification."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+    ]
+    if fields:
+        blocks.append({"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*{f['label']}*\n{f['value']}"} for f in fields
+        ]})
+    if actions:
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": a["label"], "emoji": True},
+             "url": a["url"], **({"style": a["style"]} if "style" in a else {})}
+            for a in actions
+        ]})
+    try:
+        req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=5)
+    except Exception as e:
+        print(f"[slack] notification failed: {e}")
 
 SB_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -825,6 +850,22 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
         "cities": body.cities, "found": len(leads), "saved": saved,
         "cache_hits": len(cache_hits), "uncached_combos": uncached})
     print(f"[SCRAPE] Saved {saved} leads (cache_hits={len(cache_hits)}/{len(all_combos)})")
+
+    # Slack notification
+    if saved > 0:
+        app_url = os.getenv("APP_URL", "https://leadflow-production.up.railway.app")
+        send_slack(
+            "🔍 LeadFlow Scrape Complete",
+            f"*{user}* scraped *{saved}* new leads.",
+            fields=[
+                {"label": "Industries", "value": ", ".join(k[0] for k in keywords)},
+                {"label": "Location", "value": body.state or "All"},
+                {"label": "Leads Found", "value": f":busts_in_silhouette: {len(leads)}"},
+                {"label": "New Saved", "value": f":white_check_mark: {saved}"},
+            ],
+            actions=[{"label": "📋 View Leads", "url": app_url, "style": "primary"}],
+        )
+
     return {
         "leads": leads,
         "count": len(leads),
@@ -1916,6 +1957,17 @@ def send_email(req: SendEmailRequest, user: str = Depends(verify_token)):
 
     audit_log(user, "send_email", "lead", req.lead_id, {
         "to": req.to_email, "subject": req.subject, "company": req.company})
+
+    # Slack notification
+    send_slack(
+        "📧 LeadFlow Email Sent",
+        f"*{user}* sent outreach to *{req.to_name or req.to_email}*",
+        fields=[
+            {"label": "To", "value": req.to_email},
+            {"label": "Company", "value": req.company or "—"},
+            {"label": "Subject", "value": req.subject[:50]},
+        ],
+    )
 
     return {"sent": True, "log_id": log_id}
 
