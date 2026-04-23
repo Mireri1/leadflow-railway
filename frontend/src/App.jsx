@@ -1486,6 +1486,7 @@ export default function App(){
   const [callerDetailLoading,setCallerDetailLoading] = useState(false)
   const [callerDetailDate,setCallerDetailDate] = useState("")
   const [callerDetailDateTo,setCallerDetailDateTo] = useState("")
+  const [callerSearch,setCallerSearch] = useState("")
   const [warmLeads,setWarmLeads] = useState([])
   const [warmLoading,setWarmLoading] = useState(false)
   const [emailModal,setEmailModal] = useState(null)
@@ -2736,6 +2737,7 @@ export default function App(){
                             setCallerDetail(null)
                             setCallerDetailDate("")
                             setCallerDetailDateTo("")
+                            setCallerSearch("")
                             api(`/api/caller/${encodeURIComponent(rep.name)}/detail`)
                               .then(r=>{setCallerDetail(r)})
                               .catch(()=>{notify("Failed to load caller details","error")})
@@ -2955,20 +2957,38 @@ export default function App(){
                                 {/* Call list */}
                                 {callerDetail.calls.length>0&&(
                                   <div>
-                                    <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,textTransform:"uppercase",
-                                      letterSpacing:".08em",marginBottom:8}}>Today's Call Log</div>
-                                    <div style={{maxHeight:280,overflowY:"auto",borderRadius:8,border:"1px solid #40485d15"}}>
+                                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                                      <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,textTransform:"uppercase",
+                                        letterSpacing:".08em"}}>Call Log</div>
+                                      <input placeholder="Search company, notes..." value={callerSearch||""}
+                                        onChange={e=>setCallerSearch(e.target.value)}
+                                        onClick={e=>e.stopPropagation()}
+                                        style={{background:"#0f1930",border:"1px solid #40485d30",borderRadius:8,padding:"5px 10px",
+                                          color:"#dee5ff",fontSize:11,width:200,fontFamily:"inherit"}}/>
+                                    </div>
+                                    <div style={{maxHeight:400,overflowY:"auto",borderRadius:8,border:"1px solid #40485d15"}}>
                                       <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
                                         <thead>
-                                          <tr style={{background:"#0f1930"}}>
+                                          <tr style={{background:"#0f1930",position:"sticky",top:0}}>
                                             <th style={{padding:"8px 12px",textAlign:"left",color:"#a3aac4",fontWeight:600,fontSize:10}}>Time</th>
                                             <th style={{padding:"8px 12px",textAlign:"left",color:"#a3aac4",fontWeight:600,fontSize:10}}>Company / Lead</th>
                                             <th style={{padding:"8px 12px",textAlign:"left",color:"#a3aac4",fontWeight:600,fontSize:10}}>Outcome</th>
+                                            <th style={{padding:"8px 12px",textAlign:"left",color:"#a3aac4",fontWeight:600,fontSize:10}}>Notes</th>
                                             <th style={{padding:"8px 12px",textAlign:"right",color:"#a3aac4",fontWeight:600,fontSize:10}}>Duration</th>
                                           </tr>
                                         </thead>
                                         <tbody>
-                                          {callerDetail.calls.map((c,ci)=>{
+                                          {callerDetail.calls
+                                            .filter(c=>{
+                                              if(!callerSearch) return true
+                                              const q=callerSearch.toLowerCase()
+                                              return (c.lead_company||"").toLowerCase().includes(q)
+                                                || (c.lead_name||"").toLowerCase().includes(q)
+                                                || (c.notes||"").toLowerCase().includes(q)
+                                                || (c.outcome||"").toLowerCase().includes(q)
+                                                || (c.lead_phone||"").includes(q)
+                                            })
+                                            .map((c,ci)=>{
                                             const outcomeColors={answered:"#69f6b8",interested:"#ffe083",converted:"#06d6a0",
                                               callback:"#8b5cf6",not_interested:"#ff6e84",voicemail:"#a3aac4",no_answer:"#40485d"}
                                             return(
@@ -2977,7 +2997,8 @@ export default function App(){
                                                   {c.calledAt?new Date(c.calledAt).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"}):"—"}
                                                 </td>
                                                 <td style={{padding:"6px 12px",color:"#dee5ff"}}>
-                                                  {c.lead_company||"Unknown"}{c.lead_name?` · ${c.lead_name}`:""}
+                                                  <div>{c.lead_company||"Unknown"}{c.lead_name?` · ${c.lead_name}`:""}</div>
+                                                  {c.lead_phone&&<div style={{fontSize:10,color:"#40485d"}}>{c.lead_phone}</div>}
                                                 </td>
                                                 <td style={{padding:"6px 12px"}}>
                                                   <span style={{fontSize:11,padding:"2px 8px",borderRadius:8,fontWeight:600,
@@ -2985,6 +3006,9 @@ export default function App(){
                                                     color:outcomeColors[c.outcome]||"#40485d"}}>
                                                     {c.outcome||"—"}
                                                   </span>
+                                                </td>
+                                                <td style={{padding:"6px 12px",color:"#a3aac4",maxWidth:250,fontSize:11,lineHeight:1.4}}>
+                                                  {c.notes||<span style={{color:"#2a2f3d"}}>—</span>}
                                                 </td>
                                                 <td style={{padding:"6px 12px",textAlign:"right",color:"#a3aac4",
                                                   fontFamily:"'Space Grotesk',sans-serif"}}>
