@@ -853,7 +853,7 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
 
     # Slack notification
     if saved > 0:
-        app_url = os.getenv("APP_URL", "https://leadflow-production.up.railway.app")
+        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
         send_slack(
             "🔍 LeadFlow Scrape Complete",
             f"*{user}* scraped *{saved}* new leads.",
@@ -1631,7 +1631,7 @@ def daily_summary():
 
         interested = len([c for c in (calls if isinstance(calls, list) else []) if c.get("outcome") in ("interested", "converted", "callback")])
 
-        app_url = os.getenv("APP_URL", "https://leadflow-production.up.railway.app")
+        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
 
         send_slack(
             "📊 LeadFlow Daily Summary",
