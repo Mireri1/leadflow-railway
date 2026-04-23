@@ -1889,7 +1889,7 @@ def get_caller_detail(username: str, date: str = "", date_to: str = "", user: st
             # Batch fetch lead info (up to 50)
             for batch_start in range(0, min(len(lead_ids), 50), 10):
                 batch = lead_ids[batch_start:batch_start+10]
-                ids_filter = ",".join(batch)
+                ids_filter = ",".join(str(x) for x in batch)
                 lr = req_lib.get(
                     f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})"
                     f"&select=id,company,firstName,lastName,phone,industry,city,state,status",
