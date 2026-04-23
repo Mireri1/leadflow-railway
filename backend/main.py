@@ -1886,9 +1886,9 @@ def get_caller_detail(username: str, date: str = "", date_to: str = "", user: st
         lead_ids = list(set(c.get("leadId") for c in calls if c.get("leadId")))
         lead_map = {}
         if lead_ids:
-            # Batch fetch lead info (up to 50)
-            for batch_start in range(0, min(len(lead_ids), 50), 10):
-                batch = lead_ids[batch_start:batch_start+10]
+            # Batch fetch lead info — all of them, 50 at a time
+            for batch_start in range(0, len(lead_ids), 50):
+                batch = lead_ids[batch_start:batch_start+50]
                 ids_filter = ",".join(str(x) for x in batch)
                 lr = req_lib.get(
                     f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})"
