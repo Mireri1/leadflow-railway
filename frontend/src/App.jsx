@@ -1487,6 +1487,7 @@ export default function App(){
   const [callerDetailDate,setCallerDetailDate] = useState("")
   const [callerDetailDateTo,setCallerDetailDateTo] = useState("")
   const [callerSearch,setCallerSearch] = useState("")
+  const [callerFilter,setCallerFilter] = useState("")
   const [warmLeads,setWarmLeads] = useState([])
   const [warmLoading,setWarmLoading] = useState(false)
   const [emailModal,setEmailModal] = useState(null)
@@ -2738,6 +2739,7 @@ export default function App(){
                             setCallerDetailDate("")
                             setCallerDetailDateTo("")
                             setCallerSearch("")
+                            setCallerFilter("")
                             api(`/api/caller/${encodeURIComponent(rep.name)}/detail`)
                               .then(r=>{setCallerDetail(r)})
                               .catch(()=>{notify("Failed to load caller details","error")})
@@ -2957,9 +2959,28 @@ export default function App(){
                                 {/* Call list */}
                                 {callerDetail.calls.length>0&&(
                                   <div>
-                                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                                      <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,textTransform:"uppercase",
-                                        letterSpacing:".08em"}}>Call Log</div>
+                                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,gap:8,flexWrap:"wrap"}}>
+                                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                                        <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,textTransform:"uppercase",
+                                          letterSpacing:".08em"}}>Call Log</div>
+                                        {[
+                                          {label:"All",value:""},
+                                          {label:"Has Notes",value:"notes"},
+                                          {label:"Interested",value:"interested"},
+                                          {label:"Callbacks",value:"callback"},
+                                          {label:"Converted",value:"converted"},
+                                        ].map(f=>(
+                                          <button key={f.value} onClick={e=>{e.stopPropagation();setCallerFilter(f.value)}}
+                                            style={{fontSize:10,padding:"3px 8px",borderRadius:6,border:"none",cursor:"pointer",
+                                              background:(callerFilter||"")===(f.value)?"#a3a6ff20":"transparent",
+                                              color:(callerFilter||"")===(f.value)?"#a3a6ff":"#40485d",
+                                              fontFamily:"'Space Grotesk',sans-serif",fontWeight:600}}>
+                                            {f.label}
+                                            {f.value==="notes"&&callerDetail?` (${callerDetail.calls.filter(c=>c.notes).length})`:
+                                             f.value&&callerDetail?` (${callerDetail.calls.filter(c=>c.outcome===f.value).length})`:""}
+                                          </button>
+                                        ))}
+                                      </div>
                                       <input placeholder="Search company, notes..." value={callerSearch||""}
                                         onChange={e=>setCallerSearch(e.target.value)}
                                         onClick={e=>e.stopPropagation()}
@@ -2980,6 +3001,8 @@ export default function App(){
                                         <tbody>
                                           {callerDetail.calls
                                             .filter(c=>{
+                                              if(callerFilter==="notes"&&!c.notes) return false
+                                              if(callerFilter&&callerFilter!=="notes"&&c.outcome!==callerFilter) return false
                                               if(!callerSearch) return true
                                               const q=callerSearch.toLowerCase()
                                               return (c.lead_company||"").toLowerCase().includes(q)
