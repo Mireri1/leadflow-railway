@@ -411,23 +411,6 @@ def scrape_google_places(keyword="health clinic", state="", limit=25):
                 }
                 lead["score"] = score_lead(lead)
 
-                # Get phone via place details if missing
-                if not lead["phone"]:
-                    place_id = place.get("place_id")
-                    if place_id:
-                        try:
-                            det = req_lib.get(
-                                "https://maps.googleapis.com/maps/api/place/details/json",
-                                params={"place_id": place_id, "fields": "formatted_phone_number,website", "key": GOOGLE_KEY},
-                                timeout=10
-                            ).json()
-                            result = det.get("result", {})
-                            lead["phone"]   = clean(result.get("formatted_phone_number", ""))
-                            lead["website"] = clean(result.get("website", "")) or lead["website"]
-                            lead["score"]   = score_lead(lead)
-                        except:
-                            pass
-
                 # Final validation: must have a company name and valid US state
                 if lead["company"] and (st.upper() in US_STATE_ABBREVS or not st):
                     leads.append(lead)
@@ -470,8 +453,45 @@ class ScrapeRequest(BaseModel):
     limit:     Optional[int] = 25
     source:    Optional[str] = "places"
 
+# (keyword, location, per_combo) -> (fetched_at_epoch, leads)
+SCRAPE_CACHE: dict = {}
+SCRAPE_CACHE_TTL = 24 * 60 * 60
+MAX_COMBOS_PER_REQUEST = 4
+DAILY_SCRAPE_LIMIT = 3
+
+def count_scrapes_today(user: str) -> int:
+    """Count scrape_leads actions for this user since midnight UTC."""
+    try:
+        since = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log?username=eq.{url_quote(user)}&action=eq.scrape_leads&created_at=gte.{url_quote(since)}&select=id",
+            headers=SB_ADMIN_HEADERS, timeout=5)
+        if r.status_code == 200:
+            return len(r.json() or [])
+    except:
+        pass
+    return 0
+
+def cached_scrape(keyword: str, location: str, per_combo: int):
+    key = (keyword, location, per_combo)
+    hit = SCRAPE_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < SCRAPE_CACHE_TTL:
+        print(f"[SCRAPE-CACHE] hit: {keyword} / {location}")
+        return list(hit[1])
+    leads = scrape_google_places(keyword=keyword, state=location, limit=per_combo)
+    SCRAPE_CACHE[key] = (time.time(), leads)
+    return leads
+
 @app.post("/api/scrape")
 def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
+    # Per-user daily cap to bound Google API spend
+    used = count_scrapes_today(user)
+    if used >= DAILY_SCRAPE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily scrape limit reached ({DAILY_SCRAPE_LIMIT}/day). Resets at midnight UTC."
+        )
+
     limit = min(max(body.limit or 25, 5), 60)
 
     # Build list of keywords to search
@@ -491,17 +511,24 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
     else:
         locations = [body.state or ""]
 
+    # Cap combo explosion — too many industry×city pairs = runaway Google API cost
+    if len(keywords) * len(locations) > MAX_COMBOS_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many combinations ({len(keywords)} industries × {len(locations)} cities). Max {MAX_COMBOS_PER_REQUEST} combos per scrape."
+        )
+
     # Calculate per-combo limit
     combos = len(keywords) * len(locations)
     per_combo = max(limit // combos, 3) if combos else limit
 
-    print(f"[SCRAPE] industries: {[k[0] for k in keywords]}, locations: {locations}, limit: {limit} ({per_combo}/combo, {combos} combos)")
+    print(f"[SCRAPE] user={user} ({used+1}/{DAILY_SCRAPE_LIMIT}) industries: {[k[0] for k in keywords]}, locations: {locations}, limit: {limit} ({per_combo}/combo, {combos} combos)")
 
     all_leads = []
     seen_phones = set()
     for ind_name, keyword in keywords:
         for location in locations:
-            batch = scrape_google_places(keyword=keyword, state=location, limit=per_combo)
+            batch = cached_scrape(keyword, location, per_combo)
             for lead in batch:
                 # Tag each lead with the industry it was scraped for
                 if ind_name != "All" and not lead.get("industry"):
