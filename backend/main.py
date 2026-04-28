@@ -1880,6 +1880,61 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
                             for l in leads[:3]],
     }
 
+@app.post("/api/admin/apollo/test-phone-reveal")
+def test_phone_reveal(body: dict, user: str = Depends(verify_admin)):
+    """Diagnostic — call Apollo /people/match with reveal_phone_number=true
+    and NO webhook_url to find out if Pro returns phones synchronously,
+    requires async webhook, or blocks the request entirely.
+    Body: {linkedin_url} OR {email} OR {first_name, last_name, domain}.
+    Costs whatever Apollo charges for a phone reveal (~5-8 credits if it works)."""
+    if not APOLLO_API_KEY:
+        raise HTTPException(status_code=400, detail="APOLLO_API_KEY not configured")
+
+    payload = {"reveal_phone_number": True, "reveal_personal_emails": True}
+    if body.get("linkedin_url"):
+        payload["linkedin_url"] = body["linkedin_url"]
+    elif body.get("email"):
+        payload["email"] = body["email"]
+    elif body.get("first_name") and body.get("last_name") and body.get("domain"):
+        payload["first_name"] = body["first_name"]
+        payload["last_name"]  = body["last_name"]
+        payload["domain"]     = body["domain"]
+    else:
+        raise HTTPException(status_code=400,
+            detail="Provide one of: linkedin_url, email, or first_name+last_name+domain")
+
+    headers = {
+        "X-Api-Key":     APOLLO_API_KEY,
+        "Cache-Control": "no-cache",
+        "Content-Type":  "application/json",
+    }
+    try:
+        r = req_lib.post(APOLLO_MATCH_URL, headers=headers, json=payload, timeout=30)
+        try:
+            body_data = r.json()
+        except Exception:
+            body_data = r.text[:2000]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Apollo request failed: {e}")
+
+    # Surface the parts we care about for diagnosis
+    person = (body_data or {}).get("person") if isinstance(body_data, dict) else None
+    phones = (person or {}).get("phone_numbers", []) if person else []
+    return {
+        "apollo_status_code": r.status_code,
+        "phone_returned_sync": bool(phones and any(p.get("sanitized_number") or p.get("raw_number") for p in phones)),
+        "phones": phones,
+        "rate_limit_headers": {k: v for k, v in r.headers.items() if "rate" in k.lower() or "credit" in k.lower()},
+        "person_summary": {
+            "name": f"{(person or {}).get('first_name','')} {(person or {}).get('last_name','')}".strip(),
+            "title": (person or {}).get("title"),
+            "email": (person or {}).get("email"),
+            "linkedin_url": (person or {}).get("linkedin_url"),
+        } if person else None,
+        "raw_top_keys": list(body_data.keys()) if isinstance(body_data, dict) else None,
+        "error_message": body_data.get("error") if isinstance(body_data, dict) and body_data.get("error") else None,
+    }
+
 @app.post("/api/admin/apollo/backfill")
 def apollo_backfill(body: dict, user: str = Depends(verify_admin)):
     """Enrich existing unassigned leads that have no DM info. Body: {limit: int}.
