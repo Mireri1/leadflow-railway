@@ -440,6 +440,7 @@ function ApolloFinder({onFound}){
   const [empMin,setEmpMin]         = useState(50)
   const [empMax,setEmpMax]         = useState(500)
   const [perPage,setPerPage]       = useState(25)
+  const [revealPhones,setRevealPh] = useState(false)
   const [loading,setLoad]          = useState(false)
   const [result,setResult]         = useState(null)
   const [error,setError]           = useState("")
@@ -456,10 +457,11 @@ function ApolloFinder({onFound}){
     try{
       const res = await api("/api/admin/apollo/pull",{method:"POST",body:JSON.stringify({
         titles, industries, locations,
-        employee_min: Number(empMin)||50,
-        employee_max: Number(empMax)||500,
-        per_page:     Number(perPage)||25,
-        page:         1,
+        employee_min:  Number(empMin)||50,
+        employee_max:  Number(empMax)||500,
+        per_page:      Number(perPage)||25,
+        page:          1,
+        reveal_phones: revealPhones,
       })})
       setResult(res)
       if(res.saved>0) onFound&&onFound()
@@ -528,6 +530,11 @@ function ApolloFinder({onFound}){
           style={{padding:"10px 22px",whiteSpace:"nowrap",alignSelf:"flex-end",background:"#8b5cf6"}}>
           {loading?"Pulling…":"Pull from Apollo →"}
         </button>
+        <label style={{gridColumn:"1 / -1",display:"flex",alignItems:"center",gap:8,fontSize:11,color:"#a3aac4",cursor:"pointer"}}>
+          <input type="checkbox" checked={revealPhones} onChange={e=>setRevealPh(e.target.checked)}
+            style={{cursor:"pointer"}}/>
+          <span>Also reveal direct mobile phones <span style={{color:"#ffe083"}}>(+5-8 credits per lead, async via webhook ~30s)</span></span>
+        </label>
       </div>
       {error&&<div style={{marginTop:14,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
         borderRadius:8,fontSize:12,color:"#ff6e84"}}>{error}</div>}
@@ -541,6 +548,11 @@ function ApolloFinder({onFound}){
           ✓ <b style={{color:"#8b5cf6"}}>{result.saved}</b> new leads saved
           (Apollo returned {result.returned}, {result.qualified} were actionable,
           {result.skipped?.no_company||0} missing company, {result.skipped?.no_actionable||0} no name/phone/email)
+          {result.phone_reveals&&(
+            <div style={{marginTop:6,color:"#ffe083",fontSize:11}}>
+              📱 Requested {result.phone_reveals.requested} phone reveals — phones will arrive async within ~30s, refresh the leads list to see them
+            </div>
+          )}
           {result.total_available>0&&(
             <div style={{marginTop:6,color:"#a3aac4",fontSize:11}}>
               {result.total_available.toLocaleString()} total contacts match this search
@@ -642,6 +654,8 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [lead,setLead]            = useState(leadProp)
   const [findingDM,setFindingDM]  = useState(false)
   const [dmStatus,setDmStatus]    = useState("")
+  const [revealing,setRevealing]  = useState(false)
+  const [revealStatus,setRevealStatus] = useState("")
   const [calls,setCalls]          = useState([])
   const [modalError,setModalError] = useState("")
   const [primary,setPrimary]      = useState("")       // no_answer, voicemail, answered
@@ -752,6 +766,35 @@ function CallModal({lead: leadProp,onClose,onSaved}){
     }finally{ setFindingDM(false) }
   }
 
+  async function revealMobile(){
+    if(!window.confirm("Spend ~5-8 Apollo credits to reveal this person's direct mobile?")) return
+    setRevealStatus(""); setRevealing(true)
+    try{
+      const r = await api(`/api/leads/${lead.id}/reveal-phone`,{method:"POST",body:"{}"})
+      if(r.requested){
+        setRevealStatus("📱 Searching… phone arrives in ~30s, click here to refresh")
+        // Poll once after 30s for the unlocked phone
+        setTimeout(async()=>{
+          try{
+            const fresh = await api(`/api/leads?search=${encodeURIComponent(lead.company||"")}`)
+            const updated = (fresh||[]).find(l=>l.id===lead.id)
+            if(updated&&updated.phone&&updated.phone!==lead.phone){
+              setLead(updated)
+              setRevealStatus("✓ Phone revealed: "+updated.phone)
+              onSaved&&onSaved()
+            }else{
+              setRevealStatus("Still waiting on Apollo — refresh the lead in a minute")
+            }
+          }catch{ setRevealStatus("Phone request sent — refresh the lead manually") }
+        },30000)
+      }else{
+        setRevealStatus(r.message||"Reveal request failed")
+      }
+    }catch(ex){
+      setRevealStatus(ex.message||"Couldn't request reveal")
+    }finally{ setRevealing(false) }
+  }
+
   return(
     <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="modal" style={{maxWidth:640}}>
@@ -770,12 +813,23 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                 <button onClick={findDecisionMaker} disabled={findingDM}
                   style={{fontSize:11,padding:"4px 10px",borderRadius:6,fontFamily:"inherit",cursor:findingDM?"wait":"pointer",
                     background:"#8b5cf6",color:"#fff",border:"none",opacity:findingDM?0.7:1}}
-                  title="Look up the decision maker at this company via Apollo (1 credit)">
+                  title="Look up the decision maker at this company via Apollo (~2 credits)">
                   {findingDM?"Searching Apollo…":"🔍 Find Decision Maker"}
+                </button>
+              )}
+              {lead.firstName&&!lead.phone&&(
+                <button onClick={revealMobile} disabled={revealing}
+                  style={{fontSize:11,padding:"4px 10px",borderRadius:6,fontFamily:"inherit",cursor:revealing?"wait":"pointer",
+                    background:"#ffe083",color:"#000011",border:"none",opacity:revealing?0.7:1,fontWeight:600}}
+                  title="Reveal direct mobile via Apollo webhook (~5-8 credits)">
+                  {revealing?"Requesting…":"📱 Reveal Direct Mobile"}
                 </button>
               )}
               {dmStatus&&(
                 <span style={{fontSize:11,color:dmStatus.startsWith("✓")?"#69f6b8":"#ffe083"}}>{dmStatus}</span>
+              )}
+              {revealStatus&&(
+                <span style={{fontSize:11,color:revealStatus.startsWith("✓")?"#69f6b8":"#ffe083"}}>{revealStatus}</span>
               )}
             </div>
           </div>
