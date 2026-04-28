@@ -2084,19 +2084,36 @@ def reveal_phone(lead_id: str, user: str = Depends(verify_token)):
             "message": "Apollo is searching — phone will appear within 30 seconds. Refresh the lead to see it."}
 
 @app.post("/api/webhooks/apollo/{secret}/{lead_id}")
+@app.get("/api/webhooks/apollo/{secret}/{lead_id}")  # in case Apollo health-checks
 async def apollo_phone_webhook(secret: str, lead_id: str, request: Request):
-    """Receives async phone reveals from Apollo. Auth is via the random
-    APOLLO_WEBHOOK_SECRET in the URL path — Apollo's people webhooks don't
-    HMAC-sign requests so URL-as-bearer is the standard approach."""
+    """Receives async phone reveals from Apollo. Auth via random secret in URL
+    path. Audit-logs every hit so we can prove from outside Railway whether
+    Apollo ever posted at all."""
+    raw_body = ""
+    try:
+        raw_body = (await request.body()).decode("utf-8", errors="replace")[:2000]
+    except Exception:
+        pass
+
+    # Always audit, even on auth failure / bad payload — so we can prove receipt.
+    audit_log("apollo_webhook", "received", "lead", lead_id, {
+        "method":      request.method,
+        "secret_ok":   bool(APOLLO_WEBHOOK_SECRET) and secret == APOLLO_WEBHOOK_SECRET,
+        "body_len":    len(raw_body),
+        "body_sample": raw_body[:500],
+    })
+    print(f"[APOLLO-WEBHOOK] {request.method} hit for lead={lead_id} body_len={len(raw_body)}")
+
     if not APOLLO_WEBHOOK_SECRET or secret != APOLLO_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    if request.method == "GET":
+        return {"ok": True, "method": "GET (health check)"}
 
     try:
-        data = await request.json()
+        data = json_lib.loads(raw_body) if raw_body else {}
     except Exception:
         return {"ok": False, "error": "invalid JSON"}
 
-    # Apollo's payload shape varies — try a few keys
     person = data.get("person") or data.get("contact") or data
     if not isinstance(person, dict):
         return {"ok": False, "error": "no person in payload"}
@@ -2124,6 +2141,22 @@ async def apollo_phone_webhook(secret: str, lead_id: str, request: Request):
         print(f"[APOLLO-WEBHOOK] update failed for {lead_id}: {e}")
 
     return {"ok": True, "phone": phone}
+
+@app.get("/api/admin/apollo/webhook-hits")
+def webhook_hits(user: str = Depends(verify_admin)):
+    """Diagnostic — returns the last 20 audit_log entries from the webhook
+    receiver, so we can see if Apollo has actually hit us."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?username=eq.apollo_webhook&select=created_at,resource_id,details"
+            f"&order=created_at.desc&limit=20",
+            headers=SB_ADMIN_HEADERS, timeout=10,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        return {"count": len(rows) if isinstance(rows, list) else 0, "hits": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/leads/{lead_id}/find-dm")
 def find_dm(lead_id: str, user: str = Depends(verify_token)):
