@@ -786,8 +786,11 @@ def apollo_request_phone_reveal(person: dict, lead_id: str):
     if not APOLLO_WEBHOOK_SECRET:
         return (False, "APOLLO_WEBHOOK_SECRET not set")
 
-    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
-    webhook_url = f"{app_url}/api/webhooks/apollo/{APOLLO_WEBHOOK_SECRET}/{lead_id}"
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app").rstrip("/")
+    # URL-encode the secret in case it contains chars Apollo's parser rejects.
+    safe_secret = url_quote(APOLLO_WEBHOOK_SECRET, safe="")
+    webhook_url = f"{app_url}/api/webhooks/apollo/{safe_secret}/{lead_id}"
+    print(f"[APOLLO-PHONE] webhook_url={webhook_url}")
 
     payload = {"reveal_phone_number": True, "webhook_url": webhook_url}
     # Pass through every identifying field Apollo accepts. Caller may have
@@ -1887,6 +1890,24 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "sample":          [{"company": l.get("company"), "name": f"{l.get('firstName','')} {l.get('lastName','')}".strip(),
                              "title": l.get("title"), "phone": l.get("phone"), "email": l.get("email")}
                             for l in leads[:3]],
+    }
+
+@app.get("/api/admin/apollo/webhook-url")
+def show_webhook_url(user: str = Depends(verify_admin)):
+    """Diagnostic — show exactly what webhook_url we'd send to Apollo,
+    so we can debug 'invalid HTTPS URL' rejections."""
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app").rstrip("/")
+    secret = APOLLO_WEBHOOK_SECRET or ""
+    safe_secret = url_quote(secret, safe="") if secret else ""
+    return {
+        "app_url_env":         os.getenv("APP_URL", "(unset, using default)"),
+        "app_url_used":        app_url,
+        "webhook_secret_set":  bool(secret),
+        "webhook_secret_len":  len(secret),
+        "webhook_secret_preview": (secret[:4] + "..." + secret[-4:]) if len(secret) >= 8 else "<too short>",
+        "webhook_secret_url_encoded_changed": secret != safe_secret,
+        "example_webhook_url": f"{app_url}/api/webhooks/apollo/{safe_secret}/EXAMPLE_LEAD_ID" if safe_secret else "(secret missing)",
+        "url_starts_with_https": app_url.startswith("https://"),
     }
 
 @app.post("/api/admin/apollo/test-phone-reveal")
