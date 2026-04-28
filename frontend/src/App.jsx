@@ -679,6 +679,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [sendingCampaign,setSendingCampaign] = useState(false)
   const [campaignStatus,setCampaignStatus] = useState("")
   const [campaignInfo,setCampaignInfo] = useState(null)  // {in_campaign, last_sent_at, send_count, vcc_configured}
+  const [sendEmailFollowup,setSendEmailFollowup] = useState(true)  // default checked when applicable
   const [calls,setCalls]          = useState([])
   const [modalError,setModalError] = useState("")
   const [primary,setPrimary]      = useState("")       // no_answer, voicemail, answered
@@ -748,6 +749,11 @@ function CallModal({lead: leadProp,onClose,onSaved}){
       setTimerRunning(false)
       const finalDuration = duration ? parseInt(duration)*60 : timerSeconds
       const fullNotes = cbReason ? `[${cbReason}] ${notes}`.trim() : notes
+      // Per-call email follow-up: only meaningful when this was a failed dial
+      // and the lead has the contact info we'd email + VCC is configured.
+      const emailEligible = (primary==="no_answer"||primary==="voicemail")
+        && lead.email && lead.firstName && campaignInfo?.vcc_configured
+        && !campaignInfo?.in_campaign
       const callPayload = {
         leadId:lead.id, outcome, notes:fullNotes,
         duration:finalDuration,
@@ -759,6 +765,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         followupsequence: followUpSeq||null,
         script_id: scriptId ? parseInt(scriptId) : null,
         converted: outcome === "converted",
+        send_email_followup: emailEligible && sendEmailFollowup,
       }
       await api("/api/calls",{method:"POST",body:JSON.stringify(callPayload)})
       if(scriptId) {
@@ -1106,6 +1113,24 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                 {" \u00b7 then "}
                 {FOLLOW_UP_DAYS[followUpSeq].slice(1).map(d=>"+"+d+"d").join(" \u00b7 ")}
               </div>
+            )}
+            {/* Per-call email follow-up — only show when this is a failed dial,
+                lead has email + name, VCC is configured, not already in campaign */}
+            {(primary==="no_answer"||primary==="voicemail")
+              && lead.email && lead.firstName
+              && campaignInfo?.vcc_configured
+              && !campaignInfo?.in_campaign && (
+              <label style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",marginBottom:10,
+                background:"#a3a6ff10",border:"1px solid #a3a6ff30",borderRadius:8,cursor:"pointer",fontSize:12,color:"#dee5ff"}}>
+                <input type="checkbox" checked={sendEmailFollowup} onChange={e=>setSendEmailFollowup(e.target.checked)}
+                  style={{cursor:"pointer",width:16,height:16}}/>
+                <div>
+                  <div style={{fontWeight:600}}>📧 Send "tried to call you" email after saving</div>
+                  <div style={{fontSize:10,color:"#a3aac4",marginTop:2}}>
+                    To {lead.email} via VCC. Lead will move to "Awaiting Reply" so you don't re-dial.
+                  </div>
+                </div>
+              </label>
             )}
             <button className="btn btn-p" onClick={log} disabled={saving||
               (primary==="answered"&&!secondary)||
@@ -2385,6 +2410,21 @@ export default function App(){
                       color:availableOnly?"#003d26":"#a3aac4"}}>
                     {availableOnly?"✓ Available only":"Available only"}
                   </button>
+                  {(()=>{
+                    const emailedCount = leads.filter(l=>l.status==="awaiting_email_reply").length
+                    const active = fStatus==="awaiting_email_reply"
+                    return (
+                      <button
+                        onClick={()=>setFStatus(active?"all":"awaiting_email_reply")}
+                        title="Show leads currently in the email follow-up flow (won't appear in dialer)"
+                        style={{fontSize:12,padding:"8px 14px",borderRadius:8,border:"none",cursor:"pointer",
+                          fontFamily:"'Inter',sans-serif",fontWeight:600,transition:"all .15s",
+                          background:active?"#a3a6ff":"#192540",
+                          color:active?"#000011":"#a3aac4"}}>
+                        📧 Awaiting Reply{emailedCount>0?` (${emailedCount})`:""}
+                      </button>
+                    )
+                  })()}
                 </div>
               </section>
 
@@ -3545,6 +3585,9 @@ export default function App(){
               {/* ── Login Activity (admin only) ── */}
               {isAdmin()&&<LoginActivityPanel/>}
 
+              {/* ── Campaign Activity (admin only) ── */}
+              {isAdmin()&&<CampaignActivityPanel/>}
+
               {/* ── Team Management (admin only) ── */}
               {isAdmin()&&<div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
                 <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
@@ -4234,6 +4277,101 @@ function Tile({label,value,accent}){
       <div style={{fontSize:20,color:accent,fontWeight:700,marginTop:4,fontFamily:"'Space Grotesk',sans-serif"}}>
         {value}
       </div>
+    </div>
+  )
+}
+
+function CampaignActivityPanel(){
+  const [data,setData] = useState(null)
+  const [open,setOpen] = useState(false)
+  const [days,setDays] = useState(14)
+  const load = (d)=>api(`/api/admin/campaigns/recent?days=${d}`).then(setData).catch(()=>setData(null))
+  useEffect(()=>{ load(days) },[days])
+
+  const t = data?.totals || {sends:0,replies:0,opens:0,clicks:0,bounces:0,unsubs:0}
+  const fmtTime = (iso)=>iso?new Date(iso).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>setOpen(o=>!o)}
+        style={{padding:"18px 24px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",
+          borderBottom:open?"1px solid #40485d20":"none"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+            Campaign Activity <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
+          </div>
+          {data&&!data.vcc_configured&&(
+            <span style={{fontSize:10,color:"#ffe083",background:"#ffe08315",padding:"2px 8px",borderRadius:4}}>
+              VCC not configured — sends disabled
+            </span>
+          )}
+        </div>
+        <div style={{display:"flex",gap:14,alignItems:"center",fontSize:12}}>
+          <span style={{color:"#a3a6ff"}}>📧 {t.sends} sent</span>
+          <span style={{color:"#69f6b8"}}>💬 {t.replies} replies</span>
+          <span style={{color:"#ff6e84"}}>↩ {t.bounces} bounces</span>
+          <span style={{color:"#a3aac4",fontSize:14}}>{open?"▾":"▸"}</span>
+        </div>
+      </div>
+      {open&&(
+        <div style={{padding:"20px 24px"}}>
+          {/* Headline metrics */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:18}}>
+            {[
+              {label:"Sent",     val:t.sends,    color:"#a3a6ff"},
+              {label:"Replied",  val:t.replies,  color:"#69f6b8"},
+              {label:"Opens",    val:t.opens,    color:"#ffe083"},
+              {label:"Clicks",   val:t.clicks,   color:"#8b5cf6"},
+              {label:"Bounces",  val:t.bounces,  color:"#ff6e84"},
+              {label:"Unsubs",   val:t.unsubs,   color:"#ff6e84"},
+            ].map(({label,val,color})=>(
+              <div key={label} style={{background:"#060e20",borderRadius:8,padding:12,
+                borderLeft:`3px solid ${color}`,textAlign:"center"}}>
+                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,color}}>{val}</div>
+                <div style={{fontSize:10,color:"#a3aac4",marginTop:2}}>{label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+            <span style={{fontSize:12,color:"#a3aac4"}}>
+              Reply rate: <b style={{color:"#69f6b8"}}>{data?.reply_rate_pct||0}%</b> over {data?.window_days||days}d
+            </span>
+            <select className="sel" value={days} onChange={e=>setDays(Number(e.target.value))}
+              style={{padding:"4px 10px",fontSize:11}}>
+              <option value={7}>Last 7 days</option>
+              <option value={14}>Last 14 days</option>
+              <option value={30}>Last 30 days</option>
+              <option value={90}>Last 90 days</option>
+            </select>
+          </div>
+          {/* Recent sends */}
+          <div style={{fontSize:11,color:"#a3aac4",letterSpacing:".08em",marginBottom:8}}>
+            RECENT SENDS ({data?.recent_sends?.length||0})
+          </div>
+          {(!data||data.recent_sends?.length===0)?(
+            <div style={{padding:"20px",textAlign:"center",color:"#40485d",fontSize:12,background:"#060e20",borderRadius:8}}>
+              {data?.vcc_configured ? "No sends yet — they'll appear here once a caller fires the email follow-up."
+                : "Set VCC_CAMPAIGN_WEBHOOK_URL in Railway to enable email sends."}
+            </div>
+          ):(
+            <div style={{maxHeight:240,overflowY:"auto",border:"1px solid #40485d20",borderRadius:8}}>
+              {data.recent_sends.map((s,i)=>{
+                let det = {}
+                try{ det = typeof s.details==="string"?JSON.parse(s.details):(s.details||{}) }catch{}
+                return (
+                  <div key={i} style={{padding:"10px 14px",borderBottom:i<data.recent_sends.length-1?"1px solid #40485d15":"none",
+                    display:"grid",gridTemplateColumns:"110px 1fr 1fr 1fr",gap:10,fontSize:11,alignItems:"center"}}>
+                    <span style={{color:"#a3aac4"}}>{fmtTime(s.created_at)}</span>
+                    <span style={{color:"#dee5ff"}}>{det.company||"—"}</span>
+                    <span style={{color:"#a3aac4"}}>{det.to_email||"—"}</span>
+                    <span style={{color:"#a3a6ff",fontSize:10}}>{det.trigger||""}</span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

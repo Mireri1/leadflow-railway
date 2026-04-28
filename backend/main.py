@@ -1661,6 +1661,9 @@ def log_call(call: dict, user: str = Depends(verify_token)):
     try:
         lead_id = call.get("leadId")
         caller  = call.get("calledBy") or user
+        # Pop the email-followup flag — Supabase's call_outcomes table doesn't
+        # have a column for it; we use the local var only for the trigger logic.
+        send_email_followup = bool(call.pop("send_email_followup", False))
         flags = []
 
         # Anti-gaming: empty form — no notes and no qual data filled out
@@ -1709,29 +1712,39 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                     json={"assignedTo": caller},
                     timeout=30)
 
-            # Auto-fire VCC email campaign after Nth failed-call attempt.
-            # Off by default (AUTO_CAMPAIGN_AFTER_FAILED_CALL=1 to enable).
-            # send_lead_to_campaign handles its own suppression so multiple
-            # threshold hits won't multi-send.
-            if (AUTO_CAMPAIGN_AFTER_FAILED_CALL and VCC_CAMPAIGN_WEBHOOK_URL
-                    and outcome in ("no_answer", "voicemail")
+            # Email follow-up trigger. Two paths:
+            #   (a) Caller checked "Send follow-up email" in the modal → fire now,
+            #       regardless of attempt count. Per-call override.
+            #   (b) AUTO_CAMPAIGN_AFTER_FAILED_CALL=1 + outcome is failed +
+            #       attempt count >= threshold → background auto-fire.
+            # Both paths share send_lead_to_campaign which handles 14-day
+            # suppression so a manual + auto can't double-send.
+            should_email = False
+            email_trigger = ""
+            if (VCC_CAMPAIGN_WEBHOOK_URL and outcome in ("no_answer", "voicemail")
                     and lead_full and lead_full.get("email") and lead_full.get("firstName")):
+                if send_email_followup:
+                    should_email = True
+                    email_trigger = f"{outcome}_caller_chose"
+                elif AUTO_CAMPAIGN_AFTER_FAILED_CALL:
+                    try:
+                        fr = req_lib.get(
+                            f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                            f"?leadId=eq.{lead_id}&outcome=in.(no_answer,voicemail)&select=id"
+                            f"&limit={AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD + 5}",
+                            headers={**SB_HEADERS, "Prefer": "count=exact"}, timeout=10)
+                        cr = fr.headers.get("content-range", "*/0")
+                        failed_count = int(cr.split("/")[-1]) if "/" in cr else 0
+                        if failed_count >= AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD:
+                            should_email = True
+                            email_trigger = f"{outcome}_attempt_{failed_count}_auto"
+                    except Exception as e:
+                        print(f"[AUTO-CAMPAIGN] threshold check failed for lead {lead_id}: {e}")
+            if should_email:
                 try:
-                    fr = req_lib.get(
-                        f"{SUPABASE_URL}/rest/v1/call_outcomes"
-                        f"?leadId=eq.{lead_id}&outcome=in.(no_answer,voicemail)&select=id"
-                        f"&limit={AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD + 5}",
-                        headers={**SB_HEADERS, "Prefer": "count=exact"}, timeout=10)
-                    cr = fr.headers.get("content-range", "*/0")
-                    failed_count = int(cr.split("/")[-1]) if "/" in cr else 0
-                    if failed_count >= AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD:
-                        send_lead_to_campaign(
-                            lead_full,
-                            trigger=f"{outcome}_attempt_{failed_count}",
-                            user=caller,
-                        )
+                    send_lead_to_campaign(lead_full, trigger=email_trigger, user=caller)
                 except Exception as e:
-                    print(f"[AUTO-CAMPAIGN] check failed for lead {lead_id}: {e}")
+                    print(f"[AUTO-CAMPAIGN] send failed for lead {lead_id}: {e}")
 
         return r.json()
     except Exception as e:
@@ -2515,6 +2528,63 @@ def send_to_campaign(lead_id: str, body: dict, user: str = Depends(verify_token)
     if not ok:
         return {"sent": False, "message": detail}
     return {"sent": True, "message": "Sent to VCC", "campaign": campaign, "trigger": trigger}
+
+@app.get("/api/admin/campaigns/recent")
+def campaigns_recent(days: int = 14, user: str = Depends(verify_admin)):
+    """Returns recent campaign activity for the admin panel — sends and events
+    grouped, with totals so you can verify the flow is working."""
+    days = max(1, min(int(days), 90))
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    try:
+        # Sends
+        sr = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?action=eq.campaign_sent&created_at=gte.{since}"
+            f"&select=resource_id,details,created_at,username"
+            f"&order=created_at.desc&limit=200",
+            headers=SB_ADMIN_HEADERS, timeout=15,
+        )
+        sends = sr.json() if sr.status_code == 200 else []
+        if not isinstance(sends, list): sends = []
+
+        # Events (replies/bounces/opens/clicks/unsubs from VCC callbacks)
+        er = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?action=eq.campaign_event&created_at=gte.{since}"
+            f"&select=resource_id,details,created_at"
+            f"&order=created_at.desc&limit=200",
+            headers=SB_ADMIN_HEADERS, timeout=15,
+        )
+        events = er.json() if er.status_code == 200 else []
+        if not isinstance(events, list): events = []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Activity query failed: {e}")
+
+    # Tally event counts by type for the headline numbers
+    event_counts = {"reply": 0, "open": 0, "click": 0, "bounce": 0, "unsubscribe": 0, "other": 0}
+    for ev in events:
+        try:
+            d = json_lib.loads(ev.get("details") or "{}") if isinstance(ev.get("details"), str) else (ev.get("details") or {})
+            etype = (d.get("event") or "other").lower()
+            event_counts[etype if etype in event_counts else "other"] += 1
+        except Exception:
+            event_counts["other"] += 1
+
+    return {
+        "window_days":  days,
+        "vcc_configured": bool(VCC_CAMPAIGN_WEBHOOK_URL),
+        "totals": {
+            "sends":   len(sends),
+            "replies": event_counts["reply"],
+            "opens":   event_counts["open"],
+            "clicks":  event_counts["click"],
+            "bounces": event_counts["bounce"],
+            "unsubs":  event_counts["unsubscribe"],
+        },
+        "reply_rate_pct": round((event_counts["reply"] / len(sends)) * 100, 1) if sends else 0.0,
+        "recent_sends":   sends[:20],
+        "recent_events":  events[:20],
+    }
 
 @app.get("/api/leads/{lead_id}/campaign-status")
 def campaign_status(lead_id: str, user: str = Depends(verify_token)):
