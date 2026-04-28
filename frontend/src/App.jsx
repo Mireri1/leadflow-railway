@@ -10,14 +10,19 @@ const STATES = [
 ]
 
 const STATUS_OPTIONS = [
-  { value:"new",            label:"New",            color:"#a3a6ff" },
-  { value:"called",         label:"Called",          color:"#ffe083" },
-  { value:"no_answer",      label:"No Answer",       color:"#a3aac4" },
-  { value:"interested",     label:"Interested",      color:"#69f6b8" },
-  { value:"not_interested", label:"Not Interested",  color:"#ff6e84" },
-  { value:"callback",       label:"Callback",        color:"#8b5cf6" },
-  { value:"converted",      label:"Converted",       color:"#06d6a0" },
+  { value:"new",                   label:"New",                   color:"#a3a6ff" },
+  { value:"called",                label:"Called",                color:"#ffe083" },
+  { value:"no_answer",             label:"No Answer",             color:"#a3aac4" },
+  { value:"interested",            label:"Interested",            color:"#69f6b8" },
+  { value:"not_interested",        label:"Not Interested",        color:"#ff6e84" },
+  { value:"callback",              label:"Callback",              color:"#8b5cf6" },
+  { value:"converted",             label:"Converted",             color:"#06d6a0" },
+  { value:"awaiting_email_reply",  label:"Awaiting Email Reply",  color:"#a3a6ff" },
+  { value:"do_not_contact",        label:"Do Not Contact",        color:"#ff6e84" },
 ]
+// Statuses callers should NEVER auto-dial — used to filter the dialer queue
+// and to show a "don't call" warning in the call modal.
+const NO_DIAL_STATUSES = new Set(["awaiting_email_reply","do_not_contact"])
 
 const CALL_OUTCOMES = [
   { value:"answered",       label:"Answered" },
@@ -911,6 +916,28 @@ function CallModal({lead: leadProp,onClose,onSaved}){
           <button className="btn btn-g" style={{fontSize:12,padding:"5px 10px"}} onClick={onClose}>✕</button>
         </div>
 
+        {NO_DIAL_STATUSES.has(lead.status)&&(
+          <div style={{padding:"12px 14px",marginBottom:12,
+            background:lead.status==="do_not_contact"?"#ff6e8418":"#a3a6ff18",
+            border:`1px solid ${lead.status==="do_not_contact"?"#ff6e8440":"#a3a6ff40"}`,
+            borderRadius:8,fontSize:13,
+            color:lead.status==="do_not_contact"?"#ff6e84":"#a3a6ff",
+            display:"flex",alignItems:"center",gap:8}}>
+            <span>{lead.status==="do_not_contact"?"🚫":"📧"}</span>
+            <div>
+              <div style={{fontWeight:600,marginBottom:2}}>
+                {lead.status==="do_not_contact"
+                  ? "Do not contact — this lead has unsubscribed."
+                  : "Awaiting email reply — don't dial right now."}
+              </div>
+              <div style={{fontSize:11,opacity:0.8}}>
+                {lead.status==="do_not_contact"
+                  ? "Marked do-not-contact via VCC unsubscribe. Logging a call here is not recommended."
+                  : `Email sent ${lead.updatedAt?.slice(0,10)||"recently"}. They may reply via email — give it a few days before calling.`}
+              </div>
+            </div>
+          </div>
+        )}
         {modalError&&<div style={{padding:"10px 14px",marginBottom:12,background:"#ff6e8418",border:"1px solid #ff6e8440",
           borderRadius:8,fontSize:13,color:"#ff6e84",display:"flex",alignItems:"center",gap:8}}>
           <span>⚠</span>{modalError}
@@ -2656,7 +2683,7 @@ export default function App(){
               </p>
               </div>
               {(()=>{
-                const dialerLeads=leads.filter(l=>!l.assignedTo||l.assignedTo===user)
+                const dialerLeads=leads.filter(l=>(!l.assignedTo||l.assignedTo===user)&&!NO_DIAL_STATUSES.has(l.status))
                 if(dialerLeads.length===0) return(
                   <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
                     <div style={{fontSize:40,marginBottom:12}}>✅</div>

@@ -876,7 +876,30 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "
         "campaign": campaign, "trigger": trigger,
         "to_email": lead.get("email"), "company": lead.get("company"),
     })
-    print(f"[CAMPAIGN] sent lead {lead.get('id')} to '{campaign}' via {trigger}")
+
+    # Mark the lead as awaiting an email reply so callers don't re-dial. The
+    # dialer queue + auto-suggest filters exclude this status. When VCC posts
+    # back with a 'reply' event, the callback flips it to 'interested' so it
+    # naturally returns to the queue. After 7 days with no reply, the
+    # nextfollowup nudge surfaces it again for a follow-up touch.
+    try:
+        next_followup = (datetime.utcnow() + timedelta(days=7)).date().isoformat()
+        req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead.get('id')))}",
+            headers=SB_HEADERS,
+            json={
+                "status":           "awaiting_email_reply",
+                "nextfollowup":     next_followup,
+                "followupsequence": "email_followup",
+                "updatedAt":        datetime.utcnow().isoformat(),
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        # Don't fail the send if the status patch fails — VCC already has the lead
+        print(f"[CAMPAIGN] post-send status patch failed for lead {lead.get('id')}: {e}")
+
+    print(f"[CAMPAIGN] sent lead {lead.get('id')} to '{campaign}' via {trigger} → status=awaiting_email_reply")
     return (True, "queued at VCC")
 
 class ScrapeRequest(BaseModel):
