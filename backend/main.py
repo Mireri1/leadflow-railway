@@ -26,7 +26,7 @@ SUPABASE_KEY  = os.getenv("SUPABASE_KEY", os.getenv("VITE_SUPABASE_KEY", ""))
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
-APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/search"
+APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
 # Halts every Apollo enrichment call instantly. Same shape as PLACES_KILL_SWITCH.
 APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
 # Titles tried (in priority order) when auto-enriching a scraped company.
