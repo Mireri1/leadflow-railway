@@ -1700,15 +1700,20 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
 
     leads = []
     skipped_no_company = 0
-    skipped_no_phone   = 0
+    skipped_no_actionable = 0
     for person in people:
         lead = apollo_person_to_lead(person, user)
         if not lead.get("company"):
             skipped_no_company += 1
             continue
-        # Phone is the whole point — skip contacts with neither phone nor email
-        if not lead.get("phone") and not lead.get("email"):
-            skipped_no_phone += 1
+        # Need at least *something* a caller can act on: a phone, email, or a
+        # name+title to ask for at the switchboard. Apollo's bare search often
+        # returns just name+title (no unlocked email/phone) on Pro tier — that
+        # is still actionable as a "named ask" lead.
+        has_contact = bool(lead.get("phone") or lead.get("email"))
+        has_named_ask = bool(lead.get("firstName") and lead.get("title"))
+        if not has_contact and not has_named_ask:
+            skipped_no_actionable += 1
             continue
         leads.append(lead)
 
@@ -1719,10 +1724,10 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "employee_range": f"{body.employee_min}-{body.employee_max}",
         "page": payload["page"], "per_page": per_page,
         "returned": len(people), "qualified": len(leads), "saved": saved,
-        "skipped_no_company": skipped_no_company,
-        "skipped_no_contact": skipped_no_phone,
-        "total_entries":      pagination.get("total_entries"),
-        "total_pages":        pagination.get("total_pages"),
+        "skipped_no_company":    skipped_no_company,
+        "skipped_no_actionable": skipped_no_actionable,
+        "total_entries":         pagination.get("total_entries"),
+        "total_pages":           pagination.get("total_pages"),
     })
 
     if saved > 0:
@@ -1743,10 +1748,13 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "returned":        len(people),
         "qualified":       len(leads),
         "saved":           saved,
-        "skipped":         {"no_company": skipped_no_company, "no_contact": skipped_no_phone},
+        "skipped":         {"no_company": skipped_no_company, "no_actionable": skipped_no_actionable},
         "total_available": pagination.get("total_entries"),
         "page":            pagination.get("page"),
         "total_pages":     pagination.get("total_pages"),
+        "sample":          [{"company": l.get("company"), "name": f"{l.get('firstName','')} {l.get('lastName','')}".strip(),
+                             "title": l.get("title"), "phone": l.get("phone"), "email": l.get("email")}
+                            for l in leads[:3]],
     }
 
 @app.post("/api/admin/apollo/backfill")

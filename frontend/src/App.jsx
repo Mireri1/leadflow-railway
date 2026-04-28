@@ -539,8 +539,8 @@ function ApolloFinder({onFound}){
         <div style={{marginTop:14,padding:"12px 14px",background:"#8b5cf615",border:"1px solid #8b5cf630",
           borderRadius:8,fontSize:12,color:"#dee5ff",lineHeight:1.6}}>
           ✓ <b style={{color:"#8b5cf6"}}>{result.saved}</b> new leads saved
-          (Apollo returned {result.returned}, {result.qualified} had usable contact info,
-          {result.skipped?.no_company||0} missing company, {result.skipped?.no_contact||0} no phone/email)
+          (Apollo returned {result.returned}, {result.qualified} were actionable,
+          {result.skipped?.no_company||0} missing company, {result.skipped?.no_actionable||0} no name/phone/email)
           {result.total_available>0&&(
             <div style={{marginTop:6,color:"#a3aac4",fontSize:11}}>
               {result.total_available.toLocaleString()} total contacts match this search
