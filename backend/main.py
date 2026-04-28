@@ -43,6 +43,25 @@ APOLLO_PHONE_REVEAL_INDUSTRIES = set(
     if i.strip()
 )
 APOLLO_PHONE_REVEAL_MONTHLY_CAP = int(os.getenv("APOLLO_PHONE_REVEAL_MONTHLY_CAP", "400"))
+
+# ── VCC scraper email campaign integration ─────────────────────────────────
+# After a caller can't reach a lead by phone, LeadFlow forwards the lead to
+# VCC scraper's outreach pipeline so VCC's existing email-send + stats infra
+# handles the "tried to call you" follow-up. VCC posts back to our callback
+# URL when the recipient replies, opens, or bounces.
+VCC_CAMPAIGN_WEBHOOK_URL    = os.getenv("VCC_CAMPAIGN_WEBHOOK_URL", "").strip()
+VCC_CAMPAIGN_WEBHOOK_SECRET = os.getenv("VCC_CAMPAIGN_WEBHOOK_SECRET", "").strip().rstrip("%").strip()
+# Random secret in the path of the callback URL we hand VCC, so VCC's posts
+# back to LeadFlow are authenticated. Generate with secrets.token_urlsafe(32).
+LEADFLOW_CALLBACK_SECRET    = os.getenv("LEADFLOW_CALLBACK_SECRET", "").strip().rstrip("%").strip()
+# Auto-fire after this many failed attempts (no_answer + voicemail combined).
+# 2 = lands on the second attempt; lets caller try once first, email backstops.
+AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD = int(os.getenv("AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD", "2"))
+# Set to 1 to enable auto-fire. Defaults off so a misconfigured VCC URL
+# can't spray sends without explicit opt-in.
+AUTO_CAMPAIGN_AFTER_FAILED_CALL = os.getenv("AUTO_CAMPAIGN_AFTER_FAILED_CALL", "0") == "1"
+# Don't re-send the same lead to the same campaign within this window.
+CAMPAIGN_SUPPRESSION_DAYS = int(os.getenv("CAMPAIGN_SUPPRESSION_DAYS", "14"))
 # Halts every Apollo enrichment call instantly. Same shape as PLACES_KILL_SWITCH.
 APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
 # Titles tried (in priority order) when auto-enriching a scraped company.
@@ -739,6 +758,126 @@ def save_to_supabase(leads):
     except Exception as e:
         print(f"[SUPABASE] Exception: {e}")
         return 0
+
+# ── VCC campaign helpers ───────────────────────────────────────────────────
+
+def build_tried_to_call_email(lead: dict) -> dict:
+    """Render the 'tried to call you' email subject + body for a lead.
+    Returns {subject, body_text} that VCC can either render directly or use
+    as fallback if it's templating server-side."""
+    first  = (lead.get("firstName") or "").strip() or "there"
+    company = (lead.get("company") or "").strip()
+    industry = (lead.get("industry") or "").strip().lower()
+    state    = (lead.get("state") or "").strip()
+
+    # Industry → readable phrase. Falls back to generic if Apollo didn't classify.
+    industry_phrase = f"{industry} facilities" if industry and industry not in ("", "unknown") else "commercial facilities"
+    location_phrase = f" across {state}" if state else ""
+    sender_name  = os.getenv("OUTREACH_SENDER_NAME", "Eric")
+    sender_email = OUTREACH_EMAIL
+    sender_phone = os.getenv("OUTREACH_SENDER_PHONE", "")
+    sender_line  = f"{sender_phone}  •  {sender_email}" if sender_phone else sender_email
+
+    subject = f"Quick question, {first}"
+    body = (
+        f"Hi {first},\n\n"
+        f"Tried reaching you today about cleaning at {company or 'your facility'} — didn't catch you. "
+        f"Vision Cleaning specializes in {industry_phrase}{location_phrase}, and I wanted to get you a quote either way.\n\n"
+        f"If a call is hard to schedule, just hit reply with:\n"
+        f"  • Square footage at {company or 'your location'}\n"
+        f"  • Cleaning frequency you'd want (daily / weekly / 2x weekly)\n"
+        f"  • Rough monthly budget\n\n"
+        f"I'll come back inside 24 hours with a tailored quote and next steps. "
+        f"If cleaning isn't on your radar right now, just reply \"not now\" and I'll close the loop on my end.\n\n"
+        f"Thanks,\n"
+        f"{sender_name}\n"
+        f"Vision Cleaning Company\n"
+        f"{sender_line}\n\n"
+        f"—\nReply STOP to opt out. Vision Cleaning Company."
+    )
+    return {"subject": subject, "body_text": body}
+
+def lead_already_in_campaign(lead_id: str, campaign: str = "tried-to-call") -> bool:
+    """Suppression: don't re-send the same lead to the same campaign within
+    CAMPAIGN_SUPPRESSION_DAYS. Returns True if a recent send is on file."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)).isoformat()
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?action=eq.campaign_sent&resource_id=eq.{url_quote(str(lead_id))}"
+            f"&created_at=gte.{cutoff}&select=id&limit=1",
+            headers=SB_ADMIN_HEADERS, timeout=5,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        return bool(isinstance(rows, list) and rows)
+    except Exception as e:
+        print(f"[CAMPAIGN] suppression check failed: {e}")
+        return False  # fail-open — better to risk a duplicate than miss a send
+
+def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "tried-to-call"):
+    """POST a lead to VCC's campaign ingest endpoint with full personalization.
+    Returns (ok: bool, detail: str). No-ops cleanly if VCC URL not configured."""
+    if not VCC_CAMPAIGN_WEBHOOK_URL:
+        return (False, "VCC_CAMPAIGN_WEBHOOK_URL not configured")
+    if not lead.get("email"):
+        return (False, "lead has no email")
+    if not lead.get("firstName"):
+        return (False, "lead has no firstName (run Find Decision Maker first)")
+    if lead_already_in_campaign(lead.get("id"), campaign):
+        return (False, f"already sent to '{campaign}' within last {CAMPAIGN_SUPPRESSION_DAYS} days")
+
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app").rstrip("/")
+    callback_url = (
+        f"{app_url}/api/webhooks/vcc/{url_quote(LEADFLOW_CALLBACK_SECRET, safe='')}/{lead['id']}"
+        if LEADFLOW_CALLBACK_SECRET else None
+    )
+
+    template = build_tried_to_call_email(lead)
+    payload = {
+        "campaign":  campaign,
+        "lead_id":   str(lead.get("id")),
+        "trigger":   trigger,  # e.g. "no_answer_2nd_attempt", "manual"
+        "recipient": {
+            "email":      lead.get("email"),
+            "first_name": lead.get("firstName"),
+            "last_name":  lead.get("lastName") or "",
+            "title":      lead.get("title") or "",
+            "company":    lead.get("company") or "",
+        },
+        "personalization": {
+            "industry": lead.get("industry") or "",
+            "state":    lead.get("state") or "",
+            "company":  lead.get("company") or "",
+        },
+        "sender": {
+            "name":  os.getenv("OUTREACH_SENDER_NAME", OUTREACH_NAME),
+            "email": OUTREACH_EMAIL,
+            "phone": os.getenv("OUTREACH_SENDER_PHONE", ""),
+        },
+        "template":     template,  # subject + body_text — VCC can render or fall back to its own
+        "callback_url": callback_url,
+        "sent_at":      datetime.utcnow().isoformat(),
+    }
+    headers = {
+        "Content-Type":      "application/json",
+        "X-LeadFlow-Secret": VCC_CAMPAIGN_WEBHOOK_SECRET,
+    }
+    try:
+        r = req_lib.post(VCC_CAMPAIGN_WEBHOOK_URL, headers=headers, json=payload, timeout=15)
+        if r.status_code not in (200, 201, 202, 204):
+            err = r.text[:300]
+            print(f"[CAMPAIGN] VCC rejected HTTP {r.status_code}: {err}")
+            return (False, f"VCC {r.status_code}: {err}")
+    except Exception as e:
+        print(f"[CAMPAIGN] network error posting to VCC: {e}")
+        return (False, f"network error: {e}")
+
+    audit_log(user, "campaign_sent", "lead", lead.get("id"), {
+        "campaign": campaign, "trigger": trigger,
+        "to_email": lead.get("email"), "company": lead.get("company"),
+    })
+    print(f"[CAMPAIGN] sent lead {lead.get('id')} to '{campaign}' via {trigger}")
+    return (True, "queued at VCC")
 
 class ScrapeRequest(BaseModel):
     industry:  str
@@ -1536,15 +1675,41 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                         headers=SB_HEADERS, json=call, timeout=30)
         if lead_id:
             lr = req_lib.get(
-                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=assignedTo",
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=*",
                 headers=SB_HEADERS, timeout=30)
             rows = lr.json() if lr.status_code == 200 else []
-            if rows and not rows[0].get("assignedTo"):
+            lead_full = rows[0] if rows else {}
+            if lead_full and not lead_full.get("assignedTo"):
                 req_lib.patch(
                     f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
                     headers=SB_HEADERS,
                     json={"assignedTo": caller},
                     timeout=30)
+
+            # Auto-fire VCC email campaign after Nth failed-call attempt.
+            # Off by default (AUTO_CAMPAIGN_AFTER_FAILED_CALL=1 to enable).
+            # send_lead_to_campaign handles its own suppression so multiple
+            # threshold hits won't multi-send.
+            if (AUTO_CAMPAIGN_AFTER_FAILED_CALL and VCC_CAMPAIGN_WEBHOOK_URL
+                    and outcome in ("no_answer", "voicemail")
+                    and lead_full and lead_full.get("email") and lead_full.get("firstName")):
+                try:
+                    fr = req_lib.get(
+                        f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                        f"?leadId=eq.{lead_id}&outcome=in.(no_answer,voicemail)&select=id"
+                        f"&limit={AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD + 5}",
+                        headers={**SB_HEADERS, "Prefer": "count=exact"}, timeout=10)
+                    cr = fr.headers.get("content-range", "*/0")
+                    failed_count = int(cr.split("/")[-1]) if "/" in cr else 0
+                    if failed_count >= AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD:
+                        send_lead_to_campaign(
+                            lead_full,
+                            trigger=f"{outcome}_attempt_{failed_count}",
+                            user=caller,
+                        )
+                except Exception as e:
+                    print(f"[AUTO-CAMPAIGN] check failed for lead {lead_id}: {e}")
+
         return r.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2241,6 +2406,145 @@ def webhook_hits(user: str = Depends(verify_admin)):
         return {"count": len(rows) if isinstance(rows, list) else 0, "hits": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/leads/{lead_id}/send-to-campaign")
+def send_to_campaign(lead_id: str, body: dict, user: str = Depends(verify_token)):
+    """Caller-triggered manual send of a lead to VCC's email campaign.
+    Body (optional): {campaign: str, trigger: str}. Defaults to tried-to-call/manual."""
+    if not VCC_CAMPAIGN_WEBHOOK_URL:
+        raise HTTPException(status_code=503,
+            detail="VCC_CAMPAIGN_WEBHOOK_URL not configured — VCC integration disabled")
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=*",
+            headers=SB_HEADERS, timeout=10,
+        )
+        rows = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch lead: {e}")
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = rows[0]
+
+    campaign = (body or {}).get("campaign", "tried-to-call")
+    trigger  = (body or {}).get("trigger", "manual")
+    ok, detail = send_lead_to_campaign(lead, trigger=trigger, user=user, campaign=campaign)
+    if not ok:
+        return {"sent": False, "message": detail}
+    return {"sent": True, "message": "Sent to VCC", "campaign": campaign, "trigger": trigger}
+
+@app.get("/api/leads/{lead_id}/campaign-status")
+def campaign_status(lead_id: str, user: str = Depends(verify_token)):
+    """Return the most recent campaign sends + replies/events for a lead so
+    the call modal can show a 'in campaign' badge or 'replied' status."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?resource_id=eq.{url_quote(str(lead_id))}"
+            f"&action=in.(campaign_sent,campaign_event)"
+            f"&select=action,details,created_at"
+            f"&order=created_at.desc&limit=10",
+            headers=SB_ADMIN_HEADERS, timeout=10,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if not isinstance(rows, list):
+            rows = []
+        sent_rows  = [r_ for r_ in rows if r_.get("action") == "campaign_sent"]
+        event_rows = [r_ for r_ in rows if r_.get("action") == "campaign_event"]
+        return {
+            "in_campaign":   bool(sent_rows),
+            "last_sent_at":  sent_rows[0]["created_at"] if sent_rows else None,
+            "send_count":    len(sent_rows),
+            "events":        event_rows[:5],
+            "vcc_configured": bool(VCC_CAMPAIGN_WEBHOOK_URL),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/webhooks/vcc/{secret}/{lead_id}")
+async def vcc_callback(secret: str, lead_id: str, request: Request):
+    """Receives reply/open/click/bounce events from VCC's email engine.
+    Body shape (per the contract we documented for VCC):
+      {event: 'reply'|'open'|'click'|'bounce'|'unsubscribe', timestamp, ...details}
+    On 'reply' we flip lead status to 'interested' and Slack-notify the caller."""
+    if not LEADFLOW_CALLBACK_SECRET or secret != LEADFLOW_CALLBACK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid callback secret")
+
+    raw_body = ""
+    try:
+        raw_body = (await request.body()).decode("utf-8", errors="replace")[:2000]
+        data = json_lib.loads(raw_body) if raw_body else {}
+    except Exception:
+        data = {}
+
+    event = (data.get("event") or "").strip().lower()
+    audit_log("vcc_callback", "campaign_event", "lead", lead_id, {
+        "event": event, "raw_body_sample": raw_body[:500],
+    })
+    print(f"[VCC-CALLBACK] lead={lead_id} event={event}")
+
+    # Pull the lead so we know who replied + can update status
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=*",
+            headers=SB_HEADERS, timeout=10,
+        )
+        lead_rows = r.json() if r.status_code == 200 else []
+        lead = lead_rows[0] if isinstance(lead_rows, list) and lead_rows else {}
+    except Exception:
+        lead = {}
+
+    if event == "reply":
+        # Recipient wrote back — flip to 'interested', alert the caller
+        try:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
+                headers=SB_HEADERS,
+                json={"status": "interested", "updatedAt": datetime.utcnow().isoformat()},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[VCC-CALLBACK] failed to update lead status: {e}")
+        if lead.get("company"):
+            app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+            send_slack(
+                ":incoming_envelope: Email Reply",
+                f"*{lead.get('firstName','')} {lead.get('lastName','')}* at *{lead.get('company','')}* replied to the tried-to-call email.",
+                fields=[
+                    {"label": "From",     "value": lead.get("email", "")},
+                    {"label": "Assigned", "value": lead.get("assignedTo") or "unassigned"},
+                    {"label": "Snippet",  "value": (data.get("snippet") or data.get("body_text") or "")[:200] or "(no snippet)"},
+                ],
+                actions=[{"label": "📋 Open Lead", "url": app_url, "style": "primary"}],
+            )
+
+    elif event == "bounce":
+        # Email is bad — clear it so we don't keep emailing into the void
+        try:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
+                headers=SB_HEADERS,
+                json={"email": "", "updatedAt": datetime.utcnow().isoformat(),
+                      "notes": (lead.get("notes") or "") + f" | Email bounced {datetime.utcnow().date().isoformat()}"},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[VCC-CALLBACK] failed to clear bounced email: {e}")
+
+    elif event == "unsubscribe":
+        try:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
+                headers=SB_HEADERS,
+                json={"status": "do_not_contact", "updatedAt": datetime.utcnow().isoformat()},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[VCC-CALLBACK] failed to mark unsub: {e}")
+
+    # opens + clicks: just audit-log (already done above), no lead mutation
+
+    return {"ok": True, "event": event}
 
 @app.post("/api/leads/{lead_id}/find-dm")
 def find_dm(lead_id: str, user: str = Depends(verify_token)):

@@ -671,6 +671,9 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [revealing,setRevealing]  = useState(false)
   const [revealStatus,setRevealStatus] = useState("")
   const [phoneBudget,setPhoneBudget] = useState(null)  // {monthly_cap, used_this_month, remaining, allowed_industries}
+  const [sendingCampaign,setSendingCampaign] = useState(false)
+  const [campaignStatus,setCampaignStatus] = useState("")
+  const [campaignInfo,setCampaignInfo] = useState(null)  // {in_campaign, last_sent_at, send_count, vcc_configured}
   const [calls,setCalls]          = useState([])
   const [modalError,setModalError] = useState("")
   const [primary,setPrimary]      = useState("")       // no_answer, voicemail, answered
@@ -706,6 +709,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
     api(`/api/calls/${lead.id}`).then(r=>setCalls(Array.isArray(r)?r:[])).catch(()=>setCalls([]))
     api("/api/scripts").then(r=>setScripts(Array.isArray(r)?r:[])).catch(()=>{})
     api("/api/admin/apollo/budget").then(setPhoneBudget).catch(()=>setPhoneBudget(null))
+    api(`/api/leads/${lead.id}/campaign-status`).then(setCampaignInfo).catch(()=>setCampaignInfo(null))
   },[lead.id])
 
   // Phone reveal allowed when industry is in allowlist AND budget remaining
@@ -792,6 +796,24 @@ function CallModal({lead: leadProp,onClose,onSaved}){
     }finally{ setFindingDM(false) }
   }
 
+  async function sendToCampaign(){
+    if(!window.confirm(`Send "${lead.firstName} ${lead.lastName||''}" to the tried-to-call email campaign via VCC?`)) return
+    setCampaignStatus(""); setSendingCampaign(true)
+    try{
+      const r = await api(`/api/leads/${lead.id}/send-to-campaign`,
+        {method:"POST",body:JSON.stringify({campaign:"tried-to-call",trigger:"manual"})})
+      if(r.sent){
+        setCampaignStatus("✓ Queued at VCC")
+        // Refresh status so the badge appears
+        api(`/api/leads/${lead.id}/campaign-status`).then(setCampaignInfo).catch(()=>{})
+      }else{
+        setCampaignStatus(r.message||"Send blocked")
+      }
+    }catch(ex){
+      setCampaignStatus(ex.message||"Couldn't reach VCC")
+    }finally{ setSendingCampaign(false) }
+  }
+
   async function revealMobile(){
     if(!window.confirm("Spend ~5-8 Apollo credits to reveal this person's direct mobile?")) return
     setRevealStatus(""); setRevealing(true)
@@ -859,11 +881,30 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                   {phoneBudget.remaining<=0 ? "📱 budget exhausted" : "📱 use named-ask"}
                 </span>
               )}
+              {/* Email campaign trigger — only when VCC is configured AND lead has email + name */}
+              {campaignInfo?.vcc_configured && lead.email && lead.firstName && !campaignInfo.in_campaign && (
+                <button onClick={sendToCampaign} disabled={sendingCampaign}
+                  style={{fontSize:11,padding:"4px 10px",borderRadius:6,fontFamily:"inherit",cursor:sendingCampaign?"wait":"pointer",
+                    background:"#a3a6ff",color:"#000011",border:"none",opacity:sendingCampaign?0.7:1,fontWeight:600}}
+                  title="Send the 'tried to call you' email via VCC's campaign engine">
+                  {sendingCampaign?"Sending…":"📧 Send to Campaign"}
+                </button>
+              )}
+              {campaignInfo?.in_campaign && (
+                <span style={{fontSize:10,padding:"3px 8px",borderRadius:6,background:"#a3a6ff20",
+                  color:"#a3a6ff",fontWeight:600}}
+                  title={`In campaign since ${campaignInfo.last_sent_at?.slice(0,10)} — ${campaignInfo.send_count} send${campaignInfo.send_count===1?"":"s"}`}>
+                  📧 In campaign
+                </span>
+              )}
               {dmStatus&&(
                 <span style={{fontSize:11,color:dmStatus.startsWith("✓")?"#69f6b8":"#ffe083"}}>{dmStatus}</span>
               )}
               {revealStatus&&(
                 <span style={{fontSize:11,color:revealStatus.startsWith("✓")?"#69f6b8":"#ffe083"}}>{revealStatus}</span>
+              )}
+              {campaignStatus&&(
+                <span style={{fontSize:11,color:campaignStatus.startsWith("✓")?"#69f6b8":"#ffe083"}}>{campaignStatus}</span>
               )}
             </div>
           </div>
