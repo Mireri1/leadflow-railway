@@ -34,6 +34,15 @@ APOLLO_MATCH_URL  = "https://api.apollo.io/api/v1/people/match"
 # Strip whitespace + trailing '%' (zsh's no-newline indicator) — both are
 # common copy-paste artifacts that Apollo's URL parser rejects.
 APOLLO_WEBHOOK_SECRET = os.getenv("APOLLO_WEBHOOK_SECRET", "").strip().rstrip("%").strip()
+# Phone reveals are 8 credits each — restrict to highest-value verticals only,
+# fall through to named-ask + email workflow for everyone else. Monthly cap
+# enforces a hard cutoff so we can't blow the 4,000-credit Pro budget.
+APOLLO_PHONE_REVEAL_INDUSTRIES = set(
+    i.strip().lower() for i in
+    os.getenv("APOLLO_PHONE_REVEAL_INDUSTRIES", "healthcare,education").split(",")
+    if i.strip()
+)
+APOLLO_PHONE_REVEAL_MONTHLY_CAP = int(os.getenv("APOLLO_PHONE_REVEAL_MONTHLY_CAP", "400"))
 # Halts every Apollo enrichment call instantly. Same shape as PLACES_KILL_SWITCH.
 APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
 # Titles tried (in priority order) when auto-enriching a scraped company.
@@ -774,6 +783,42 @@ def apollo_cache_set(company: str, person):
         _apollo_enrich_cache.clear()
     key = company.lower().strip()
     _apollo_enrich_cache[key] = (time.time() + APOLLO_ENRICH_CACHE_TTL_HOURS * 3600, person)
+
+def phone_reveal_count_this_month() -> int:
+    """Count successful 'reveal_phone_requested' audit_log entries since the
+    first of this UTC month. Used for the monthly budget cap. Fail-open on
+    DB errors (better to allow occasional over-spend than block the caller)."""
+    try:
+        first_of_month = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?action=eq.reveal_phone_requested&created_at=gte.{first_of_month}"
+            f"&select=id",
+            headers={**SB_ADMIN_HEADERS, "Prefer": "count=exact"}, timeout=5,
+        )
+        cr = r.headers.get("content-range", "*/0")
+        return int(cr.split("/")[-1]) if "/" in cr else 0
+    except Exception as e:
+        print(f"[APOLLO-BUDGET] count query failed: {e}")
+        return 0  # fail-open
+
+def can_reveal_phone(lead: dict):
+    """Returns (allowed: bool, reason: str). Enforces industry allowlist + monthly cap."""
+    industry = (lead.get("industry") or "").strip().lower()
+    if APOLLO_PHONE_REVEAL_INDUSTRIES:
+        ok = any(allowed in industry for allowed in APOLLO_PHONE_REVEAL_INDUSTRIES)
+        if not ok:
+            allowed_list = ", ".join(sorted(APOLLO_PHONE_REVEAL_INDUSTRIES))
+            return (False,
+                f"Phone reveals restricted to {allowed_list} verticals. "
+                f"This lead's industry is '{industry or 'unset'}' — use the switchboard "
+                f"and ask for {lead.get('firstName','the contact')} by name.")
+    used = phone_reveal_count_this_month()
+    if used >= APOLLO_PHONE_REVEAL_MONTHLY_CAP:
+        return (False,
+            f"Monthly phone reveal budget exhausted ({used}/{APOLLO_PHONE_REVEAL_MONTHLY_CAP}). "
+            f"Resets first of next month — use switchboard + named-ask until then.")
+    return (True, "")
 
 def apollo_request_phone_reveal(person: dict, lead_id: str):
     """Fire-and-forget request for Apollo to async-reveal direct phone numbers.
@@ -1844,14 +1889,22 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     # Fire phone reveals (async via webhook) if requested. Apollo posts back to
     # /api/webhooks/apollo/{secret}/{lead_id} when ready.
     phone_reveals_requested = 0
+    phone_reveals_blocked_by_policy = 0
     if body.reveal_phones and saved_rows and APOLLO_WEBHOOK_SECRET:
-        # saved_rows order matches qualified_pairs order (Supabase preserves
-        # batch insert order). Zip them to map each saved lead to its Apollo person.
+        # Same industry + budget gate the per-lead endpoint uses, applied per row.
         for (lead, person), saved_row in zip(qualified_pairs, saved_rows):
-            if saved_row.get("id"):
-                ok, _detail = apollo_request_phone_reveal(person, saved_row["id"])
-                if ok:
-                    phone_reveals_requested += 1
+            if not saved_row.get("id"):
+                continue
+            policy_ok, _ = can_reveal_phone(lead)
+            if not policy_ok:
+                phone_reveals_blocked_by_policy += 1
+                continue
+            ok, _detail = apollo_request_phone_reveal(person, saved_row["id"])
+            if ok:
+                phone_reveals_requested += 1
+                # Audit-log per reveal so the budget counter stays accurate
+                audit_log(user, "reveal_phone_requested", "lead", saved_row["id"],
+                          {"company": lead.get("company"), "via": "bulk_pull"})
 
     audit_log(user, "apollo_pull", "lead", None, {
         "titles": titles, "industries": industries, "locations": locations,
@@ -2070,6 +2123,11 @@ def reveal_phone(lead_id: str, user: str = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="Lead not found")
     lead = rows[0]
 
+    # Policy gate: industry allowlist + monthly budget cap
+    policy_ok, policy_reason = can_reveal_phone(lead)
+    if not policy_ok:
+        return {"requested": False, "blocked_by_policy": True, "message": policy_reason}
+
     person = lead_to_apollo_query(lead)
     if not person:
         return {"requested": False,
@@ -2153,6 +2211,20 @@ async def apollo_phone_webhook(secret: str, lead_id: str, request: Request):
         print(f"[APOLLO-WEBHOOK] update failed for {lead_id}: {e}")
 
     return {"ok": True, "phone": phone}
+
+@app.get("/api/admin/apollo/budget")
+def apollo_budget(user: str = Depends(verify_token)):
+    """Surface the phone-reveal policy + current usage so the UI can show
+    a budget meter and decide whether to display the Reveal Mobile button.
+    Caller-readable so the call modal can hide the button when blocked."""
+    used = phone_reveal_count_this_month()
+    return {
+        "monthly_cap":            APOLLO_PHONE_REVEAL_MONTHLY_CAP,
+        "used_this_month":        used,
+        "remaining":              max(0, APOLLO_PHONE_REVEAL_MONTHLY_CAP - used),
+        "allowed_industries":     sorted(APOLLO_PHONE_REVEAL_INDUSTRIES),
+        "credits_per_reveal_est": 8,
+    }
 
 @app.get("/api/admin/apollo/webhook-hits")
 def webhook_hits(user: str = Depends(verify_admin)):

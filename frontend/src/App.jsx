@@ -444,6 +444,10 @@ function ApolloFinder({onFound}){
   const [loading,setLoad]          = useState(false)
   const [result,setResult]         = useState(null)
   const [error,setError]           = useState("")
+  const [budget,setBudget]         = useState(null)
+  useEffect(()=>{
+    api("/api/admin/apollo/budget").then(setBudget).catch(()=>{})
+  },[])
   // Backfill: enrich existing unassigned leads with no DM info
   const [backfillN,setBackfillN]      = useState(25)
   const [backfilling,setBackfilling]  = useState(false)
@@ -493,6 +497,16 @@ function ApolloFinder({onFound}){
       <div className="finder-sub">
         Decision-maker contacts: real names + titles + direct phones/emails. Burns Apollo credits.
       </div>
+      {budget&&(
+        <div style={{marginBottom:14,padding:"8px 12px",background:"#0f1930",border:"1px solid #40485d40",
+          borderRadius:8,fontSize:11,color:"#a3aac4",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+          <span>📱 Phone reveals this month: <b style={{color: budget.remaining<=0?"#ff6e84":"#8b5cf6"}}>{budget.used_this_month}/{budget.monthly_cap}</b>
+            <span style={{color:"#40485d"}}> · ~{budget.credits_per_reveal_est} cr each</span></span>
+          <span style={{color:"#40485d",fontSize:10}}>
+            Allowed: {budget.allowed_industries?.join(", ")||"any"}
+          </span>
+        </div>
+      )}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,alignItems:"flex-end"}}>
         <div className="ff" style={{gridColumn:"1 / -1"}}>
           <label>Job Titles (comma-separated)</label>
@@ -656,6 +670,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [dmStatus,setDmStatus]    = useState("")
   const [revealing,setRevealing]  = useState(false)
   const [revealStatus,setRevealStatus] = useState("")
+  const [phoneBudget,setPhoneBudget] = useState(null)  // {monthly_cap, used_this_month, remaining, allowed_industries}
   const [calls,setCalls]          = useState([])
   const [modalError,setModalError] = useState("")
   const [primary,setPrimary]      = useState("")       // no_answer, voicemail, answered
@@ -690,7 +705,18 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   useEffect(()=>{
     api(`/api/calls/${lead.id}`).then(r=>setCalls(Array.isArray(r)?r:[])).catch(()=>setCalls([]))
     api("/api/scripts").then(r=>setScripts(Array.isArray(r)?r:[])).catch(()=>{})
+    api("/api/admin/apollo/budget").then(setPhoneBudget).catch(()=>setPhoneBudget(null))
   },[lead.id])
+
+  // Phone reveal allowed when industry is in allowlist AND budget remaining
+  const phoneRevealAllowed = (()=>{
+    if(!phoneBudget) return false
+    if(phoneBudget.remaining<=0) return false
+    const inds = phoneBudget.allowed_industries||[]
+    if(inds.length===0) return true
+    const leadInd = (lead.industry||"").toLowerCase()
+    return inds.some(i=>leadInd.includes(i.toLowerCase()))
+  })()
 
   // Derive the flat outcome for storage (backward compatible)
   const outcome = primary==="answered" ? (secondary||"answered") : primary
@@ -817,13 +843,21 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                   {findingDM?"Searching Apollo…":"🔍 Find Decision Maker"}
                 </button>
               )}
-              {lead.firstName&&!lead.phone&&(
+              {lead.firstName&&!lead.phone&&phoneRevealAllowed&&(
                 <button onClick={revealMobile} disabled={revealing}
                   style={{fontSize:11,padding:"4px 10px",borderRadius:6,fontFamily:"inherit",cursor:revealing?"wait":"pointer",
                     background:"#ffe083",color:"#000011",border:"none",opacity:revealing?0.7:1,fontWeight:600}}
-                  title="Reveal direct mobile via Apollo webhook (~5-8 credits)">
+                  title={`Reveal direct mobile via Apollo (~8 credits). Budget: ${phoneBudget?.remaining??"?"}/${phoneBudget?.monthly_cap??"?"} this month.`}>
                   {revealing?"Requesting…":"📱 Reveal Direct Mobile"}
                 </button>
+              )}
+              {lead.firstName&&!lead.phone&&!phoneRevealAllowed&&phoneBudget&&(
+                <span style={{fontSize:10,color:"#a3aac4",fontStyle:"italic"}}
+                  title={phoneBudget.remaining<=0
+                    ? `Phone reveal budget exhausted (${phoneBudget.used_this_month}/${phoneBudget.monthly_cap}). Resets next month.`
+                    : `Phone reveals only for ${(phoneBudget.allowed_industries||[]).join(", ")} verticals. Use switchboard + ask for ${lead.firstName} by name.`}>
+                  {phoneBudget.remaining<=0 ? "📱 budget exhausted" : "📱 use named-ask"}
+                </span>
               )}
               {dmStatus&&(
                 <span style={{fontSize:11,color:dmStatus.startsWith("✓")?"#69f6b8":"#ffe083"}}>{dmStatus}</span>
