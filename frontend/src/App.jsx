@@ -443,6 +443,11 @@ function ApolloFinder({onFound}){
   const [loading,setLoad]          = useState(false)
   const [result,setResult]         = useState(null)
   const [error,setError]           = useState("")
+  // Backfill: enrich existing unassigned leads with no DM info
+  const [backfillN,setBackfillN]      = useState(25)
+  const [backfilling,setBackfilling]  = useState(false)
+  const [backfillResult,setBfResult]  = useState(null)
+  const [backfillError,setBfError]    = useState("")
 
   async function pull(){
     setError(""); setResult(null)
@@ -461,6 +466,20 @@ function ApolloFinder({onFound}){
     }catch(ex){
       setError(ex.message||"Apollo pull failed — check API key in Railway.")
     }finally{ setLoad(false) }
+  }
+
+  async function backfill(){
+    setBfError(""); setBfResult(null)
+    const n = Math.max(1,Math.min(Number(backfillN)||25,200))
+    if(!window.confirm(`Spend up to ${n} Apollo credits to enrich existing unassigned leads with decision-maker info?`)) return
+    setBackfilling(true)
+    try{
+      const res = await api("/api/admin/apollo/backfill",{method:"POST",body:JSON.stringify({limit:n})})
+      setBfResult(res)
+      if(res.enriched>0) onFound&&onFound()
+    }catch(ex){
+      setBfError(ex.message||"Backfill failed — check Apollo key + kill switch.")
+    }finally{ setBackfilling(false) }
   }
 
   return(
@@ -530,6 +549,37 @@ function ApolloFinder({onFound}){
           )}
         </div>
       )}
+
+      {/* ── Backfill: enrich existing leads with no DM info ─────────────── */}
+      <div style={{marginTop:18,paddingTop:18,borderTop:"1px solid #40485d30"}}>
+        <div style={{fontSize:12,color:"#dee5ff",fontWeight:600,marginBottom:6}}>
+          Enrich Existing Leads
+        </div>
+        <div style={{fontSize:11,color:"#a3aac4",marginBottom:10}}>
+          Run Apollo on unassigned leads in your queue that have no decision-maker name yet.
+          One credit per lead checked.
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <label style={{fontSize:11,color:"#a3aac4"}}>How many:</label>
+          <input className="sel" type="number" min={1} max={200} value={backfillN}
+            onChange={e=>setBackfillN(e.target.value)} style={{width:90,padding:"6px 10px"}}/>
+          <button className="btn btn-p" onClick={backfill} disabled={backfilling}
+            style={{fontSize:11,padding:"7px 14px",background:"#8b5cf6"}}>
+            {backfilling?"Enriching…":"Backfill Now"}
+          </button>
+        </div>
+        {backfillError&&<div style={{marginTop:10,padding:"8px 12px",background:"#ff6e8418",border:"1px solid #ff6e8440",
+          borderRadius:8,fontSize:11,color:"#ff6e84"}}>{backfillError}</div>}
+        {backfillResult&&(
+          <div style={{marginTop:10,padding:"10px 12px",background:"#8b5cf615",border:"1px solid #8b5cf630",
+            borderRadius:8,fontSize:11,color:"#dee5ff"}}>
+            ✓ Checked <b>{backfillResult.checked}</b> leads, enriched <b style={{color:"#8b5cf6"}}>{backfillResult.enriched}</b> with decision-maker info
+            {backfillResult.checked>backfillResult.enriched&&(
+              <span style={{color:"#a3aac4"}}> ({backfillResult.checked-backfillResult.enriched} had no Apollo match)</span>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -585,7 +635,13 @@ function QualChip({label, value, options, onChange}){
 
 // ─── CallModal ───────────────────────────────────────────────────────────────
 
-function CallModal({lead,onClose,onSaved}){
+function CallModal({lead: leadProp,onClose,onSaved}){
+  // Local mirror so the Find-DM button can update the displayed contact info
+  // without closing the modal or refetching from the server. lead.id is
+  // stable, so the existing useEffect on lead.id stays correct.
+  const [lead,setLead]            = useState(leadProp)
+  const [findingDM,setFindingDM]  = useState(false)
+  const [dmStatus,setDmStatus]    = useState("")
   const [calls,setCalls]          = useState([])
   const [modalError,setModalError] = useState("")
   const [primary,setPrimary]      = useState("")       // no_answer, voicemail, answered
@@ -680,6 +736,22 @@ function CallModal({lead,onClose,onSaved}){
   const selectedScript = scripts.find(s=>s.id===parseInt(scriptId))
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
 
+  async function findDecisionMaker(){
+    setDmStatus(""); setFindingDM(true)
+    try{
+      const r = await api(`/api/leads/${lead.id}/find-dm`,{method:"POST",body:"{}"})
+      if(r.enriched && r.lead){
+        setLead(r.lead)
+        setDmStatus("✓ Found")
+        onSaved&&onSaved()  // refresh the parent leads list in the background
+      }else{
+        setDmStatus(r.message||"No Apollo match found for this company")
+      }
+    }catch(ex){
+      setDmStatus(ex.message||"Couldn't reach Apollo — try again later")
+    }finally{ setFindingDM(false) }
+  }
+
   return(
     <div className="modal-bg" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="modal" style={{maxWidth:640}}>
@@ -688,9 +760,23 @@ function CallModal({lead,onClose,onSaved}){
             <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:16,fontWeight:700,color:"#dee5ff",marginBottom:4}}>
               {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}
             </div>
-            <div style={{display:"flex",gap:12,fontSize:12,color:"#a3aac4"}}>
+            {lead.firstName&&lead.title&&(
+              <div style={{fontSize:11,color:"#a3aac4",marginBottom:4}}>{lead.title} · {lead.company}</div>
+            )}
+            <div style={{display:"flex",gap:12,fontSize:12,color:"#a3aac4",flexWrap:"wrap",alignItems:"center"}}>
               {lead.phone&&<span>📞 {lead.phone}</span>}
               {lead.email&&<span>✉ {lead.email}</span>}
+              {!lead.firstName&&(
+                <button onClick={findDecisionMaker} disabled={findingDM}
+                  style={{fontSize:11,padding:"4px 10px",borderRadius:6,fontFamily:"inherit",cursor:findingDM?"wait":"pointer",
+                    background:"#8b5cf6",color:"#fff",border:"none",opacity:findingDM?0.7:1}}
+                  title="Look up the decision maker at this company via Apollo (1 credit)">
+                  {findingDM?"Searching Apollo…":"🔍 Find Decision Maker"}
+                </button>
+              )}
+              {dmStatus&&(
+                <span style={{fontSize:11,color:dmStatus.startsWith("✓")?"#69f6b8":"#ffe083"}}>{dmStatus}</span>
+              )}
             </div>
           </div>
           <button className="btn btn-g" style={{fontSize:12,padding:"5px 10px"}} onClick={onClose}>✕</button>

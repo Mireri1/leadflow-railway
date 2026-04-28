@@ -27,6 +27,15 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
 APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/search"
+# Halts every Apollo enrichment call instantly. Same shape as PLACES_KILL_SWITCH.
+APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
+# Titles tried (in priority order) when auto-enriching a scraped company.
+APOLLO_ENRICH_TITLES = [t.strip() for t in os.getenv("APOLLO_ENRICH_TITLES",
+    "Facility Manager,Director of Operations,Operations Manager,Property Manager,General Manager,Owner,Principal").split(",") if t.strip()]
+# How long to remember "we already searched Apollo for this company" so we don't
+# re-spend credits on the same company. In-memory only — restarts wipe it,
+# which is fine; the worst case is paying for a few duplicate lookups.
+APOLLO_ENRICH_CACHE_TTL_HOURS = int(os.getenv("APOLLO_ENRICH_CACHE_TTL_HOURS", "720"))  # 30 days
 
 # ── Google Places cost controls ─────────────────────────────────────────────
 # PLACES_KILL_SWITCH=1 halts every Places call instantly (same env name as
@@ -724,10 +733,109 @@ class ScrapeRequest(BaseModel):
     source:    Optional[str] = "places"
 
 # ── Apollo.io integration ───────────────────────────────────────────────────
-# Pulls decision-maker contacts (name + title + direct email/phone) from
-# Apollo's People Search API. Uses search-only flow — no separate enrich
-# call — so credit cost is whatever Apollo charges for a search hit on
-# your plan tier (Pro = 4,000 credits/seat/month).
+# Two flows:
+#   1. Auto-enrichment: when Google Places scrape returns a company, look up
+#      the most-likely decision maker at that company and merge name + direct
+#      contact info into the lead before insert. Caller never sees Apollo —
+#      they just see leads with real names attached.
+#   2. Direct DM pull: admin-only "Pull from Apollo" finder (ApolloFinder UI)
+#      generates fresh DM leads not tied to existing companies.
+# Credit cost: ~1 credit per lookup on Pro tier (4,000/month).
+
+# Process-wide cache: company_name_lower -> (expires_ts, person_dict_or_None).
+# We cache MISS results too — no point re-paying when Apollo had nothing.
+_apollo_enrich_cache = {}
+
+def apollo_cache_get(company: str):
+    """Returns ('HIT', person_or_None) or ('MISS', None)."""
+    if not company:
+        return ("MISS", None)
+    key = company.lower().strip()
+    hit = _apollo_enrich_cache.get(key)
+    if not hit:
+        return ("MISS", None)
+    expires, person = hit
+    if expires < time.time():
+        _apollo_enrich_cache.pop(key, None)
+        return ("MISS", None)
+    return ("HIT", person)
+
+def apollo_cache_set(company: str, person):
+    if not company:
+        return
+    if len(_apollo_enrich_cache) > 10000:
+        _apollo_enrich_cache.clear()
+    key = company.lower().strip()
+    _apollo_enrich_cache[key] = (time.time() + APOLLO_ENRICH_CACHE_TTL_HOURS * 3600, person)
+
+def apollo_find_dm_at_company(company_name: str, titles=None):
+    """Search Apollo for the top-ranked DM at a given company.
+    Returns the Apollo person dict, or None if no match / API error / kill switch on."""
+    if not APOLLO_API_KEY or APOLLO_KILL_SWITCH or not company_name:
+        return None
+    payload = {
+        "q_organization_name": company_name,
+        "person_titles":       titles or APOLLO_ENRICH_TITLES,
+        "per_page":            1,
+        "page":                1,
+    }
+    headers = {
+        "X-Api-Key":     APOLLO_API_KEY,
+        "Cache-Control": "no-cache",
+        "Content-Type":  "application/json",
+    }
+    try:
+        r = req_lib.post(APOLLO_SEARCH_URL, headers=headers, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"[APOLLO-ENRICH] HTTP {r.status_code} for '{company_name}': {r.text[:150]}")
+            return None
+        data = r.json()
+        people = data.get("people") or data.get("contacts") or []
+        return people[0] if people else None
+    except Exception as e:
+        print(f"[APOLLO-ENRICH] exception for '{company_name}': {e}")
+        return None
+
+def apollo_enrich_lead_in_place(lead: dict) -> bool:
+    """Mutate `lead` to merge Apollo DM info on top of whatever Google Places
+    found. Returns True if real enrichment happened (i.e. we got a person).
+    Cache-aware: a previously-MISSed company in the cache window is skipped."""
+    if not lead.get("company"):
+        return False
+    if lead.get("firstName"):  # Already has a DM — don't re-spend credits
+        return False
+
+    cache_state, cached = apollo_cache_get(lead["company"])
+    if cache_state == "HIT":
+        person = cached  # may be None — that's a cached miss, still skip
+    else:
+        person = apollo_find_dm_at_company(lead["company"])
+        apollo_cache_set(lead["company"], person)
+
+    if not person:
+        return False
+
+    lead["firstName"] = clean(person.get("first_name", "")) or lead.get("firstName", "")
+    lead["lastName"]  = clean(person.get("last_name", ""))  or lead.get("lastName", "")
+    lead["title"]     = clean(person.get("title", ""))      or lead.get("title", "")
+
+    em = person.get("email") or ""
+    if em and "email_not_unlocked" not in em:
+        lead["email"] = em
+
+    # Direct line beats switchboard — overwrite Google's main number if Apollo has personal
+    for p in (person.get("phone_numbers") or []):
+        cand = p.get("sanitized_number") or p.get("raw_number") or ""
+        if cand:
+            lead["phone"] = cand
+            break
+
+    li = person.get("linkedin_url")
+    if li and "linkedin" not in (lead.get("notes") or "").lower():
+        lead["notes"] = ((lead.get("notes") or "") + f" | LinkedIn: {li}").strip(" |")
+
+    lead["score"] = score_lead(lead)
+    return True
 
 def apollo_person_to_lead(person: dict, user: str) -> dict:
     """Map Apollo person object → LeadFlow lead schema."""
@@ -915,25 +1023,40 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
     for lead in leads:
         lead["createdBy"] = user
 
+    # Auto-enrich with Apollo: replace switchboard contact info with the actual
+    # decision maker's name + direct line/email. Silent no-op if APOLLO_API_KEY
+    # is missing or APOLLO_KILL_SWITCH=1. Per-company cache prevents re-spending
+    # credits on the same company within APOLLO_ENRICH_CACHE_TTL_HOURS.
+    apollo_enriched = 0
+    if APOLLO_API_KEY and not APOLLO_KILL_SWITCH:
+        for lead in leads:
+            if apollo_enrich_lead_in_place(lead):
+                apollo_enriched += 1
+        print(f"[SCRAPE] Apollo enriched {apollo_enriched}/{len(leads)} leads with DM info")
+
     saved = save_to_supabase(leads)
     audit_log(user, "scrape_leads", "lead", None, {
         "industries": [k[0] for k in keywords], "state": body.state,
         "cities": body.cities, "found": len(leads), "saved": saved,
-        "cache_hits": len(cache_hits), "uncached_combos": uncached})
-    print(f"[SCRAPE] Saved {saved} leads (cache_hits={len(cache_hits)}/{len(all_combos)})")
+        "cache_hits": len(cache_hits), "uncached_combos": uncached,
+        "apollo_enriched": apollo_enriched})
+    print(f"[SCRAPE] Saved {saved} leads (cache_hits={len(cache_hits)}/{len(all_combos)}, apollo_enriched={apollo_enriched})")
 
     # Slack notification
     if saved > 0:
         app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+        fields = [
+            {"label": "Industries", "value": ", ".join(k[0] for k in keywords)},
+            {"label": "Location", "value": body.state or "All"},
+            {"label": "Leads Found", "value": f":busts_in_silhouette: {len(leads)}"},
+            {"label": "New Saved", "value": f":white_check_mark: {saved}"},
+        ]
+        if apollo_enriched > 0:
+            fields.append({"label": "DM Enriched (Apollo)", "value": f":telephone_receiver: {apollo_enriched}"})
         send_slack(
             "🔍 LeadFlow Scrape Complete",
             f"*{user}* scraped *{saved}* new leads.",
-            fields=[
-                {"label": "Industries", "value": ", ".join(k[0] for k in keywords)},
-                {"label": "Location", "value": body.state or "All"},
-                {"label": "Leads Found", "value": f":busts_in_silhouette: {len(leads)}"},
-                {"label": "New Saved", "value": f":white_check_mark: {saved}"},
-            ],
+            fields=fields,
             actions=[{"label": "📋 View Leads", "url": app_url, "style": "primary"}],
         )
 
@@ -1625,6 +1748,108 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "page":            pagination.get("page"),
         "total_pages":     pagination.get("total_pages"),
     }
+
+@app.post("/api/admin/apollo/backfill")
+def apollo_backfill(body: dict, user: str = Depends(verify_admin)):
+    """Enrich existing unassigned leads that have no DM info. Body: {limit: int}.
+    Walks current 'new' + unassigned leads with empty firstName, runs Apollo
+    enrichment, and updates Supabase in place. Burns ~1 credit per lead."""
+    if not APOLLO_API_KEY:
+        raise HTTPException(status_code=400, detail="APOLLO_API_KEY not configured")
+    if APOLLO_KILL_SWITCH:
+        raise HTTPException(status_code=503, detail="Apollo kill switch is on (APOLLO_KILL_SWITCH=1)")
+
+    limit = max(1, min(int(body.get("limit", 25)), 200))
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?firstName=eq.&assignedTo=eq.&status=eq.new"
+            f"&select=id,company,firstName,lastName,title,email,phone,notes,score"
+            f"&limit={limit}",
+            headers=SB_HEADERS, timeout=30,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if not isinstance(rows, list):
+            rows = []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch leads: {e}")
+
+    enriched = 0
+    updated_ids = []
+    for lead in rows:
+        if not apollo_enrich_lead_in_place(lead):
+            continue
+        update_payload = {
+            "firstName": lead.get("firstName", ""),
+            "lastName":  lead.get("lastName", ""),
+            "title":     lead.get("title", ""),
+            "email":     lead.get("email", ""),
+            "phone":     lead.get("phone", ""),
+            "notes":     lead.get("notes", ""),
+            "score":     lead.get("score"),
+            "updatedAt": datetime.utcnow().isoformat(),
+        }
+        try:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead['id']}",
+                headers=SB_HEADERS, json=update_payload, timeout=10,
+            )
+            enriched += 1
+            updated_ids.append(lead["id"])
+        except Exception as e:
+            print(f"[APOLLO-BACKFILL] update failed for {lead.get('id')}: {e}")
+
+    audit_log(user, "apollo_backfill", "lead", None, {
+        "checked": len(rows), "enriched": enriched, "limit": limit,
+    })
+    print(f"[APOLLO-BACKFILL] checked={len(rows)} enriched={enriched}")
+    return {"checked": len(rows), "enriched": enriched, "updated_ids": updated_ids[:20]}
+
+@app.post("/api/leads/{lead_id}/find-dm")
+def find_dm(lead_id: str, user: str = Depends(verify_token)):
+    """Caller-triggered Apollo enrichment for a single lead. Returns the
+    updated lead so the call modal can refresh inline."""
+    if not APOLLO_API_KEY or APOLLO_KILL_SWITCH:
+        raise HTTPException(status_code=503, detail="Apollo enrichment unavailable")
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=*",
+            headers=SB_HEADERS, timeout=10,
+        )
+        rows = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch lead: {e}")
+
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = rows[0]
+
+    if not apollo_enrich_lead_in_place(lead):
+        return {"enriched": False, "lead": lead, "message": "No Apollo match found for this company"}
+
+    update_payload = {
+        "firstName": lead.get("firstName", ""),
+        "lastName":  lead.get("lastName", ""),
+        "title":     lead.get("title", ""),
+        "email":     lead.get("email", ""),
+        "phone":     lead.get("phone", ""),
+        "notes":     lead.get("notes", ""),
+        "score":     lead.get("score"),
+        "updatedAt": datetime.utcnow().isoformat(),
+    }
+    try:
+        req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
+            headers=SB_HEADERS, json=update_payload, timeout=10,
+        )
+    except Exception as e:
+        print(f"[APOLLO-FIND-DM] update failed for {lead_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+
+    audit_log(user, "find_dm", "lead", lead_id, {
+        "company": lead.get("company"), "enriched": True,
+    })
+    return {"enriched": True, "lead": lead}
 
 @app.post("/api/leads/reassign")
 def reassign_leads(body: dict, user: str = Depends(verify_admin)):
