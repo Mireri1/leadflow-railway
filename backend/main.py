@@ -2743,6 +2743,45 @@ def send_to_campaign(lead_id: str, body: dict, user: str = Depends(verify_token)
         return {"sent": False, "message": detail}
     return {"sent": True, "message": "Sent to VCC", "campaign": campaign, "trigger": trigger}
 
+@app.get("/api/admin/email/setup-status")
+def email_setup_status(user: str = Depends(verify_admin)):
+    """One-stop diagnostic for the email + reply pipeline. Shows what's
+    configured, what's missing, and the exact webhook URL to paste into
+    Resend dashboard. Designed to be the only page admin needs while wiring."""
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app").rstrip("/")
+    secret  = RESEND_WEBHOOK_SECRET or ""
+    safe_secret = url_quote(secret, safe="") if secret else ""
+    webhook_url = f"{app_url}/api/webhooks/resend/{safe_secret}" if secret else None
+
+    last = _imap_poll_state.get("last_run")
+    last_result = _imap_poll_state.get("last_result")
+
+    return {
+        "send_path": {
+            "resend_api_key_set":      bool(RESEND_API_KEY),
+            "from_address":            f"{os.getenv('OUTREACH_SENDER_NAME', OUTREACH_NAME)} <{OUTREACH_EMAIL}>",
+            "reply_to":                OUTREACH_REPLY_TO or OUTREACH_EMAIL,
+            "ready":                   bool(RESEND_API_KEY),
+        },
+        "webhook_path": {
+            "resend_webhook_secret_set": bool(secret),
+            "url_for_resend_dashboard":  webhook_url,
+            "url_starts_with_https":     bool(webhook_url and webhook_url.startswith("https://")),
+            "ready":                     bool(secret),
+        },
+        "reply_path": {
+            "imap_configured":           bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+            "imap_server":               IMAP_SERVER or None,
+            "imap_username":             IMAP_USERNAME or None,
+            "imap_folder":               IMAP_FOLDER,
+            "poll_interval_minutes":     IMAP_POLL_INTERVAL_MINUTES,
+            "last_poll_run_at":          last,
+            "last_poll_result":          last_result,
+            "ready":                     bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+        },
+        "all_ready": bool(RESEND_API_KEY and secret and IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+    }
+
 @app.post("/api/admin/poll-replies")
 def poll_replies_now(user: str = Depends(verify_admin)):
     """Manual trigger for the IMAP reply poller — useful when you want an
