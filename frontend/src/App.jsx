@@ -678,7 +678,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [phoneBudget,setPhoneBudget] = useState(null)  // {monthly_cap, used_this_month, remaining, allowed_industries}
   const [sendingCampaign,setSendingCampaign] = useState(false)
   const [campaignStatus,setCampaignStatus] = useState("")
-  const [campaignInfo,setCampaignInfo] = useState(null)  // {in_campaign, last_sent_at, send_count, vcc_configured}
+  const [campaignInfo,setCampaignInfo] = useState(null)  // {in_campaign, last_sent_at, send_count, email_configured}
   const [sendEmailFollowup,setSendEmailFollowup] = useState(true)  // default checked when applicable
   const [calls,setCalls]          = useState([])
   const [modalError,setModalError] = useState("")
@@ -752,7 +752,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
       // Per-call email follow-up: only meaningful when this was a failed dial
       // and the lead has the contact info we'd email + VCC is configured.
       const emailEligible = (primary==="no_answer"||primary==="voicemail")
-        && lead.email && lead.firstName && campaignInfo?.vcc_configured
+        && lead.email && lead.firstName && campaignInfo?.email_configured
         && !campaignInfo?.in_campaign
       const callPayload = {
         leadId:lead.id, outcome, notes:fullNotes,
@@ -894,7 +894,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                 </span>
               )}
               {/* Email campaign trigger — only when VCC is configured AND lead has email + name */}
-              {campaignInfo?.vcc_configured && lead.email && lead.firstName && !campaignInfo.in_campaign && (
+              {campaignInfo?.email_configured && lead.email && lead.firstName && !campaignInfo.in_campaign && (
                 <button onClick={sendToCampaign} disabled={sendingCampaign}
                   style={{fontSize:11,padding:"4px 10px",borderRadius:6,fontFamily:"inherit",cursor:sendingCampaign?"wait":"pointer",
                     background:"#a3a6ff",color:"#000011",border:"none",opacity:sendingCampaign?0.7:1,fontWeight:600}}
@@ -1118,7 +1118,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                 lead has email + name, VCC is configured, not already in campaign */}
             {(primary==="no_answer"||primary==="voicemail")
               && lead.email && lead.firstName
-              && campaignInfo?.vcc_configured
+              && campaignInfo?.email_configured
               && !campaignInfo?.in_campaign && (
               <label style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",marginBottom:10,
                 background:"#a3a6ff10",border:"1px solid #a3a6ff30",borderRadius:8,cursor:"pointer",fontSize:12,color:"#dee5ff"}}>
@@ -4285,8 +4285,25 @@ function CampaignActivityPanel(){
   const [data,setData] = useState(null)
   const [open,setOpen] = useState(false)
   const [days,setDays] = useState(14)
+  const [polling,setPolling] = useState(false)
+  const [pollResult,setPollResult] = useState("")
   const load = (d)=>api(`/api/admin/campaigns/recent?days=${d}`).then(setData).catch(()=>setData(null))
   useEffect(()=>{ load(days) },[days])
+
+  async function pollNow(){
+    setPolling(true); setPollResult("")
+    try{
+      const r = await api("/api/admin/poll-replies",{method:"POST",body:"{}"})
+      if(r.ok){
+        const s = r.stats || {}
+        setPollResult(`✓ Checked ${s.checked||0} unread, matched ${s.matched||0} replies, skipped ${s.auto_replies_skipped||0} auto-replies`)
+        load(days)
+      }else{
+        setPollResult("⚠ "+(r.error||"poll failed"))
+      }
+    }catch(ex){ setPollResult("⚠ "+(ex.message||"error")) }
+    finally{ setPolling(false) }
+  }
 
   const t = data?.totals || {sends:0,replies:0,opens:0,clicks:0,bounces:0,unsubs:0}
   const fmtTime = (iso)=>iso?new Date(iso).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""
@@ -4300,9 +4317,15 @@ function CampaignActivityPanel(){
           <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
             Campaign Activity <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
           </div>
-          {data&&!data.vcc_configured&&(
+          {data&&!data.email_configured&&(
             <span style={{fontSize:10,color:"#ffe083",background:"#ffe08315",padding:"2px 8px",borderRadius:4}}>
-              VCC not configured — sends disabled
+              Resend not configured — sends disabled
+            </span>
+          )}
+          {data&&data.email_configured&&!data.imap_configured&&(
+            <span style={{fontSize:10,color:"#ffe083",background:"#ffe08315",padding:"2px 8px",borderRadius:4}}
+              title="IMAP poller not configured — replies won't auto-flip lead status. Set IMAP_SERVER/USERNAME/PASSWORD in Railway.">
+              IMAP not configured — replies won't auto-detect
             </span>
           )}
         </div>
@@ -4332,26 +4355,43 @@ function CampaignActivityPanel(){
               </div>
             ))}
           </div>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}}>
             <span style={{fontSize:12,color:"#a3aac4"}}>
               Reply rate: <b style={{color:"#69f6b8"}}>{data?.reply_rate_pct||0}%</b> over {data?.window_days||days}d
             </span>
-            <select className="sel" value={days} onChange={e=>setDays(Number(e.target.value))}
-              style={{padding:"4px 10px",fontSize:11}}>
-              <option value={7}>Last 7 days</option>
-              <option value={14}>Last 14 days</option>
-              <option value={30}>Last 30 days</option>
-              <option value={90}>Last 90 days</option>
-            </select>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              {data?.imap_configured&&(
+                <button onClick={pollNow} disabled={polling}
+                  className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
+                  title="Force-check the inbox for new replies right now (otherwise the background poller runs every 10 min)">
+                  {polling?"Checking…":"📬 Check Replies Now"}
+                </button>
+              )}
+              <select className="sel" value={days} onChange={e=>setDays(Number(e.target.value))}
+                style={{padding:"4px 10px",fontSize:11}}>
+                <option value={7}>Last 7 days</option>
+                <option value={14}>Last 14 days</option>
+                <option value={30}>Last 30 days</option>
+                <option value={90}>Last 90 days</option>
+              </select>
+            </div>
           </div>
+          {pollResult&&(
+            <div style={{marginBottom:12,padding:"8px 12px",fontSize:11,
+              background:pollResult.startsWith("✓")?"#69f6b815":"#ffe08315",
+              border:`1px solid ${pollResult.startsWith("✓")?"#69f6b830":"#ffe08330"}`,
+              borderRadius:6,color:pollResult.startsWith("✓")?"#69f6b8":"#ffe083"}}>
+              {pollResult}
+            </div>
+          )}
           {/* Recent sends */}
           <div style={{fontSize:11,color:"#a3aac4",letterSpacing:".08em",marginBottom:8}}>
             RECENT SENDS ({data?.recent_sends?.length||0})
           </div>
           {(!data||data.recent_sends?.length===0)?(
             <div style={{padding:"20px",textAlign:"center",color:"#40485d",fontSize:12,background:"#060e20",borderRadius:8}}>
-              {data?.vcc_configured ? "No sends yet — they'll appear here once a caller fires the email follow-up."
-                : "Set VCC_CAMPAIGN_WEBHOOK_URL in Railway to enable email sends."}
+              {data?.email_configured ? "No sends yet — they'll appear here once a caller fires the email follow-up."
+                : "Set RESEND_API_KEY in Railway to enable email sends."}
             </div>
           ):(
             <div style={{maxHeight:240,overflowY:"auto",border:"1px solid #40485d20",borderRadius:8}}>

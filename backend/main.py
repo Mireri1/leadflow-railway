@@ -8,6 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt, os, re, time, json as json_lib, requests as req_lib
+import imaplib, email as email_lib, threading
+from email.header import decode_header
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
@@ -44,24 +46,32 @@ APOLLO_PHONE_REVEAL_INDUSTRIES = set(
 )
 APOLLO_PHONE_REVEAL_MONTHLY_CAP = int(os.getenv("APOLLO_PHONE_REVEAL_MONTHLY_CAP", "400"))
 
-# ── VCC scraper email campaign integration ─────────────────────────────────
-# After a caller can't reach a lead by phone, LeadFlow forwards the lead to
-# VCC scraper's outreach pipeline so VCC's existing email-send + stats infra
-# handles the "tried to call you" follow-up. VCC posts back to our callback
-# URL when the recipient replies, opens, or bounces.
-VCC_CAMPAIGN_WEBHOOK_URL    = os.getenv("VCC_CAMPAIGN_WEBHOOK_URL", "").strip()
-VCC_CAMPAIGN_WEBHOOK_SECRET = os.getenv("VCC_CAMPAIGN_WEBHOOK_SECRET", "").strip().rstrip("%").strip()
-# Random secret in the path of the callback URL we hand VCC, so VCC's posts
-# back to LeadFlow are authenticated. Generate with secrets.token_urlsafe(32).
-LEADFLOW_CALLBACK_SECRET    = os.getenv("LEADFLOW_CALLBACK_SECRET", "").strip().rstrip("%").strip()
-# Auto-fire after this many failed attempts (no_answer + voicemail combined).
-# 2 = lands on the second attempt; lets caller try once first, email backstops.
+# ── Email campaign integration ────────────────────────────────────────────
+# After a caller can't reach a lead by phone, LeadFlow sends a "tried to
+# call you" follow-up directly via Resend (same API key + from-address that
+# already powers other Vision Cleaning sends, so deliverability matches).
 AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD = int(os.getenv("AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD", "2"))
-# Set to 1 to enable auto-fire. Defaults off so a misconfigured VCC URL
-# can't spray sends without explicit opt-in.
 AUTO_CAMPAIGN_AFTER_FAILED_CALL = os.getenv("AUTO_CAMPAIGN_AFTER_FAILED_CALL", "0") == "1"
-# Don't re-send the same lead to the same campaign within this window.
 CAMPAIGN_SUPPRESSION_DAYS = int(os.getenv("CAMPAIGN_SUPPRESSION_DAYS", "14"))
+# Resend webhook secret — random token in URL path. Configure the URL
+# (with this secret) in Resend dashboard → Webhooks. Auth is URL-as-bearer.
+RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "").strip().rstrip("%").strip()
+# IMAP reply poller — watches the inbox for replies to campaign sends and
+# flips the lead status to 'interested' automatically so callers don't need
+# to manually mark anything.
+IMAP_SERVER     = os.getenv("IMAP_SERVER", "").strip()        # e.g. imap.gmail.com
+IMAP_PORT       = int(os.getenv("IMAP_PORT", "993"))
+IMAP_USERNAME   = os.getenv("IMAP_USERNAME", "").strip()      # full email
+IMAP_PASSWORD   = os.getenv("IMAP_PASSWORD", "").strip()      # app password if Gmail+2FA
+IMAP_POLL_INTERVAL_MINUTES = int(os.getenv("IMAP_POLL_INTERVAL_MINUTES", "10"))
+IMAP_FOLDER     = os.getenv("IMAP_FOLDER", "INBOX")
+# Phrases that mark a message as auto-reply (case-insensitive). Skip these
+# so a vacation responder doesn't false-flip a lead to 'interested'.
+AUTO_REPLY_MARKERS = (
+    "out of office", "out-of-office", "ooo:", "automatic reply",
+    "auto-reply", "auto reply", "vacation reply", "i am away",
+    "i'm away", "i'm currently out", "currently out of",
+)
 # Halts every Apollo enrichment call instantly. Same shape as PLACES_KILL_SWITCH.
 APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
 # Titles tried (in priority order) when auto-enriching a scraped company.
@@ -815,10 +825,11 @@ def lead_already_in_campaign(lead_id: str, campaign: str = "tried-to-call") -> b
         return False  # fail-open — better to risk a duplicate than miss a send
 
 def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "tried-to-call"):
-    """POST a lead to VCC's campaign ingest endpoint with full personalization.
-    Returns (ok: bool, detail: str). No-ops cleanly if VCC URL not configured."""
-    if not VCC_CAMPAIGN_WEBHOOK_URL:
-        return (False, "VCC_CAMPAIGN_WEBHOOK_URL not configured")
+    """Send the 'tried to call you' follow-up directly via Resend. Same API key
+    + from-address as the rest of Vision Cleaning's outbound, so SPF/DKIM/sender
+    reputation match. Returns (ok: bool, detail: str)."""
+    if not RESEND_API_KEY:
+        return (False, "RESEND_API_KEY not configured")
     if not lead.get("email"):
         return (False, "lead has no email")
     if not lead.get("firstName"):
@@ -826,55 +837,47 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "
     if lead_already_in_campaign(lead.get("id"), campaign):
         return (False, f"already sent to '{campaign}' within last {CAMPAIGN_SUPPRESSION_DAYS} days")
 
-    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app").rstrip("/")
-    callback_url = (
-        f"{app_url}/api/webhooks/vcc/{url_quote(LEADFLOW_CALLBACK_SECRET, safe='')}/{lead['id']}"
-        if LEADFLOW_CALLBACK_SECRET else None
-    )
-
     template = build_tried_to_call_email(lead)
+    from_name  = os.getenv("OUTREACH_SENDER_NAME", OUTREACH_NAME)
+    from_email = OUTREACH_EMAIL
+    reply_to   = OUTREACH_REPLY_TO or from_email  # replies hit this inbox; IMAP poller watches it
     payload = {
-        "campaign":  campaign,
-        "lead_id":   str(lead.get("id")),
-        "trigger":   trigger,  # e.g. "no_answer_2nd_attempt", "manual"
-        "recipient": {
-            "email":      lead.get("email"),
-            "first_name": lead.get("firstName"),
-            "last_name":  lead.get("lastName") or "",
-            "title":      lead.get("title") or "",
-            "company":    lead.get("company") or "",
-        },
-        "personalization": {
-            "industry": lead.get("industry") or "",
-            "state":    lead.get("state") or "",
-            "company":  lead.get("company") or "",
-        },
-        "sender": {
-            "name":  os.getenv("OUTREACH_SENDER_NAME", OUTREACH_NAME),
-            "email": OUTREACH_EMAIL,
-            "phone": os.getenv("OUTREACH_SENDER_PHONE", ""),
-        },
-        "template":     template,  # subject + body_text — VCC can render or fall back to its own
-        "callback_url": callback_url,
-        "sent_at":      datetime.utcnow().isoformat(),
+        "from":    f"{from_name} <{from_email}>",
+        "to":      [lead["email"]],
+        "subject": template["subject"],
+        "text":    template["body_text"],
+        "reply_to": reply_to,
+        # Tags survive in Resend's webhook payload — we use them to map events
+        # back to lead_id without keeping a separate mapping table.
+        "tags": [
+            {"name": "campaign", "value": campaign},
+            {"name": "lead_id",  "value": str(lead.get("id"))},
+            {"name": "trigger",  "value": trigger.replace(" ", "_")[:40]},
+        ],
     }
     headers = {
-        "Content-Type":      "application/json",
-        "X-LeadFlow-Secret": VCC_CAMPAIGN_WEBHOOK_SECRET,
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type":  "application/json",
     }
     try:
-        r = req_lib.post(VCC_CAMPAIGN_WEBHOOK_URL, headers=headers, json=payload, timeout=15)
-        if r.status_code not in (200, 201, 202, 204):
+        r = req_lib.post("https://api.resend.com/emails", headers=headers, json=payload, timeout=15)
+        if r.status_code not in (200, 201, 202):
             err = r.text[:300]
-            print(f"[CAMPAIGN] VCC rejected HTTP {r.status_code}: {err}")
-            return (False, f"VCC {r.status_code}: {err}")
+            print(f"[CAMPAIGN] Resend rejected HTTP {r.status_code}: {err}")
+            return (False, f"Resend {r.status_code}: {err}")
+        resend_id = ""
+        try:
+            resend_id = (r.json() or {}).get("id", "")
+        except Exception:
+            pass
     except Exception as e:
-        print(f"[CAMPAIGN] network error posting to VCC: {e}")
+        print(f"[CAMPAIGN] network error posting to Resend: {e}")
         return (False, f"network error: {e}")
 
     audit_log(user, "campaign_sent", "lead", lead.get("id"), {
         "campaign": campaign, "trigger": trigger,
         "to_email": lead.get("email"), "company": lead.get("company"),
+        "resend_id": resend_id,
     })
 
     # Mark the lead as awaiting an email reply so callers don't re-dial. The
@@ -901,6 +904,217 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "
 
     print(f"[CAMPAIGN] sent lead {lead.get('id')} to '{campaign}' via {trigger} → status=awaiting_email_reply")
     return (True, "queued at VCC")
+
+# ── IMAP reply poller ─────────────────────────────────────────────────────
+# Watches the campaign sender's inbox for replies to "tried to call you"
+# emails. When a real reply arrives, looks up the lead by sender email,
+# flips status from awaiting_email_reply → interested, prepends the reply
+# snippet to the lead's notes, fires a Slack ping, and marks the email read.
+# Auto-replies (out-of-office) are suppressed so they don't false-flip leads.
+
+_imap_poll_lock = threading.Lock()  # don't run two polls concurrently
+_imap_poll_state = {"last_run": None, "last_result": None}
+
+def _decode_header_str(raw):
+    """IMAP header values can be MIME-encoded (=?utf-8?B?...?=). Decode safely."""
+    if not raw:
+        return ""
+    try:
+        parts = decode_header(raw)
+        return "".join(
+            (p.decode(enc or "utf-8", errors="replace") if isinstance(p, bytes) else p)
+            for p, enc in parts
+        )
+    except Exception:
+        return str(raw)
+
+def _extract_from_email(from_header: str) -> str:
+    """Pull the bare email out of 'Sarah Chen <sarah@example.com>'."""
+    if not from_header:
+        return ""
+    m = re.search(r"<([^>]+)>", from_header)
+    addr = m.group(1) if m else from_header
+    return addr.strip().lower()
+
+def _is_auto_reply(subject: str, body: str, headers: dict) -> bool:
+    """Catch the common auto-reply patterns so we don't false-flip leads."""
+    if headers.get("auto-submitted") and headers.get("auto-submitted").lower() != "no":
+        return True
+    if headers.get("x-auto-response-suppress"):
+        return True
+    if headers.get("x-autoreply") or headers.get("x-autorespond"):
+        return True
+    blob = f"{subject or ''} {body or ''}".lower()
+    return any(m in blob for m in AUTO_REPLY_MARKERS)
+
+def _extract_body_snippet(msg, max_len: int = 400) -> str:
+    """Pull a short text preview from a multipart email."""
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                disp  = str(part.get("Content-Disposition") or "")
+                if ctype == "text/plain" and "attachment" not in disp:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        return payload.decode(part.get_content_charset() or "utf-8", errors="replace").strip()[:max_len]
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                return payload.decode(msg.get_content_charset() or "utf-8", errors="replace").strip()[:max_len]
+    except Exception as e:
+        print(f"[IMAP-POLL] body extract failed: {e}")
+    return ""
+
+def imap_poll_replies():
+    """Connect to IMAP, scan unread messages, match to awaiting-email leads.
+    Returns a stats dict for the manual endpoint + activity panel."""
+    if not (IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD):
+        return {"ok": False, "error": "IMAP not configured"}
+    if not _imap_poll_lock.acquire(blocking=False):
+        return {"ok": False, "error": "another poll is running"}
+
+    stats = {"checked": 0, "matched": 0, "auto_replies_skipped": 0, "no_match": 0, "errors": 0}
+    started = datetime.utcnow()
+    try:
+        try:
+            mbox = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+            mbox.login(IMAP_USERNAME, IMAP_PASSWORD)
+            mbox.select(IMAP_FOLDER)
+        except Exception as e:
+            stats["errors"] += 1
+            return {"ok": False, "error": f"IMAP connect failed: {e}", "stats": stats}
+
+        try:
+            typ, data = mbox.search(None, "UNSEEN")
+            if typ != "OK":
+                return {"ok": False, "error": f"IMAP search failed: {typ}", "stats": stats}
+            ids = data[0].split() if data and data[0] else []
+        except Exception as e:
+            return {"ok": False, "error": f"IMAP search exception: {e}", "stats": stats}
+
+        for msg_id in ids:
+            stats["checked"] += 1
+            try:
+                typ, msg_data = mbox.fetch(msg_id, "(RFC822)")
+                if typ != "OK" or not msg_data or not msg_data[0]:
+                    stats["errors"] += 1
+                    continue
+                raw = msg_data[0][1]
+                msg = email_lib.message_from_bytes(raw)
+
+                from_addr = _extract_from_email(_decode_header_str(msg.get("From", "")))
+                subject   = _decode_header_str(msg.get("Subject", ""))
+                headers   = {k.lower(): str(v) for k, v in msg.items()}
+                body      = _extract_body_snippet(msg)
+
+                if _is_auto_reply(subject, body, headers):
+                    stats["auto_replies_skipped"] += 1
+                    # Mark read so we don't keep re-scanning auto-replies
+                    try: mbox.store(msg_id, "+FLAGS", "\\Seen")
+                    except: pass
+                    continue
+
+                if not from_addr:
+                    stats["no_match"] += 1
+                    continue
+
+                # Find a lead awaiting email reply with this email address.
+                # Prefer awaiting_email_reply; fall back to any lead with that email.
+                try:
+                    lr = req_lib.get(
+                        f"{SUPABASE_URL}/rest/v1/leads"
+                        f"?email=ilike.{url_quote(from_addr)}"
+                        f"&order=updatedAt.desc&limit=5&select=id,company,firstName,lastName,status,assignedTo,notes",
+                        headers=SB_HEADERS, timeout=10,
+                    )
+                    leads = lr.json() if lr.status_code == 200 else []
+                except Exception as e:
+                    print(f"[IMAP-POLL] lead lookup failed for {from_addr}: {e}")
+                    stats["errors"] += 1
+                    continue
+
+                if not isinstance(leads, list) or not leads:
+                    stats["no_match"] += 1
+                    continue
+
+                # Prefer awaiting_email_reply lead; fall back to most recent
+                target = next((l for l in leads if l.get("status") == "awaiting_email_reply"), leads[0])
+                lead_id = target.get("id")
+                snippet = (body or "")[:300].replace("\n", " ").strip()
+                reply_note = f"📧 Reply ({datetime.utcnow().date().isoformat()}): {snippet}"
+
+                try:
+                    req_lib.patch(
+                        f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id))}",
+                        headers=SB_HEADERS,
+                        json={
+                            "status":    "interested",
+                            "notes":     (reply_note + "\n\n" + (target.get("notes") or ""))[:4000],
+                            "updatedAt": datetime.utcnow().isoformat(),
+                        },
+                        timeout=10,
+                    )
+                except Exception as e:
+                    print(f"[IMAP-POLL] lead update failed: {e}")
+                    stats["errors"] += 1
+                    continue
+
+                audit_log("imap_poller", "campaign_event", "lead", lead_id, {
+                    "event": "reply", "from": from_addr, "subject": subject[:200], "snippet": snippet,
+                })
+                send_slack(
+                    ":incoming_envelope: Email Reply",
+                    f"*{target.get('firstName','')} {target.get('lastName','')}* at *{target.get('company','')}* replied.",
+                    fields=[
+                        {"label": "From",     "value": from_addr},
+                        {"label": "Assigned", "value": target.get("assignedTo") or "unassigned"},
+                        {"label": "Snippet",  "value": snippet[:200] or "(empty)"},
+                    ],
+                    actions=[{"label": "📋 Open LeadFlow",
+                              "url": os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app"),
+                              "style": "primary"}],
+                )
+                stats["matched"] += 1
+
+                # Mark seen so we don't re-process
+                try: mbox.store(msg_id, "+FLAGS", "\\Seen")
+                except: pass
+
+            except Exception as e:
+                print(f"[IMAP-POLL] error processing msg {msg_id}: {e}")
+                stats["errors"] += 1
+
+        try: mbox.logout()
+        except: pass
+
+        return {"ok": True, "stats": stats, "took_ms": int((datetime.utcnow()-started).total_seconds()*1000)}
+    finally:
+        _imap_poll_state["last_run"] = datetime.utcnow().isoformat()
+        _imap_poll_lock.release()
+
+def _imap_poll_loop():
+    """Background thread loop. Sleeps between polls so we're not hammering."""
+    print(f"[IMAP-POLL] background poller starting (every {IMAP_POLL_INTERVAL_MINUTES} min)")
+    # Initial delay so we don't poll during startup before everything is ready
+    time.sleep(60)
+    while True:
+        try:
+            res = imap_poll_replies()
+            _imap_poll_state["last_result"] = res
+            if res.get("ok") and res.get("stats", {}).get("matched", 0) > 0:
+                print(f"[IMAP-POLL] matched {res['stats']['matched']} replies this cycle")
+        except Exception as e:
+            print(f"[IMAP-POLL] loop exception: {e}")
+        time.sleep(IMAP_POLL_INTERVAL_MINUTES * 60)
+
+# Start the background thread once at module load if IMAP is configured.
+# Daemon=True so it dies cleanly with the process. Uvicorn's single-worker
+# default on Railway means exactly one poller runs.
+if IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD:
+    threading.Thread(target=_imap_poll_loop, daemon=True, name="imap-reply-poller").start()
+else:
+    print("[IMAP-POLL] not started — set IMAP_SERVER, IMAP_USERNAME, IMAP_PASSWORD to enable")
 
 class ScrapeRequest(BaseModel):
     industry:  str
@@ -1721,7 +1935,7 @@ def log_call(call: dict, user: str = Depends(verify_token)):
             # suppression so a manual + auto can't double-send.
             should_email = False
             email_trigger = ""
-            if (VCC_CAMPAIGN_WEBHOOK_URL and outcome in ("no_answer", "voicemail")
+            if (RESEND_API_KEY and outcome in ("no_answer", "voicemail")
                     and lead_full and lead_full.get("email") and lead_full.get("firstName")):
                 if send_email_followup:
                     should_email = True
@@ -2507,9 +2721,9 @@ def webhook_hits(user: str = Depends(verify_admin)):
 def send_to_campaign(lead_id: str, body: dict, user: str = Depends(verify_token)):
     """Caller-triggered manual send of a lead to VCC's email campaign.
     Body (optional): {campaign: str, trigger: str}. Defaults to tried-to-call/manual."""
-    if not VCC_CAMPAIGN_WEBHOOK_URL:
+    if not RESEND_API_KEY:
         raise HTTPException(status_code=503,
-            detail="VCC_CAMPAIGN_WEBHOOK_URL not configured — VCC integration disabled")
+            detail="RESEND_API_KEY not configured — email sending disabled")
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=*",
@@ -2528,6 +2742,15 @@ def send_to_campaign(lead_id: str, body: dict, user: str = Depends(verify_token)
     if not ok:
         return {"sent": False, "message": detail}
     return {"sent": True, "message": "Sent to VCC", "campaign": campaign, "trigger": trigger}
+
+@app.post("/api/admin/poll-replies")
+def poll_replies_now(user: str = Depends(verify_admin)):
+    """Manual trigger for the IMAP reply poller — useful when you want an
+    immediate check rather than waiting for the next 10-min background pass."""
+    if not (IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD):
+        raise HTTPException(status_code=503,
+            detail="IMAP not configured. Set IMAP_SERVER, IMAP_USERNAME, IMAP_PASSWORD in Railway.")
+    return imap_poll_replies()
 
 @app.get("/api/admin/campaigns/recent")
 def campaigns_recent(days: int = 14, user: str = Depends(verify_admin)):
@@ -2572,7 +2795,8 @@ def campaigns_recent(days: int = 14, user: str = Depends(verify_admin)):
 
     return {
         "window_days":  days,
-        "vcc_configured": bool(VCC_CAMPAIGN_WEBHOOK_URL),
+        "email_configured": bool(RESEND_API_KEY),
+        "imap_configured":  bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
         "totals": {
             "sends":   len(sends),
             "replies": event_counts["reply"],
@@ -2609,82 +2833,74 @@ def campaign_status(lead_id: str, user: str = Depends(verify_token)):
             "last_sent_at":  sent_rows[0]["created_at"] if sent_rows else None,
             "send_count":    len(sent_rows),
             "events":        event_rows[:5],
-            "vcc_configured": bool(VCC_CAMPAIGN_WEBHOOK_URL),
+            "email_configured": bool(RESEND_API_KEY),
+        "imap_configured":  bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/webhooks/vcc/{secret}/{lead_id}")
-async def vcc_callback(secret: str, lead_id: str, request: Request):
-    """Receives reply/open/click/bounce events from VCC's email engine.
-    Body shape (per the contract we documented for VCC):
-      {event: 'reply'|'open'|'click'|'bounce'|'unsubscribe', timestamp, ...details}
-    On 'reply' we flip lead status to 'interested' and Slack-notify the caller."""
-    if not LEADFLOW_CALLBACK_SECRET or secret != LEADFLOW_CALLBACK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid callback secret")
+@app.post("/api/webhooks/resend/{secret}")
+async def resend_webhook(secret: str, request: Request):
+    """Receives email events from Resend (delivered/opened/clicked/bounced/
+    complained). lead_id is in the email's `tags` we set on send. Auth via
+    secret in URL path. Configure URL + this secret in Resend dashboard."""
+    if not RESEND_WEBHOOK_SECRET or secret != RESEND_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     raw_body = ""
     try:
-        raw_body = (await request.body()).decode("utf-8", errors="replace")[:2000]
+        raw_body = (await request.body()).decode("utf-8", errors="replace")[:3000]
         data = json_lib.loads(raw_body) if raw_body else {}
     except Exception:
         data = {}
 
-    event = (data.get("event") or "").strip().lower()
-    audit_log("vcc_callback", "campaign_event", "lead", lead_id, {
-        "event": event, "raw_body_sample": raw_body[:500],
+    # Resend payload shape: {type: "email.opened", created_at, data: {email_id, to, tags: [...], ...}}
+    etype  = (data.get("type") or "").lower()
+    payload = data.get("data") or {}
+    tags = {t.get("name"): t.get("value") for t in (payload.get("tags") or []) if isinstance(t, dict)}
+    lead_id = tags.get("lead_id")
+
+    # Map Resend event types to our canonical event names so the activity panel
+    # can keep its existing category tallies.
+    event_map = {
+        "email.delivered":      "delivered",
+        "email.opened":         "open",
+        "email.clicked":        "click",
+        "email.bounced":        "bounce",
+        "email.complained":     "complaint",
+        "email.unsubscribed":   "unsubscribe",
+        "email.delivery_delayed":"delayed",
+        "email.failed":         "failed",
+    }
+    event = event_map.get(etype, etype.replace("email.", "") or "other")
+
+    audit_log("resend_webhook", "campaign_event", "lead", lead_id, {
+        "event": event, "resend_type": etype, "email_id": payload.get("email_id"),
     })
-    print(f"[VCC-CALLBACK] lead={lead_id} event={event}")
+    print(f"[RESEND-WEBHOOK] lead={lead_id} event={event} ({etype})")
 
-    # Pull the lead so we know who replied + can update status
-    try:
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=*",
-            headers=SB_HEADERS, timeout=10,
-        )
-        lead_rows = r.json() if r.status_code == 200 else []
-        lead = lead_rows[0] if isinstance(lead_rows, list) and lead_rows else {}
-    except Exception:
-        lead = {}
+    if not lead_id:
+        return {"ok": True, "no_lead_id": True}
 
-    if event == "reply":
-        # Recipient wrote back — flip to 'interested', alert the caller
+    # Bounce → clear email so we don't keep emailing into the void
+    if event == "bounce":
         try:
-            req_lib.patch(
-                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
-                headers=SB_HEADERS,
-                json={"status": "interested", "updatedAt": datetime.utcnow().isoformat()},
-                timeout=10,
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=notes",
+                headers=SB_HEADERS, timeout=10,
             )
-        except Exception as e:
-            print(f"[VCC-CALLBACK] failed to update lead status: {e}")
-        if lead.get("company"):
-            app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
-            send_slack(
-                ":incoming_envelope: Email Reply",
-                f"*{lead.get('firstName','')} {lead.get('lastName','')}* at *{lead.get('company','')}* replied to the tried-to-call email.",
-                fields=[
-                    {"label": "From",     "value": lead.get("email", "")},
-                    {"label": "Assigned", "value": lead.get("assignedTo") or "unassigned"},
-                    {"label": "Snippet",  "value": (data.get("snippet") or data.get("body_text") or "")[:200] or "(no snippet)"},
-                ],
-                actions=[{"label": "📋 Open Lead", "url": app_url, "style": "primary"}],
-            )
-
-    elif event == "bounce":
-        # Email is bad — clear it so we don't keep emailing into the void
-        try:
+            existing = (r.json() or [{}])[0] if r.status_code == 200 else {}
             req_lib.patch(
                 f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
                 headers=SB_HEADERS,
                 json={"email": "", "updatedAt": datetime.utcnow().isoformat(),
-                      "notes": (lead.get("notes") or "") + f" | Email bounced {datetime.utcnow().date().isoformat()}"},
+                      "notes": (existing.get("notes") or "") + f" | Email bounced {datetime.utcnow().date().isoformat()}"},
                 timeout=10,
             )
         except Exception as e:
-            print(f"[VCC-CALLBACK] failed to clear bounced email: {e}")
+            print(f"[RESEND-WEBHOOK] bounce update failed: {e}")
 
-    elif event == "unsubscribe":
+    elif event in ("complaint", "unsubscribe"):
         try:
             req_lib.patch(
                 f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
@@ -2693,9 +2909,9 @@ async def vcc_callback(secret: str, lead_id: str, request: Request):
                 timeout=10,
             )
         except Exception as e:
-            print(f"[VCC-CALLBACK] failed to mark unsub: {e}")
+            print(f"[RESEND-WEBHOOK] do_not_contact update failed: {e}")
 
-    # opens + clicks: just audit-log (already done above), no lead mutation
+    # opens + clicks + delivered: audit-log only (already done above)
 
     return {"ok": True, "event": event}
 
