@@ -31,7 +31,9 @@ APOLLO_MATCH_URL  = "https://api.apollo.io/api/v1/people/match"
 # Random shared secret in the webhook URL path — Apollo's "people" webhook
 # doesn't HMAC-sign requests, so URL-as-bearer is the standard auth model.
 # Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-APOLLO_WEBHOOK_SECRET = os.getenv("APOLLO_WEBHOOK_SECRET", "")
+# Strip whitespace + trailing '%' (zsh's no-newline indicator) — both are
+# common copy-paste artifacts that Apollo's URL parser rejects.
+APOLLO_WEBHOOK_SECRET = os.getenv("APOLLO_WEBHOOK_SECRET", "").strip().rstrip("%").strip()
 # Halts every Apollo enrichment call instantly. Same shape as PLACES_KILL_SWITCH.
 APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
 # Titles tried (in priority order) when auto-enriching a scraped company.
