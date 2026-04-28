@@ -2810,8 +2810,10 @@ export default function App(){
                   {qualifiedCalls.map((call,i)=>{
                     const lead=call.leads||{}
                     const ac=avatarColor(lead.company||lead.firstName||call.calledBy||"?")
-                    const qualColor=call.qualified==="Hot"?"#ff6e84":call.qualified==="Warm"?"#ffe083":
-                      call.qualified==="Not Yet"?"#a3a6ff":"#40485d"
+                    const review=call.admin_review
+                    const reviewColor=review==="approved"?"#69f6b8":review==="rejected"?"#ff6e84":null
+                    const qualColor=reviewColor||(call.qualified==="Hot"?"#ff6e84":call.qualified==="Warm"?"#ffe083":
+                      call.qualified==="Not Yet"?"#a3a6ff":"#40485d")
                     const qualChips=[
                       {label:"Focus",val:call.budgetfocus},
                       {label:"Vendor",val:call.vendorstatus},
@@ -2819,6 +2821,24 @@ export default function App(){
                       {label:"Timeline",val:call.timeline},
                       {label:"Qualified",val:call.qualified},
                     ].filter(c=>c.val)
+                    const refresh=()=>{
+                      api("/api/calls/qualified").then(r=>setQualifiedCalls(Array.isArray(r)?r:[])).catch(()=>{})
+                    }
+                    const setReview=async v=>{
+                      try{ await api(`/api/calls/${call.id}/review`,{method:"PATCH",body:JSON.stringify({review:v})}); refresh() }
+                      catch{ alert("Couldn't update review") }
+                    }
+                    const moveToFollowUp=async()=>{
+                      const d=prompt("Follow-up date (YYYY-MM-DD)?",addDays(7))
+                      if(!d) return
+                      try{ await api(`/api/calls/${call.id}/followup`,{method:"POST",body:JSON.stringify({date:d})}); refresh(); loadLeads&&loadLeads() }
+                      catch{ alert("Couldn't move to follow-up") }
+                    }
+                    const deleteCall=async()=>{
+                      if(!confirm("Delete this qualification entry? The lead is not affected.")) return
+                      try{ await api(`/api/calls/${call.id}`,{method:"DELETE"}); refresh() }
+                      catch{ alert("Couldn't delete") }
+                    }
                     return(
                       <div key={call.id||i} style={{background:"#0f1930",borderRadius:12,
                         borderLeft:`4px solid ${qualColor}`,overflow:"hidden"}}>
@@ -2842,6 +2862,12 @@ export default function App(){
                             </div>
                           </div>
                           <div style={{display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+                            {review&&(
+                              <span className="pill" style={{background:reviewColor+"20",color:reviewColor,
+                                border:`1px solid ${reviewColor}30`,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".05em"}}>
+                                {review==="approved"?"\u2713 Approved":"\u2717 Rejected"}
+                              </span>
+                            )}
                             <span className="pill" style={{background:qualColor+"20",color:qualColor,
                               border:`1px solid ${qualColor}30`,fontSize:12,fontWeight:700}}>
                               {call.qualified||"Pending"}
@@ -2874,6 +2900,39 @@ export default function App(){
                           <div style={{padding:"0 20px 16px",fontSize:12,color:"#a3aac4",
                             borderTop:"1px solid #40485d15",paddingTop:12,marginTop:0}}>
                             {call.notes}
+                          </div>
+                        )}
+
+                        {/* Admin actions */}
+                        {isAdmin()&&(
+                          <div style={{padding:"12px 20px",display:"flex",gap:8,flexWrap:"wrap",
+                            borderTop:"1px solid #40485d20",background:"#0c1528"}}>
+                            <button className="btn" style={{fontSize:11,padding:"5px 12px",
+                              background:review==="approved"?"#69f6b820":"transparent",
+                              color:review==="approved"?"#69f6b8":"#a3aac4",
+                              border:"1px solid "+(review==="approved"?"#69f6b860":"#40485d40")}}
+                              onClick={()=>setReview(review==="approved"?null:"approved")}>
+                              {review==="approved"?"✓ Approved":"Approve"}
+                            </button>
+                            <button className="btn" style={{fontSize:11,padding:"5px 12px",
+                              background:review==="rejected"?"#ff6e8420":"transparent",
+                              color:review==="rejected"?"#ff6e84":"#a3aac4",
+                              border:"1px solid "+(review==="rejected"?"#ff6e8460":"#40485d40")}}
+                              onClick={()=>setReview(review==="rejected"?null:"rejected")}>
+                              {review==="rejected"?"✗ Rejected":"Reject"}
+                            </button>
+                            {lead.id&&(
+                              <button className="btn" style={{fontSize:11,padding:"5px 12px",
+                                background:"transparent",color:"#a3a6ff",border:"1px solid #a3a6ff40"}}
+                                onClick={moveToFollowUp}>
+                                Move to Follow-up
+                              </button>
+                            )}
+                            <button className="btn" style={{fontSize:11,padding:"5px 12px",
+                              background:"transparent",color:"#ff6e84",border:"1px solid #ff6e8440",marginLeft:"auto"}}
+                              onClick={deleteCall}>
+                              Delete
+                            </button>
                           </div>
                         )}
                       </div>

@@ -1856,6 +1856,66 @@ def get_qualified_calls(user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.patch("/api/calls/{call_id}/review")
+def review_call(call_id: str, body: dict, user: str = Depends(verify_admin)):
+    review = body.get("review")
+    if review not in ("approved", "rejected", None, ""):
+        raise HTTPException(status_code=400, detail="review must be approved, rejected, or null")
+    try:
+        payload = {
+            "admin_review": review or None,
+            "admin_reviewed_by": user if review else None,
+            "admin_reviewed_at": datetime.utcnow().isoformat() if review else None,
+        }
+        r = req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}",
+            headers=SB_HEADERS, json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return {"ok": True, "review": review or None}
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/calls/{call_id}")
+def delete_call(call_id: str, user: str = Depends(verify_admin)):
+    try:
+        r = req_lib.delete(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}",
+            headers=SB_HEADERS, timeout=30)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return {"deleted": True}
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/calls/{call_id}/followup")
+def followup_call(call_id: str, body: dict, user: str = Depends(verify_admin)):
+    date = (body.get("date") or "").strip()
+    if not date:
+        raise HTTPException(status_code=400, detail="date required (YYYY-MM-DD)")
+    try:
+        cr = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}&select=leadId",
+            headers=SB_HEADERS, timeout=30)
+        rows = cr.json() if cr.status_code == 200 else []
+        if not rows or not rows[0].get("leadId"):
+            raise HTTPException(status_code=404, detail="call or lead not found")
+        lead_id = rows[0]["leadId"]
+        lr = req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+            headers=SB_HEADERS,
+            json={"status": "callback", "callbackDate": date,
+                  "nextfollowup": date, "updatedAt": datetime.utcnow().isoformat()},
+            timeout=30)
+        if lr.status_code >= 400:
+            raise HTTPException(status_code=lr.status_code, detail=lr.text)
+        return {"ok": True, "leadId": lead_id, "callbackDate": date}
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/calls/history")
 def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
                      user: str = Depends(verify_token)):
