@@ -773,30 +773,32 @@ def apollo_cache_set(company: str, person):
     key = company.lower().strip()
     _apollo_enrich_cache[key] = (time.time() + APOLLO_ENRICH_CACHE_TTL_HOURS * 3600, person)
 
-def apollo_request_phone_reveal(person: dict, lead_id: str) -> bool:
+def apollo_request_phone_reveal(person: dict, lead_id: str):
     """Fire-and-forget request for Apollo to async-reveal direct phone numbers.
-    Apollo will POST the unlocked phone(s) to APOLLO_WEBHOOK_URL within ~5-30s.
+    Apollo will POST the unlocked phone(s) to our webhook within ~5-30s.
     Costs 5-8 credits per successful reveal (charged when Apollo posts back),
-    NOT when this function is called. Returns True if the request was accepted."""
-    if not APOLLO_API_KEY or APOLLO_KILL_SWITCH or not person or not lead_id:
-        return False
+    NOT when this function is called.
+    Returns (ok: bool, detail: str) — detail is for surfacing Apollo's error."""
+    if not APOLLO_API_KEY or APOLLO_KILL_SWITCH:
+        return (False, "APOLLO_API_KEY missing or kill switch on")
+    if not person or not lead_id:
+        return (False, "missing person or lead_id")
     if not APOLLO_WEBHOOK_SECRET:
-        print("[APOLLO-PHONE] APOLLO_WEBHOOK_SECRET not set — phone reveal disabled")
-        return False
+        return (False, "APOLLO_WEBHOOK_SECRET not set")
 
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
     webhook_url = f"{app_url}/api/webhooks/apollo/{APOLLO_WEBHOOK_SECRET}/{lead_id}"
 
-    payload = {
-        "reveal_phone_number": True,
-        "webhook_url":         webhook_url,
-    }
-    if person.get("linkedin_url"):
-        payload["linkedin_url"] = person["linkedin_url"]
-    elif person.get("id"):
-        payload["id"] = person["id"]
-    else:
-        return False
+    payload = {"reveal_phone_number": True, "webhook_url": webhook_url}
+    # Pass through every identifying field Apollo accepts. Caller may have
+    # filled any subset (linkedin_url > id > email > first+last+domain).
+    for key in ("linkedin_url", "id", "email", "first_name", "last_name", "domain"):
+        if person.get(key):
+            payload[key] = person[key]
+    has_strong_id = any(payload.get(k) for k in ("linkedin_url", "id", "email"))
+    has_full_name_domain = payload.get("first_name") and payload.get("last_name") and payload.get("domain")
+    if not has_strong_id and not has_full_name_domain:
+        return (False, "no usable identifier (need linkedin_url, id, email, or first+last+domain)")
 
     headers = {
         "X-Api-Key":     APOLLO_API_KEY,
@@ -806,12 +808,17 @@ def apollo_request_phone_reveal(person: dict, lead_id: str) -> bool:
     try:
         r = req_lib.post(APOLLO_MATCH_URL, headers=headers, json=payload, timeout=15)
         if r.status_code != 200:
-            print(f"[APOLLO-PHONE] reveal request HTTP {r.status_code}: {r.text[:200]}")
-            return False
-        return True
+            err = r.text[:300]
+            try:
+                err = r.json().get("error") or err
+            except Exception:
+                pass
+            print(f"[APOLLO-PHONE] reveal request HTTP {r.status_code}: {err}")
+            return (False, f"Apollo {r.status_code}: {err}")
+        return (True, "request accepted")
     except Exception as e:
         print(f"[APOLLO-PHONE] exception: {e}")
-        return False
+        return (False, f"network error: {e}")
 
 def apollo_enrich_person(person: dict):
     """Unlock email + last name via Apollo /people/match. Apollo's api_search
@@ -1836,8 +1843,10 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         # saved_rows order matches qualified_pairs order (Supabase preserves
         # batch insert order). Zip them to map each saved lead to its Apollo person.
         for (lead, person), saved_row in zip(qualified_pairs, saved_rows):
-            if saved_row.get("id") and apollo_request_phone_reveal(person, saved_row["id"]):
-                phone_reveals_requested += 1
+            if saved_row.get("id"):
+                ok, _detail = apollo_request_phone_reveal(person, saved_row["id"])
+                if ok:
+                    phone_reveals_requested += 1
 
     audit_log(user, "apollo_pull", "lead", None, {
         "titles": titles, "industries": industries, "locations": locations,
@@ -2043,8 +2052,9 @@ def reveal_phone(lead_id: str, user: str = Depends(verify_token)):
         return {"requested": False,
                 "message": "Not enough info to identify this person on Apollo (need email or LinkedIn URL — try Find Decision Maker first)"}
 
-    if not apollo_request_phone_reveal(person, lead_id):
-        return {"requested": False, "message": "Apollo rejected the request — try again in a moment"}
+    ok, detail = apollo_request_phone_reveal(person, lead_id)
+    if not ok:
+        return {"requested": False, "message": f"Apollo rejected the request: {detail}"}
 
     audit_log(user, "reveal_phone_requested", "lead", lead_id, {"company": lead.get("company")})
     return {"requested": True,
