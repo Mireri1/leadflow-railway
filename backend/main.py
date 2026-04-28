@@ -27,6 +27,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
 APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
+APOLLO_MATCH_URL  = "https://api.apollo.io/api/v1/people/match"
 # Halts every Apollo enrichment call instantly. Same shape as PLACES_KILL_SWITCH.
 APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
 # Titles tried (in priority order) when auto-enriching a scraped company.
@@ -768,6 +769,45 @@ def apollo_cache_set(company: str, person):
     key = company.lower().strip()
     _apollo_enrich_cache[key] = (time.time() + APOLLO_ENRICH_CACHE_TTL_HOURS * 3600, person)
 
+def apollo_enrich_person(person: dict):
+    """Unlock email + last name via Apollo /people/match. Apollo's api_search
+    returns masked fields ('Robert' with no last name, no email) on Pro tier;
+    /people/match unlocks them for ~1 credit per contact. Identifier priority:
+    LinkedIn URL > Apollo person id > first+last+domain."""
+    if not APOLLO_API_KEY or APOLLO_KILL_SWITCH or not person:
+        return None
+
+    payload = {"reveal_personal_emails": True}
+    if person.get("linkedin_url"):
+        payload["linkedin_url"] = person["linkedin_url"]
+    elif person.get("id"):
+        payload["id"] = person["id"]
+    else:
+        org = person.get("organization") or {}
+        domain = org.get("primary_domain") or org.get("website_url", "").replace("https://", "").replace("http://", "").split("/")[0]
+        if person.get("first_name") and person.get("last_name") and domain:
+            payload["first_name"] = person["first_name"]
+            payload["last_name"]  = person["last_name"]
+            payload["domain"]     = domain
+        else:
+            return None  # Not enough identifying info to call /match
+
+    headers = {
+        "X-Api-Key":     APOLLO_API_KEY,
+        "Cache-Control": "no-cache",
+        "Content-Type":  "application/json",
+    }
+    try:
+        r = req_lib.post(APOLLO_MATCH_URL, headers=headers, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"[APOLLO-MATCH] HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        data = r.json()
+        return data.get("person") or None
+    except Exception as e:
+        print(f"[APOLLO-MATCH] exception: {e}")
+        return None
+
 def apollo_find_dm_at_company(company_name: str, titles=None):
     """Search Apollo for the top-ranked DM at a given company.
     Returns the Apollo person dict, or None if no match / API error / kill switch on."""
@@ -810,6 +850,12 @@ def apollo_enrich_lead_in_place(lead: dict) -> bool:
         person = cached  # may be None — that's a cached miss, still skip
     else:
         person = apollo_find_dm_at_company(lead["company"])
+        # Unlock email + last name via /match before caching (~1 extra credit).
+        # Without this the cached person has only first_name and is unusable.
+        if person:
+            enriched = apollo_enrich_person(person)
+            if enriched:
+                person = {**person, **enriched}
         apollo_cache_set(lead["company"], person)
 
     if not person:
@@ -1702,16 +1748,20 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     skipped_no_company = 0
     skipped_no_actionable = 0
     for person in people:
+        # Unlock email + last name via /people/match (~1 credit). api_search alone
+        # masks these on Pro tier — match is the only way to make leads dialable.
+        enriched = apollo_enrich_person(person)
+        if enriched:
+            person = {**person, **enriched}
+
         lead = apollo_person_to_lead(person, user)
         if not lead.get("company"):
             skipped_no_company += 1
             continue
         # Need at least *something* a caller can act on: a phone, email, or a
-        # name+title to ask for at the switchboard. Apollo's bare search often
-        # returns just name+title (no unlocked email/phone) on Pro tier — that
-        # is still actionable as a "named ask" lead.
+        # full name + title to ask for at the switchboard.
         has_contact = bool(lead.get("phone") or lead.get("email"))
-        has_named_ask = bool(lead.get("firstName") and lead.get("title"))
+        has_named_ask = bool(lead.get("firstName") and lead.get("lastName") and lead.get("title"))
         if not has_contact and not has_named_ask:
             skipped_no_actionable += 1
             continue
