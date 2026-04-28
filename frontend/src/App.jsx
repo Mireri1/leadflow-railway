@@ -428,6 +428,112 @@ function LeadFinder({onFound, industries}){
   )
 }
 
+// ─── ApolloFinder (admin only) ───────────────────────────────────────────────
+// Pulls decision-maker contacts from Apollo.io: real names, titles, direct
+// emails/phones — built to bypass gatekeepers. Admin-only because it burns
+// paid Apollo credits (4,000/month on Pro, ~$0.025/contact at typical rates).
+
+function ApolloFinder({onFound}){
+  const [titles,setTitles]         = useState("Facility Manager,Director of Operations,Operations Manager,Property Manager")
+  const [industries,setIndustries] = useState("")
+  const [locations,setLocations]   = useState("")
+  const [empMin,setEmpMin]         = useState(50)
+  const [empMax,setEmpMax]         = useState(500)
+  const [perPage,setPerPage]       = useState(25)
+  const [loading,setLoad]          = useState(false)
+  const [result,setResult]         = useState(null)
+  const [error,setError]           = useState("")
+
+  async function pull(){
+    setError(""); setResult(null)
+    if(!titles.trim()){ setError("Enter at least one job title."); return }
+    setLoad(true)
+    try{
+      const res = await api("/api/admin/apollo/pull",{method:"POST",body:JSON.stringify({
+        titles, industries, locations,
+        employee_min: Number(empMin)||50,
+        employee_max: Number(empMax)||500,
+        per_page:     Number(perPage)||25,
+        page:         1,
+      })})
+      setResult(res)
+      if(res.saved>0) onFound&&onFound()
+    }catch(ex){
+      setError(ex.message||"Apollo pull failed — check API key in Railway.")
+    }finally{ setLoad(false) }
+  }
+
+  return(
+    <div className="finder" style={{borderTop:"3px solid #8b5cf6"}}>
+      <div className="finder-title">
+        📞 Pull from Apollo
+        <span style={{color:"#ff6e84",fontSize:9,marginLeft:8,verticalAlign:"middle"}}>ADMIN</span>
+      </div>
+      <div className="finder-sub">
+        Decision-maker contacts: real names + titles + direct phones/emails. Burns Apollo credits.
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,alignItems:"flex-end"}}>
+        <div className="ff" style={{gridColumn:"1 / -1"}}>
+          <label>Job Titles (comma-separated)</label>
+          <input className="sel" value={titles} onChange={e=>setTitles(e.target.value)}
+            placeholder="Facility Manager, Director of Operations, Property Manager"/>
+        </div>
+        <div className="ff">
+          <label>Industries (comma-separated, optional)</label>
+          <input className="sel" value={industries} onChange={e=>setIndustries(e.target.value)}
+            placeholder="Hospital, Education, Manufacturing"/>
+        </div>
+        <div className="ff">
+          <label>Locations (comma-separated, optional)</label>
+          <input className="sel" value={locations} onChange={e=>setLocations(e.target.value)}
+            placeholder="California, US  |  Phoenix, AZ"/>
+        </div>
+        <div className="ff">
+          <label>Company Size (employees)</label>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <input className="sel" type="number" min={1} value={empMin}
+              onChange={e=>setEmpMin(e.target.value)} style={{width:"100%"}}/>
+            <span style={{color:"#40485d"}}>to</span>
+            <input className="sel" type="number" min={1} value={empMax}
+              onChange={e=>setEmpMax(e.target.value)} style={{width:"100%"}}/>
+          </div>
+        </div>
+        <div className="range-wrap">
+          <label style={{fontSize:10,letterSpacing:".1em",textTransform:"uppercase",color:"#a3aac4",display:"flex",justifyContent:"space-between"}}>
+            <span>How Many</span><span style={{color:"#8b5cf6"}}>{perPage}</span>
+          </label>
+          <input type="range" min={5} max={100} step={5} value={perPage} onChange={e=>setPerPage(Number(e.target.value))}/>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#40485d"}}><span>5</span><span>100</span></div>
+        </div>
+        <button className="btn btn-p" onClick={pull} disabled={loading}
+          style={{padding:"10px 22px",whiteSpace:"nowrap",alignSelf:"flex-end",background:"#8b5cf6"}}>
+          {loading?"Pulling…":"Pull from Apollo →"}
+        </button>
+      </div>
+      {error&&<div style={{marginTop:14,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
+        borderRadius:8,fontSize:12,color:"#ff6e84"}}>{error}</div>}
+      {loading&&<div style={{marginTop:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
+        <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#8b5cf6"}}/>
+        Searching Apollo…
+      </div>}
+      {result&&!loading&&(
+        <div style={{marginTop:14,padding:"12px 14px",background:"#8b5cf615",border:"1px solid #8b5cf630",
+          borderRadius:8,fontSize:12,color:"#dee5ff",lineHeight:1.6}}>
+          ✓ <b style={{color:"#8b5cf6"}}>{result.saved}</b> new leads saved
+          (Apollo returned {result.returned}, {result.qualified} had usable contact info,
+          {result.skipped?.no_company||0} missing company, {result.skipped?.no_contact||0} no phone/email)
+          {result.total_available>0&&(
+            <div style={{marginTop:6,color:"#a3aac4",fontSize:11}}>
+              {result.total_available.toLocaleString()} total contacts match this search
+              ({result.total_pages} pages of {perPage} each — bump page param to pull more)
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Follow-up sequences ─────────────────────────────────────────────────────
 
 const FOLLOW_UP_SEQUENCES = [
@@ -1977,6 +2083,9 @@ export default function App(){
 
               {industries.length>0&&(
                 <div style={{marginTop:32}}><LeadFinder onFound={loadLeads} industries={industries}/></div>
+              )}
+              {isAdmin()&&(
+                <div style={{marginTop:24}}><ApolloFinder onFound={loadLeads}/></div>
               )}
             </div>
           )}

@@ -25,6 +25,8 @@ SUPABASE_KEY  = os.getenv("SUPABASE_KEY", os.getenv("VITE_SUPABASE_KEY", ""))
 # Service role key bypasses RLS — needed for login_log, audit_log, user_sessions
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
 GOOGLE_KEY    = os.getenv("GOOGLE_API_KEY", "")
+APOLLO_API_KEY = os.getenv("APOLLO_API_KEY", "")
+APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/search"
 
 # ── Google Places cost controls ─────────────────────────────────────────────
 # PLACES_KILL_SWITCH=1 halts every Places call instantly (same env name as
@@ -720,6 +722,75 @@ class ScrapeRequest(BaseModel):
     cities:    Optional[str] = ""
     limit:     Optional[int] = 25
     source:    Optional[str] = "places"
+
+# ── Apollo.io integration ───────────────────────────────────────────────────
+# Pulls decision-maker contacts (name + title + direct email/phone) from
+# Apollo's People Search API. Uses search-only flow — no separate enrich
+# call — so credit cost is whatever Apollo charges for a search hit on
+# your plan tier (Pro = 4,000 credits/seat/month).
+
+def apollo_person_to_lead(person: dict, user: str) -> dict:
+    """Map Apollo person object → LeadFlow lead schema."""
+    org = person.get("organization") or {}
+
+    # Phone: prefer person mobile, fall back to org main line
+    phone = ""
+    for p in (person.get("phone_numbers") or []):
+        cand = p.get("sanitized_number") or p.get("raw_number") or ""
+        if cand:
+            phone = cand
+            break
+    if not phone:
+        phone = org.get("phone") or org.get("primary_phone", {}).get("sanitized_number", "") or ""
+
+    # Email: Apollo masks unrevealed emails as "email_not_unlocked@domain.com"
+    email = person.get("email") or ""
+    if "email_not_unlocked" in email:
+        email = ""
+
+    city  = person.get("city") or org.get("city") or ""
+    state = person.get("state") or org.get("state") or ""
+    addr  = org.get("street_address") or ""
+    title = person.get("title") or ""
+    linkedin = person.get("linkedin_url") or ""
+
+    notes_parts = [f"Apollo: {title}".strip(": ")]
+    if linkedin: notes_parts.append(f"LinkedIn: {linkedin}")
+    if person.get("seniority"): notes_parts.append(f"Seniority: {person['seniority']}")
+
+    now = datetime.utcnow().isoformat()
+    lead = {
+        "company":     clean(org.get("name", "")),
+        "industry":    clean(org.get("industry") or ""),
+        "phone":       clean(phone),
+        "address":     clean(addr),
+        "city":        clean(city),
+        "state":       clean(state),
+        "website":     clean(org.get("website_url") or ""),
+        "notes":       " | ".join(notes_parts),
+        "source":      "Apollo",
+        "firstName":   clean(person.get("first_name", "")),
+        "lastName":    clean(person.get("last_name", "")),
+        "title":       clean(title),
+        "email":       clean(email),
+        "assignedTo":  "",
+        "callbackDate":"",
+        "status":      "new",
+        "createdAt":   now,
+        "updatedAt":   now,
+        "createdBy":   user,
+    }
+    lead["score"] = score_lead(lead)
+    return lead
+
+class ApolloPullRequest(BaseModel):
+    titles:        Optional[str] = ""   # comma-sep e.g. "Facility Manager,Director of Operations"
+    industries:    Optional[str] = ""   # comma-sep keywords e.g. "Hospital,Education"
+    locations:     Optional[str] = ""   # comma-sep e.g. "California, US" or "Phoenix, AZ"
+    employee_min:  Optional[int] = 50
+    employee_max:  Optional[int] = 500
+    per_page:      Optional[int] = 25   # Apollo caps at 100
+    page:          Optional[int] = 1
 
 @app.post("/api/scrape")
 def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
@@ -1453,6 +1524,107 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
         return {"recycled": recycled, "total_checked": len(stale)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/apollo/pull")
+def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
+    """Pull decision-maker contacts from Apollo and insert into leads.
+    Admin-only. Dedupes via Supabase unique constraints (same as Google Places flow)."""
+    if not APOLLO_API_KEY:
+        raise HTTPException(status_code=400,
+            detail="APOLLO_API_KEY not configured. Set it in Railway env vars.")
+
+    titles     = [t.strip() for t in (body.titles or "").split(",") if t.strip()]
+    industries = [i.strip() for i in (body.industries or "").split(",") if i.strip()]
+    locations  = [l.strip() for l in (body.locations or "").split(",") if l.strip()]
+    per_page   = max(1, min(body.per_page or 25, 100))
+
+    payload = {"page": body.page or 1, "per_page": per_page}
+    if titles:     payload["person_titles"] = titles
+    if industries: payload["q_organization_industries"] = industries
+    if locations:  payload["person_locations"] = locations
+    if body.employee_min and body.employee_max:
+        payload["organization_num_employees_ranges"] = [f"{body.employee_min},{body.employee_max}"]
+
+    headers = {
+        "X-Api-Key":     APOLLO_API_KEY,
+        "Cache-Control": "no-cache",
+        "Content-Type":  "application/json",
+    }
+
+    print(f"[APOLLO] user={user} payload={payload}")
+    try:
+        r = req_lib.post(APOLLO_SEARCH_URL, headers=headers, json=payload, timeout=30)
+        print(f"[APOLLO] HTTP {r.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Apollo API call failed: {e}")
+
+    if r.status_code == 401:
+        raise HTTPException(status_code=401, detail="Apollo rejected the API key. Verify APOLLO_API_KEY in Railway.")
+    if r.status_code == 422:
+        raise HTTPException(status_code=400, detail=f"Apollo rejected the search params: {r.text[:300]}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502,
+            detail=f"Apollo returned {r.status_code}: {r.text[:300]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Apollo returned non-JSON response")
+
+    people = data.get("people") or data.get("contacts") or []
+    pagination = data.get("pagination") or {}
+    print(f"[APOLLO] returned {len(people)} people (total available: {pagination.get('total_entries')})")
+
+    leads = []
+    skipped_no_company = 0
+    skipped_no_phone   = 0
+    for person in people:
+        lead = apollo_person_to_lead(person, user)
+        if not lead.get("company"):
+            skipped_no_company += 1
+            continue
+        # Phone is the whole point — skip contacts with neither phone nor email
+        if not lead.get("phone") and not lead.get("email"):
+            skipped_no_phone += 1
+            continue
+        leads.append(lead)
+
+    saved = save_to_supabase(leads) if leads else 0
+
+    audit_log(user, "apollo_pull", "lead", None, {
+        "titles": titles, "industries": industries, "locations": locations,
+        "employee_range": f"{body.employee_min}-{body.employee_max}",
+        "page": payload["page"], "per_page": per_page,
+        "returned": len(people), "qualified": len(leads), "saved": saved,
+        "skipped_no_company": skipped_no_company,
+        "skipped_no_contact": skipped_no_phone,
+        "total_entries":      pagination.get("total_entries"),
+        "total_pages":        pagination.get("total_pages"),
+    })
+
+    if saved > 0:
+        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+        send_slack(
+            ":telephone_receiver: Apollo Pull Complete",
+            f"*{user}* pulled *{saved}* new decision-maker leads from Apollo.",
+            fields=[
+                {"label": "Titles",    "value": ", ".join(titles) or "Any"},
+                {"label": "Locations", "value": ", ".join(locations) or "Any"},
+                {"label": "Returned",  "value": str(len(people))},
+                {"label": "Saved",     "value": f":white_check_mark: {saved}"},
+            ],
+            actions=[{"label": "📋 View Leads", "url": app_url, "style": "primary"}],
+        )
+
+    return {
+        "returned":        len(people),
+        "qualified":       len(leads),
+        "saved":           saved,
+        "skipped":         {"no_company": skipped_no_company, "no_contact": skipped_no_phone},
+        "total_available": pagination.get("total_entries"),
+        "page":            pagination.get("page"),
+        "total_pages":     pagination.get("total_pages"),
+    }
 
 @app.post("/api/leads/reassign")
 def reassign_leads(body: dict, user: str = Depends(verify_admin)):
