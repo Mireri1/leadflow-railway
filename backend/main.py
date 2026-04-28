@@ -2114,16 +2114,28 @@ async def apollo_phone_webhook(secret: str, lead_id: str, request: Request):
     except Exception:
         return {"ok": False, "error": "invalid JSON"}
 
-    person = data.get("person") or data.get("contact") or data
+    # Apollo's actual payload shape (verified from real webhook hit):
+    #   {"status":"success", "credits_consumed":8, "people":[{"phone_numbers":[...]}]}
+    # Older/other endpoints may send {"person": {...}} or just the person dict.
+    person = None
+    if isinstance(data.get("people"), list) and data["people"]:
+        person = data["people"][0]
+    elif isinstance(data.get("person"), dict):
+        person = data["person"]
+    elif isinstance(data.get("contact"), dict):
+        person = data["contact"]
+    elif isinstance(data.get("phone_numbers"), list):
+        person = data
     if not isinstance(person, dict):
-        return {"ok": False, "error": "no person in payload"}
+        return {"ok": False, "error": "no person in payload", "raw_keys": list(data.keys()) if isinstance(data, dict) else None}
 
+    # Prefer mobile numbers over other types when multiple are returned
     phone = ""
-    for p in (person.get("phone_numbers") or []):
-        cand = p.get("sanitized_number") or p.get("raw_number") or ""
-        if cand:
-            phone = cand
-            break
+    phones = person.get("phone_numbers") or []
+    mobile = next((p for p in phones if p.get("type_cd") == "mobile"), None)
+    chosen = mobile or (phones[0] if phones else None)
+    if chosen:
+        phone = chosen.get("sanitized_number") or chosen.get("raw_number") or ""
 
     if not phone:
         print(f"[APOLLO-WEBHOOK] no phone in payload for lead {lead_id}")
