@@ -978,12 +978,21 @@ def imap_poll_replies():
     started = datetime.utcnow()
     try:
         try:
-            mbox = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+            # 30s timeout — without it, a slow Gmail handshake hangs forever
+            # and never releases the poll lock. Python 3.9+ supports timeout=
+            # on IMAP4_SSL directly; fall back to socket.setdefaulttimeout for
+            # older runtimes (Railway runs 3.11+ so this is belt + suspenders).
+            try:
+                mbox = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=30)
+            except TypeError:
+                import socket as _socket
+                _socket.setdefaulttimeout(30)
+                mbox = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
             mbox.login(IMAP_USERNAME, IMAP_PASSWORD)
             mbox.select(IMAP_FOLDER)
         except Exception as e:
             stats["errors"] += 1
-            return {"ok": False, "error": f"IMAP connect failed: {e}", "stats": stats}
+            return {"ok": False, "error": f"IMAP connect failed: {type(e).__name__}: {e}", "stats": stats}
 
         try:
             typ, data = mbox.search(None, "UNSEEN")
