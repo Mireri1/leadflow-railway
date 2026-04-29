@@ -1013,6 +1013,25 @@ function CallModal({lead: leadProp,onClose,onSaved}){
             </div>
           </div>
         )}
+        {/* Persistent "previously emailed" banner — shows even after status
+            moves off awaiting_email_reply, so caller knows context when working
+            a returning lead. Hidden when the no-dial banner above already
+            covers the same info to avoid double-stacking. */}
+        {!NO_DIAL_STATUSES.has(lead.status) && campaignInfo?.send_count>0 && (
+          <div style={{padding:"10px 14px",marginBottom:12,
+            background:"#a3a6ff10",border:"1px solid #a3a6ff30",borderRadius:8,
+            fontSize:12,color:"#a3a6ff",display:"flex",alignItems:"center",gap:8}}>
+            <span>📧</span>
+            <div style={{lineHeight:1.4}}>
+              <b>Previously emailed</b>
+              {campaignInfo.send_count>1?` (${campaignInfo.send_count} sends)`:""}
+              {campaignInfo.last_sent_at ? ` — last on ${campaignInfo.last_sent_at.slice(0,10)}` : ""}
+              <span style={{color:"#a3aac4",marginLeft:6}}>
+                · reference the email if they bring it up
+              </span>
+            </div>
+          </div>
+        )}
         {modalError&&<div style={{padding:"10px 14px",marginBottom:12,background:"#ff6e8418",border:"1px solid #ff6e8440",
           borderRadius:8,fontSize:13,color:"#ff6e84",display:"flex",alignItems:"center",gap:8}}>
           <span>⚠</span>{modalError}
@@ -1891,6 +1910,10 @@ const SIDEBAR_NAV = [
 export default function App(){
   const [user,setUser]             = useState(()=>isLoggedIn()?localStorage.getItem("lf_user"):null)
   const [leads,setLeads]           = useState([])
+  // Persistent "this lead was emailed" map. Survives status changes so the
+  // badge stays even after a reply flips the lead back to 'interested'.
+  // Shape: { [lead_id]: {last_emailed_at, email_count} }
+  const [emailedFlags,setEmailedFlags] = useState({})
   const [stats,setStats]           = useState(null)
   const [loading,setLoad]          = useState(false)
   const [toast,setToast]           = useState(null)
@@ -1907,6 +1930,7 @@ export default function App(){
   const [fState,setFState]         = useState("")
   const [fCity,setFCity]           = useState("")
   const [availableOnly,setAvailOnly] = useState(false)
+  const [emailedOnly,setEmailedOnly] = useState(false)
   const [activeNav,setNav]         = useState("dashboard")
   const [callHistory,setCallHistory] = useState([])
   const [histData,setHistData]       = useState(null)
@@ -1989,6 +2013,12 @@ export default function App(){
       setLeads(Array.isArray(leadsData)?leadsData:[])
       try{ const s=await api("/api/stats"); if(s) setStats(s) }catch{}
       try{ const q=await api("/api/quota"); if(q) setQuota(q) }catch{}
+      // Persistent email-history map for the 📧 badges.
+      // 90-day window covers most workflows; older history is fine to forget.
+      try{
+        const f=await api("/api/leads/emailed-flags?days=90")
+        if(f?.flags) setEmailedFlags(f.flags)
+      }catch{}
     }catch(ex){ notify("Error loading leads","error") }
     finally{ setLoad(false) }
   },[search,fStatus,sortBy,cbOnly])
@@ -2098,6 +2128,7 @@ export default function App(){
       if(!cityLower.startsWith(filterLower) && cityLower !== filterLower) return false
     }
     if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
+    if(emailedOnly&&!emailedFlags[l.id]) return false
     return true
   })
   const newTodayLeads = displayLeads.filter(l=>(l.createdAt||"").startsWith(today))
@@ -2123,7 +2154,7 @@ export default function App(){
   // state variable on the /warm nav tab (VCC-source filtered).
   const pipelineWarm   = sortNewFirst(displayLeads.filter(l=>!isApolloLead(l)))
 
-  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false)}
+  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false)}
 
   return(
     <div style={{minHeight:"100vh",background:"#060e20"}}>
@@ -2528,6 +2559,20 @@ export default function App(){
                       </button>
                     )
                   })()}
+                  {(()=>{
+                    const everEmailedCount = leads.filter(l=>emailedFlags[l.id]).length
+                    return (
+                      <button
+                        onClick={()=>setEmailedOnly(p=>!p)}
+                        title="Show only leads that have ever been sent a campaign email (any send in last 90 days). Persists across status changes."
+                        style={{fontSize:12,padding:"8px 14px",borderRadius:8,border:"none",cursor:"pointer",
+                          fontFamily:"'Inter',sans-serif",fontWeight:600,transition:"all .15s",
+                          background:emailedOnly?"#a3a6ff":"#192540",
+                          color:emailedOnly?"#000011":"#a3aac4"}}>
+                        📧 Emailed Previously{everEmailedCount>0?` (${everEmailedCount})`:""}
+                      </button>
+                    )
+                  })()}
                 </div>
               </section>
 
@@ -2594,6 +2639,16 @@ export default function App(){
                               {!takenBy&&lead.assignedTo&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>✓ mine</span>}
                               {lead.source&&<span className="src-tag">{lead.source}</span>}
                               {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf630"}}>🔔 {lead.callbackDate}</span>}
+                              {/* 📧 Persistent email-history badge — survives status changes
+                                  so caller knows "this lead got our email" even after a
+                                  reply flips them back into the pool. */}
+                              {emailedFlags[lead.id]&&(
+                                <span style={{fontSize:9,background:"#a3a6ff20",color:"#a3a6ff",
+                                  padding:"2px 7px",borderRadius:4,border:"1px solid #a3a6ff40",fontWeight:700}}
+                                  title={`Emailed ${emailedFlags[lead.id].email_count}× — last on ${emailedFlags[lead.id].last_emailed_at?.slice(0,10)||"?"}`}>
+                                  📧 EMAILED{emailedFlags[lead.id].email_count>1?` ${emailedFlags[lead.id].email_count}×`:""}
+                                </span>
+                              )}
                               {lead.contract_value>0&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>${(lead.contract_value||0).toLocaleString()}</span>}
                               {lead.followupsequence&&<span style={{fontSize:9,background:"#ffe08312",color:"#ffe083",padding:"2px 7px",borderRadius:4,border:"1px solid #ffe08325"}}>⏱ fu</span>}
                             </div>

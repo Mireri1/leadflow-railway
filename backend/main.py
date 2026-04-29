@@ -3155,6 +3155,42 @@ def email_setup_status(user: str = Depends(verify_admin)):
         "all_ready": bool(RESEND_API_KEY and secret and IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
     }
 
+@app.get("/api/leads/emailed-flags")
+def emailed_flags(days: int = 90, user: str = Depends(verify_token)):
+    """Returns a per-lead-id map of email history so the leads list can
+    show a persistent '📧 emailed' badge that survives status changes.
+    Caller-readable so reps see the badge in the Leads tab too. Pulled
+    from audit_log (action=campaign_sent) — no schema migration needed."""
+    days = max(1, min(int(days), 365))
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?action=eq.campaign_sent&created_at=gte.{since}"
+            f"&select=resource_id,created_at"
+            f"&order=created_at.desc&limit=10000",
+            headers=SB_ADMIN_HEADERS, timeout=15,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if not isinstance(rows, list):
+            rows = []
+    except Exception as e:
+        print(f"[EMAILED-FLAGS] query failed: {e}")
+        return {"flags": {}, "window_days": days}
+
+    # Aggregate: most recent send (rows are desc) + count per lead.
+    flags = {}
+    for row in rows:
+        lid = row.get("resource_id")
+        if not lid:
+            continue
+        key = str(lid)
+        if key not in flags:
+            flags[key] = {"last_emailed_at": row.get("created_at"), "email_count": 1}
+        else:
+            flags[key]["email_count"] += 1
+    return {"flags": flags, "window_days": days, "total_leads_emailed": len(flags)}
+
 @app.get("/api/admin/campaigns/eligible")
 def campaigns_eligible(window_days: int = 7, user: str = Depends(verify_admin)):
     """Returns leads with recent no-answer/voicemail outcomes that haven't
