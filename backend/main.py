@@ -2288,6 +2288,144 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def _is_us_state_value(s) -> bool:
+    """Accept either a 2-letter code or a full state name. Empty → False
+    (treats no-state as suspicious for cleanup)."""
+    s = (s or "").strip()
+    if not s:
+        return False
+    if s.upper() in US_STATE_ABBREVS:
+        return True
+    if s.lower() in US_STATE_NAMES:
+        return True
+    return False
+
+@app.get("/api/admin/leads/cleanup-preview")
+def cleanup_preview(user: str = Depends(verify_admin)):
+    """Categorize likely-irrelevant leads. NON-DESTRUCTIVE — returns IDs
+    + samples grouped by reason. Caller picks which categories to act on,
+    then sends those IDs back to /cleanup-execute."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?select=id,company,phone,email,state,city,source,createdAt,assignedTo,status,total_calls"
+            f"&limit=10000",
+            headers=SB_HEADERS, timeout=30,
+        )
+        leads = r.json() if r.status_code == 200 else []
+        if not isinstance(leads, list):
+            leads = []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch leads: {e}")
+
+    # ── Foreign / no-state leads ──────────────────────────────────────────
+    foreign_ids = []
+    foreign_samples = []
+    for l in leads:
+        if not _is_us_state_value(l.get("state")):
+            foreign_ids.append(l["id"])
+            if len(foreign_samples) < 12:
+                foreign_samples.append({
+                    "id": l["id"], "company": l.get("company"),
+                    "state": l.get("state"), "city": l.get("city"),
+                    "source": l.get("source"),
+                })
+
+    # ── Duplicate by phone ──────────────────────────────────────────────
+    # Group by exact phone match. Keep the newest createdAt; mark older
+    # extras for deletion ONLY if they have no caller activity (otherwise
+    # we'd lose call-history attached to a worked lead).
+    phone_groups = {}
+    for l in leads:
+        ph = (l.get("phone") or "").strip()
+        if ph:
+            phone_groups.setdefault(ph, []).append(l)
+    dup_phone_ids = []
+    dup_phone_samples = []
+    for ph, group in phone_groups.items():
+        if len(group) < 2:
+            continue
+        group_sorted = sorted(group, key=lambda x: x.get("createdAt") or "", reverse=True)
+        keep = group_sorted[0]
+        extras = group_sorted[1:]
+        worth_deleting = []
+        for e in extras:
+            # Skip if worked: assigned, calls logged, or status moved past 'new'
+            if e.get("assignedTo"):
+                continue
+            if (e.get("total_calls") or 0) > 0:
+                continue
+            if e.get("status") and e.get("status") != "new":
+                continue
+            worth_deleting.append(e)
+        if not worth_deleting:
+            continue
+        for e in worth_deleting:
+            dup_phone_ids.append(e["id"])
+        if len(dup_phone_samples) < 8:
+            dup_phone_samples.append({
+                "phone": ph,
+                "kept":  {"id": keep["id"], "company": keep.get("company"),
+                          "createdAt": (keep.get("createdAt") or "")[:10],
+                          "source": keep.get("source")},
+                "delete":[{"id": e["id"], "company": e.get("company"),
+                           "createdAt": (e.get("createdAt") or "")[:10],
+                           "source": e.get("source")} for e in worth_deleting],
+            })
+
+    return {
+        "total_leads":   len(leads),
+        "categories": {
+            "foreign": {
+                "label":   "Foreign / non-US (Apollo's loose location filter before fix)",
+                "count":   len(foreign_ids),
+                "ids":     foreign_ids,
+                "samples": foreign_samples,
+            },
+            "duplicate_phones": {
+                "label":   "Duplicate phone numbers (newer copy kept; only deletes unworked extras)",
+                "count":   len(dup_phone_ids),
+                "ids":     dup_phone_ids,
+                "samples": dup_phone_samples,
+            },
+        },
+    }
+
+@app.post("/api/admin/leads/cleanup-execute")
+def cleanup_execute(body: dict, user: str = Depends(verify_admin)):
+    """Delete leads by ID list. Body: {ids: [...], reason: 'foreign'|'duplicate_phones'|...}.
+    Batched by 50 because Supabase URL length limits."""
+    ids = body.get("ids") or []
+    reason = (body.get("reason") or "manual").strip()
+    if not ids:
+        return {"deleted": 0, "requested": 0}
+
+    deleted = 0
+    failed_batches = 0
+    BATCH = 50
+    for i in range(0, len(ids), BATCH):
+        batch = [str(x) for x in ids[i:i+BATCH]]
+        try:
+            r = req_lib.delete(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({','.join(batch)})",
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                timeout=30,
+            )
+            if r.status_code in (200, 204):
+                deleted += len(batch)
+            else:
+                failed_batches += 1
+                print(f"[CLEANUP] batch delete HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            failed_batches += 1
+            print(f"[CLEANUP] batch delete exception: {e}")
+
+    audit_log(user, "leads_cleanup", "lead", None, {
+        "reason": reason, "requested": len(ids),
+        "deleted": deleted, "failed_batches": failed_batches,
+    })
+    return {"deleted": deleted, "requested": len(ids), "failed_batches": failed_batches}
+
 @app.post("/api/leads/recycle-stale")
 def recycle_stale_leads(user: str = Depends(verify_admin)):
     """Unassign leads that haven't been touched in 7+ days"""

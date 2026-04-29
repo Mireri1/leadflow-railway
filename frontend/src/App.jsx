@@ -2575,6 +2575,14 @@ export default function App(){
                             <div style={{fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,
                               overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                               {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                            {/* Show title only when we have a person (firstName) — for warm leads
+                                where line 1 is already the company, repeating it would look weird. */}
+                            {lead.firstName&&lead.title&&(
+                              <div style={{fontSize:12,color:"#8b5cf6",marginTop:1,fontWeight:600,
+                                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                {lead.title}
+                              </div>
+                            )}
                             <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}{lead.city&&lead.state?` · ${lead.city}, ${lead.state}`:lead.state?` · ${lead.state}`:lead.city?` · ${lead.city}`:""}</div>
                             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
                               {isNewToday&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4,border:"1px solid #69f6b830",fontWeight:700}}>NEW TODAY</span>}
@@ -3716,6 +3724,9 @@ export default function App(){
               {/* ── Campaign Activity (admin only) ── */}
               {isAdmin()&&<CampaignActivityPanel/>}
 
+              {/* ── Lead Cleanup (admin only) ── */}
+              {isAdmin()&&<LeadCleanupPanel onCleanup={loadLeads}/>}
+
               {/* ── Team Management (admin only) ── */}
               {isAdmin()&&<div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
                 <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
@@ -4405,6 +4416,143 @@ function Tile({label,value,accent}){
       <div style={{fontSize:20,color:accent,fontWeight:700,marginTop:4,fontFamily:"'Space Grotesk',sans-serif"}}>
         {value}
       </div>
+    </div>
+  )
+}
+
+function LeadCleanupPanel({onCleanup}){
+  const [data,setData]   = useState(null)
+  const [open,setOpen]   = useState(false)
+  const [loading,setLoad]= useState(false)
+  const [busy,setBusy]   = useState(null)  // category currently being deleted
+  const [result,setRes]  = useState(null)
+
+  const loadPreview = ()=>{
+    setLoad(true)
+    api("/api/admin/leads/cleanup-preview")
+      .then(setData).catch(()=>setData(null)).finally(()=>setLoad(false))
+  }
+  useEffect(()=>{ if(open && !data) loadPreview() },[open])
+
+  async function deleteCategory(catKey, label, count){
+    if(count===0) return
+    if(!window.confirm(`Permanently delete ${count} lead${count!==1?"s":""} from "${label}"?\n\nThis can't be undone.`)) return
+    setBusy(catKey); setRes(null)
+    try{
+      const r = await api("/api/admin/leads/cleanup-execute",{method:"POST",body:JSON.stringify({
+        ids: data.categories[catKey].ids, reason: catKey,
+      })})
+      setRes({cat: label, ...r})
+      loadPreview()
+      onCleanup&&onCleanup()
+    }catch(ex){
+      setRes({cat: label, error: ex.message||"delete failed"})
+    }finally{ setBusy(null) }
+  }
+
+  const cats = data?.categories || {}
+  const totalIrrelevant = Object.values(cats).reduce((s,c)=>s+(c.count||0), 0)
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>setOpen(o=>!o)}
+        style={{padding:"18px 24px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+            🧹 Lead Cleanup <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
+          </div>
+          {data&&totalIrrelevant>0&&(
+            <span style={{fontSize:11,color:"#ff6e84",background:"#ff6e8418",padding:"2px 8px",borderRadius:4,fontWeight:700}}>
+              {totalIrrelevant} likely-irrelevant
+            </span>
+          )}
+        </div>
+        <span style={{color:"#a3aac4",fontSize:14}}>{open?"▾":"▸"}</span>
+      </div>
+      {open&&(
+        <div style={{padding:"0 24px 20px",borderTop:"1px solid #40485d20"}}>
+          {loading?(
+            <div style={{padding:"30px",textAlign:"center",color:"#40485d",fontSize:12}}>Scanning leads…</div>
+          ):!data?(
+            <div style={{padding:"20px",textAlign:"center",color:"#40485d",fontSize:12}}>
+              <button className="btn btn-g" style={{fontSize:12}} onClick={loadPreview}>Load preview</button>
+            </div>
+          ):totalIrrelevant===0?(
+            <div style={{padding:"30px",textAlign:"center"}}>
+              <div style={{fontSize:36,marginBottom:8}}>✓</div>
+              <div style={{color:"#69f6b8",fontSize:13,fontWeight:600}}>
+                Pipeline is clean — {data.total_leads} leads, no irrelevant data found
+              </div>
+            </div>
+          ):(
+            <div style={{paddingTop:16}}>
+              <div style={{fontSize:11,color:"#a3aac4",marginBottom:14}}>
+                Scanned {data.total_leads.toLocaleString()} leads. Below are categories that look irrelevant.
+                Each category has its own delete button — review the samples first, nothing happens until you click + confirm.
+              </div>
+
+              {Object.entries(cats).map(([key,cat])=>(
+                <div key={key} style={{background:"#060e20",borderRadius:10,padding:14,marginBottom:12,
+                  border:"1px solid "+(cat.count>0?"#ff6e8430":"#40485d20")}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,gap:10,flexWrap:"wrap"}}>
+                    <div>
+                      <div style={{fontSize:12,fontWeight:700,color:"#dee5ff",marginBottom:2}}>
+                        {cat.label}
+                      </div>
+                      <div style={{fontSize:11,color:cat.count>0?"#ff6e84":"#69f6b8",fontWeight:600}}>
+                        {cat.count} lead{cat.count!==1?"s":""} flagged
+                      </div>
+                    </div>
+                    <button className="btn"
+                      disabled={cat.count===0||busy===key}
+                      onClick={()=>deleteCategory(key,cat.label,cat.count)}
+                      style={{fontSize:11,padding:"6px 14px",
+                        background:cat.count>0?"#ff6e84":"#40485d20",
+                        color:cat.count>0?"#000011":"#40485d",
+                        fontWeight:700,
+                        cursor:cat.count>0?"pointer":"not-allowed",
+                        border:"none"}}>
+                      {busy===key?"Deleting…":`Delete ${cat.count}`}
+                    </button>
+                  </div>
+                  {cat.samples?.length>0&&(
+                    <div style={{fontSize:10,color:"#a3aac4",lineHeight:1.5,maxHeight:160,overflowY:"auto",
+                      borderTop:"1px solid #40485d20",paddingTop:8,marginTop:6}}>
+                      <div style={{color:"#40485d",marginBottom:4,fontSize:9,letterSpacing:".06em",textTransform:"uppercase"}}>
+                        Samples ({Math.min(cat.samples.length,12)} of {cat.count}):
+                      </div>
+                      {cat.samples.map((s,i)=>(
+                        <div key={i} style={{padding:"3px 0"}}>
+                          {s.phone ? (
+                            <>
+                              📞 <b>{s.phone}</b> — keeping {s.kept?.company} ({s.kept?.createdAt}, {s.kept?.source}),
+                              deleting {s.delete?.length} older copy{s.delete?.length!==1?"ies":""}
+                            </>
+                          ) : (
+                            <>· {s.company || "(no company)"} — state={s.state!==undefined?<i>{String(s.state||"empty")}</i>:""}{s.city?` · ${s.city}`:""}{s.source?` · ${s.source}`:""}</>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {result&&(
+                <div style={{marginTop:12,padding:"10px 14px",fontSize:11,
+                  background:result.error?"#ff6e8418":"#69f6b818",
+                  border:`1px solid ${result.error?"#ff6e8430":"#69f6b830"}`,
+                  borderRadius:8,
+                  color:result.error?"#ff6e84":"#69f6b8"}}>
+                  {result.error
+                    ? `⚠ ${result.cat}: ${result.error}`
+                    : `✓ ${result.cat}: deleted ${result.deleted} of ${result.requested} leads${result.failed_batches?` (${result.failed_batches} batch failures)`:""}`}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
