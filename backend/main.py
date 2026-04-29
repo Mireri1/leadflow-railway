@@ -2305,16 +2305,28 @@ def cleanup_preview(user: str = Depends(verify_admin)):
     """Categorize likely-irrelevant leads. NON-DESTRUCTIVE — returns IDs
     + samples grouped by reason. Caller picks which categories to act on,
     then sends those IDs back to /cleanup-execute."""
+    # Supabase caps result size at 1000/page regardless of limit param. Paginate
+    # via Range header so we see the full DB, not just the first thousand.
+    leads = []
+    PAGE = 1000
+    MAX_PAGES = 50  # 50,000-lead ceiling — fail-safe so a runaway can't OOM
     try:
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads"
-            f"?select=id,company,phone,email,state,city,source,createdAt,assignedTo,status,total_calls"
-            f"&limit=10000",
-            headers=SB_HEADERS, timeout=30,
-        )
-        leads = r.json() if r.status_code == 200 else []
-        if not isinstance(leads, list):
-            leads = []
+        for page in range(MAX_PAGES):
+            start = page * PAGE
+            end   = start + PAGE - 1
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads"
+                f"?select=id,company,phone,email,state,city,source,createdAt,assignedTo,status,total_calls"
+                f"&order=id.asc",
+                headers={**SB_HEADERS, "Range-Unit": "items", "Range": f"{start}-{end}"},
+                timeout=30,
+            )
+            batch = r.json() if r.status_code in (200, 206) else []
+            if not isinstance(batch, list) or len(batch) == 0:
+                break
+            leads.extend(batch)
+            if len(batch) < PAGE:
+                break  # last page
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch leads: {e}")
 
