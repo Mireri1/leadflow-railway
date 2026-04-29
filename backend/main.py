@@ -1453,14 +1453,23 @@ def apollo_person_to_lead(person: dict, user: str) -> dict:
     return lead
 
 class ApolloPullRequest(BaseModel):
-    titles:        Optional[str] = ""   # comma-sep e.g. "Facility Manager,Director of Operations"
-    industries:    Optional[str] = ""   # comma-sep keywords e.g. "Hospital,Education"
-    locations:     Optional[str] = ""   # comma-sep e.g. "California, US" or "Phoenix, AZ"
+    # Accept either comma-sep string (legacy) OR list (preferred — avoids the
+    # "Phoenix, AZ" string-split problem where embedded commas break parsing).
+    titles:        Optional[object] = ""
+    industries:    Optional[object] = ""
+    locations:     Optional[object] = ""
     employee_min:  Optional[int] = 50
     employee_max:  Optional[int] = 500
     per_page:      Optional[int] = 25   # Apollo caps at 100
     page:          Optional[int] = 1
     reveal_phones: Optional[bool] = False  # Costs +5-8 credits per lead via async webhook
+
+def _to_str_list(v):
+    """Coerce a request field to a list of trimmed non-empty strings.
+    Accepts list (used directly) or string (split on commas)."""
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [t.strip() for t in str(v or "").split(",") if t.strip()]
 
 @app.post("/api/scrape")
 def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
@@ -2317,9 +2326,9 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         raise HTTPException(status_code=400,
             detail="APOLLO_API_KEY not configured. Set it in Railway env vars.")
 
-    titles     = [t.strip() for t in (body.titles or "").split(",") if t.strip()]
-    industries = [i.strip() for i in (body.industries or "").split(",") if i.strip()]
-    locations  = [l.strip() for l in (body.locations or "").split(",") if l.strip()]
+    titles     = _to_str_list(body.titles)
+    industries = _to_str_list(body.industries)
+    locations  = _to_str_list(body.locations)
     per_page   = max(1, min(body.per_page or 25, 100))
 
     payload = {"page": body.page or 1, "per_page": per_page}

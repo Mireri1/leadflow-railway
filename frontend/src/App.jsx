@@ -9,6 +9,20 @@ const STATES = [
   "VA","WA","WV","WI","WY"
 ]
 
+// Used to convert state codes to Apollo's expected location format:
+//   "California, US" / "Phoenix, AZ" — bare "California" matches UK/AU regions too.
+const STATE_NAMES = {
+  AL:"Alabama",AK:"Alaska",AZ:"Arizona",AR:"Arkansas",CA:"California",CO:"Colorado",
+  CT:"Connecticut",DE:"Delaware",FL:"Florida",GA:"Georgia",HI:"Hawaii",ID:"Idaho",
+  IL:"Illinois",IN:"Indiana",IA:"Iowa",KS:"Kansas",KY:"Kentucky",LA:"Louisiana",
+  ME:"Maine",MD:"Maryland",MA:"Massachusetts",MI:"Michigan",MN:"Minnesota",MS:"Mississippi",
+  MO:"Missouri",MT:"Montana",NE:"Nebraska",NV:"Nevada",NH:"New Hampshire",NJ:"New Jersey",
+  NM:"New Mexico",NY:"New York",NC:"North Carolina",ND:"North Dakota",OH:"Ohio",OK:"Oklahoma",
+  OR:"Oregon",PA:"Pennsylvania",RI:"Rhode Island",SC:"South Carolina",SD:"South Dakota",
+  TN:"Tennessee",TX:"Texas",UT:"Utah",VT:"Vermont",VA:"Virginia",WA:"Washington",
+  WV:"West Virginia",WI:"Wisconsin",WY:"Wyoming",
+}
+
 const STATUS_OPTIONS = [
   { value:"new",                   label:"New",                   color:"#a3a6ff" },
   { value:"called",                label:"Called",                color:"#ffe083" },
@@ -438,10 +452,15 @@ function LeadFinder({onFound, industries}){
 // emails/phones — built to bypass gatekeepers. Admin-only because it burns
 // paid Apollo credits (4,000/month on Pro, ~$0.025/contact at typical rates).
 
-function ApolloFinder({onFound}){
+function ApolloFinder({onFound, industries: industryOptions = []}){
   const [titles,setTitles]         = useState("Facility Manager,Director of Operations,Operations Manager,Property Manager")
-  const [industries,setIndustries] = useState("")
-  const [locations,setLocations]   = useState("")
+  // Structured location: state code + comma-sep cities. Replaces the loose
+  // free-text input that was matching UK/AU "California, Wales"-style results.
+  const [state,setState]           = useState("")
+  const [cities,setCities]         = useState("")
+  // Industry chips (multi-select). Uses the same /api/industries list as
+  // Find Leads so callers see one consistent vocabulary.
+  const [selIndustries,setSelInds] = useState([])
   const [empMin,setEmpMin]         = useState(50)
   const [empMax,setEmpMax]         = useState(500)
   const [perPage,setPerPage]       = useState(25)
@@ -459,13 +478,36 @@ function ApolloFinder({onFound}){
   const [backfillResult,setBfResult]  = useState(null)
   const [backfillError,setBfError]    = useState("")
 
+  function toggleIndustry(ind){
+    if(ind==="_all_"){
+      setSelInds(s=>s.length===industryOptions.length?[]:[...industryOptions])
+      return
+    }
+    setSelInds(s=>s.includes(ind)?s.filter(i=>i!==ind):[...s,ind])
+  }
+
+  // Build Apollo's person_locations array from structured state+cities. This
+  // is the whole point of the refactor — avoids matching "California" against
+  // South Wales etc. Always anchors to US.
+  function buildLocations(){
+    if(!state) return []  // empty = nationwide US (handled by titles+industries)
+    const fullState = STATE_NAMES[state] || state
+    const cityList = cities.split(",").map(c=>c.trim()).filter(Boolean)
+    if(cityList.length===0) return [`${fullState}, US`]
+    return cityList.map(c=>`${c}, ${state}`)
+  }
+
   async function pull(){
     setError(""); setResult(null)
     if(!titles.trim()){ setError("Enter at least one job title."); return }
+    if(cities.trim()&&!state){ setError("Pick a state when targeting specific cities."); return }
     setLoad(true)
     try{
+      const locArr = buildLocations()
       const res = await api("/api/admin/apollo/pull",{method:"POST",body:JSON.stringify({
-        titles, industries, locations,
+        titles,
+        industries:    selIndustries,  // backend accepts list now
+        locations:     locArr,
         employee_min:  Number(empMin)||50,
         employee_max:  Number(empMax)||500,
         per_page:      Number(perPage)||25,
@@ -518,15 +560,41 @@ function ApolloFinder({onFound}){
           <input className="sel" value={titles} onChange={e=>setTitles(e.target.value)}
             placeholder="Facility Manager, Director of Operations, Property Manager"/>
         </div>
+        {industryOptions.length>0 && (
+          <div className="ff" style={{gridColumn:"1 / -1"}}>
+            <label style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span>Industries ({selIndustries.length===industryOptions.length?"All":selIndustries.length} selected)</span>
+              <button onClick={()=>toggleIndustry("_all_")} style={{background:"none",border:"none",
+                color:"#8b5cf6",fontSize:11,cursor:"pointer",padding:0}}>
+                {selIndustries.length===industryOptions.length?"Clear all":"Select all"}
+              </button>
+            </label>
+            <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:4}}>
+              {industryOptions.map(ind=>(
+                <button key={ind} onClick={()=>toggleIndustry(ind)}
+                  style={{padding:"4px 10px",borderRadius:6,fontSize:11,fontFamily:"inherit",cursor:"pointer",
+                    background:selIndustries.includes(ind)?"#8b5cf6":"transparent",
+                    color:selIndustries.includes(ind)?"#000011":"#a3aac4",
+                    border:`1px solid ${selIndustries.includes(ind)?"#8b5cf6":"#40485d40"}`,
+                    transition:"all .1s"}}>
+                  {ind}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="ff">
-          <label>Industries (comma-separated, optional)</label>
-          <input className="sel" value={industries} onChange={e=>setIndustries(e.target.value)}
-            placeholder="Hospital, Education, Manufacturing"/>
+          <label>{cities.trim()?"State (required for city search)":"State (optional — empty = nationwide)"}</label>
+          <select value={state} onChange={e=>setState(e.target.value)} className="sel"
+            style={{color:state?"#dee5ff":"#a3aac4",border:cities.trim()&&!state?"1px solid #ff6e84":""}}>
+            <option value="">All States (US-only)</option>
+            {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s} — {STATE_NAMES[s]||s}</option>)}
+          </select>
         </div>
         <div className="ff">
-          <label>Locations (comma-separated, optional)</label>
-          <input className="sel" value={locations} onChange={e=>setLocations(e.target.value)}
-            placeholder="California, US  |  Phoenix, AZ"/>
+          <label>Cities (optional, multi)</label>
+          <CityAutocomplete value={cities} onChange={setCities} state={state} multi={true}
+            placeholder={state?"e.g. Phoenix, Tucson, Tempe":"Pick a state first"}/>
         </div>
         <div className="ff">
           <label>Company Size (employees)</label>
@@ -2352,7 +2420,7 @@ export default function App(){
                 <div style={{marginTop:32}}><LeadFinder onFound={loadLeads} industries={industries}/></div>
               )}
               {isAdmin()&&(
-                <div style={{marginTop:24}}><ApolloFinder onFound={loadLeads}/></div>
+                <div style={{marginTop:24}}><ApolloFinder onFound={loadLeads} industries={industries}/></div>
               )}
             </div>
           )}
@@ -2869,10 +2937,24 @@ export default function App(){
                       catch{ alert("Couldn't update review") }
                     }
                     const moveToFollowUp=async()=>{
-                      const d=prompt("Follow-up date (YYYY-MM-DD)?",addDays(7))
+                      // Future Follow-Ups tab filters callbackDate >= today+180d.
+                      // Default to 180d so the lead lands where the user expects;
+                      // shorter dates still save fine but show under regular Leads
+                      // with status=callback (and on the Dashboard's callbacks-due card).
+                      const d=prompt(
+                        "Follow-up date (YYYY-MM-DD)\nTip: 180+ days from today shows in the Future Follow-Ups tab.",
+                        addDays(180)
+                      )
                       if(!d) return
-                      try{ await api(`/api/calls/${call.id}/followup`,{method:"POST",body:JSON.stringify({date:d})}); refresh(); loadLeads&&loadLeads() }
-                      catch{ alert("Couldn't move to follow-up") }
+                      try{
+                        await api(`/api/calls/${call.id}/followup`,{method:"POST",body:JSON.stringify({date:d})})
+                        const isFuture = d >= addDays(180)
+                        notify(`✓ Follow-up scheduled for ${d}${isFuture?" — see Future Follow-Ups tab":""}`)
+                        refresh()
+                        loadLeads&&loadLeads()
+                      }catch(ex){
+                        notify("Couldn't move to follow-up — "+(ex.message||"try again"),"error")
+                      }
                     }
                     const deleteCall=async()=>{
                       if(!confirm("Delete this qualification entry? The lead is not affected.")) return
