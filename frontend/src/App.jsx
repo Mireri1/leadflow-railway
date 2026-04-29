@@ -2102,6 +2102,26 @@ export default function App(){
   const newTodayLeads = displayLeads.filter(l=>(l.createdAt||"").startsWith(today))
   const olderLeads = displayLeads.filter(l=>!(l.createdAt||"").startsWith(today))
 
+  // Source-based segmentation for the Leads tab — keeps Apollo-pulled
+  // decision-maker contacts visually separate from Google Places / manual
+  // / VCC warm leads so callers can see at a glance which list they're in.
+  // Apollo-direct pulls have source="Apollo"; everything else (Google
+  // Places + auto-enriched Google Places, manual imports, VCC warm) goes
+  // under Warm Leads. The banner counts use the FILTERED set so they
+  // reflect what the user is currently looking at.
+  const isApolloLead = (l) => (l.source||"").toLowerCase() === "apollo"
+  // Within each segment, surface "new today" first (preserves the prior
+  // newest-first behavior — just nested inside each section).
+  const sortNewFirst = (arr) => {
+    const newToday = arr.filter(l=>(l.createdAt||"").startsWith(today))
+    const older    = arr.filter(l=>!(l.createdAt||"").startsWith(today))
+    return [...newToday, ...older]
+  }
+  const dmLeads        = sortNewFirst(displayLeads.filter(isApolloLead))
+  // Named pipelineWarm to avoid collision with the existing `warmLeads`
+  // state variable on the /warm nav tab (VCC-source filtered).
+  const pipelineWarm   = sortNewFirst(displayLeads.filter(l=>!isApolloLead(l)))
+
   function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false)}
 
   return(
@@ -2433,6 +2453,17 @@ export default function App(){
                   color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Leads</h1>
                 <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
                   {leads.length} prospect{leads.length!==1?"s":""} in your pipeline
+                  {(()=>{
+                    const dmCount   = leads.filter(l=>(l.source||"").toLowerCase()==="apollo").length
+                    const warmCount = leads.length - dmCount
+                    if(leads.length===0) return null
+                    return (
+                      <span style={{marginLeft:10,fontSize:12,color:"#40485d"}}>
+                        · <span style={{color:"#8b5cf6"}}>{dmCount}</span> decision maker{dmCount!==1?"s":""}
+                        · <span style={{color:"#ffe083"}}>{warmCount}</span> warm
+                      </span>
+                    )
+                  })()}
                 </p>
               </div>
 
@@ -2517,41 +2548,18 @@ export default function App(){
                       {cbOnly?"No callbacks due":"Import a CSV or use Find Leads to get started"}
                     </div>
                   </div>
-                ):(
-                  <div>
-                  {newTodayLeads.length>0&&(
-                    <div style={{padding:"10px 24px",background:"#69f6b808",borderBottom:"1px solid #69f6b820",
-                      display:"flex",alignItems:"center",gap:8}}>
-                      <span style={{fontSize:11,fontWeight:700,color:"#69f6b8",letterSpacing:".08em",textTransform:"uppercase"}}>
-                        New Today
-                      </span>
-                      <span style={{fontSize:11,color:"#69f6b8",background:"#69f6b818",padding:"2px 8px",borderRadius:10,fontWeight:700}}>
-                        {newTodayLeads.length}
-                      </span>
-                    </div>
-                  )}
-                  {(newTodayLeads.length>0?[...newTodayLeads,...olderLeads]:displayLeads).map((lead,_li)=>{
-                    const isNewSection = newTodayLeads.length>0 && _li===newTodayLeads.length
+                ):(()=>{
+                  // Single per-row renderer reused for both segments below.
+                  const renderRow = (lead) => {
                     const info=si(lead.status)
                     const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
                     const score=lead.score||scoreLead(lead)||0
                     const ac=avatarColor(lead.company||lead.firstName||"?")
                     const isMine=!lead.assignedTo||lead.assignedTo===user
                     const takenBy=!isMine?lead.assignedTo:null
+                    const isNewToday=(lead.createdAt||"").startsWith(today)
                     return(
-                      <React.Fragment key={lead.id}>
-                      {isNewSection&&(
-                        <div style={{padding:"10px 24px",background:"#141f3850",borderBottom:"1px solid #40485d15",borderTop:"1px solid #40485d15",
-                          display:"flex",alignItems:"center",gap:8}}>
-                          <span style={{fontSize:11,fontWeight:700,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase"}}>
-                            All Leads
-                          </span>
-                          <span style={{fontSize:11,color:"#40485d",background:"#40485d18",padding:"2px 8px",borderRadius:10,fontWeight:700}}>
-                            {olderLeads.length}
-                          </span>
-                        </div>
-                      )}
-                      <div className={isCb?"lrow-cb":""}
+                      <div key={lead.id} className={isCb?"lrow-cb":""}
                         style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
                           padding:"16px 24px",alignItems:"center",gap:16,
                           borderBottom:"1px solid #40485d12",transition:"background .12s",cursor:"default",
@@ -2569,6 +2577,7 @@ export default function App(){
                               {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
                             <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}{lead.city&&lead.state?` · ${lead.city}, ${lead.state}`:lead.state?` · ${lead.state}`:lead.city?` · ${lead.city}`:""}</div>
                             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
+                              {isNewToday&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4,border:"1px solid #69f6b830",fontWeight:700}}>NEW TODAY</span>}
                               {takenBy&&<span style={{fontSize:9,background:"#ff6e8420",color:"#ff6e84",padding:"2px 7px",borderRadius:4,border:"1px solid #ff6e8430"}}>🔒 {takenBy}</span>}
                               {!takenBy&&lead.assignedTo&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>✓ mine</span>}
                               {lead.source&&<span className="src-tag">{lead.source}</span>}
@@ -2614,11 +2623,48 @@ export default function App(){
                             hoverColor="#ff6e84" baseColor="#40485d"><IconTrash/></IconBtn>
                         </div>
                       </div>
-                      </React.Fragment>
                     )
-                  })}
-                  </div>
-                )}
+                  }
+                  // Section banner reused for both groups — keeps the visual
+                  // pattern that matches the existing header strip on the page.
+                  const Banner = ({color,icon,label,count,subtitle}) => (
+                    <div style={{padding:"12px 24px",background:`${color}10`,borderBottom:`1px solid ${color}30`,
+                      display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                      <span style={{fontSize:14}}>{icon}</span>
+                      <span style={{fontSize:11,fontWeight:700,color,letterSpacing:".08em",textTransform:"uppercase"}}>
+                        {label}
+                      </span>
+                      <span style={{fontSize:11,color,background:`${color}25`,padding:"2px 9px",borderRadius:10,fontWeight:700}}>
+                        {count}
+                      </span>
+                      {subtitle&&<span style={{fontSize:11,color:"#a3aac4",marginLeft:4}}>{subtitle}</span>}
+                    </div>
+                  )
+                  const today_count_dm   = dmLeads.filter(l=>(l.createdAt||"").startsWith(today)).length
+                  const today_count_warm = pipelineWarm.filter(l=>(l.createdAt||"").startsWith(today)).length
+                  return (
+                    <div>
+                      {dmLeads.length>0&&(
+                        <>
+                          <Banner color="#8b5cf6" icon="🎯"
+                            label="Decision Makers (Apollo)"
+                            count={dmLeads.length}
+                            subtitle={today_count_dm>0?`+${today_count_dm} new today`:"Direct contacts pulled from Apollo"}/>
+                          {dmLeads.map(renderRow)}
+                        </>
+                      )}
+                      {pipelineWarm.length>0&&(
+                        <>
+                          <Banner color="#ffe083" icon="🌡️"
+                            label="Warm Leads"
+                            count={pipelineWarm.length}
+                            subtitle={today_count_warm>0?`+${today_count_warm} new today`:"Companies — call switchboard, ask for the DM by name if known"}/>
+                          {pipelineWarm.map(renderRow)}
+                        </>
+                      )}
+                    </div>
+                  )
+                })()}
               </div>
 
               <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:24,padding:"0 4px"}}>
