@@ -3036,10 +3036,13 @@ def save_email_template(body: dict, user: str = Depends(verify_admin)):
         "key":   f"email_template_{name}",
         "value": json_lib.dumps({"subject": subject, "body": text}),
     }
+    # Use service-role headers so RLS doesn't block the write — same pattern
+    # audit_log uses. Endpoint is verify_admin-gated upstream so this is
+    # appropriate. Without service role, anon-key writes fail with RLS 42501.
     try:
         r = req_lib.post(
-            f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            f"{SUPABASE_URL}/rest/v1/app_settings",
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
             json=payload, timeout=10,
         )
         if r.status_code not in (200, 201, 204):
@@ -3061,7 +3064,7 @@ def reset_email_template(name: str = "tried-to-call", user: str = Depends(verify
     try:
         req_lib.delete(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.email_template_{name}",
-            headers=SB_HEADERS, timeout=10,
+            headers=SB_ADMIN_HEADERS, timeout=10,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reset failed: {e}")
