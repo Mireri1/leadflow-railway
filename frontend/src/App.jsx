@@ -1881,8 +1881,9 @@ const SIDEBAR_NAV = [
   { key:"leads",     label:"Leads",           Icon:IconPeople },
   { key:"warm",      label:"Warm Leads",      Icon:IconChart },
   { key:"dialer",    label:"Dialer",          Icon:IconPhone },
-  { key:"future",    label:"Future Follow-Ups", Icon:IconCalendarFar },
+  { key:"followups", label:"Follow-Ups",      Icon:IconCalendarFar },
   { key:"qualified", label:"Qualified",        Icon:IconClipCheck },
+  { key:"campaigns", label:"Email Campaigns",  Icon:IconMail },
   { key:"analytics", label:"Analytics",       Icon:IconChart },
   { key:"history",   label:"History",         Icon:IconHistory },
 ]
@@ -2355,6 +2356,9 @@ export default function App(){
                   </div>
                 )
               })()}
+
+              {/* Email Campaigns summary — clickable, jumps to full campaigns tab */}
+              <CampaignSummaryCard onClick={()=>setNav("campaigns")}/>
 
               {/* Overdue callbacks */}
               {leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted").length>0&&(
@@ -3119,16 +3123,45 @@ export default function App(){
             </div>
           )}
 
-          {/* ── FUTURE FOLLOW-UPS ───────────────────────────────────────────── */}
-          {activeNav==="future"&&(()=>{
-            const sixMonths=addDays(180)
-            const futureLeads=leads
-              .filter(l=>l.callbackDate&&l.callbackDate>=sixMonths&&l.status!=="converted")
+          {/* ── FOLLOW-UPS (overdue + today + week + month + later + future) ── */}
+          {activeNav==="followups"&&(()=>{
+            const allFollowups = leads
+              .filter(l=>l.callbackDate&&l.status!=="converted")
               .sort((a,b)=>a.callbackDate.localeCompare(b.callbackDate))
 
-            function monthsAway(dateStr){
-              const diff=Math.round((new Date(dateStr)-new Date())/(1000*60*60*24*30))
-              return diff<=1?"~1 month":diff+" months"
+            const d7  = addDays(7)
+            const d30 = addDays(30)
+            const d180= addDays(180)
+            const buckets = [
+              {key:"overdue", label:"Overdue", color:"#ff6e84", icon:"⚠",
+                desc:"Past due — these callbacks didn't happen yet",
+                leads: allFollowups.filter(l=>l.callbackDate<today)},
+              {key:"today",   label:"Today",   color:"#ffe083", icon:"📞",
+                desc:"Call back today",
+                leads: allFollowups.filter(l=>l.callbackDate===today)},
+              {key:"week",    label:"This Week", color:"#69f6b8", icon:"🗓",
+                desc:"Next 7 days",
+                leads: allFollowups.filter(l=>l.callbackDate>today&&l.callbackDate<=d7)},
+              {key:"month",   label:"Next 30 Days", color:"#a3a6ff", icon:"📅",
+                desc:"Coming up — schedule outreach",
+                leads: allFollowups.filter(l=>l.callbackDate>d7&&l.callbackDate<=d30)},
+              {key:"later",   label:"Later (1 to 6 months)", color:"#8b5cf6", icon:"⏳",
+                desc:"30 days to 6 months out",
+                leads: allFollowups.filter(l=>l.callbackDate>d30&&l.callbackDate<d180)},
+              {key:"future",  label:"Future (6+ months)", color:"#06d6a0", icon:"🌱",
+                desc:"Long-tail — quarterly check-in candidates",
+                leads: allFollowups.filter(l=>l.callbackDate>=d180)},
+            ]
+
+            function relativeTime(dateStr){
+              const days=Math.round((new Date(dateStr)-new Date())/(1000*60*60*24))
+              if(days<0) return Math.abs(days)+"d overdue"
+              if(days===0) return "today"
+              if(days===1) return "tomorrow"
+              if(days<7) return `in ${days}d`
+              if(days<30) return `in ${Math.round(days/7)}w`
+              if(days<365) return `in ${Math.round(days/30)}mo`
+              return `in ${Math.round(days/365)}y`
             }
 
             return(
@@ -3137,109 +3170,115 @@ export default function App(){
                   justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
                   <div>
                     <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
-                      color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Future Follow-Ups</h1>
+                      color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Follow-Ups</h1>
                     <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
-                      Leads scheduled 6+ months out
+                      Every scheduled callback in one place — overdue, this week, future
                     </p>
                   </div>
-                  {futureLeads.length>0&&(
+                  {allFollowups.length>0&&(
                     <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
-                      color:"#a3a6ff"}}>{futureLeads.length}</div>
+                      color:"#a3a6ff"}}>{allFollowups.length}</div>
                   )}
                 </div>
 
-                {futureLeads.length===0?(
+                {allFollowups.length===0?(
                   <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
                     <div style={{fontSize:40,marginBottom:12}}>&#x1f4c5;</div>
-                    <div style={{color:"#a3aac4",fontSize:14}}>No future follow-ups scheduled</div>
+                    <div style={{color:"#a3aac4",fontSize:14}}>No follow-ups scheduled</div>
                     <div style={{color:"#40485d",fontSize:12,marginTop:6}}>
-                      When you log a callback date 6+ months away, it will appear here
+                      Log a call with outcome "Callback" + a date and it appears here
                     </div>
                   </div>
                 ):(
-                  <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
-                    <div style={{display:"grid",gridTemplateColumns:"3fr 2fr 1fr 2fr 2fr",
-                      padding:"10px 24px",fontSize:"0.55rem",fontWeight:700,
-                      color:"#a3aac4",textTransform:"uppercase",letterSpacing:".08em",
-                      borderBottom:"1px solid #40485d20"}}>
-                      <div>Contact &amp; Company</div>
-                      <div>Scheduled</div>
-                      <div>Status</div>
-                      <div>Notes</div>
-                      <div style={{textAlign:"right"}}>Actions</div>
-                    </div>
-                    {futureLeads.map(lead=>{
-                      const ac=avatarColor(lead.company||lead.firstName||"?")
-                      const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
-                      return(
-                        <div key={lead.id}
-                          style={{display:"grid",gridTemplateColumns:"3fr 2fr 1fr 2fr 2fr",
-                            padding:"16px 24px",alignItems:"center",gap:16,
-                            borderBottom:"1px solid #40485d10",transition:"background .12s"}}
-                          onMouseEnter={e=>e.currentTarget.style.background="#192540"}
-                          onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                          <div style={{display:"flex",alignItems:"center",gap:12,minWidth:0}}>
-                            <div style={{width:38,height:38,borderRadius:"50%",background:ac+"22",flexShrink:0,
-                              display:"flex",alignItems:"center",justifyContent:"center",
-                              fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
-                              {getInitials(lead)}</div>
-                            <div style={{minWidth:0}}>
-                              <div style={{fontWeight:600,color:"#dee5ff",fontSize:14,
-                                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                                {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
-                              <div style={{fontSize:12,color:"#a3aac4"}}>{lead.company}</div>
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
-                              fontWeight:700,color:"#a3a6ff"}}>{lead.callbackDate}</div>
-                            <div style={{fontSize:11,color:"#40485d",marginTop:2}}>
-                              {monthsAway(lead.callbackDate)} away
-                            </div>
-                          </div>
-                          <span className="pill" style={{background:info.color+"20",color:info.color,
-                            border:`1px solid ${info.color}30`,width:"fit-content"}}>{info.label}</span>
-                          <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",
-                            display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>
-                            {lead.notes||<span style={{color:"#40485d"}}>{"\u2014"}</span>}
-                          </div>
-                          <div style={{display:"flex",gap:6,justifyContent:"flex-end",flexWrap:"wrap"}}>
-                            <button className="btn btn-g"
-                              style={{fontSize:11,padding:"6px 12px",whiteSpace:"nowrap"}}
-                              onClick={async()=>{
-                                const d=window.prompt(
-                                  `Move follow-up for ${lead.company||lead.firstName} to when?\n(YYYY-MM-DD)`,
-                                  addDays(30)
-                                )
-                                if(d&&d.match(/^\d{4}-\d{2}-\d{2}$/)){
-                                  await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
-                                    callbackDate:d,status:"callback",updatedAt:new Date().toISOString()})})
-                                  setLeads(p=>p.map(l=>l.id===lead.id?{...l,callbackDate:d,status:"callback"}:l))
-                                  notify("Follow-up moved to "+d)
-                                }
-                              }}>
-                              Bring Forward
-                            </button>
-                            <IconBtn onClick={()=>setCallModal(lead)} title="Log call"><IconPhone/></IconBtn>
-                            <IconBtn onClick={()=>setEditModal(lead)} title="Edit"><IconEdit/></IconBtn>
-                          </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:18}}>
+                    {buckets.filter(b=>b.leads.length>0).map(b=>(
+                      <div key={b.key} style={{background:"#0f1930",borderRadius:12,overflow:"hidden",
+                        borderTop:`3px solid ${b.color}`}}>
+                        <div style={{padding:"14px 24px",display:"flex",alignItems:"center",gap:12,
+                          borderBottom:"1px solid #40485d20",background:`${b.color}08`,flexWrap:"wrap"}}>
+                          <span style={{fontSize:18}}>{b.icon}</span>
+                          <span style={{fontSize:13,fontWeight:700,color:b.color,letterSpacing:".05em",textTransform:"uppercase"}}>
+                            {b.label}
+                          </span>
+                          <span style={{fontSize:12,color:b.color,background:`${b.color}25`,
+                            padding:"2px 10px",borderRadius:10,fontWeight:700}}>
+                            {b.leads.length}
+                          </span>
+                          <span style={{fontSize:11,color:"#a3aac4",marginLeft:6}}>{b.desc}</span>
                         </div>
-                      )
-                    })}
-                    <div style={{padding:"12px 24px",borderTop:"1px solid #40485d20",
-                      display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                      <span style={{fontSize:12,color:"#40485d"}}>
-                        Earliest: <span style={{color:"#a3a6ff",fontFamily:"'Space Grotesk',sans-serif",fontWeight:600}}>{futureLeads[0]?.callbackDate}</span>
-                        {" \u00b7 "}Latest: <span style={{color:"#a3a6ff",fontFamily:"'Space Grotesk',sans-serif",fontWeight:600}}>{futureLeads[futureLeads.length-1]?.callbackDate}</span>
-                      </span>
-                      <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,
-                        fontWeight:700,color:"#a3a6ff"}}>{futureLeads.length} lead{futureLeads.length!==1?"s":""}</span>
-                    </div>
+                        {b.leads.map(lead=>{
+                          const ac=avatarColor(lead.company||lead.firstName||"?")
+                          const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
+                          return(
+                            <div key={lead.id}
+                              style={{display:"grid",gridTemplateColumns:"3fr 2fr 1fr 2fr 2fr",
+                                padding:"14px 24px",alignItems:"center",gap:16,
+                                borderBottom:"1px solid #40485d10",transition:"background .12s"}}
+                              onMouseEnter={e=>e.currentTarget.style.background="#192540"}
+                              onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                              <div style={{display:"flex",alignItems:"center",gap:12,minWidth:0}}>
+                                <div style={{width:36,height:36,borderRadius:"50%",background:ac+"22",flexShrink:0,
+                                  display:"flex",alignItems:"center",justifyContent:"center",
+                                  fontSize:12,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif"}}>
+                                  {getInitials(lead)}</div>
+                                <div style={{minWidth:0}}>
+                                  <div style={{fontWeight:600,color:"#dee5ff",fontSize:14,
+                                    overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                    {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                                  <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                    {lead.title?`${lead.title} · `:""}{lead.company||""}
+                                    {lead.city&&lead.state?` · ${lead.city}, ${lead.state}`:lead.state?` · ${lead.state}`:""}
+                                  </div>
+                                </div>
+                              </div>
+                              <div>
+                                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:13,fontWeight:700,color:b.color}}>
+                                  {lead.callbackDate}
+                                </div>
+                                <div style={{fontSize:11,color:"#40485d",marginTop:2}}>
+                                  {relativeTime(lead.callbackDate)}
+                                </div>
+                              </div>
+                              <span className="pill" style={{background:info.color+"20",color:info.color,
+                                border:`1px solid ${info.color}30`,width:"fit-content"}}>{info.label}</span>
+                              <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",
+                                display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>
+                                {lead.phone?<><span style={{color:"#a3a6ff"}}>📞</span> {lead.phone}<br/></>:""}
+                                {lead.notes||""}
+                              </div>
+                              <div style={{display:"flex",gap:6,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                                <button className="btn btn-g"
+                                  style={{fontSize:11,padding:"6px 12px",whiteSpace:"nowrap"}}
+                                  onClick={async()=>{
+                                    const d=window.prompt(
+                                      `Reschedule follow-up for ${lead.company||lead.firstName}? (YYYY-MM-DD)`,
+                                      addDays(7)
+                                    )
+                                    if(d&&d.match(/^\d{4}-\d{2}-\d{2}$/)){
+                                      await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
+                                        callbackDate:d,status:"callback",updatedAt:new Date().toISOString()})})
+                                      setLeads(p=>p.map(l=>l.id===lead.id?{...l,callbackDate:d,status:"callback"}:l))
+                                      notify("Follow-up moved to "+d)
+                                    }
+                                  }}>
+                                  Reschedule
+                                </button>
+                                <IconBtn onClick={()=>setCallModal(lead)} title="Log call"><IconPhone/></IconBtn>
+                                <IconBtn onClick={()=>setEditModal(lead)} title="Edit"><IconEdit/></IconBtn>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
             )
           })()}
+
+          {/* ── EMAIL CAMPAIGNS (full page, top-level nav) ─────────────────── */}
+          {activeNav==="campaigns"&&<CampaignsPage/>}
 
           {/* ── ANALYTICS ───────────────────────────────────────────────────── */}
           {activeNav==="analytics"&&(
@@ -3721,8 +3760,10 @@ export default function App(){
               {/* ── Login Activity (admin only) ── */}
               {isAdmin()&&<LoginActivityPanel/>}
 
-              {/* ── Campaign Activity (admin only) ── */}
-              {isAdmin()&&<CampaignActivityPanel/>}
+              {/* Campaign Activity now lives on its own top-level "Email Campaigns"
+                  nav tab — promoted from a collapsible admin panel because email
+                  reply detection is a primary feature. Quick-glance summary card
+                  rendered above on the Dashboard. */}
 
               {/* ── Lead Cleanup (admin only) ── */}
               {isAdmin()&&<LeadCleanupPanel onCleanup={loadLeads}/>}
@@ -4553,6 +4594,242 @@ function LeadCleanupPanel({onCleanup}){
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+// Small Dashboard tile — clickable, navigates to the full Campaigns page.
+function CampaignSummaryCard({onClick}){
+  const [data,setData] = useState(null)
+  useEffect(()=>{
+    api("/api/admin/campaigns/recent?days=14").then(setData).catch(()=>{})
+  },[])
+  if(!data) return null
+  const t = data.totals||{}
+  // Hide entirely if email feature is dormant — Dashboard real estate is precious.
+  if(!data.email_configured && t.sends===0) return null
+  return (
+    <div onClick={onClick}
+      style={{background:"linear-gradient(135deg, #1a1f3d 0%, #0f1930 100%)",
+        borderRadius:12,padding:"16px 20px",marginTop:16,cursor:"pointer",
+        border:"1px solid #a3a6ff20",transition:"all .15s"}}
+      onMouseEnter={e=>e.currentTarget.style.borderColor="#a3a6ff60"}
+      onMouseLeave={e=>e.currentTarget.style.borderColor="#a3a6ff20"}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:14,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:14}}>
+          <div style={{fontSize:24}}>📧</div>
+          <div>
+            <div style={{fontSize:"0.6rem",color:"#a3a6ff",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+              Email Campaigns · last 14 days
+            </div>
+            <div style={{display:"flex",gap:18,marginTop:6,fontSize:13,color:"#dee5ff",flexWrap:"wrap"}}>
+              <span><b style={{color:"#a3a6ff"}}>{t.sends||0}</b> sent</span>
+              <span><b style={{color:"#69f6b8"}}>{t.replies||0}</b> replied</span>
+              <span><b style={{color:"#ff6e84"}}>{t.bounces||0}</b> bounced</span>
+              <span style={{color:"#a3aac4",fontSize:12}}>· reply rate <b style={{color:"#69f6b8"}}>{data.reply_rate_pct||0}%</b></span>
+            </div>
+          </div>
+        </div>
+        <span style={{fontSize:11,color:"#a3a6ff",fontWeight:600}}>View all →</span>
+      </div>
+    </div>
+  )
+}
+
+function CampaignsPage(){
+  const [data,setData]   = useState(null)
+  const [days,setDays]   = useState(14)
+  const [setup,setSetup] = useState(null)
+  const [polling,setPolling] = useState(false)
+  const [pollResult,setPollResult] = useState("")
+
+  const load = (d)=>{
+    api(`/api/admin/campaigns/recent?days=${d}`).then(setData).catch(()=>setData(null))
+    api("/api/admin/email/setup-status").then(setSetup).catch(()=>{})
+  }
+  useEffect(()=>{ load(days) },[days])
+
+  async function pollNow(){
+    setPolling(true); setPollResult("")
+    try{
+      const r = await api("/api/admin/poll-replies",{method:"POST",body:"{}"})
+      if(r.ok){
+        const s = r.stats || {}
+        setPollResult(`✓ Checked ${s.checked||0} unread, matched ${s.matched||0} replies, ${s.auto_replies_skipped||0} auto-replies skipped, ${s.not_a_reply||0} not-a-reply`)
+        load(days)
+      }else{
+        setPollResult("⚠ "+(r.error||"poll failed"))
+      }
+    }catch(ex){ setPollResult("⚠ "+(ex.message||"error")) }
+    finally{ setPolling(false) }
+  }
+
+  const t = data?.totals || {sends:0,replies:0,opens:0,clicks:0,bounces:0,unsubs:0}
+  const fmtTime = (iso)=>iso?new Date(iso).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{marginBottom:28,display:"flex",alignItems:"flex-end",
+        justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
+        <div>
+          <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+            color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Email Campaigns</h1>
+          <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+            "Tried to call you" follow-up sends · Resend delivery + IMAP reply detection
+          </p>
+        </div>
+        <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+          <select className="sel" value={days} onChange={e=>setDays(Number(e.target.value))}
+            style={{padding:"6px 12px",fontSize:12}}>
+            <option value={7}>Last 7 days</option>
+            <option value={14}>Last 14 days</option>
+            <option value={30}>Last 30 days</option>
+            <option value={90}>Last 90 days</option>
+          </select>
+          {setup?.reply_path?.imap_configured&&(
+            <button onClick={pollNow} disabled={polling}
+              className="btn btn-p" style={{fontSize:12,padding:"7px 14px",background:"#a3a6ff"}}
+              title="Force-check the inbox for new replies right now (background poll runs every 10 min)">
+              {polling?"Checking…":"📬 Check Replies Now"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Setup-status banner (only if something missing) */}
+      {setup&&!setup.all_ready&&(
+        <div style={{padding:"14px 18px",marginBottom:18,background:"#ffe08315",
+          border:"1px solid #ffe08340",borderRadius:10,fontSize:12,color:"#dee5ff",lineHeight:1.6}}>
+          <div style={{fontWeight:700,color:"#ffe083",marginBottom:6}}>⚠ Setup incomplete</div>
+          {!setup.send_path?.ready&&<div>• Resend not configured — set RESEND_API_KEY in Railway</div>}
+          {!setup.webhook_path?.ready&&<div>• Webhook secret missing — set RESEND_WEBHOOK_SECRET in Railway, paste URL in Resend dashboard</div>}
+          {!setup.reply_path?.ready&&<div>• IMAP not configured — replies won't auto-flip lead status. Set IMAP_SERVER + IMAP_USERNAME + IMAP_PASSWORD in Railway</div>}
+        </div>
+      )}
+
+      {pollResult&&(
+        <div style={{marginBottom:18,padding:"10px 14px",fontSize:12,
+          background:pollResult.startsWith("✓")?"#69f6b815":"#ffe08315",
+          border:`1px solid ${pollResult.startsWith("✓")?"#69f6b830":"#ffe08330"}`,
+          borderRadius:8,color:pollResult.startsWith("✓")?"#69f6b8":"#ffe083"}}>
+          {pollResult}
+        </div>
+      )}
+
+      {/* Headline metrics */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:12,marginBottom:24}}>
+        {[
+          {label:"Sent",     val:t.sends,    color:"#a3a6ff"},
+          {label:"Replied",  val:t.replies,  color:"#69f6b8"},
+          {label:"Opens",    val:t.opens,    color:"#ffe083"},
+          {label:"Clicks",   val:t.clicks,   color:"#8b5cf6"},
+          {label:"Bounces",  val:t.bounces,  color:"#ff6e84"},
+          {label:"Unsubs",   val:t.unsubs,   color:"#ff6e84"},
+        ].map(({label,val,color})=>(
+          <div key={label} style={{background:"#0f1930",borderRadius:12,padding:18,
+            borderLeft:`4px solid ${color}`,textAlign:"center"}}>
+            <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:34,fontWeight:700,color,lineHeight:1}}>
+              {val}
+            </div>
+            <div style={{fontSize:11,color:"#a3aac4",marginTop:6,letterSpacing:".05em",textTransform:"uppercase"}}>
+              {label}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Reply rate banner */}
+      <div style={{marginBottom:24,padding:"16px 24px",background:"#0f1930",borderRadius:12,
+        display:"flex",alignItems:"center",justifyContent:"space-between",gap:14,flexWrap:"wrap"}}>
+        <div>
+          <div style={{fontSize:11,color:"#a3aac4",letterSpacing:".06em",textTransform:"uppercase",marginBottom:4}}>
+            Reply rate over {data?.window_days||days} days
+          </div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:42,fontWeight:700,color:"#69f6b8",lineHeight:1}}>
+            {data?.reply_rate_pct||0}%
+          </div>
+        </div>
+        <div style={{fontSize:11,color:"#40485d",textAlign:"right",maxWidth:380}}>
+          Industry benchmark for cold "tried to call you" sequences sits 3-8%.
+          Reply triggers an auto-flip of lead status to <span style={{color:"#69f6b8"}}>interested</span> + Slack ping.
+        </div>
+      </div>
+
+      {/* Two-column: recent sends + recent events */}
+      <div style={{display:"grid",gridTemplateColumns:"3fr 2fr",gap:18}}>
+        <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+          <div style={{padding:"14px 20px",borderBottom:"1px solid #40485d20",
+            display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <span style={{fontSize:12,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",fontWeight:700}}>
+              Recent Sends
+            </span>
+            <span style={{fontSize:11,color:"#40485d"}}>{data?.recent_sends?.length||0} shown</span>
+          </div>
+          {(!data||data.recent_sends?.length===0)?(
+            <div style={{padding:"36px 20px",textAlign:"center",color:"#40485d",fontSize:12}}>
+              {setup?.send_path?.ready ? "No sends in this window — fire the email follow-up checkbox on a no-answer call to start." : "Resend not configured."}
+            </div>
+          ):(
+            <div style={{maxHeight:480,overflowY:"auto"}}>
+              {data.recent_sends.map((s,i)=>{
+                let det = {}
+                try{ det = typeof s.details==="string"?JSON.parse(s.details):(s.details||{}) }catch{}
+                return (
+                  <div key={i} style={{padding:"12px 20px",
+                    borderBottom:i<data.recent_sends.length-1?"1px solid #40485d15":"none",
+                    display:"grid",gridTemplateColumns:"100px 1fr",gap:14,fontSize:12,alignItems:"start"}}>
+                    <span style={{color:"#a3aac4",fontSize:11}}>{fmtTime(s.created_at)}</span>
+                    <div>
+                      <div style={{color:"#dee5ff",fontWeight:600}}>{det.company||"—"}</div>
+                      <div style={{color:"#a3aac4",fontSize:11,marginTop:2}}>{det.to_email||""}</div>
+                      {det.trigger&&<div style={{fontSize:10,color:"#a3a6ff",marginTop:3}}>{det.trigger}</div>}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+          <div style={{padding:"14px 20px",borderBottom:"1px solid #40485d20",
+            display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <span style={{fontSize:12,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",fontWeight:700}}>
+              Recent Events
+            </span>
+            <span style={{fontSize:11,color:"#40485d"}}>{data?.recent_events?.length||0} shown</span>
+          </div>
+          {(!data||data.recent_events?.length===0)?(
+            <div style={{padding:"36px 20px",textAlign:"center",color:"#40485d",fontSize:12}}>
+              No events yet (replies, bounces, opens). They'll appear here as Resend webhooks fire and IMAP polls find replies.
+            </div>
+          ):(
+            <div style={{maxHeight:480,overflowY:"auto"}}>
+              {data.recent_events.map((ev,i)=>{
+                let det = {}
+                try{ det = typeof ev.details==="string"?JSON.parse(ev.details):(ev.details||{}) }catch{}
+                const eventType = (det.event||"").toLowerCase()
+                const evColor = eventType==="reply"?"#69f6b8":eventType==="bounce"?"#ff6e84":eventType==="unsubscribe"?"#ff6e84":eventType==="click"?"#8b5cf6":"#ffe083"
+                return (
+                  <div key={i} style={{padding:"10px 20px",
+                    borderBottom:i<data.recent_events.length-1?"1px solid #40485d15":"none",
+                    fontSize:12}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                      <span style={{color:evColor,fontWeight:700,textTransform:"uppercase",fontSize:10,letterSpacing:".06em"}}>
+                        {eventType||"event"}
+                      </span>
+                      <span style={{color:"#40485d",fontSize:10}}>{fmtTime(ev.created_at)}</span>
+                    </div>
+                    {det.from&&<div style={{color:"#dee5ff",fontSize:11,marginTop:3}}>{det.from}</div>}
+                    {det.snippet&&<div style={{color:"#a3aac4",fontSize:11,marginTop:3,fontStyle:"italic"}}>"{det.snippet.slice(0,120)}"</div>}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
