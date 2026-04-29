@@ -1027,16 +1027,34 @@ def imap_poll_replies():
                 subject   = _decode_header_str(msg.get("Subject", ""))
                 headers   = {k.lower(): str(v) for k, v in msg.items()}
                 body      = _extract_body_snippet(msg)
+                to_addr   = _decode_header_str(msg.get("To", "")).lower()
 
                 if _is_auto_reply(subject, body, headers):
                     stats["auto_replies_skipped"] += 1
-                    # Mark read so we don't keep re-scanning auto-replies
                     try: mbox.store(msg_id, "+FLAGS", "\\Seen")
                     except: pass
                     continue
 
                 if not from_addr:
                     stats["no_match"] += 1
+                    continue
+
+                # Tight match: this must look like a genuine reply to one of
+                # OUR sends, not just any email from a known lead. Require
+                # ANY of: (a) subject prefixed Re:/RE:/etc., (b) In-Reply-To
+                # header set, (c) addressed to our outreach address. If none
+                # match, this is some other inbound email we shouldn't react to.
+                is_re      = bool(re.match(r"^\s*(re|fw|fwd)\s*:", subject, re.IGNORECASE))
+                has_in_reply = bool(headers.get("in-reply-to") or headers.get("references"))
+                outreach_lower = (OUTREACH_EMAIL or "").lower()
+                reply_to_lower = (OUTREACH_REPLY_TO or "").lower()
+                addressed_to_us = bool(
+                    (outreach_lower and outreach_lower in to_addr) or
+                    (reply_to_lower and reply_to_lower in to_addr)
+                )
+                if not (is_re or has_in_reply or addressed_to_us):
+                    stats.setdefault("not_a_reply", 0)
+                    stats["not_a_reply"] += 1
                     continue
 
                 # Find a lead awaiting email reply with this email address.
