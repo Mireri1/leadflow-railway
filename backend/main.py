@@ -1970,6 +1970,7 @@ def log_call(call: dict, user: str = Depends(verify_token)):
     try:
         lead_id = call.get("leadId")
         caller  = call.get("calledBy") or user
+        outcome = (call.get("outcome") or "").strip().lower()
         # Pop the email-followup flag — Supabase's call_outcomes table doesn't
         # have a column for it; we use the local var only for the trigger logic.
         send_email_followup = bool(call.pop("send_email_followup", False))
