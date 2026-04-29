@@ -4598,6 +4598,155 @@ function LeadCleanupPanel({onCleanup}){
   )
 }
 
+function EmailTemplateEditor(){
+  const [tpl,setTpl]         = useState(null)         // {subject, body, default, placeholders, is_default}
+  const [subject,setSubject] = useState("")
+  const [bodyText,setBody]   = useState("")
+  const [preview,setPreview] = useState(null)
+  const [saving,setSaving]   = useState(false)
+  const [resetting,setResetting] = useState(false)
+  const [status,setStatus]   = useState("")
+
+  const load = ()=>{
+    api("/api/admin/email-template").then(r=>{
+      setTpl(r); setSubject(r.subject||""); setBody(r.body||""); setStatus("")
+    }).catch(()=>{})
+  }
+  useEffect(load, [])
+
+  // Debounced live preview — re-render 400ms after user stops typing.
+  useEffect(()=>{
+    if(!subject && !bodyText) return
+    const t = setTimeout(()=>{
+      api("/api/admin/email-template/preview",{method:"POST",
+        body:JSON.stringify({subject, body:bodyText})})
+        .then(setPreview).catch(()=>{})
+    }, 400)
+    return ()=>clearTimeout(t)
+  }, [subject, bodyText])
+
+  async function save(){
+    setSaving(true); setStatus("")
+    try{
+      await api("/api/admin/email-template",{method:"PUT",
+        body:JSON.stringify({subject, body:bodyText})})
+      setStatus("✓ Saved — next send uses this template")
+      load()
+    }catch(ex){ setStatus("⚠ "+(ex.message||"save failed")) }
+    finally{ setSaving(false) }
+  }
+  async function resetDefault(){
+    if(!window.confirm("Reset to the built-in default template? Your custom edits will be lost.")) return
+    setResetting(true); setStatus("")
+    try{
+      await api("/api/admin/email-template",{method:"DELETE"})
+      setStatus("✓ Reset to default")
+      load()
+    }catch(ex){ setStatus("⚠ "+(ex.message||"reset failed")) }
+    finally{ setResetting(false) }
+  }
+
+  const dirty = tpl && (subject !== tpl.subject || bodyText !== tpl.body)
+  const isDefault = tpl?.is_default
+
+  if(!tpl) return null
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:12,marginTop:24,overflow:"hidden"}}>
+      <div style={{padding:"16px 20px",borderBottom:"1px solid #40485d20",
+        display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
+        <div>
+          <div style={{fontSize:12,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",fontWeight:700}}>
+            ✏️ Email Template — "Tried to Call You"
+            {isDefault && <span style={{marginLeft:10,fontSize:9,padding:"2px 8px",background:"#a3a6ff20",color:"#a3a6ff",borderRadius:4,letterSpacing:".05em"}}>USING DEFAULT</span>}
+            {!isDefault && <span style={{marginLeft:10,fontSize:9,padding:"2px 8px",background:"#69f6b820",color:"#69f6b8",borderRadius:4,letterSpacing:".05em"}}>CUSTOMIZED</span>}
+          </div>
+          <div style={{fontSize:11,color:"#40485d",marginTop:4}}>
+            Edits apply to every future send. Use {"{placeholders}"} below to personalize.
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {status&&<span style={{fontSize:11,color:status.startsWith("✓")?"#69f6b8":"#ff6e84"}}>{status}</span>}
+          {!isDefault && (
+            <button className="btn btn-g" onClick={resetDefault} disabled={resetting}
+              style={{fontSize:11,padding:"6px 12px"}}>
+              {resetting?"Resetting…":"Reset to Default"}
+            </button>
+          )}
+          <button className="btn btn-p" onClick={save} disabled={saving||!dirty}
+            style={{fontSize:11,padding:"7px 14px",background:dirty?"#a3a6ff":"#40485d40",
+              color:dirty?"#000011":"#40485d",cursor:dirty?"pointer":"not-allowed",fontWeight:700}}>
+            {saving?"Saving…":(dirty?"Save Changes":"Saved")}
+          </button>
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:0}}>
+        {/* Editor */}
+        <div style={{padding:"16px 20px",borderRight:"1px solid #40485d20"}}>
+          <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",marginBottom:6}}>
+            Subject
+          </div>
+          <input value={subject} onChange={e=>setSubject(e.target.value)}
+            style={{width:"100%",padding:"8px 12px",fontSize:13,fontFamily:"inherit",
+              background:"#060e20",border:"1px solid #40485d40",borderRadius:6,color:"#dee5ff",marginBottom:14}}/>
+
+          <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",marginBottom:6}}>
+            Body
+          </div>
+          <textarea value={bodyText} onChange={e=>setBody(e.target.value)}
+            rows={20}
+            style={{width:"100%",padding:"10px 12px",fontSize:12,fontFamily:"'JetBrains Mono', ui-monospace, monospace",
+              background:"#060e20",border:"1px solid #40485d40",borderRadius:6,color:"#dee5ff",
+              lineHeight:1.5,resize:"vertical"}}/>
+
+          {/* Placeholder reference */}
+          <div style={{marginTop:14,padding:"10px 12px",background:"#060e20",borderRadius:8,
+            fontSize:11,color:"#a3aac4",lineHeight:1.7,maxHeight:160,overflowY:"auto"}}>
+            <div style={{fontSize:10,color:"#a3a6ff",letterSpacing:".06em",textTransform:"uppercase",marginBottom:6,fontWeight:700}}>
+              Placeholders
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:"3px 10px"}}>
+              {(tpl.placeholders||[]).map(p=>(
+                <React.Fragment key={p.key}>
+                  <code style={{color:"#69f6b8",fontFamily:"'JetBrains Mono', ui-monospace, monospace",fontSize:10}}>
+                    {"{"+p.key+"}"}
+                  </code>
+                  <span style={{fontSize:10}}>{p.desc}</span>
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Preview */}
+        <div style={{padding:"16px 20px",background:"#060e2050"}}>
+          <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",marginBottom:6,
+            display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>Live Preview</span>
+            {preview?.lead_used?.is_sample
+              ? <span style={{fontSize:9,color:"#40485d"}}>using sample (Sarah Chen, Atlas Healthcare)</span>
+              : preview?.lead_used?.name && <span style={{fontSize:9,color:"#40485d"}}>using {preview.lead_used.name}</span>}
+          </div>
+          {preview ? (
+            <div style={{background:"#fffefb",borderRadius:8,padding:"16px 20px",
+              fontFamily:"'Inter', sans-serif",color:"#1a1a1a",lineHeight:1.55,fontSize:13,minHeight:300}}>
+              <div style={{fontSize:11,color:"#666",marginBottom:8,paddingBottom:8,borderBottom:"1px solid #eee"}}>
+                <b style={{color:"#222"}}>Subject:</b> {preview.subject||"(empty)"}
+              </div>
+              <div style={{whiteSpace:"pre-wrap"}}>{preview.body_text}</div>
+            </div>
+          ) : (
+            <div style={{padding:"40px 20px",textAlign:"center",color:"#40485d",fontSize:11}}>
+              Type to see preview…
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // Small Dashboard tile — clickable, navigates to the full Campaigns page.
 function CampaignSummaryCard({onClick}){
   const [data,setData] = useState(null)
@@ -4756,8 +4905,11 @@ function CampaignsPage(){
         </div>
       </div>
 
+      {/* Email template editor — admin-edits the message that goes out on every send */}
+      <EmailTemplateEditor/>
+
       {/* Two-column: recent sends + recent events */}
-      <div style={{display:"grid",gridTemplateColumns:"3fr 2fr",gap:18}}>
+      <div style={{display:"grid",gridTemplateColumns:"3fr 2fr",gap:18,marginTop:24}}>
         <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
           <div style={{padding:"14px 20px",borderBottom:"1px solid #40485d20",
             display:"flex",alignItems:"center",justifyContent:"space-between"}}>

@@ -771,41 +771,87 @@ def save_to_supabase(leads):
 
 # ── VCC campaign helpers ───────────────────────────────────────────────────
 
-def build_tried_to_call_email(lead: dict) -> dict:
-    """Render the 'tried to call you' email subject + body for a lead.
-    Returns {subject, body_text} that VCC can either render directly or use
-    as fallback if it's templating server-side."""
-    first  = (lead.get("firstName") or "").strip() or "there"
-    company = (lead.get("company") or "").strip()
-    industry = (lead.get("industry") or "").strip().lower()
-    state    = (lead.get("state") or "").strip()
+DEFAULT_EMAIL_TEMPLATE = {
+    "subject": "Quick question, {first_name}",
+    "body":
+        "Hi {first_name},\n\n"
+        "Tried reaching you today about cleaning at {company} — didn't catch you. "
+        "Vision Cleaning specializes in {industry_phrase}{state_phrase}, and I wanted to get you a quote either way.\n\n"
+        "If a call is hard to schedule, just hit reply with:\n"
+        "  • Square footage at {company}\n"
+        "  • Cleaning frequency you'd want (daily / weekly / 2x weekly)\n"
+        "  • Rough monthly budget\n\n"
+        "I'll come back inside 24 hours with a tailored quote and next steps. "
+        "If cleaning isn't on your radar right now, just reply \"not now\" and I'll close the loop on my end.\n\n"
+        "Thanks,\n"
+        "{sender_name}\n"
+        "Vision Cleaning Company\n"
+        "{sender_line}\n\n"
+        "—\nReply STOP to opt out. Vision Cleaning Company.",
+}
 
-    # Industry → readable phrase. Falls back to generic if Apollo didn't classify.
-    industry_phrase = f"{industry} facilities" if industry and industry not in ("", "unknown") else "commercial facilities"
-    location_phrase = f" across {state}" if state else ""
+def _email_template_vars(lead: dict) -> dict:
+    """Build the placeholder dict used to render an email template against a lead."""
+    first   = (lead.get("firstName") or "").strip() or "there"
+    last    = (lead.get("lastName")  or "").strip()
+    industry = (lead.get("industry") or "").strip()
+    state    = (lead.get("state")    or "").strip()
+    company  = (lead.get("company")  or "").strip() or "your facility"
     sender_name  = os.getenv("OUTREACH_SENDER_NAME", "Eric")
     sender_email = OUTREACH_EMAIL
     sender_phone = os.getenv("OUTREACH_SENDER_PHONE", "")
     sender_line  = f"{sender_phone}  •  {sender_email}" if sender_phone else sender_email
+    return {
+        "first_name":      first,
+        "last_name":       last,
+        "full_name":       (first + " " + last).strip() or "there",
+        "company":         company,
+        "industry":        industry,
+        "industry_phrase": (industry.lower() + " facilities") if industry and industry.lower() != "unknown" else "commercial facilities",
+        "state":           state,
+        "state_phrase":    (" across " + state) if state else "",
+        "city":            (lead.get("city")  or "").strip(),
+        "title":           (lead.get("title") or "").strip(),
+        "sender_name":     sender_name,
+        "sender_email":    sender_email,
+        "sender_phone":    sender_phone,
+        "sender_line":     sender_line,
+    }
 
-    subject = f"Quick question, {first}"
-    body = (
-        f"Hi {first},\n\n"
-        f"Tried reaching you today about cleaning at {company or 'your facility'} — didn't catch you. "
-        f"Vision Cleaning specializes in {industry_phrase}{location_phrase}, and I wanted to get you a quote either way.\n\n"
-        f"If a call is hard to schedule, just hit reply with:\n"
-        f"  • Square footage at {company or 'your location'}\n"
-        f"  • Cleaning frequency you'd want (daily / weekly / 2x weekly)\n"
-        f"  • Rough monthly budget\n\n"
-        f"I'll come back inside 24 hours with a tailored quote and next steps. "
-        f"If cleaning isn't on your radar right now, just reply \"not now\" and I'll close the loop on my end.\n\n"
-        f"Thanks,\n"
-        f"{sender_name}\n"
-        f"Vision Cleaning Company\n"
-        f"{sender_line}\n\n"
-        f"—\nReply STOP to opt out. Vision Cleaning Company."
-    )
-    return {"subject": subject, "body_text": body}
+def _render_email_template(template_str: str, vars_: dict) -> str:
+    """Replace {placeholder} tokens with values. Unknown {tokens} are left as-is
+    rather than crashed on so a typo doesn't break a send."""
+    out = template_str or ""
+    for k, v in vars_.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+def load_email_template(name: str = "tried-to-call") -> dict:
+    """Load admin-edited template from app_settings, or return the default."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.email_template_{name}&select=value",
+            headers=SB_HEADERS, timeout=5,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if isinstance(rows, list) and rows and rows[0].get("value"):
+            data = json_lib.loads(rows[0]["value"])
+            if isinstance(data, dict) and data.get("subject") and data.get("body"):
+                return data
+    except Exception as e:
+        print(f"[EMAIL-TEMPLATE] load failed for '{name}': {e}")
+    return dict(DEFAULT_EMAIL_TEMPLATE)
+
+def build_tried_to_call_email(lead: dict) -> dict:
+    """Render the 'tried to call you' email subject + body for a lead.
+    Pulls the (admin-editable) template from app_settings, falls back to
+    DEFAULT_EMAIL_TEMPLATE if nothing's been saved."""
+    tpl  = load_email_template("tried-to-call")
+    vars_= _email_template_vars(lead)
+    return {
+        "subject":   _render_email_template(tpl.get("subject"), vars_),
+        "body_text": _render_email_template(tpl.get("body"),    vars_),
+    }
 
 def lead_already_in_campaign(lead_id: str, campaign: str = "tried-to-call") -> bool:
     """Suppression: don't re-send the same lead to the same campaign within
@@ -2939,6 +2985,130 @@ def send_to_campaign(lead_id: str, body: dict, user: str = Depends(verify_token)
     if not ok:
         return {"sent": False, "message": detail}
     return {"sent": True, "message": "Sent to VCC", "campaign": campaign, "trigger": trigger}
+
+@app.get("/api/admin/email-template")
+def get_email_template(name: str = "tried-to-call", user: str = Depends(verify_admin)):
+    """Returns the current saved template + the default + the placeholder
+    list so the editor UI can show everything it needs to render."""
+    saved = load_email_template(name)
+    return {
+        "name":     name,
+        "is_default": saved == DEFAULT_EMAIL_TEMPLATE,
+        "subject":  saved.get("subject"),
+        "body":     saved.get("body"),
+        "default": {
+            "subject": DEFAULT_EMAIL_TEMPLATE["subject"],
+            "body":    DEFAULT_EMAIL_TEMPLATE["body"],
+        },
+        # Documented placeholder list shown in the editor's reference panel
+        "placeholders": [
+            {"key": "first_name",      "desc": "Lead's first name (falls back to 'there')"},
+            {"key": "last_name",       "desc": "Lead's last name"},
+            {"key": "full_name",       "desc": "First + last (falls back to 'there')"},
+            {"key": "company",         "desc": "Company name (falls back to 'your facility')"},
+            {"key": "title",           "desc": "Job title — Facility Manager, etc."},
+            {"key": "industry",        "desc": "Raw industry string"},
+            {"key": "industry_phrase", "desc": "'<industry> facilities' or 'commercial facilities'"},
+            {"key": "state",           "desc": "Two-letter state code or full name"},
+            {"key": "state_phrase",    "desc": "' across <state>' or empty string"},
+            {"key": "city",            "desc": "City"},
+            {"key": "sender_name",     "desc": "From OUTREACH_SENDER_NAME env var"},
+            {"key": "sender_email",    "desc": "From OUTREACH_EMAIL env var"},
+            {"key": "sender_phone",    "desc": "From OUTREACH_SENDER_PHONE env var"},
+            {"key": "sender_line",     "desc": "Pre-formatted phone + email signature line"},
+        ],
+    }
+
+@app.put("/api/admin/email-template")
+def save_email_template(body: dict, user: str = Depends(verify_admin)):
+    """Save an edited template. Body: {name?, subject, body}.
+    Empty subject/body strings are rejected so a fat-finger save doesn't
+    silently send blank emails."""
+    name    = (body.get("name") or "tried-to-call").strip()
+    subject = (body.get("subject") or "").strip()
+    text    = (body.get("body") or "").strip()
+    if not subject or not text:
+        raise HTTPException(status_code=400, detail="Both subject and body are required")
+    if len(subject) > 200:
+        raise HTTPException(status_code=400, detail="Subject too long (max 200 chars)")
+
+    payload = {
+        "key":   f"email_template_{name}",
+        "value": json_lib.dumps({"subject": subject, "body": text}),
+    }
+    try:
+        r = req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=payload, timeout=10,
+        )
+        if r.status_code not in (200, 201, 204):
+            raise HTTPException(status_code=500, detail=f"Save failed: {r.text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Save failed: {e}")
+
+    audit_log(user, "email_template_saved", "template", name, {
+        "subject_len": len(subject), "body_len": len(text),
+    })
+    return {"ok": True, "name": name}
+
+@app.delete("/api/admin/email-template")
+def reset_email_template(name: str = "tried-to-call", user: str = Depends(verify_admin)):
+    """Reset to default by deleting the override row in app_settings.
+    Next send falls back to DEFAULT_EMAIL_TEMPLATE."""
+    try:
+        req_lib.delete(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.email_template_{name}",
+            headers=SB_HEADERS, timeout=10,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reset failed: {e}")
+    audit_log(user, "email_template_reset", "template", name, {})
+    return {"ok": True, "reset_to": "default"}
+
+@app.post("/api/admin/email-template/preview")
+def preview_email_template(body: dict, user: str = Depends(verify_admin)):
+    """Render a draft template against either a real lead or a sample.
+    Body: {subject, body, lead_id?}. If lead_id given, pulls that lead;
+    otherwise uses a built-in sample so the editor can show a live preview
+    even without a lead handy."""
+    subject = body.get("subject") or ""
+    text    = body.get("body") or ""
+    lead_id = body.get("lead_id")
+
+    lead = None
+    if lead_id:
+        try:
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id))}&select=*",
+                headers=SB_HEADERS, timeout=10,
+            )
+            rows = r.json() if r.status_code == 200 else []
+            lead = rows[0] if isinstance(rows, list) and rows else None
+        except Exception:
+            lead = None
+    if not lead:
+        lead = {
+            "firstName": "Sarah", "lastName": "Chen",
+            "company":   "Atlas Healthcare", "title": "Facility Manager",
+            "industry":  "Healthcare", "state": "AZ", "city": "Phoenix",
+        }
+
+    vars_ = _email_template_vars(lead)
+    return {
+        "subject":   _render_email_template(subject, vars_),
+        "body_text": _render_email_template(text, vars_),
+        "vars_used": vars_,
+        "lead_used": {
+            "id":        lead.get("id"),
+            "name":      f"{lead.get('firstName','')} {lead.get('lastName','')}".strip(),
+            "company":   lead.get("company"),
+            "title":     lead.get("title"),
+            "is_sample": lead.get("id") is None,
+        },
+    }
 
 @app.get("/api/admin/email/setup-status")
 def email_setup_status(user: str = Depends(verify_admin)):
