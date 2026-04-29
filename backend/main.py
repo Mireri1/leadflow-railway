@@ -827,11 +827,13 @@ def _render_email_template(template_str: str, vars_: dict) -> str:
     return out
 
 def load_email_template(name: str = "tried-to-call") -> dict:
-    """Load admin-edited template from app_settings, or return the default."""
+    """Load admin-edited template from app_settings, or return the default.
+    Uses service-role headers to match the writer (RLS may block anon reads
+    of rows written with service-role)."""
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.email_template_{name}&select=value",
-            headers=SB_HEADERS, timeout=5,
+            headers=SB_ADMIN_HEADERS, timeout=5,
         )
         rows = r.json() if r.status_code == 200 else []
         if isinstance(rows, list) and rows and rows[0].get("value"):
@@ -3036,12 +3038,12 @@ def save_email_template(body: dict, user: str = Depends(verify_admin)):
         "key":   f"email_template_{name}",
         "value": json_lib.dumps({"subject": subject, "body": text}),
     }
-    # Use service-role headers so RLS doesn't block the write — same pattern
-    # audit_log uses. Endpoint is verify_admin-gated upstream so this is
-    # appropriate. Without service role, anon-key writes fail with RLS 42501.
+    # Service-role headers bypass RLS (the anon key has no INSERT/UPDATE
+    # policy for this key prefix). on_conflict=key tells Supabase to merge
+    # on the unique 'key' column instead of inserting a duplicate row.
     try:
         r = req_lib.post(
-            f"{SUPABASE_URL}/rest/v1/app_settings",
+            f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
             headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
             json=payload, timeout=10,
         )
