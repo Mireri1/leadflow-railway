@@ -1014,6 +1014,70 @@ def _extract_body_snippet(msg, max_len: int = 400) -> str:
         print(f"[IMAP-POLL] body extract failed: {e}")
     return ""
 
+def release_stale_email_leads():
+    """Find leads stuck in awaiting_email_reply past the suppression window
+    (default 14 days) and flip them back to 'new' so they return to the
+    dialer queue. Idempotent — safe to run on every poll cycle.
+    Returns the count released."""
+    cutoff = (datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)).isoformat()
+    try:
+        # Find candidates — leads still awaiting reply whose status was last
+        # updated before the suppression cutoff. updatedAt is a reliable proxy
+        # since send_lead_to_campaign sets it when flipping the status. If an
+        # admin manually edits the lead later, updatedAt advances and we leave
+        # it alone — they presumably have an active reason.
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?status=eq.awaiting_email_reply"
+            f"&updatedAt=lt.{cutoff}"
+            f"&select=id,company,updatedAt"
+            f"&limit=500",
+            headers=SB_HEADERS, timeout=15,
+        )
+        stale = r.json() if r.status_code == 200 else []
+        if not isinstance(stale, list) or len(stale) == 0:
+            return 0
+    except Exception as e:
+        print(f"[STALE-EMAIL] query failed: {e}")
+        return 0
+
+    ids = [s["id"] for s in stale if s.get("id") is not None]
+    if not ids:
+        return 0
+
+    # Batch patch — ids=in.() URL has a length cap, do in 100s.
+    released = 0
+    BATCH = 100
+    for i in range(0, len(ids), BATCH):
+        chunk = ids[i:i+BATCH]
+        ids_csv = ",".join(str(x) for x in chunk)
+        try:
+            pr = req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_csv})",
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                json={
+                    "status":       "new",
+                    "nextfollowup": None,
+                    "updatedAt":    datetime.utcnow().isoformat(),
+                },
+                timeout=30,
+            )
+            if pr.status_code in (200, 204):
+                released += len(chunk)
+            else:
+                print(f"[STALE-EMAIL] batch patch HTTP {pr.status_code}: {pr.text[:200]}")
+        except Exception as e:
+            print(f"[STALE-EMAIL] batch patch failed: {e}")
+
+    if released > 0:
+        audit_log("auto_release", "leads_released_stale_email", "lead", None, {
+            "released":    released,
+            "cutoff_days": CAMPAIGN_SUPPRESSION_DAYS,
+            "sample_ids":  ids[:20],
+        })
+        print(f"[STALE-EMAIL] released {released} leads back to pool (no reply within {CAMPAIGN_SUPPRESSION_DAYS}d)")
+    return released
+
 def imap_poll_replies():
     """Connect to IMAP, scan unread messages, match to awaiting-email leads.
     Returns a stats dict for the manual endpoint + activity panel."""
@@ -1179,28 +1243,36 @@ def imap_poll_replies():
         _imap_poll_state["last_run"] = datetime.utcnow().isoformat()
         _imap_poll_lock.release()
 
-def _imap_poll_loop():
-    """Background thread loop. Sleeps between polls so we're not hammering."""
-    print(f"[IMAP-POLL] background poller starting (every {IMAP_POLL_INTERVAL_MINUTES} min)")
-    # Initial delay so we don't poll during startup before everything is ready
-    time.sleep(60)
+def _bg_maintenance_loop():
+    """Background thread — two independent jobs every cycle:
+       1. IMAP reply poll (skipped silently if IMAP not configured)
+       2. Stale-email release (always runs — pulls leads out of limbo)
+    Both are idempotent and cheap. Bundling keeps deployment simple."""
+    imap_on = bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD)
+    print(f"[BG] maintenance loop starting (every {IMAP_POLL_INTERVAL_MINUTES} min)"
+          f" — IMAP={'on' if imap_on else 'off'}, stale-release=on")
+    time.sleep(60)  # let app finish startup before first run
     while True:
+        if imap_on:
+            try:
+                res = imap_poll_replies()
+                _imap_poll_state["last_result"] = res
+                if res.get("ok") and res.get("stats", {}).get("matched", 0) > 0:
+                    print(f"[IMAP-POLL] matched {res['stats']['matched']} replies this cycle")
+            except Exception as e:
+                print(f"[IMAP-POLL] loop exception: {e}")
+        # Always release stale leads — runs even with IMAP off so leads
+        # never get permanently stuck in awaiting_email_reply.
         try:
-            res = imap_poll_replies()
-            _imap_poll_state["last_result"] = res
-            if res.get("ok") and res.get("stats", {}).get("matched", 0) > 0:
-                print(f"[IMAP-POLL] matched {res['stats']['matched']} replies this cycle")
+            release_stale_email_leads()
         except Exception as e:
-            print(f"[IMAP-POLL] loop exception: {e}")
+            print(f"[STALE-EMAIL] auto-release exception: {e}")
         time.sleep(IMAP_POLL_INTERVAL_MINUTES * 60)
 
-# Start the background thread once at module load if IMAP is configured.
-# Daemon=True so it dies cleanly with the process. Uvicorn's single-worker
-# default on Railway means exactly one poller runs.
-if IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD:
-    threading.Thread(target=_imap_poll_loop, daemon=True, name="imap-reply-poller").start()
-else:
-    print("[IMAP-POLL] not started — set IMAP_SERVER, IMAP_USERNAME, IMAP_PASSWORD to enable")
+# Start the background thread once at module load. Runs regardless of IMAP
+# config — stale-release is the bigger guarantee. Daemon=True dies cleanly
+# with the process. Uvicorn's single-worker default on Railway = one runner.
+threading.Thread(target=_bg_maintenance_loop, daemon=True, name="bg-maintenance").start()
 
 class ScrapeRequest(BaseModel):
     industry:  str
@@ -3358,6 +3430,13 @@ def campaigns_batch_send(body: dict, user: str = Depends(verify_admin)):
         "skips":    skipped[:30],
         "failures": failed[:30],
     }
+
+@app.post("/api/admin/leads/release-stale-emails")
+def manual_release_stale_emails(user: str = Depends(verify_admin)):
+    """Manual trigger for stale-email release. Same logic the bg loop runs
+    every 10 min — useful for an immediate "unblock everyone" action."""
+    released = release_stale_email_leads()
+    return {"released": released, "cutoff_days": CAMPAIGN_SUPPRESSION_DAYS}
 
 @app.post("/api/admin/poll-replies")
 def poll_replies_now(user: str = Depends(verify_admin)):

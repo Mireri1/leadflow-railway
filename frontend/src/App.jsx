@@ -5031,6 +5031,8 @@ function CampaignsPage(){
   const [setup,setSetup] = useState(null)
   const [polling,setPolling] = useState(false)
   const [pollResult,setPollResult] = useState("")
+  const [releasing,setReleasing] = useState(false)
+  const [releaseResult,setReleaseResult] = useState("")
 
   const load = (d)=>{
     api(`/api/admin/campaigns/recent?days=${d}`).then(setData).catch(()=>setData(null))
@@ -5051,6 +5053,17 @@ function CampaignsPage(){
       }
     }catch(ex){ setPollResult("⚠ "+(ex.message||"error")) }
     finally{ setPolling(false) }
+  }
+
+  async function releaseStale(){
+    setReleasing(true); setReleaseResult("")
+    try{
+      const r = await api("/api/admin/leads/release-stale-emails",{method:"POST",body:"{}"})
+      setReleaseResult(r.released>0
+        ? `✓ Released ${r.released} stale lead${r.released===1?"":"s"} back to dialer (no reply within ${r.cutoff_days}d)`
+        : `✓ Nothing to release — no leads stuck past ${r.cutoff_days}d`)
+    }catch(ex){ setReleaseResult("⚠ "+(ex.message||"error")) }
+    finally{ setReleasing(false) }
   }
 
   const t = data?.totals || {sends:0,replies:0,opens:0,clicks:0,bounces:0,unsubs:0}
@@ -5083,6 +5096,11 @@ function CampaignsPage(){
               {polling?"Checking…":"📬 Check Replies Now"}
             </button>
           )}
+          <button onClick={releaseStale} disabled={releasing}
+            className="btn btn-g" style={{fontSize:12,padding:"7px 14px"}}
+            title="Manually pull leads stuck in 'awaiting_email_reply' for >14 days back to the dialer. Bg loop runs this every 10 min anyway.">
+            {releasing?"Releasing…":"↻ Release Stale"}
+          </button>
         </div>
       </div>
 
@@ -5103,6 +5121,14 @@ function CampaignsPage(){
           border:`1px solid ${pollResult.startsWith("✓")?"#69f6b830":"#ffe08330"}`,
           borderRadius:8,color:pollResult.startsWith("✓")?"#69f6b8":"#ffe083"}}>
           {pollResult}
+        </div>
+      )}
+      {releaseResult&&(
+        <div style={{marginBottom:18,padding:"10px 14px",fontSize:12,
+          background:releaseResult.startsWith("✓")?"#69f6b815":"#ffe08315",
+          border:`1px solid ${releaseResult.startsWith("✓")?"#69f6b830":"#ffe08330"}`,
+          borderRadius:8,color:releaseResult.startsWith("✓")?"#69f6b8":"#ffe083"}}>
+          {releaseResult}
         </div>
       )}
 
