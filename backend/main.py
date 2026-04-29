@@ -52,7 +52,7 @@ APOLLO_PHONE_REVEAL_MONTHLY_CAP = int(os.getenv("APOLLO_PHONE_REVEAL_MONTHLY_CAP
 # already powers other Vision Cleaning sends, so deliverability matches).
 AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD = int(os.getenv("AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD", "2"))
 AUTO_CAMPAIGN_AFTER_FAILED_CALL = os.getenv("AUTO_CAMPAIGN_AFTER_FAILED_CALL", "0") == "1"
-CAMPAIGN_SUPPRESSION_DAYS = int(os.getenv("CAMPAIGN_SUPPRESSION_DAYS", "14"))
+CAMPAIGN_SUPPRESSION_DAYS = int(os.getenv("CAMPAIGN_SUPPRESSION_DAYS", "7"))
 # Resend webhook secret — random token in URL path. Configure the URL
 # (with this secret) in Resend dashboard → Webhooks. Auth is URL-as-bearer.
 RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "").strip().rstrip("%").strip()
@@ -1016,9 +1016,9 @@ def _extract_body_snippet(msg, max_len: int = 400) -> str:
 
 def release_stale_email_leads():
     """Find leads stuck in awaiting_email_reply past the suppression window
-    (default 14 days) and flip them back to 'new' so they return to the
-    dialer queue. Idempotent — safe to run on every poll cycle.
-    Returns the count released."""
+    (default 7 days, env: CAMPAIGN_SUPPRESSION_DAYS) and flip them back to
+    'new' so they return to the dialer queue. Idempotent — safe to run on
+    every poll cycle. Returns the count released."""
     cutoff = (datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)).isoformat()
     try:
         # Find candidates — leads still awaiting reply whose status was last
@@ -2099,8 +2099,9 @@ def log_call(call: dict, user: str = Depends(verify_token)):
             #       regardless of attempt count. Per-call override.
             #   (b) AUTO_CAMPAIGN_AFTER_FAILED_CALL=1 + outcome is failed +
             #       attempt count >= threshold → background auto-fire.
-            # Both paths share send_lead_to_campaign which handles 14-day
-            # suppression so a manual + auto can't double-send.
+            # Both paths share send_lead_to_campaign which handles the
+            # suppression window (CAMPAIGN_SUPPRESSION_DAYS) so a manual +
+            # auto can't double-send.
             should_email = False
             email_trigger = ""
             if (RESEND_API_KEY and outcome in ("no_answer", "voicemail")

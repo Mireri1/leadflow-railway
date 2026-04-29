@@ -5098,7 +5098,7 @@ function CampaignsPage(){
           )}
           <button onClick={releaseStale} disabled={releasing}
             className="btn btn-g" style={{fontSize:12,padding:"7px 14px"}}
-            title="Manually pull leads stuck in 'awaiting_email_reply' for >14 days back to the dialer. Bg loop runs this every 10 min anyway.">
+            title="Manually pull leads stuck in 'awaiting_email_reply' past the suppression window (7d default) back to the dialer. Bg loop runs this every 10 min anyway.">
             {releasing?"Releasing…":"↻ Release Stale"}
           </button>
         </div>
