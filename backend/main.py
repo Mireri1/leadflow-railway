@@ -995,10 +995,21 @@ def imap_poll_replies():
             return {"ok": False, "error": f"IMAP connect failed: {type(e).__name__}: {e}", "stats": stats}
 
         try:
-            typ, data = mbox.search(None, "UNSEEN")
+            # Only search the suppression window — older unread emails in a
+            # busy info@ inbox shouldn't be re-processed every cycle. IMAP
+            # SINCE format: "01-Jan-2026" (3-letter month, no leading 0 fine).
+            since_dt = datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)
+            since_str = since_dt.strftime("%d-%b-%Y")
+            typ, data = mbox.search(None, f'(UNSEEN SINCE {since_str})')
             if typ != "OK":
                 return {"ok": False, "error": f"IMAP search failed: {typ}", "stats": stats}
             ids = data[0].split() if data and data[0] else []
+            # Cap per-poll work — if 200 messages match, process the newest 100
+            # and let the next poll catch the rest.
+            MAX_PER_POLL = 100
+            if len(ids) > MAX_PER_POLL:
+                stats["truncated_from"] = len(ids)
+                ids = ids[-MAX_PER_POLL:]  # IMAP returns oldest-first; tail = newest
         except Exception as e:
             return {"ok": False, "error": f"IMAP search exception: {e}", "stats": stats}
 
