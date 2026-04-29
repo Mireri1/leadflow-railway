@@ -3155,6 +3155,174 @@ def email_setup_status(user: str = Depends(verify_admin)):
         "all_ready": bool(RESEND_API_KEY and secret and IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
     }
 
+@app.get("/api/admin/campaigns/eligible")
+def campaigns_eligible(window_days: int = 7, user: str = Depends(verify_admin)):
+    """Returns leads with recent no-answer/voicemail outcomes that haven't
+    yet been emailed and meet the prerequisites: email + firstName populated,
+    not currently awaiting a reply, not within the suppression window.
+    Designed for the EOD batch-send queue — admin reviews + bulk-fires
+    instead of relying on callers to check the per-call box."""
+    if not RESEND_API_KEY:
+        return {"eligible": [], "count": 0, "window_days": window_days,
+                "error": "RESEND_API_KEY not configured"}
+
+    window_days = max(1, min(int(window_days), 30))
+    since_dt = datetime.utcnow() - timedelta(days=window_days)
+    since = since_dt.isoformat()
+
+    # 1. Recent failed-call records in window
+    try:
+        cr = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes"
+            f"?outcome=in.(no_answer,voicemail)"
+            f"&calledAt=gte.{since}"
+            f"&select=id,leadId,outcome,calledAt,calledBy,notes"
+            f"&order=calledAt.desc&limit=500",
+            headers=SB_HEADERS, timeout=30,
+        )
+        calls = cr.json() if cr.status_code == 200 else []
+        if not isinstance(calls, list):
+            calls = []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch calls: {e}")
+
+    # Group by lead — we want the MOST RECENT failed call per lead, not every
+    # past attempt. The order=desc above means the first hit per leadId wins.
+    by_lead = {}
+    for c in calls:
+        lid = c.get("leadId")
+        if lid and lid not in by_lead:
+            by_lead[lid] = c
+    if not by_lead:
+        return {"eligible": [], "count": 0, "window_days": window_days}
+
+    # 2. Suppression list — leads already campaign_sent within
+    # CAMPAIGN_SUPPRESSION_DAYS. We pull this once instead of per-lead so the
+    # eligibility check stays a single batch.
+    sup_cutoff = (datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)).isoformat()
+    try:
+        sr = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/audit_log"
+            f"?action=eq.campaign_sent&created_at=gte.{sup_cutoff}"
+            f"&select=resource_id&limit=10000",
+            headers=SB_ADMIN_HEADERS, timeout=10,
+        )
+        rows = sr.json() if sr.status_code == 200 else []
+        suppressed = {str(r_.get("resource_id")) for r_ in (rows if isinstance(rows, list) else []) if r_.get("resource_id")}
+    except Exception as e:
+        print(f"[ELIGIBLE] suppression query failed: {e}")
+        suppressed = set()
+
+    # 3. Fetch each lead — batched in chunks of 100 since id=in.() URL has length limits
+    lead_ids = [lid for lid in by_lead.keys() if str(lid) not in suppressed]
+    leads_by_id = {}
+    BATCH = 100
+    for i in range(0, len(lead_ids), BATCH):
+        batch = lead_ids[i:i+BATCH]
+        ids_csv = ",".join(str(x) for x in batch)
+        try:
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_csv})"
+                f"&select=id,company,firstName,lastName,title,email,phone,industry,state,city,status,assignedTo",
+                headers=SB_HEADERS, timeout=30,
+            )
+            for l in (r.json() if r.status_code == 200 else []):
+                if isinstance(l, dict):
+                    leads_by_id[l["id"]] = l
+        except Exception as e:
+            print(f"[ELIGIBLE] batch lead fetch failed: {e}")
+
+    # 4. Filter to email-eligible
+    eligible = []
+    for lead_id, call in by_lead.items():
+        if str(lead_id) in suppressed:
+            continue
+        lead = leads_by_id.get(lead_id)
+        if not lead:
+            continue
+        if not (lead.get("email") or "").strip():
+            continue
+        if not (lead.get("firstName") or "").strip():
+            continue
+        if lead.get("status") in ("awaiting_email_reply", "do_not_contact", "converted"):
+            continue
+        eligible.append({
+            "lead_id":      lead["id"],
+            "company":      lead.get("company"),
+            "first_name":   lead.get("firstName"),
+            "last_name":    lead.get("lastName") or "",
+            "title":        lead.get("title") or "",
+            "email":        lead.get("email"),
+            "phone":        lead.get("phone") or "",
+            "industry":     lead.get("industry") or "",
+            "state":        lead.get("state") or "",
+            "city":         lead.get("city") or "",
+            "status":       lead.get("status") or "new",
+            "assigned_to":  lead.get("assignedTo") or "",
+            "last_outcome": call.get("outcome"),
+            "last_call_at": call.get("calledAt"),
+            "last_call_by": call.get("calledBy"),
+        })
+
+    eligible.sort(key=lambda x: x.get("last_call_at") or "", reverse=True)
+    return {"eligible": eligible, "count": len(eligible), "window_days": window_days}
+
+@app.post("/api/admin/campaigns/batch-send")
+def campaigns_batch_send(body: dict, user: str = Depends(verify_admin)):
+    """Send the campaign email to a list of leads in one shot. Body:
+       {lead_ids: [int, ...], trigger?: str}
+    Each lead is processed via send_lead_to_campaign which handles its own
+    suppression + status flip — so calling this twice with the same list
+    is idempotent within the suppression window."""
+    if not RESEND_API_KEY:
+        raise HTTPException(status_code=400, detail="RESEND_API_KEY not configured")
+
+    lead_ids = body.get("lead_ids") or []
+    if not isinstance(lead_ids, list) or len(lead_ids) == 0:
+        return {"sent": 0, "failed": 0, "skipped": 0, "details": []}
+    trigger = (body.get("trigger") or "batch_eod").strip() or "batch_eod"
+
+    sent = 0
+    failed = []
+    skipped = []
+    for lid in lead_ids[:500]:  # hard cap so a fat-fingered request can't fan out forever
+        try:
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lid))}&select=*",
+                headers=SB_HEADERS, timeout=10,
+            )
+            rows = r.json() if r.status_code == 200 else []
+            lead = rows[0] if isinstance(rows, list) and rows else None
+        except Exception as e:
+            failed.append({"lead_id": lid, "reason": f"fetch error: {e}"})
+            continue
+        if not lead:
+            failed.append({"lead_id": lid, "reason": "lead not found"})
+            continue
+
+        ok, detail = send_lead_to_campaign(lead, trigger=trigger, user=user)
+        if ok:
+            sent += 1
+        elif "already sent" in (detail or "").lower():
+            skipped.append({"lead_id": lid, "company": lead.get("company"), "reason": detail})
+        else:
+            failed.append({"lead_id": lid, "company": lead.get("company"), "reason": detail})
+
+    audit_log(user, "campaigns_batch_sent", "campaign", None, {
+        "trigger":  trigger,
+        "requested": len(lead_ids),
+        "sent":     sent,
+        "skipped":  len(skipped),
+        "failed":   len(failed),
+    })
+    return {
+        "sent":     sent,
+        "skipped":  len(skipped),
+        "failed":   len(failed),
+        "skips":    skipped[:30],
+        "failures": failed[:30],
+    }
+
 @app.post("/api/admin/poll-replies")
 def poll_replies_now(user: str = Depends(verify_admin)):
     """Manual trigger for the IMAP reply poller — useful when you want an

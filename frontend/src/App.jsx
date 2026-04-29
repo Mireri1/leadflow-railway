@@ -4598,6 +4598,191 @@ function LeadCleanupPanel({onCleanup}){
   )
 }
 
+function EligibleEmailQueue(){
+  const [data,setData]    = useState(null)
+  const [loading,setLoad] = useState(false)
+  const [windowDays,setWindowDays] = useState(7)
+  const [selected,setSelected] = useState(new Set())
+  const [sending,setSending] = useState(false)
+  const [result,setResult] = useState(null)
+
+  const load = (d=windowDays)=>{
+    setLoad(true); setResult(null)
+    api(`/api/admin/campaigns/eligible?window_days=${d}`)
+      .then(r=>{
+        setData(r)
+        // Default-select every eligible lead so EOD batch is one click.
+        // User can deselect any they don't want.
+        setSelected(new Set((r?.eligible||[]).map(e=>e.lead_id)))
+      })
+      .catch(()=>setData(null))
+      .finally(()=>setLoad(false))
+  }
+  useEffect(()=>{ load(windowDays) },[windowDays])
+
+  const eligible = data?.eligible || []
+  const allSelected = eligible.length>0 && selected.size===eligible.length
+
+  function toggleAll(){
+    if(allSelected) setSelected(new Set())
+    else setSelected(new Set(eligible.map(e=>e.lead_id)))
+  }
+  function toggleOne(id){
+    setSelected(prev=>{
+      const next = new Set(prev)
+      if(next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+
+  async function batchSend(){
+    if(selected.size===0) return
+    if(!window.confirm(`Send the "tried to call you" email to ${selected.size} lead${selected.size===1?"":"s"}?\n\nEach send burns 1 Resend credit and flips that lead to "Awaiting Email Reply" so callers won't re-dial them.`)) return
+    setSending(true); setResult(null)
+    try{
+      const ids = Array.from(selected)
+      const r = await api("/api/admin/campaigns/batch-send",{method:"POST",
+        body:JSON.stringify({lead_ids: ids, trigger: "batch_eod"})})
+      setResult(r)
+      load(windowDays) // refresh — sent leads should drop off the list
+    }catch(ex){
+      setResult({error: ex.message||"batch send failed"})
+    }finally{ setSending(false) }
+  }
+
+  const fmtTime = (iso)=>iso?new Date(iso).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—"
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:12,marginTop:24,overflow:"hidden",
+      borderLeft:"4px solid #ffe083"}}>
+      <div style={{padding:"16px 20px",borderBottom:"1px solid #40485d20",
+        display:"flex",justifyContent:"space-between",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+        <div>
+          <div style={{fontSize:12,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",fontWeight:700}}>
+            📬 Pending Email Follow-Ups
+            {eligible.length>0&&(
+              <span style={{marginLeft:10,padding:"2px 10px",background:"#ffe08325",color:"#ffe083",
+                borderRadius:10,fontSize:11,fontWeight:700,letterSpacing:0,textTransform:"none"}}>
+                {eligible.length}
+              </span>
+            )}
+          </div>
+          <div style={{fontSize:11,color:"#40485d",marginTop:4}}>
+            Recent no-answer / voicemail calls where the lead has email + name + isn't already in a campaign.
+            Review and send the batch when you're ready (e.g. end of day).
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <select className="sel" value={windowDays} onChange={e=>setWindowDays(Number(e.target.value))}
+            style={{padding:"5px 10px",fontSize:12}}>
+            <option value={1}>Last 24 hours</option>
+            <option value={3}>Last 3 days</option>
+            <option value={7}>Last 7 days</option>
+            <option value={14}>Last 14 days</option>
+            <option value={30}>Last 30 days</option>
+          </select>
+          <button className="btn btn-g" onClick={()=>load(windowDays)} disabled={loading}
+            style={{fontSize:11,padding:"6px 12px"}}>
+            {loading?"…":"Refresh"}
+          </button>
+          <button className="btn btn-p" onClick={batchSend}
+            disabled={selected.size===0||sending}
+            style={{fontSize:12,padding:"7px 14px",
+              background:selected.size>0?"#ffe083":"#40485d20",
+              color:selected.size>0?"#000011":"#40485d",
+              fontWeight:700,cursor:selected.size>0?"pointer":"not-allowed",border:"none"}}>
+            {sending?"Sending…":`Send ${selected.size} Selected`}
+          </button>
+        </div>
+      </div>
+
+      {result&&(
+        <div style={{padding:"10px 20px",fontSize:11,
+          background:result.error?"#ff6e8418":(result.failed>0?"#ffe08315":"#69f6b815"),
+          borderBottom:"1px solid #40485d20",
+          color:result.error?"#ff6e84":(result.failed>0?"#ffe083":"#69f6b8")}}>
+          {result.error
+            ? `⚠ ${result.error}`
+            : `✓ Sent ${result.sent} email${result.sent===1?"":"s"}${result.skipped?` · ${result.skipped} skipped (already sent recently)`:""}${result.failed?` · ${result.failed} failed`:""}`}
+          {result.failures?.length>0&&(
+            <div style={{marginTop:6,color:"#ff6e84",fontSize:10}}>
+              Failures: {result.failures.map(f=>`${f.company||f.lead_id}: ${f.reason}`).join(" · ")}
+            </div>
+          )}
+        </div>
+      )}
+
+      {loading?(
+        <div style={{padding:"40px 20px",textAlign:"center",color:"#40485d",fontSize:12}}>Scanning calls…</div>
+      ):eligible.length===0?(
+        <div style={{padding:"40px 20px",textAlign:"center"}}>
+          <div style={{fontSize:30,marginBottom:8}}>📭</div>
+          <div style={{color:"#a3aac4",fontSize:13,fontWeight:600}}>No pending follow-ups</div>
+          <div style={{color:"#40485d",fontSize:11,marginTop:6}}>
+            {data?.error || `No no-answer / voicemail calls in the last ${windowDays} day${windowDays===1?"":"s"} that need an email.`}
+          </div>
+        </div>
+      ):(
+        <>
+          <div style={{padding:"8px 20px",background:"#060e20",borderBottom:"1px solid #40485d20",
+            display:"grid",gridTemplateColumns:"32px 2fr 2fr 1.2fr 1fr",gap:14,
+            fontSize:9,color:"#a3aac4",letterSpacing:".06em",textTransform:"uppercase",fontWeight:700}}>
+            <input type="checkbox" checked={allSelected} onChange={toggleAll}
+              style={{cursor:"pointer",justifySelf:"center"}}
+              title={allSelected?"Deselect all":"Select all"}/>
+            <span>Contact</span>
+            <span>Company / Email</span>
+            <span>Last Failed Call</span>
+            <span>By</span>
+          </div>
+          <div style={{maxHeight:520,overflowY:"auto"}}>
+            {eligible.map(e=>{
+              const isSel = selected.has(e.lead_id)
+              return(
+                <div key={e.lead_id}
+                  onClick={()=>toggleOne(e.lead_id)}
+                  style={{display:"grid",gridTemplateColumns:"32px 2fr 2fr 1.2fr 1fr",gap:14,
+                    padding:"10px 20px",alignItems:"center",fontSize:12,cursor:"pointer",
+                    background:isSel?"#ffe08308":"transparent",
+                    borderBottom:"1px solid #40485d12",transition:"background .12s"}}
+                  onMouseEnter={ev=>{if(!isSel) ev.currentTarget.style.background="#192540"}}
+                  onMouseLeave={ev=>{ev.currentTarget.style.background=isSel?"#ffe08308":"transparent"}}>
+                  <input type="checkbox" checked={isSel} onChange={()=>toggleOne(e.lead_id)}
+                    onClick={ev=>ev.stopPropagation()}
+                    style={{cursor:"pointer",justifySelf:"center"}}/>
+                  <div style={{minWidth:0}}>
+                    <div style={{color:"#dee5ff",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                      {e.first_name} {e.last_name}
+                    </div>
+                    {e.title&&<div style={{color:"#8b5cf6",fontSize:11,marginTop:1}}>{e.title}</div>}
+                  </div>
+                  <div style={{minWidth:0}}>
+                    <div style={{color:"#dee5ff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                      {e.company||"—"}
+                    </div>
+                    <div style={{color:"#a3aac4",fontSize:10,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                      {e.email}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{color:e.last_outcome==="voicemail"?"#a3a6ff":"#a3aac4",fontSize:11,fontWeight:600}}>
+                      {e.last_outcome==="voicemail"?"📨 Voicemail":"📵 No Answer"}
+                    </div>
+                    <div style={{color:"#40485d",fontSize:10,marginTop:1}}>
+                      {fmtTime(e.last_call_at)}
+                    </div>
+                  </div>
+                  <span style={{color:"#a3aac4",fontSize:11}}>{e.last_call_by||"—"}</span>
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function EmailTemplateEditor(){
   const [tpl,setTpl]         = useState(null)         // {subject, body, default, placeholders, is_default}
   const [subject,setSubject] = useState("")
@@ -4904,6 +5089,9 @@ function CampaignsPage(){
           Reply triggers an auto-flip of lead status to <span style={{color:"#69f6b8"}}>interested</span> + Slack ping.
         </div>
       </div>
+
+      {/* Pending email queue — EOD batch send for failed-call leads */}
+      <EligibleEmailQueue/>
 
       {/* Email template editor — admin-edits the message that goes out on every send */}
       <EmailTemplateEditor/>
