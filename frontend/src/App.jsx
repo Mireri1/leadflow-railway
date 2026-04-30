@@ -4838,7 +4838,17 @@ function EligibleEmailQueue(){
   )
 }
 
+// Three-touch email sequence — admin can edit each step's template separately.
+// Touch 1 fires on caller action; Touches 2 and 3 are auto-fired by the
+// backend bg-loop sequencer at +3 days and +7 days.
+const EMAIL_TEMPLATE_STEPS = [
+  {name:"tried-to-call",   label:"Touch 1",  sub:"Day 0 — initial outreach (caller-triggered)"},
+  {name:"tried-to-call-2", label:"Touch 2",  sub:"Day 3 — softer nudge (auto-fired)"},
+  {name:"tried-to-call-3", label:"Touch 3",  sub:"Day 7 — last touch (auto-fired)"},
+]
+
 function EmailTemplateEditor(){
+  const [stepName,setStepName] = useState("tried-to-call")
   const [tpl,setTpl]         = useState(null)         // {subject, body, default, placeholders, is_default}
   const [subject,setSubject] = useState("")
   const [bodyText,setBody]   = useState("")
@@ -4848,28 +4858,29 @@ function EmailTemplateEditor(){
   const [status,setStatus]   = useState("")
 
   const load = ()=>{
-    api("/api/admin/email-template").then(r=>{
+    api(`/api/admin/email-template?name=${encodeURIComponent(stepName)}`).then(r=>{
       setTpl(r); setSubject(r.subject||""); setBody(r.body||""); setStatus("")
     }).catch(()=>{})
   }
-  useEffect(load, [])
+  // Re-fetch whenever the user switches between Touch 1/2/3.
+  useEffect(load, [stepName])
 
   // Debounced live preview — re-render 400ms after user stops typing.
   useEffect(()=>{
     if(!subject && !bodyText) return
     const t = setTimeout(()=>{
       api("/api/admin/email-template/preview",{method:"POST",
-        body:JSON.stringify({subject, body:bodyText})})
+        body:JSON.stringify({subject, body:bodyText, name:stepName})})
         .then(setPreview).catch(()=>{})
     }, 400)
     return ()=>clearTimeout(t)
-  }, [subject, bodyText])
+  }, [subject, bodyText, stepName])
 
   async function save(){
     setSaving(true); setStatus("")
     try{
       await api("/api/admin/email-template",{method:"PUT",
-        body:JSON.stringify({subject, body:bodyText})})
+        body:JSON.stringify({name:stepName, subject, body:bodyText})})
       setStatus("✓ Saved — next send uses this template")
       load()
     }catch(ex){ setStatus("⚠ "+(ex.message||"save failed")) }
@@ -4879,7 +4890,7 @@ function EmailTemplateEditor(){
     if(!window.confirm("Reset to the built-in default template? Your custom edits will be lost.")) return
     setResetting(true); setStatus("")
     try{
-      await api("/api/admin/email-template",{method:"DELETE"})
+      await api(`/api/admin/email-template?name=${encodeURIComponent(stepName)}`,{method:"DELETE"})
       setStatus("✓ Reset to default")
       load()
     }catch(ex){ setStatus("⚠ "+(ex.message||"reset failed")) }
@@ -4888,16 +4899,38 @@ function EmailTemplateEditor(){
 
   const dirty = tpl && (subject !== tpl.subject || bodyText !== tpl.body)
   const isDefault = tpl?.is_default
+  const currentStep = EMAIL_TEMPLATE_STEPS.find(s=>s.name===stepName) || EMAIL_TEMPLATE_STEPS[0]
 
   if(!tpl) return null
 
   return (
     <div style={{background:"#0f1930",borderRadius:12,marginTop:24,overflow:"hidden"}}>
+      {/* Step selector — 3 tabs across the top */}
+      <div style={{display:"flex",borderBottom:"1px solid #40485d20",background:"#060e2030"}}>
+        {EMAIL_TEMPLATE_STEPS.map(s=>{
+          const active = s.name===stepName
+          return (
+            <button key={s.name} onClick={()=>{
+              if(dirty && !window.confirm("Discard unsaved changes to switch?")) return
+              setStepName(s.name)
+            }}
+              style={{flex:1,padding:"14px 16px",border:"none",cursor:"pointer",
+                background:active?"#0f1930":"transparent",
+                borderBottom:active?"2px solid #a3a6ff":"2px solid transparent",
+                fontFamily:"'Inter',sans-serif",textAlign:"left",transition:"all .15s"}}>
+              <div style={{fontSize:11,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",
+                color:active?"#a3a6ff":"#a3aac4"}}>{s.label}</div>
+              <div style={{fontSize:10,color:active?"#dee5ff":"#40485d",marginTop:2}}>{s.sub}</div>
+            </button>
+          )
+        })}
+      </div>
+
       <div style={{padding:"16px 20px",borderBottom:"1px solid #40485d20",
         display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
         <div>
           <div style={{fontSize:12,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",fontWeight:700}}>
-            ✏️ Email Template — "Tried to Call You"
+            ✏️ {currentStep.label} Template
             {isDefault && <span style={{marginLeft:10,fontSize:9,padding:"2px 8px",background:"#a3a6ff20",color:"#a3a6ff",borderRadius:4,letterSpacing:".05em"}}>USING DEFAULT</span>}
             {!isDefault && <span style={{marginLeft:10,fontSize:9,padding:"2px 8px",background:"#69f6b820",color:"#69f6b8",borderRadius:4,letterSpacing:".05em"}}>CUSTOMIZED</span>}
           </div>
