@@ -776,24 +776,65 @@ def save_to_supabase(leads):
 
 # ── VCC campaign helpers ───────────────────────────────────────────────────
 
-DEFAULT_EMAIL_TEMPLATE = {
-    "subject": "Quick question, {first_name}",
-    "body":
-        "Hi {first_name},\n\n"
-        "Tried reaching you today about cleaning at {company} — didn't catch you. "
-        "Vision Cleaning specializes in {industry_phrase}{state_phrase}, and I wanted to get you a quote either way.\n\n"
-        "If a call is hard to schedule, just hit reply with:\n"
-        "  • Square footage at {company}\n"
-        "  • Cleaning frequency you'd want (daily / weekly / 2x weekly)\n"
-        "  • Rough monthly budget\n\n"
-        "I'll come back inside 24 hours with a tailored quote and next steps. "
-        "If cleaning isn't on your radar right now, just reply \"not now\" and I'll close the loop on my end.\n\n"
-        "Thanks,\n"
-        "{sender_name}\n"
-        "Vision Cleaning Company\n"
-        "{sender_line}\n\n"
-        "—\nReply STOP to opt out. Vision Cleaning Company.",
+# Three-touch email sequence. Touch 1 fires when a caller marks "no answer
+# / voicemail" with the email-followup box checked (or via the EOD batch).
+# Touches 2 and 3 are auto-fired by process_email_sequences in the bg loop
+# at +3 days and +7 days. After Touch 3, a 5-day reply window passes, then
+# the lead is released back to the dialer pool with an audit note in the
+# notes field showing the sequence ran.
+DEFAULT_EMAIL_TEMPLATES = {
+    "tried-to-call": {  # Touch 1, Day 0 — initial outreach
+        "subject": "Quick question, {first_name}",
+        "body":
+            "Hi {first_name},\n\n"
+            "Tried reaching you today about cleaning at {company} — didn't catch you. "
+            "Vision Cleaning specializes in {industry_phrase}{state_phrase}, and I wanted to get you a quote either way.\n\n"
+            "If a call is hard to schedule, just hit reply with:\n"
+            "  • Square footage at {company}\n"
+            "  • Cleaning frequency you'd want (daily / weekly / 2x weekly)\n"
+            "  • Rough monthly budget\n\n"
+            "I'll come back inside 24 hours with a tailored quote and next steps. "
+            "If cleaning isn't on your radar right now, just reply \"not now\" and I'll close the loop on my end.\n\n"
+            "Thanks,\n"
+            "{sender_name}\n"
+            "Vision Cleaning Company\n"
+            "{sender_line}\n\n"
+            "—\nReply STOP to opt out. Vision Cleaning Company.",
+    },
+    "tried-to-call-2": {  # Touch 2, Day 3 — softer nudge, lower friction
+        "subject": "Re: cleaning at {company}",
+        "body":
+            "Hi {first_name},\n\n"
+            "Quick follow-up — I sent you a note a few days back about cleaning service at {company}. "
+            "I know inboxes pile up, so I wanted to surface it once more.\n\n"
+            "Most {industry_phrase} we work with end up saving 15-25% versus their current vendor, "
+            "and the switch takes about a week. If you want me to put a quote together, just hit reply "
+            "with your square footage and cleaning frequency. 30 seconds on your end.\n\n"
+            "If now isn't the right time, no problem — a one-line \"not now\" closes the loop.\n\n"
+            "Thanks,\n"
+            "{sender_name}\n"
+            "Vision Cleaning Company\n"
+            "{sender_line}\n\n"
+            "—\nReply STOP to opt out. Vision Cleaning Company.",
+    },
+    "tried-to-call-3": {  # Touch 3, Day 7 — final, "closing your file" frame
+        "subject": "Closing your file at Vision Cleaning",
+        "body":
+            "Hi {first_name},\n\n"
+            "Last note from me — I've reached out a couple of times about cleaning service at {company} "
+            "and haven't heard back, so I'm closing your file on my end.\n\n"
+            "If timing changes — new building, change of janitorial vendor, budget review — "
+            "just reply to this email and I'll pick it back up. No pressure either way.\n\n"
+            "Best of luck with the rest of the year.\n\n"
+            "Thanks,\n"
+            "{sender_name}\n"
+            "Vision Cleaning Company\n"
+            "{sender_line}\n\n"
+            "—\nReply STOP to opt out. Vision Cleaning Company.",
+    },
 }
+# Backward compat — older code paths reference the singular constant.
+DEFAULT_EMAIL_TEMPLATE = DEFAULT_EMAIL_TEMPLATES["tried-to-call"]
 
 def _email_template_vars(lead: dict) -> dict:
     """Build the placeholder dict used to render an email template against a lead."""
@@ -847,18 +888,7 @@ def load_email_template(name: str = "tried-to-call") -> dict:
                 return data
     except Exception as e:
         print(f"[EMAIL-TEMPLATE] load failed for '{name}': {e}")
-    return dict(DEFAULT_EMAIL_TEMPLATE)
-
-def build_tried_to_call_email(lead: dict) -> dict:
-    """Render the 'tried to call you' email subject + body for a lead.
-    Pulls the (admin-editable) template from app_settings, falls back to
-    DEFAULT_EMAIL_TEMPLATE if nothing's been saved."""
-    tpl  = load_email_template("tried-to-call")
-    vars_= _email_template_vars(lead)
-    return {
-        "subject":   _render_email_template(tpl.get("subject"), vars_),
-        "body_text": _render_email_template(tpl.get("body"),    vars_),
-    }
+    return dict(DEFAULT_EMAIL_TEMPLATES.get(name, DEFAULT_EMAIL_TEMPLATE))
 
 def lead_already_in_campaign(lead_id: str, campaign: str = "tried-to-call") -> bool:
     """Suppression: don't re-send the same lead to the same campaign within
@@ -877,33 +907,45 @@ def lead_already_in_campaign(lead_id: str, campaign: str = "tried-to-call") -> b
         print(f"[CAMPAIGN] suppression check failed: {e}")
         return False  # fail-open — better to risk a duplicate than miss a send
 
-def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "tried-to-call"):
-    """Send the 'tried to call you' follow-up directly via Resend. Same API key
-    + from-address as the rest of Vision Cleaning's outbound, so SPF/DKIM/sender
-    reputation match. Returns (ok: bool, detail: str)."""
+def send_lead_to_campaign(lead: dict, trigger: str, user: str,
+                          campaign: str = "tried-to-call", step: int = 1,
+                          bypass_suppression: bool = False):
+    """Send a campaign email via Resend. step=1 is the initial caller-triggered
+    touch; step=2 and step=3 are auto-fired by process_email_sequences using
+    different templates. bypass_suppression skips lead_already_in_campaign so
+    the auto-sequence isn't blocked by its own initial send. Returns
+    (ok: bool, detail: str)."""
     if not RESEND_API_KEY:
         return (False, "RESEND_API_KEY not configured")
     if not lead.get("email"):
         return (False, "lead has no email")
     if not lead.get("firstName"):
         return (False, "lead has no firstName (run Find Decision Maker first)")
-    if lead_already_in_campaign(lead.get("id"), campaign):
+    if step not in (1, 2, 3):
+        return (False, f"invalid step {step}")
+    if step == 1 and not bypass_suppression and lead_already_in_campaign(lead.get("id"), campaign):
         return (False, f"already sent to '{campaign}' within last {CAMPAIGN_SUPPRESSION_DAYS} days")
 
-    template = build_tried_to_call_email(lead)
+    template_name = "tried-to-call" if step == 1 else f"tried-to-call-{step}"
+    tpl   = load_email_template(template_name)
+    vars_ = _email_template_vars(lead)
+    subject   = _render_email_template(tpl.get("subject"), vars_)
+    body_text = _render_email_template(tpl.get("body"),    vars_)
+
     from_name  = os.getenv("OUTREACH_SENDER_NAME", OUTREACH_NAME)
     from_email = OUTREACH_EMAIL
     reply_to   = OUTREACH_REPLY_TO or from_email  # replies hit this inbox; IMAP poller watches it
     payload = {
         "from":    f"{from_name} <{from_email}>",
         "to":      [lead["email"]],
-        "subject": template["subject"],
-        "text":    template["body_text"],
+        "subject": subject,
+        "text":    body_text,
         "reply_to": reply_to,
         # Tags survive in Resend's webhook payload — we use them to map events
         # back to lead_id without keeping a separate mapping table.
         "tags": [
             {"name": "campaign", "value": campaign},
+            {"name": "step",     "value": str(step)},
             {"name": "lead_id",  "value": str(lead.get("id"))},
             {"name": "trigger",  "value": trigger.replace(" ", "_")[:40]},
         ],
@@ -928,18 +970,18 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "
         return (False, f"network error: {e}")
 
     audit_log(user, "campaign_sent", "lead", lead.get("id"), {
-        "campaign": campaign, "trigger": trigger,
+        "campaign": campaign, "trigger": trigger, "step": step,
         "to_email": lead.get("email"), "company": lead.get("company"),
         "resend_id": resend_id,
     })
 
-    # Mark the lead as awaiting an email reply so callers don't re-dial. The
-    # dialer queue + auto-suggest filters exclude this status. When VCC posts
-    # back with a 'reply' event, the callback flips it to 'interested' so it
-    # naturally returns to the queue. After 7 days with no reply, the
-    # nextfollowup nudge surfaces it again for a follow-up touch.
+    # Schedule the next sequence event:
+    #   step 1 → fire Touch 2 in 3 days
+    #   step 2 → fire Touch 3 in 4 days  (i.e. day 7 from initial)
+    #   step 3 → release to dialer pool in 5 days (final reply window)
+    next_offset_days = {1: 3, 2: 4, 3: 5}[step]
+    next_followup = (datetime.utcnow() + timedelta(days=next_offset_days)).date().isoformat()
     try:
-        next_followup = (datetime.utcnow() + timedelta(days=7)).date().isoformat()
         req_lib.patch(
             f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead.get('id')))}",
             headers=SB_HEADERS,
@@ -947,16 +989,17 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str, campaign: str = "
                 "status":           "awaiting_email_reply",
                 "nextfollowup":     next_followup,
                 "followupsequence": "email_followup",
+                "followupstep":     step,
                 "updatedAt":        datetime.utcnow().isoformat(),
             },
             timeout=10,
         )
     except Exception as e:
-        # Don't fail the send if the status patch fails — VCC already has the lead
+        # Don't fail the send if the status patch fails — Resend already has the email
         print(f"[CAMPAIGN] post-send status patch failed for lead {lead.get('id')}: {e}")
 
-    print(f"[CAMPAIGN] sent lead {lead.get('id')} to '{campaign}' via {trigger} → status=awaiting_email_reply")
-    return (True, "queued at VCC")
+    print(f"[CAMPAIGN] sent step {step} to lead {lead.get('id')} via {trigger}")
+    return (True, f"sent step {step}")
 
 # ── IMAP reply poller ─────────────────────────────────────────────────────
 # Watches the campaign sender's inbox for replies to "tried to call you"
@@ -1019,69 +1062,113 @@ def _extract_body_snippet(msg, max_len: int = 400) -> str:
         print(f"[IMAP-POLL] body extract failed: {e}")
     return ""
 
-def release_stale_email_leads():
-    """Find leads stuck in awaiting_email_reply past the suppression window
-    (default 7 days, env: CAMPAIGN_SUPPRESSION_DAYS) and flip them back to
-    'new' so they return to the dialer queue. Idempotent — safe to run on
-    every poll cycle. Returns the count released."""
-    cutoff = (datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)).isoformat()
+def _release_lead_from_email_seq(lead: dict, sent_count: int):
+    """Hand a lead back to the dialer pool with an audit trail in the notes
+    field showing how many emails fired before release. The caller seeing
+    this lead in the dialer will know exactly where it came from."""
+    lead_id = lead.get("id")
+    if not lead_id:
+        return False
+    today = datetime.utcnow().date().isoformat()
+    plural = "s" if sent_count != 1 else ""
+    summary = f"📧 Email sequence complete — {sent_count} email{plural} sent, no reply. Returned to dialer pool {today}."
+    existing_notes = (lead.get("notes") or "").strip()
+    new_notes = (summary + "\n\n" + existing_notes) if existing_notes else summary
     try:
-        # Find candidates — leads still awaiting reply whose status was last
-        # updated before the suppression cutoff. updatedAt is a reliable proxy
-        # since send_lead_to_campaign sets it when flipping the status. If an
-        # admin manually edits the lead later, updatedAt advances and we leave
-        # it alone — they presumably have an active reason.
+        pr = req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id))}",
+            headers={**SB_HEADERS, "Prefer": "return=minimal"},
+            json={
+                "status":           "new",
+                "followupsequence": None,
+                "followupstep":     None,
+                "nextfollowup":     None,
+                "notes":            new_notes,
+                "updatedAt":        datetime.utcnow().isoformat(),
+            },
+            timeout=10,
+        )
+        return pr.status_code in (200, 204)
+    except Exception as e:
+        print(f"[EMAIL-SEQ] release failed for {lead_id}: {e}")
+        return False
+
+def process_email_sequences():
+    """Drive the 3-touch email follow-up sequence (replaces the old single-
+    touch release_stale_email_leads). Runs every bg-loop cycle.
+
+      Touch 1 (Day 0)  — caller-triggered via send_lead_to_campaign(step=1)
+      Touch 2 (Day 3)  — auto-fired here when followupstep=1 and due
+      Touch 3 (Day 7)  — auto-fired here when followupstep=2 and due
+      Release (Day 12) — hand back to dialer when followupstep=3 and due
+
+    Legacy leads (followupsequence='email_followup' but followupstep null,
+    pre-sequence-feature data) fall back to the original 7-day release
+    behavior so we don't strand them."""
+    today_iso = datetime.utcnow().date().isoformat()
+    legacy_cutoff = (datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)).isoformat()
+    try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads"
             f"?status=eq.awaiting_email_reply"
-            f"&updatedAt=lt.{cutoff}"
-            f"&select=id,company,updatedAt"
+            f"&select=id,email,firstName,lastName,company,industry,state,city,title,notes,"
+            f"followupsequence,followupstep,nextfollowup,updatedAt"
             f"&limit=500",
             headers=SB_HEADERS, timeout=15,
         )
-        stale = r.json() if r.status_code == 200 else []
-        if not isinstance(stale, list) or len(stale) == 0:
-            return 0
+        leads = r.json() if r.status_code == 200 else []
+        if not isinstance(leads, list) or len(leads) == 0:
+            return {"sent_2": 0, "sent_3": 0, "released": 0}
     except Exception as e:
-        print(f"[STALE-EMAIL] query failed: {e}")
-        return 0
+        print(f"[EMAIL-SEQ] query failed: {e}")
+        return {"sent_2": 0, "sent_3": 0, "released": 0}
 
-    ids = [s["id"] for s in stale if s.get("id") is not None]
-    if not ids:
-        return 0
+    sent_2 = sent_3 = released = 0
+    for lead in leads:
+        step = lead.get("followupstep")
+        nf   = lead.get("nextfollowup") or ""
+        seq  = lead.get("followupsequence") or ""
 
-    # Batch patch — ids=in.() URL has a length cap, do in 100s.
-    released = 0
-    BATCH = 100
-    for i in range(0, len(ids), BATCH):
-        chunk = ids[i:i+BATCH]
-        ids_csv = ",".join(str(x) for x in chunk)
-        try:
-            pr = req_lib.patch(
-                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_csv})",
-                headers={**SB_HEADERS, "Prefer": "return=minimal"},
-                json={
-                    "status":       "new",
-                    "nextfollowup": None,
-                    "updatedAt":    datetime.utcnow().isoformat(),
-                },
-                timeout=30,
-            )
-            if pr.status_code in (200, 204):
-                released += len(chunk)
-            else:
-                print(f"[STALE-EMAIL] batch patch HTTP {pr.status_code}: {pr.text[:200]}")
-        except Exception as e:
-            print(f"[STALE-EMAIL] batch patch failed: {e}")
+        # Legacy path — no step tracked. Release by old 7-day-since-update rule.
+        if step is None or seq != "email_followup":
+            updated = lead.get("updatedAt") or ""
+            if updated and updated < legacy_cutoff:
+                if _release_lead_from_email_seq(lead, sent_count=1):
+                    released += 1
+            continue
 
-    if released > 0:
-        audit_log("auto_release", "leads_released_stale_email", "lead", None, {
-            "released":    released,
-            "cutoff_days": CAMPAIGN_SUPPRESSION_DAYS,
-            "sample_ids":  ids[:20],
+        # Modern path — only act on entries whose nextfollowup has come due.
+        if not nf or nf > today_iso:
+            continue
+
+        if step == 1:
+            ok, _ = send_lead_to_campaign(lead, trigger="auto_followup_2",
+                                          user="auto_sequencer",
+                                          step=2, bypass_suppression=True)
+            if ok: sent_2 += 1
+        elif step == 2:
+            ok, _ = send_lead_to_campaign(lead, trigger="auto_followup_3",
+                                          user="auto_sequencer",
+                                          step=3, bypass_suppression=True)
+            if ok: sent_3 += 1
+        elif step == 3:
+            if _release_lead_from_email_seq(lead, sent_count=3):
+                released += 1
+
+    if sent_2 or sent_3 or released:
+        audit_log("auto_sequencer", "email_sequence_tick", "lead", None, {
+            "sent_step_2": sent_2, "sent_step_3": sent_3, "released": released,
         })
-        print(f"[STALE-EMAIL] released {released} leads back to pool (no reply within {CAMPAIGN_SUPPRESSION_DAYS}d)")
-    return released
+        print(f"[EMAIL-SEQ] cycle: sent_2={sent_2} sent_3={sent_3} released={released}")
+    return {"sent_2": sent_2, "sent_3": sent_3, "released": released}
+
+# Backward-compat alias — the manual admin endpoint and the bg loop both
+# expect this name. The new function name is more accurate (it now drives
+# the sequence, not just stale releases) but we keep the alias to avoid
+# breaking callers.
+def release_stale_email_leads():
+    res = process_email_sequences()
+    return res.get("released", 0)
 
 def imap_poll_replies():
     """Connect to IMAP, scan unread messages, match to awaiting-email leads.
@@ -1266,12 +1353,14 @@ def _bg_maintenance_loop():
                     print(f"[IMAP-POLL] matched {res['stats']['matched']} replies this cycle")
             except Exception as e:
                 print(f"[IMAP-POLL] loop exception: {e}")
-        # Always release stale leads — runs even with IMAP off so leads
-        # never get permanently stuck in awaiting_email_reply.
+        # Drive the 3-touch email sequence: fire Touch 2/3 when due, release
+        # to dialer pool after the final reply window. Legacy single-touch
+        # leads fall back to the old 7-day release rule. Always runs so
+        # leads never get permanently stuck in awaiting_email_reply.
         try:
-            release_stale_email_leads()
+            process_email_sequences()
         except Exception as e:
-            print(f"[STALE-EMAIL] auto-release exception: {e}")
+            print(f"[EMAIL-SEQ] auto-process exception: {e}")
         # Self-healing weekly dedupe — internal cooldown, no-ops most ticks.
         try:
             run_dedupe_sweep_if_due()
