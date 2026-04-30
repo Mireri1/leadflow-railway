@@ -2257,6 +2257,29 @@ def city_autocomplete(q: str = "", state: str = "", user: str = Depends(verify_t
 def get_industries():
     return {"industries": list(INDUSTRY_MAP.keys())}
 
+def _paginated_get(url: str, headers: dict = None, page_size: int = 1000, max_pages: int = 50) -> list:
+    """Paginated PostgREST GET. Supabase silently caps single requests at
+    1000 rows; without this, /api/leads and /api/stats only see the first
+    1000 leads no matter how big the table actually is. Loops via Range
+    header until a short page lands or we hit the safety ceiling."""
+    rows = []
+    base_headers = {**(headers or SB_HEADERS), "Range-Unit": "items"}
+    for page in range(max_pages):
+        start = page * page_size
+        end   = start + page_size - 1
+        try:
+            r = req_lib.get(url, headers={**base_headers, "Range": f"{start}-{end}"}, timeout=30)
+            batch = r.json() if r.status_code in (200, 206) else []
+            if not isinstance(batch, list) or len(batch) == 0:
+                break
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+        except Exception as e:
+            print(f"[PAGINATED-GET] page {page} failed: {e}")
+            break
+    return rows
+
 @app.get("/api/leads")
 def list_leads(status: str = "", search: str = "", sort: str = "score",
                callbacks: str = "", source: str = "", user: str = Depends(verify_token)):
@@ -2272,8 +2295,7 @@ def list_leads(status: str = "", search: str = "", sort: str = "score",
             url += f"&or=(company.ilike.%25{s}%25,firstName.ilike.%25{s}%25,lastName.ilike.%25{s}%25,phone.ilike.%25{s}%25)"
         order_map = {"score":"score.desc","newest":"createdAt.desc","company":"company.asc","callbacks":"callbackDate.asc"}
         url += f"&order={order_map.get(sort,'score.desc')}"
-        r = req_lib.get(url, headers=SB_HEADERS, timeout=30)
-        return r.json()
+        return _paginated_get(url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4102,11 +4124,11 @@ def get_calls(lead_id: str, user: str = Depends(verify_token)):
 def get_stats(user: str = Depends(verify_token)):
     try:
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        r1 = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?select=status,score,callbackDate,createdAt",
-                        headers=SB_HEADERS, timeout=30)
+        # Paginate — Supabase caps single requests at 1000 rows, so without
+        # this the 'total' field undercounts once the DB grows past 1000.
+        sl = _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=status,score,callbackDate,createdAt")
         r2 = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{today}T00:00:00",
                         headers=SB_HEADERS, timeout=30)
-        sl = r1.json() if r1.status_code == 200 else []
         sc = r2.json() if r2.status_code == 200 else []
         total     = len(sl)
         converted = len([l for l in sl if l.get("status")=="converted"])
