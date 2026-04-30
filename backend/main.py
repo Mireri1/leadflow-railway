@@ -3884,6 +3884,96 @@ def manual_release_stale_emails(user: str = Depends(verify_admin)):
     released = release_stale_email_leads()
     return {"released": released, "cutoff_days": CAMPAIGN_SUPPRESSION_DAYS}
 
+@app.post("/api/admin/email-sequence/backfill")
+def email_sequence_backfill(execute: bool = False, user: str = Depends(verify_admin)):
+    """Retroactively put legacy leads (followupsequence='email_followup',
+    followupstep IS NULL) onto the new 3-touch pipeline. Sets followupstep=1
+    and aligns nextfollowup to (Touch1 date + 3 days), or tomorrow if that's
+    already past. The bg-loop sequencer then fires Touch 2 and Touch 3 on
+    the standard cadence and releases at the end.
+
+    Dry-run by default — pass ?execute=true to apply. Idempotent (only
+    targets rows where followupstep IS NULL, so re-running is safe)."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?status=eq.awaiting_email_reply"
+            f"&followupsequence=eq.email_followup"
+            f"&followupstep=is.null"
+            f"&select=id,company,firstName,lastName,email,updatedAt,nextfollowup"
+            f"&limit=1000",
+            headers=SB_HEADERS, timeout=15,
+        )
+        candidates = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not isinstance(candidates, list) or not candidates:
+        return {"candidates": 0, "message": "No legacy leads need backfill"}
+
+    today = datetime.utcnow().date()
+    tomorrow = today + timedelta(days=1)
+
+    plan = []  # one entry per lead
+    for l in candidates:
+        # updatedAt was set by send_lead_to_campaign on the original Touch 1
+        # send. Use it as Touch 1's date; if it's been edited since, the
+        # delta will be smaller and Touch 2 fires sooner — acceptable.
+        try:
+            updated_iso = (l.get("updatedAt") or "").replace("Z", "").split("+")[0]
+            touch1_date = datetime.fromisoformat(updated_iso).date() if updated_iso else today
+        except Exception:
+            touch1_date = today
+        ideal_t2 = touch1_date + timedelta(days=3)
+        next_fu  = max(ideal_t2, tomorrow)
+        plan.append({
+            "id":               l.get("id"),
+            "company":          l.get("company"),
+            "firstName":        l.get("firstName"),
+            "touch1_date":      touch1_date.isoformat(),
+            "touch1_age_days":  (today - touch1_date).days,
+            "next_touch":       next_fu.isoformat(),
+        })
+
+    if not execute:
+        return {
+            "candidates": len(plan),
+            "rule":       "set followupstep=1, nextfollowup=max(touch1+3d, tomorrow)",
+            "plan":       plan[:30],
+            "execute_with": "POST /api/admin/email-sequence/backfill?execute=true",
+        }
+
+    # Execute — patch leads individually since each gets a different nextfollowup.
+    now_iso = datetime.utcnow().isoformat()
+    updated = 0
+    failed  = 0
+    for entry in plan:
+        try:
+            pr = req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(entry['id']))}",
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                json={
+                    "followupstep": 1,
+                    "nextfollowup": entry["next_touch"],
+                    "updatedAt":    now_iso,
+                },
+                timeout=10,
+            )
+            if pr.status_code in (200, 204):
+                updated += 1
+            else:
+                failed += 1
+                print(f"[BACKFILL] patch {entry['id']} HTTP {pr.status_code}: {pr.text[:200]}")
+        except Exception as e:
+            failed += 1
+            print(f"[BACKFILL] patch {entry['id']} exception: {e}")
+
+    audit_log(user, "email_sequence_backfill", "lead", None, {
+        "candidates": len(plan), "updated": updated, "failed": failed,
+    })
+    return {"candidates": len(plan), "updated": updated, "failed": failed,
+            "next_sequencer_tick": "within 10 min"}
+
 @app.post("/api/admin/poll-replies")
 def poll_replies_now(user: str = Depends(verify_admin)):
     """Manual trigger for the IMAP reply poller — useful when you want an
