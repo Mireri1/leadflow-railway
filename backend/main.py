@@ -64,6 +64,11 @@ IMAP_PORT       = int(os.getenv("IMAP_PORT", "993"))
 IMAP_USERNAME   = os.getenv("IMAP_USERNAME", "").strip()      # full email
 IMAP_PASSWORD   = os.getenv("IMAP_PASSWORD", "").strip()      # app password if Gmail+2FA
 IMAP_POLL_INTERVAL_MINUTES = int(os.getenv("IMAP_POLL_INTERVAL_MINUTES", "10"))
+# Self-healing Apollo dedupe sweep. Runs inside the bg-maintenance loop with
+# a DB-tracked cooldown (app_settings.last_dedupe_sweep) so it fires once per
+# week regardless of restarts. Auto-deletes truly-safe Apollo dupes; Slack-
+# pings borderline cases that need a human eye.
+DEDUPE_SWEEP_INTERVAL_DAYS = int(os.getenv("DEDUPE_SWEEP_INTERVAL_DAYS", "7"))
 IMAP_FOLDER     = os.getenv("IMAP_FOLDER", "INBOX")
 # Phrases that mark a message as auto-reply (case-insensitive). Skip these
 # so a vacation responder doesn't false-flip a lead to 'interested'.
@@ -1267,7 +1272,184 @@ def _bg_maintenance_loop():
             release_stale_email_leads()
         except Exception as e:
             print(f"[STALE-EMAIL] auto-release exception: {e}")
+        # Self-healing weekly dedupe — internal cooldown, no-ops most ticks.
+        try:
+            run_dedupe_sweep_if_due()
+        except Exception as e:
+            print(f"[DEDUPE-SWEEP] loop exception: {e}")
         time.sleep(IMAP_POLL_INTERVAL_MINUTES * 60)
+
+# ── Apollo dedupe — shared detection + self-healing weekly sweep ─────────
+def find_apollo_dupe_groups(leads: list) -> list:
+    """Pure helper: group leads by (firstName, lastName, company) lowercase
+    and return one entry per multi-row group. Each entry distinguishes the
+    'keep' row from extras, and splits extras into safe-to-auto-delete vs
+    borderline (has activity / assigned / status moved past 'new').
+
+    Caller decides what to do with each group:
+      - cleanup-preview reports both safe + borderline
+      - weekly auto-sweep deletes safe extras, alerts on borderline groups
+
+    Returns list of dicts:
+      {'person', 'kept', 'safe_extras', 'risky_extras'}"""
+    groups = {}
+    for l in leads:
+        first = (l.get("firstName") or "").strip().lower()
+        last  = (l.get("lastName")  or "").strip().lower()
+        comp  = (l.get("company")   or "").strip().lower()
+        if not (first and last and comp):
+            continue
+        groups.setdefault((first, last, comp), []).append(l)
+
+    out = []
+    for key, group in groups.items():
+        if len(group) < 2:
+            continue
+        # Most call activity wins; ties → oldest createdAt (preserves the
+        # original pull). Anything else in the group is an extra.
+        sorted_group = sorted(
+            group,
+            key=lambda x: (-(x.get("total_calls") or 0), x.get("createdAt") or ""),
+        )
+        keep = sorted_group[0]
+        safe_extras  = []
+        risky_extras = []
+        for e in sorted_group[1:]:
+            unworked = (
+                not e.get("assignedTo") and
+                (e.get("total_calls") or 0) == 0 and
+                (e.get("status") or "new") == "new"
+            )
+            (safe_extras if unworked else risky_extras).append(e)
+        out.append({
+            "person":        f"{key[0].title()} {key[1].title()} @ {keep.get('company') or '?'}",
+            "kept":          keep,
+            "safe_extras":   safe_extras,
+            "risky_extras":  risky_extras,
+        })
+    return out
+
+def _fetch_all_leads_for_dedupe() -> list:
+    """Paginated full-table read for the dedupe sweep. Mirrors the loop
+    pattern in cleanup_preview but returns only the columns dedupe needs."""
+    leads = []
+    PAGE = 1000
+    MAX_PAGES = 50
+    for page in range(MAX_PAGES):
+        start = page * PAGE
+        end   = start + PAGE - 1
+        try:
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads"
+                f"?select=id,company,firstName,lastName,createdAt,assignedTo,status,total_calls"
+                f"&order=id.asc",
+                headers={**SB_HEADERS, "Range-Unit": "items", "Range": f"{start}-{end}"},
+                timeout=30,
+            )
+            batch = r.json() if r.status_code in (200, 206) else []
+            if not isinstance(batch, list) or len(batch) == 0:
+                break
+            leads.extend(batch)
+            if len(batch) < PAGE:
+                break
+        except Exception as e:
+            print(f"[DEDUPE-SWEEP] fetch page {page} failed: {e}")
+            break
+    return leads
+
+def _dedupe_sweep_due() -> bool:
+    """Read app_settings.last_dedupe_sweep; True if ≥ INTERVAL_DAYS have passed
+    (or no row yet). Conservative on errors — returns False to avoid
+    double-firing if the cooldown row is unreadable."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_dedupe_sweep&select=value",
+            headers=SB_HEADERS, timeout=10,
+        )
+        if r.status_code != 200:
+            return False
+        rows = r.json()
+        if not rows:
+            return True  # never run → due
+        last_iso = (rows[0].get("value") or "").replace("Z", "")
+        try:
+            last_dt = datetime.fromisoformat(last_iso)
+        except Exception:
+            return True  # corrupted timestamp → re-run
+        return (datetime.utcnow() - last_dt).total_seconds() >= DEDUPE_SWEEP_INTERVAL_DAYS * 86400
+    except Exception as e:
+        print(f"[DEDUPE-SWEEP] cooldown check failed: {e}")
+        return False
+
+def _record_dedupe_sweep_run():
+    try:
+        req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/app_settings",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"key": "last_dedupe_sweep", "value": datetime.utcnow().isoformat() + "Z"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[DEDUPE-SWEEP] failed to record last-run: {e}")
+
+def run_dedupe_sweep_if_due():
+    """Weekly self-healing dedupe. Skips silently if not due."""
+    if not _dedupe_sweep_due():
+        return
+    print("[DEDUPE-SWEEP] starting weekly sweep")
+    leads = _fetch_all_leads_for_dedupe()
+    if not leads:
+        print("[DEDUPE-SWEEP] empty fetch — aborting (will retry next cycle)")
+        return  # don't record run, retry on next loop tick
+
+    groups = find_apollo_dupe_groups(leads)
+    auto_ids   = [e["id"] for g in groups for e in g["safe_extras"]]
+    borderline = [g for g in groups if g["risky_extras"]]
+
+    deleted = 0
+    if auto_ids:
+        BATCH = 50
+        for i in range(0, len(auto_ids), BATCH):
+            batch = [str(x) for x in auto_ids[i:i+BATCH]]
+            try:
+                r = req_lib.delete(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=in.({','.join(batch)})",
+                    headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                    timeout=30,
+                )
+                if r.status_code in (200, 204):
+                    deleted += len(batch)
+                else:
+                    print(f"[DEDUPE-SWEEP] batch delete HTTP {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                print(f"[DEDUPE-SWEEP] batch delete exception: {e}")
+        audit_log("system", "leads_cleanup", "lead", None, {
+            "reason":   "weekly_dedupe_sweep",
+            "deleted":  deleted,
+            "borderline_groups": len(borderline),
+        })
+
+    # Slack only when there's something to say. Quiet weeks stay quiet.
+    if deleted > 0 or borderline:
+        fields = [{"label": "Auto-cleaned",
+                   "value": f":white_check_mark: {deleted} duplicate Apollo contacts"}]
+        if borderline:
+            sample_lines = []
+            for b in borderline[:5]:
+                others = ", ".join(o["id"][:8] for o in b["risky_extras"])
+                sample_lines.append(f"• {b['person']} (kept `{b['kept']['id'][:8]}`, others: `{others}`)")
+            more = f"\n…and {len(borderline) - 5} more" if len(borderline) > 5 else ""
+            fields.append({
+                "label": f"Need review ({len(borderline)})",
+                "value": "\n".join(sample_lines) + more,
+            })
+        summary = f"Auto-cleaned {deleted} duplicates"
+        if borderline:
+            summary += f" — {len(borderline)} group(s) need review (call history at risk)"
+        send_slack(":broom: Weekly Apollo dedupe sweep", summary, fields=fields)
+
+    _record_dedupe_sweep_run()
+    print(f"[DEDUPE-SWEEP] done — deleted={deleted} borderline={len(borderline)}")
 
 # Start the background thread once at module load. Runs regardless of IMAP
 # config — stale-release is the bigger guarantee. Daemon=True dies cleanly
@@ -2620,55 +2802,28 @@ def cleanup_preview(user: str = Depends(verify_admin)):
             })
 
     # ── Duplicate Apollo contacts ─────────────────────────────────────────
-    # Same person (firstName+lastName) at same company appearing in multiple
-    # rows — typically caused by repeat Apollo bulk pulls before the
-    # pre-enrichment dedupe was in place. Keep the row with the most call
-    # activity (preserves history); delete unworked extras only.
-    apollo_groups = {}
-    for l in leads:
-        first = (l.get("firstName") or "").strip().lower()
-        last  = (l.get("lastName")  or "").strip().lower()
-        comp  = (l.get("company")   or "").strip().lower()
-        if not (first and last and comp):
-            continue
-        apollo_groups.setdefault((first, last, comp), []).append(l)
-    dup_apollo_ids = []
+    # Same person at same company appearing in multiple rows — typically
+    # caused by repeat Apollo bulk pulls before the pre-enrichment dedupe
+    # was in place. Shared detection logic with the weekly auto-sweep.
+    dupe_groups = find_apollo_dupe_groups(leads)
+    dup_apollo_ids = [e["id"] for g in dupe_groups for e in g["safe_extras"]]
     dup_apollo_samples = []
-    for key, group in apollo_groups.items():
-        if len(group) < 2:
+    for g in dupe_groups:
+        if not g["safe_extras"]:
             continue
-        # Sort by activity DESC, then oldest createdAt ASC — keeps the lead
-        # that's actually been worked, or the original pull if all unworked.
-        group_sorted = sorted(
-            group,
-            key=lambda x: (-(x.get("total_calls") or 0), x.get("createdAt") or ""),
-        )
-        keep = group_sorted[0]
-        extras = group_sorted[1:]
-        worth_deleting = []
-        for e in extras:
-            if e.get("assignedTo"):
-                continue
-            if (e.get("total_calls") or 0) > 0:
-                continue
-            if e.get("status") and e.get("status") != "new":
-                continue
-            worth_deleting.append(e)
-        if not worth_deleting:
-            continue
-        for e in worth_deleting:
-            dup_apollo_ids.append(e["id"])
-        if len(dup_apollo_samples) < 8:
-            dup_apollo_samples.append({
-                "person": f"{key[0].title()} {key[1].title()} @ {keep.get('company')}",
-                "kept":   {"id": keep["id"],
-                           "createdAt": (keep.get("createdAt") or "")[:10],
-                           "total_calls": keep.get("total_calls") or 0,
-                           "source": keep.get("source")},
-                "delete": [{"id": e["id"],
-                            "createdAt": (e.get("createdAt") or "")[:10],
-                            "source": e.get("source")} for e in worth_deleting],
-            })
+        if len(dup_apollo_samples) >= 8:
+            break
+        keep = g["kept"]
+        dup_apollo_samples.append({
+            "person": g["person"],
+            "kept":   {"id": keep["id"],
+                       "createdAt": (keep.get("createdAt") or "")[:10],
+                       "total_calls": keep.get("total_calls") or 0,
+                       "source": keep.get("source")},
+            "delete": [{"id": e["id"],
+                        "createdAt": (e.get("createdAt") or "")[:10],
+                        "source": e.get("source")} for e in g["safe_extras"]],
+        })
 
     return {
         "total_leads":   len(leads),
