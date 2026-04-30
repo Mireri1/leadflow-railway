@@ -1293,30 +1293,80 @@ class ScrapeRequest(BaseModel):
 # Credit cost: ~1 credit per lookup on Pro tier (4,000/month).
 
 # Process-wide cache: company_name_lower -> (expires_ts, person_dict_or_None).
-# We cache MISS results too — no point re-paying when Apollo had nothing.
+# Backed by the apollo_enrich_cache Supabase table (migration 004) so it
+# survives Railway redeploys. The in-memory dict is a hot cache for the
+# current process — Supabase is consulted on miss.
 _apollo_enrich_cache = {}
 
 def apollo_cache_get(company: str):
-    """Returns ('HIT', person_or_None) or ('MISS', None)."""
+    """Returns ('HIT', person_or_None) or ('MISS', None). Checks the
+    in-process dict first, falls back to the Supabase persistence table."""
     if not company:
         return ("MISS", None)
     key = company.lower().strip()
     hit = _apollo_enrich_cache.get(key)
-    if not hit:
-        return ("MISS", None)
-    expires, person = hit
-    if expires < time.time():
+    if hit:
+        expires, person = hit
+        if expires >= time.time():
+            return ("HIT", person)
         _apollo_enrich_cache.pop(key, None)
+
+    # Persistence-layer lookup. Fail-open: any error → treat as MISS, the
+    # caller will re-query Apollo (worst case: one extra credit).
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/apollo_enrich_cache",
+            headers=SB_HEADERS,
+            params={"company_key": f"eq.{key}",
+                    "select":      "person,expires_at",
+                    "limit":       "1"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return ("MISS", None)
+        rows = r.json()
+        if not rows:
+            return ("MISS", None)
+        row = rows[0]
+        try:
+            expires_dt = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+            expires_ts = expires_dt.timestamp()
+        except Exception:
+            return ("MISS", None)
+        if expires_ts < time.time():
+            return ("MISS", None)
+        person = row.get("person")  # may be None — that's a cached miss, still HIT
+        _apollo_enrich_cache[key] = (expires_ts, person)
+        return ("HIT", person)
+    except Exception as e:
+        print(f"[APOLLO-CACHE] Supabase lookup failed for '{company}': {e}")
         return ("MISS", None)
-    return ("HIT", person)
 
 def apollo_cache_set(company: str, person):
+    """Write through to both the in-memory dict and the Supabase table.
+    Fail-open on the Supabase write — losing persistence is better than
+    blocking the enrichment flow."""
     if not company:
         return
     if len(_apollo_enrich_cache) > 10000:
         _apollo_enrich_cache.clear()
     key = company.lower().strip()
-    _apollo_enrich_cache[key] = (time.time() + APOLLO_ENRICH_CACHE_TTL_HOURS * 3600, person)
+    expires_ts = time.time() + APOLLO_ENRICH_CACHE_TTL_HOURS * 3600
+    _apollo_enrich_cache[key] = (expires_ts, person)
+    try:
+        req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/apollo_enrich_cache",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={
+                "company_key": key,
+                "person":      person,
+                "expires_at":  datetime.utcfromtimestamp(expires_ts).isoformat() + "Z",
+                "updated_at":  datetime.utcnow().isoformat() + "Z",
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[APOLLO-CACHE] Supabase upsert failed for '{company}': {e}")
 
 def phone_reveal_count_this_month() -> int:
     """Count successful 'reveal_phone_requested' audit_log entries since the
@@ -1571,6 +1621,68 @@ def apollo_person_to_lead(person: dict, user: str) -> dict:
     }
     lead["score"] = score_lead(lead)
     return lead
+
+def filter_apollo_dupes(people: list) -> tuple:
+    """Pre-enrichment dedupe: drop Apollo search results that already exist
+    in our leads table. Apollo's /people/match call costs ~1 credit per
+    contact; running it on a lead we already own is paying twice. Match on:
+      1. linkedin_url present in any existing lead's notes column
+      2. (first_name, company) fingerprint, case-insensitive
+    Returns (filtered_people, skipped_count). Fail-open: if the lookup
+    errors, we return the input unchanged rather than block the pull."""
+    if not people:
+        return people, 0
+
+    orgs = set()
+    for p in people:
+        org = ((p.get("organization") or {}).get("name") or "").strip()
+        if org:
+            orgs.add(org)
+    if not orgs:
+        return people, 0
+
+    # PostgREST in.() — wrap each value in double quotes so commas inside
+    # company names ("Acme, Inc.") don't split the list. requests will
+    # URL-encode the quotes for us.
+    org_filter = ",".join('"' + o.replace('"', '\\"') + '"' for o in orgs)
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers=SB_HEADERS,
+            params={
+                "select": "firstName,company,notes",
+                "company": f"in.({org_filter})",
+                "limit":   "5000",
+            },
+            timeout=15,
+        )
+        existing = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"[APOLLO-DEDUPE] existing-lead lookup failed: {e}")
+        return people, 0
+
+    fingerprints = set()
+    linkedins = set()
+    for lead in existing:
+        company = (lead.get("company") or "").strip().lower()
+        first   = (lead.get("firstName") or "").strip().lower()
+        if company and first:
+            fingerprints.add((first, company))
+        m = re.search(r'LinkedIn:\s*(https?://[^\s|]+)', lead.get("notes") or "", re.IGNORECASE)
+        if m:
+            linkedins.add(m.group(1).rstrip('/').lower())
+
+    filtered = []
+    skipped = 0
+    for p in people:
+        first = (p.get("first_name") or "").strip().lower()
+        org   = ((p.get("organization") or {}).get("name") or "").strip().lower()
+        li    = (p.get("linkedin_url") or "").rstrip('/').lower()
+        if (li and li in linkedins) or (first and org and (first, org) in fingerprints):
+            skipped += 1
+            continue
+        filtered.append(p)
+    return filtered, skipped
 
 class ApolloPullRequest(BaseModel):
     # Accept either comma-sep string (legacy) OR list (preferred — avoids the
@@ -2438,7 +2550,7 @@ def cleanup_preview(user: str = Depends(verify_admin)):
             end   = start + PAGE - 1
             r = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads"
-                f"?select=id,company,phone,email,state,city,source,createdAt,assignedTo,status,total_calls"
+                f"?select=id,company,firstName,lastName,phone,email,state,city,source,createdAt,assignedTo,status,total_calls"
                 f"&order=id.asc",
                 headers={**SB_HEADERS, "Range-Unit": "items", "Range": f"{start}-{end}"},
                 timeout=30,
@@ -2507,6 +2619,57 @@ def cleanup_preview(user: str = Depends(verify_admin)):
                            "source": e.get("source")} for e in worth_deleting],
             })
 
+    # ── Duplicate Apollo contacts ─────────────────────────────────────────
+    # Same person (firstName+lastName) at same company appearing in multiple
+    # rows — typically caused by repeat Apollo bulk pulls before the
+    # pre-enrichment dedupe was in place. Keep the row with the most call
+    # activity (preserves history); delete unworked extras only.
+    apollo_groups = {}
+    for l in leads:
+        first = (l.get("firstName") or "").strip().lower()
+        last  = (l.get("lastName")  or "").strip().lower()
+        comp  = (l.get("company")   or "").strip().lower()
+        if not (first and last and comp):
+            continue
+        apollo_groups.setdefault((first, last, comp), []).append(l)
+    dup_apollo_ids = []
+    dup_apollo_samples = []
+    for key, group in apollo_groups.items():
+        if len(group) < 2:
+            continue
+        # Sort by activity DESC, then oldest createdAt ASC — keeps the lead
+        # that's actually been worked, or the original pull if all unworked.
+        group_sorted = sorted(
+            group,
+            key=lambda x: (-(x.get("total_calls") or 0), x.get("createdAt") or ""),
+        )
+        keep = group_sorted[0]
+        extras = group_sorted[1:]
+        worth_deleting = []
+        for e in extras:
+            if e.get("assignedTo"):
+                continue
+            if (e.get("total_calls") or 0) > 0:
+                continue
+            if e.get("status") and e.get("status") != "new":
+                continue
+            worth_deleting.append(e)
+        if not worth_deleting:
+            continue
+        for e in worth_deleting:
+            dup_apollo_ids.append(e["id"])
+        if len(dup_apollo_samples) < 8:
+            dup_apollo_samples.append({
+                "person": f"{key[0].title()} {key[1].title()} @ {keep.get('company')}",
+                "kept":   {"id": keep["id"],
+                           "createdAt": (keep.get("createdAt") or "")[:10],
+                           "total_calls": keep.get("total_calls") or 0,
+                           "source": keep.get("source")},
+                "delete": [{"id": e["id"],
+                            "createdAt": (e.get("createdAt") or "")[:10],
+                            "source": e.get("source")} for e in worth_deleting],
+            })
+
     return {
         "total_leads":   len(leads),
         "categories": {
@@ -2521,6 +2684,12 @@ def cleanup_preview(user: str = Depends(verify_admin)):
                 "count":   len(dup_phone_ids),
                 "ids":     dup_phone_ids,
                 "samples": dup_phone_samples,
+            },
+            "duplicate_apollo_contacts": {
+                "label":   "Same person (firstName+lastName) at same company across multiple rows — keeps most-worked copy, deletes unworked extras",
+                "count":   len(dup_apollo_ids),
+                "ids":     dup_apollo_ids,
+                "samples": dup_apollo_samples,
             },
         },
     }
@@ -2640,6 +2809,12 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     pagination = data.get("pagination") or {}
     print(f"[APOLLO] returned {len(people)} people (total available: {pagination.get('total_entries')})")
 
+    # Pre-enrichment dedupe — drop people we already have in leads before we
+    # spend ~1 credit/each on /people/match. Saves money on repeat searches.
+    people, skipped_already_in_db = filter_apollo_dupes(people)
+    if skipped_already_in_db:
+        print(f"[APOLLO] dedupe: skipped {skipped_already_in_db} already-known contacts before enrichment")
+
     qualified_pairs = []  # list of (lead, original_person) — kept aligned for phone reveal step
     skipped_no_company = 0
     skipped_no_actionable = 0
@@ -2704,7 +2879,9 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "titles": titles, "industries": industries, "locations": locations,
         "employee_range": f"{body.employee_min}-{body.employee_max}",
         "page": payload["page"], "per_page": per_page,
-        "returned": len(people), "qualified": len(leads), "saved": saved,
+        "returned": len(people) + skipped_already_in_db,
+        "qualified": len(leads), "saved": saved,
+        "skipped_already_in_db":   skipped_already_in_db,
         "skipped_no_company":      skipped_no_company,
         "skipped_no_actionable":   skipped_no_actionable,
         "phone_reveals_requested": phone_reveals_requested,
@@ -2727,10 +2904,12 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         )
 
     return {
-        "returned":        len(people),
+        "returned":        len(people) + skipped_already_in_db,
         "qualified":       len(leads),
         "saved":           saved,
-        "skipped":         {"no_company": skipped_no_company, "no_actionable": skipped_no_actionable},
+        "skipped":         {"already_in_db": skipped_already_in_db,
+                            "no_company": skipped_no_company,
+                            "no_actionable": skipped_no_actionable},
         "phone_reveals":   {"requested": phone_reveals_requested,
                             "note": "phones arrive async via webhook within 30s"} if body.reveal_phones else None,
         "total_available": pagination.get("total_entries"),
