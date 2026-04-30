@@ -4838,6 +4838,80 @@ function EligibleEmailQueue(){
   )
 }
 
+// Live count of leads at each step of the 3-touch sequence. Lets the admin
+// see at a glance that past sends are queued for follow-up — no need to
+// curl the API or trust the bg loop is running.
+function EmailSequenceStatus(){
+  const [data,setData] = useState(null)
+  useEffect(()=>{
+    let cancelled = false
+    const tick = ()=>{
+      api("/api/admin/email-sequence/status").then(r=>{ if(!cancelled) setData(r) }).catch(()=>{})
+    }
+    tick()
+    const id = setInterval(tick, 60_000)  // refresh once a minute
+    return ()=>{ cancelled = true; clearInterval(id) }
+  },[])
+  if(!data) return null
+  const total = data.total || 0
+  if(total === 0){
+    return (
+      <div style={{background:"#0f1930",borderRadius:12,padding:"14px 20px",marginTop:24,
+        fontSize:12,color:"#a3aac4",display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontSize:16}}>📭</span>
+        <span>No leads in the email sequence right now.</span>
+      </div>
+    )
+  }
+  const cards = [
+    {key:"step_1", label:"At Touch 1",  next:"Touch 2 next", emoji:"📨", color:"#a3a6ff"},
+    {key:"step_2", label:"At Touch 2",  next:"Touch 3 next", emoji:"📬", color:"#69f6b8"},
+    {key:"step_3", label:"At Touch 3",  next:"Release next", emoji:"🏁", color:"#ffe083"},
+  ]
+  return (
+    <div style={{background:"#0f1930",borderRadius:12,padding:"16px 20px",marginTop:24,overflow:"hidden"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:12}}>
+        <div style={{fontSize:12,color:"#a3aac4",letterSpacing:".08em",textTransform:"uppercase",fontWeight:700}}>
+          📈 Email Sequence — Drip Queue
+        </div>
+        <div style={{fontSize:11,color:"#40485d"}}>
+          {total} lead{total!==1?"s":""} mid-sequence · auto-fires every 10 min
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12}}>
+        {cards.map(c=>{
+          const cell = data[c.key] || {count:0, next_due:null}
+          const isEmpty = cell.count === 0
+          return (
+            <div key={c.key} style={{background:"#060e20",borderRadius:8,padding:"14px 16px",
+              borderLeft:`3px solid ${isEmpty?"#40485d40":c.color}`,opacity:isEmpty?0.5:1}}>
+              <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".06em",textTransform:"uppercase",
+                display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span>{c.emoji} {c.label}</span>
+              </div>
+              <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
+                color:isEmpty?"#40485d":c.color,lineHeight:1.1,marginTop:8}}>
+                {cell.count}
+              </div>
+              <div style={{fontSize:10,color:"#a3aac4",marginTop:6}}>
+                {cell.next_due
+                  ? <>{c.next} on <b style={{color:"#dee5ff"}}>{cell.next_due}</b></>
+                  : <span style={{color:"#40485d"}}>—</span>}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      {data.legacy?.count > 0 && (
+        <div style={{marginTop:10,padding:"8px 12px",background:"#ff6e8410",borderRadius:6,
+          fontSize:11,color:"#ff6e84",borderLeft:"2px solid #ff6e84"}}>
+          ⚠ {data.legacy.count} legacy lead{data.legacy.count!==1?"s":""} (pre-sequence) — run backfill: <code>POST /api/admin/email-sequence/backfill?execute=true</code>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // Three-touch email sequence — admin can edit each step's template separately.
 // Touch 1 fires on caller action; Touches 2 and 3 are auto-fired by the
 // backend bg-loop sequencer at +3 days and +7 days.
@@ -5206,6 +5280,9 @@ function CampaignsPage(){
 
       {/* Pending email queue — EOD batch send for failed-call leads */}
       <EligibleEmailQueue/>
+
+      {/* Drip queue status — proves the auto-sequencer is working on past sends */}
+      <EmailSequenceStatus/>
 
       {/* Email template editor — admin-edits the message that goes out on every send */}
       <EmailTemplateEditor/>

@@ -3884,6 +3884,43 @@ def manual_release_stale_emails(user: str = Depends(verify_admin)):
     released = release_stale_email_leads()
     return {"released": released, "cutoff_days": CAMPAIGN_SUPPRESSION_DAYS}
 
+@app.get("/api/admin/email-sequence/status")
+def email_sequence_status(user: str = Depends(verify_admin)):
+    """Live counts of leads at each step of the 3-touch email sequence so
+    the admin UI can show 'drip is queued' state. Counts only leads in
+    awaiting_email_reply with followupsequence='email_followup'.
+
+      step_1 — Touch 1 sent, Touch 2 next
+      step_2 — Touch 2 sent, Touch 3 next
+      step_3 — Touch 3 sent, release next
+      legacy — followupstep IS NULL (pre-sequence-feature data)"""
+    rows = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/leads"
+        f"?status=eq.awaiting_email_reply"
+        f"&select=followupsequence,followupstep,nextfollowup"
+    )
+    buckets = {1: [], 2: [], 3: [], 0: []}  # 0 = legacy
+    for l in rows:
+        if (l.get("followupsequence") or "") != "email_followup":
+            continue
+        step = l.get("followupstep")
+        if step in (1, 2, 3):
+            buckets[step].append(l)
+        else:
+            buckets[0].append(l)
+
+    def summarize(rs):
+        dates = sorted([r.get("nextfollowup") for r in rs if r.get("nextfollowup")])
+        return {"count": len(rs), "next_due": dates[0] if dates else None}
+
+    return {
+        "step_1": summarize(buckets[1]),  # at step 1 → next event is Touch 2
+        "step_2": summarize(buckets[2]),  # at step 2 → next event is Touch 3
+        "step_3": summarize(buckets[3]),  # at step 3 → next event is release
+        "legacy": {"count": len(buckets[0])},
+        "total":  sum(len(v) for v in buckets.values()),
+    }
+
 @app.post("/api/admin/email-sequence/backfill")
 def email_sequence_backfill(execute: bool = False, user: str = Depends(verify_admin)):
     """Retroactively put legacy leads (followupsequence='email_followup',
