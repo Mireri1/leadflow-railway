@@ -22,6 +22,14 @@ ADMIN_USERS     = set(u.strip().lower() for u in os.getenv("ADMIN_USERS", "eric"
 BLOCKED_USERS   = set(u.strip().lower() for u in os.getenv("BLOCKED_USERS", "").split(",") if u.strip())
 ALGORITHM       = "HS256"
 
+# Pipeline / MCP service-to-service auth. When set, requests presenting this
+# value as a Bearer token (or X-API-Key header) are treated as an admin-level
+# system principal — used by the leadflow-mcp wrapper and other Vision MCP
+# ecosystem services that need read-only programmatic access to LeadFlow data.
+# Empty/unset → static-key auth disabled (UI JWT auth still works).
+PIPELINE_API_KEY = os.getenv("PIPELINE_API_KEY", "").strip()
+PIPELINE_PRINCIPAL = "mcp-pipeline"  # username recorded in audit/logs for key-auth callers
+
 SUPABASE_URL  = os.getenv("SUPABASE_URL", os.getenv("VITE_SUPABASE_URL", ""))
 SUPABASE_KEY  = os.getenv("SUPABASE_KEY", os.getenv("VITE_SUPABASE_KEY", ""))
 # Service role key bypasses RLS — needed for login_log, audit_log, user_sessions
@@ -173,7 +181,24 @@ def create_token(username, role="caller"):
         SECRET_KEY, algorithm=ALGORITHM
     )
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def _check_pipeline_key(request: Request, credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
+    """Return True if the request presents the static PIPELINE_API_KEY via either
+    `Authorization: Bearer <key>` or `X-API-Key: <key>`. Disabled (returns False)
+    when PIPELINE_API_KEY is unset, so we never accept an empty token as auth."""
+    if not PIPELINE_API_KEY:
+        return False
+    if credentials and credentials.credentials == PIPELINE_API_KEY:
+        return True
+    header_key = request.headers.get("x-api-key") if request else None
+    if header_key and header_key == PIPELINE_API_KEY:
+        return True
+    return False
+
+def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    # Static key path first — service-to-service callers (leadflow-mcp) don't
+    # have a UI session, just the shared PIPELINE_API_KEY.
+    if _check_pipeline_key(request, credentials):
+        return PIPELINE_PRINCIPAL
     if not credentials:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -182,7 +207,11 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except (jwt.exceptions.InvalidTokenError, KeyError, Exception):
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def verify_admin(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    # Static-key callers are treated as admin — the key only ships to trusted
+    # backend services (MCPs, internal pipelines), never to end-user UIs.
+    if _check_pipeline_key(request, credentials):
+        return PIPELINE_PRINCIPAL
     if not credentials:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
