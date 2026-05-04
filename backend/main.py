@@ -10,7 +10,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt, os, re, time, json as json_lib, requests as req_lib
 import imaplib, email as email_lib, threading
 from email.header import decode_header
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pydantic import BaseModel
 from urllib.parse import quote as url_quote
@@ -622,6 +622,58 @@ US_STATES_FULL = {
 US_STATE_ABBREVS = set(US_STATES_FULL.keys())
 US_STATE_NAMES = set(v.lower() for v in US_STATES_FULL.values())
 
+# State → IANA timezone mapping for connectivity-rate bucketing. We bucket
+# calls by the *prospect's* local time, not the caller's, because pickup rate
+# is driven by what time it is at the office being dialed (a 9am AZ call to
+# NY = noon Eastern at the receptionist's desk). Multi-zone states use the
+# dominant zone for simplicity — TN/KY/IN/FL/etc. have edge regions in a
+# different zone but the bulk of leads land in the listed zone.
+US_STATE_TIMEZONES = {
+    "AL":"America/Chicago",     "AK":"America/Anchorage",
+    "AZ":"America/Phoenix",     "AR":"America/Chicago",
+    "CA":"America/Los_Angeles", "CO":"America/Denver",
+    "CT":"America/New_York",    "DE":"America/New_York",
+    "FL":"America/New_York",    "GA":"America/New_York",
+    "HI":"Pacific/Honolulu",    "ID":"America/Boise",
+    "IL":"America/Chicago",     "IN":"America/Indiana/Indianapolis",
+    "IA":"America/Chicago",     "KS":"America/Chicago",
+    "KY":"America/New_York",    "LA":"America/Chicago",
+    "ME":"America/New_York",    "MD":"America/New_York",
+    "MA":"America/New_York",    "MI":"America/Detroit",
+    "MN":"America/Chicago",     "MS":"America/Chicago",
+    "MO":"America/Chicago",     "MT":"America/Denver",
+    "NE":"America/Chicago",     "NV":"America/Los_Angeles",
+    "NH":"America/New_York",    "NJ":"America/New_York",
+    "NM":"America/Denver",      "NY":"America/New_York",
+    "NC":"America/New_York",    "ND":"America/Chicago",
+    "OH":"America/New_York",    "OK":"America/Chicago",
+    "OR":"America/Los_Angeles", "PA":"America/New_York",
+    "RI":"America/New_York",    "SC":"America/New_York",
+    "SD":"America/Chicago",     "TN":"America/Chicago",
+    "TX":"America/Chicago",     "UT":"America/Denver",
+    "VT":"America/New_York",    "VA":"America/New_York",
+    "WA":"America/Los_Angeles", "WV":"America/New_York",
+    "WI":"America/Chicago",     "WY":"America/Denver",
+    "DC":"America/New_York",
+    "PR":"America/Puerto_Rico", "VI":"America/Puerto_Rico",
+    "GU":"Pacific/Guam",        "MP":"Pacific/Guam",
+}
+
+def state_to_iana_tz(state) -> str:
+    """Resolve a state value (abbrev or full name) to IANA tz string. Returns
+    empty string if unknown — caller falls back to LEADFLOW_TZ_OFFSET_HOURS."""
+    if not state:
+        return ""
+    s = str(state).strip()
+    if s.upper() in US_STATE_TIMEZONES:
+        return US_STATE_TIMEZONES[s.upper()]
+    # Full-name fallback: "California" → "CA" → tz
+    s_lower = s.lower()
+    for abbrev, full in US_STATES_FULL.items():
+        if full.lower() == s_lower:
+            return US_STATE_TIMEZONES.get(abbrev, "")
+    return ""
+
 def is_us_address(addr):
     """Check if a formatted address looks like it's in the USA"""
     if not addr:
@@ -643,6 +695,35 @@ def is_us_address(addr):
         if part.lower() in US_STATE_NAMES:
             return True
     return False
+
+def is_valid_us_phone(phone) -> bool:
+    """NANP-format check for US phones. Connectivity-rate complaints from
+    callers traced back to Google Places returning rows with empty / 7-digit /
+    all-same-digit / 555-exchange phones. We skip those at capture so the
+    caller never sees a guaranteed-fail dial.
+
+      - 10 digits, or 11 digits starting with 1
+      - Area code first digit must be 2-9 (NANP)
+      - Exchange (4th digit overall) must be 2-9 (NANP)
+      - Rejects all-same-digit (1111111111)
+      - Rejects 555 exchange (fictional/test reservation, not dialable)
+    """
+    if not phone:
+        return False
+    digits = re.sub(r"\D", "", str(phone))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return False
+    if digits[0] in ("0", "1"):
+        return False
+    if digits[3] in ("0", "1"):
+        return False
+    if len(set(digits)) == 1:
+        return False
+    if digits[3:6] == "555":
+        return False
+    return True
 
 def scrape_google_places(keyword="health clinic", state="", limit=25, username="unknown"):
     # Emergency brake. Env PLACES_KILL_SWITCH=1 is an absolute override;
@@ -759,7 +840,11 @@ def scrape_google_places(keyword="health clinic", state="", limit=25, username="
                         except:
                             pass
 
-                # Final validation: must have a company name and valid US state
+                # Final validation: company + US state. Phone validity is
+                # NOT checked here because Apollo enrichment (downstream in
+                # run_scrape) may rescue this row with a DM phone or
+                # actionable name+email even if Google's phone is junk. The
+                # final callable filter runs in run_scrape AFTER enrichment.
                 if lead["company"] and (st.upper() in US_STATE_ABBREVS or not st):
                     leads.append(lead)
                     fetched += 1
@@ -1686,6 +1771,68 @@ def phone_reveal_count_this_month() -> int:
         print(f"[APOLLO-BUDGET] count query failed: {e}")
         return 0  # fail-open
 
+def _check_apollo_budget_alert():
+    """Fire a Slack alert when phone-reveal usage crosses 80% or 95% of the
+    monthly cap. Idempotent per-threshold-per-month — uses app_settings to
+    track which thresholds we've already alerted on, so the same threshold
+    doesn't spam Slack on every reveal in the danger zone. Resets monthly."""
+    cap = APOLLO_PHONE_REVEAL_MONTHLY_CAP
+    if not cap or cap <= 0:
+        return
+    used = phone_reveal_count_this_month()
+    pct = (used / cap) * 100
+    THRESHOLDS = [80, 95]
+    crossed = [t for t in THRESHOLDS if pct >= t]
+    if not crossed:
+        return
+
+    month_key = datetime.utcnow().strftime("%Y-%m")
+    state_key = "apollo_budget_alert_state"
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{state_key}&select=value",
+            headers=SB_HEADERS, timeout=5,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        cur = json_lib.loads(rows[0]["value"]) if rows and rows[0].get("value") else {}
+    except Exception:
+        cur = {}
+
+    if cur.get("month") != month_key:
+        cur = {"month": month_key, "alerted_at": []}
+
+    new_thresholds = [t for t in crossed if t not in cur.get("alerted_at", [])]
+    if not new_thresholds:
+        return
+    fire_threshold = max(new_thresholds)
+
+    icon = ":rotating_light:" if fire_threshold >= 95 else ":warning:"
+    next_step = ("Hard cap nearly reached — reveals will start returning "
+                 "'budget exhausted' to the caller. Raise APOLLO_PHONE_REVEAL_MONTHLY_CAP "
+                 "or pause bulk pulls until next month.") \
+                if fire_threshold >= 95 else \
+                ("Approaching cap — consider pausing bulk Apollo pulls or "
+                 "raising APOLLO_PHONE_REVEAL_MONTHLY_CAP if the spend pencils out.")
+    try:
+        send_slack(
+            f"{icon} Apollo phone-reveal budget at {fire_threshold}%",
+            f"Used *{used}/{cap}* phone reveals this month ({pct:.0f}%). {next_step}",
+        )
+    except Exception as e:
+        print(f"[APOLLO-BUDGET-ALERT] Slack send failed: {e}")
+        return
+
+    cur.setdefault("alerted_at", []).extend(new_thresholds)
+    try:
+        req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/app_settings",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"key": state_key, "value": json_lib.dumps(cur)},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[APOLLO-BUDGET-ALERT] state persist failed: {e}")
+
 def can_reveal_phone(lead: dict):
     """Returns (allowed: bool, reason: str). Enforces industry allowlist + monthly cap."""
     industry = (lead.get("industry") or "").strip().lower()
@@ -1922,6 +2069,26 @@ def apollo_person_to_lead(person: dict, user: str) -> dict:
     lead["score"] = score_lead(lead)
     return lead
 
+def _apollo_person_is_us(person: dict) -> bool:
+    """Belt-and-suspenders US filter for Apollo /mixed_people results.
+
+    Even with person_locations='United States', Apollo's matcher is loose —
+    Filipino call-center managers, Indian ops directors, Canadian property
+    managers slip through. The api_search response includes `country` and
+    `state` directly on each person and on the org; we accept only if at
+    least one of those resolves to US. Empty country + empty US-state =
+    reject (better to miss a few than spend match credits on a UK lead)."""
+    org = person.get("organization") or {}
+    country = (person.get("country") or org.get("country") or "").strip().lower()
+    state   = (person.get("state")   or org.get("state")   or "").strip()
+    state_is_us = (state.upper() in US_STATE_ABBREVS) or (state.lower() in US_STATE_NAMES)
+    us_country_aliases = {"united states", "usa", "us", "u.s.", "u.s.a.", "united states of america"}
+    if country in us_country_aliases:
+        return True
+    if not country and state_is_us:
+        return True
+    return False
+
 def filter_apollo_dupes(people: list) -> tuple:
     """Pre-enrichment dedupe: drop Apollo search results that already exist
     in our leads table. Apollo's /people/match call costs ~1 credit per
@@ -2137,13 +2304,34 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
                 apollo_enriched += 1
         print(f"[SCRAPE] Apollo enriched {apollo_enriched}/{len(leads)} leads with DM info")
 
+    # Callable-lead filter, runs AFTER Apollo enrichment so a bad-Google-phone
+    # row gets rescued by Apollo's DM phone (when available) or kept for email
+    # outreach when Apollo gave us a name+email. Drop only the rows that have
+    # neither a dialable number nor a usable DM contact — those are guaranteed
+    # disconnects + dead emails, the caller's connectivity-rate killers.
+    pre_filter_count = len(leads)
+    callable_leads = []
+    for lead in leads:
+        ph = (lead.get("phone") or "").strip()
+        em = (lead.get("email") or "").strip()
+        has_phone = is_valid_us_phone(ph)
+        has_email = "@" in em and "." in em.split("@")[-1]
+        has_dm    = bool(lead.get("firstName"))
+        if has_phone or (has_dm and has_email):
+            callable_leads.append(lead)
+        # else: drop — no dialable phone AND no DM email = uncallable
+    dropped_uncallable = pre_filter_count - len(callable_leads)
+    leads = callable_leads
+    print(f"[SCRAPE] Callable filter: {len(leads)} kept, {dropped_uncallable} dropped (no phone + no DM email)")
+
     saved = save_to_supabase(leads)
     audit_log(user, "scrape_leads", "lead", None, {
         "industries": [k[0] for k in keywords], "state": body.state,
-        "cities": body.cities, "found": len(leads), "saved": saved,
+        "cities": body.cities, "found": pre_filter_count, "saved": saved,
         "cache_hits": len(cache_hits), "uncached_combos": uncached,
-        "apollo_enriched": apollo_enriched})
-    print(f"[SCRAPE] Saved {saved} leads (cache_hits={len(cache_hits)}/{len(all_combos)}, apollo_enriched={apollo_enriched})")
+        "apollo_enriched": apollo_enriched,
+        "dropped_uncallable": dropped_uncallable})
+    print(f"[SCRAPE] Saved {saved} leads (cache_hits={len(cache_hits)}/{len(all_combos)}, apollo_enriched={apollo_enriched}, dropped={dropped_uncallable})")
 
     # Slack notification
     if saved > 0:
@@ -2156,6 +2344,8 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
         ]
         if apollo_enriched > 0:
             fields.append({"label": "DM Enriched (Apollo)", "value": f":telephone_receiver: {apollo_enriched}"})
+        if dropped_uncallable > 0:
+            fields.append({"label": "Dropped (uncallable)", "value": f":no_entry: {dropped_uncallable}"})
         send_slack(
             "🔍 LeadFlow Scrape Complete",
             f"*{user}* scraped *{saved}* new leads.",
@@ -2169,6 +2359,8 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
         "saved": saved,
         "cacheHits": len(cache_hits),
         "combos":    len(all_combos),
+        "apolloEnriched":    apollo_enriched,
+        "droppedUncallable": dropped_uncallable,
     }
 
 @app.get("/api/usage")
@@ -2521,12 +2713,17 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                 headers=SB_HEADERS, timeout=30)
             rows = lr.json() if lr.status_code == 200 else []
             lead_full = rows[0] if rows else {}
+            # Always bump updatedAt so the lead card surfaces "last contacted"
+            # date+time — caller uses this to adjust dial timing for non-answers
+            # (don't keep retrying at the same hour). Auto-claim if unassigned.
+            patch_payload = {"updatedAt": datetime.utcnow().isoformat()}
             if lead_full and not lead_full.get("assignedTo"):
-                req_lib.patch(
-                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
-                    headers=SB_HEADERS,
-                    json={"assignedTo": caller},
-                    timeout=30)
+                patch_payload["assignedTo"] = caller
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+                headers=SB_HEADERS,
+                json=patch_payload,
+                timeout=30)
 
             # Email follow-up trigger. Two paths:
             #   (a) Caller checked "Send follow-up email" in the modal → fire now,
@@ -2750,15 +2947,17 @@ def followup_call(call_id: str, body: dict, user: str = Depends(verify_admin)):
 def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
                      user: str = Depends(verify_token)):
     try:
-        url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*&order=calledAt.desc&limit=1000"
+        # Paginate via _paginated_get — Supabase caps single-request returns
+        # at 1000 rows, so the analytics tab's "Calls Made" was stuck at 1000
+        # the moment lifetime calls crossed that threshold.
+        url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*&order=calledAt.desc"
         if date_from:
             url += f"&calledAt=gte.{date_from}T00:00:00"
         if date_to:
             url += f"&calledAt=lte.{date_to}T23:59:59"
         if caller:
             url += f"&calledBy=eq.{caller}"
-        r = req_lib.get(url, headers=SB_HEADERS, timeout=30)
-        calls = r.json() if r.status_code == 200 else []
+        calls = _paginated_get(url)
         if not isinstance(calls, list):
             return {"calls": [], "summary": {}, "callers": []}
 
@@ -2941,6 +3140,53 @@ def cleanup_preview(user: str = Depends(verify_admin)):
                            "source": e.get("source")} for e in worth_deleting],
             })
 
+    # ── Non-NANP phone numbers (caller can't dial these) ─────────────────
+    # Connectivity-rate complaints traced to Google-Places rows whose phones
+    # don't match NANP (wrong digit count, 0/1 area code, all-same-digit, 555
+    # exchange). Only flag rows with no email backup so deletion can't strand
+    # an active email outreach. Skip anything assigned/worked.
+    bad_phone_ids = []
+    bad_phone_samples = []
+    for l in leads:
+        ph = (l.get("phone") or "").strip()
+        if not ph or is_valid_us_phone(ph):
+            continue
+        em = (l.get("email") or "").strip()
+        has_email = "@" in em and "." in em.split("@")[-1]
+        if has_email:
+            continue
+        if l.get("assignedTo") or (l.get("total_calls") or 0) > 0:
+            continue
+        if l.get("status") and l.get("status") != "new":
+            continue
+        bad_phone_ids.append(l["id"])
+        if len(bad_phone_samples) < 12:
+            bad_phone_samples.append({
+                "id": l["id"], "company": l.get("company"),
+                "phone": ph, "source": l.get("source"),
+            })
+
+    # ── No phone AND no email = totally unreachable ──────────────────────
+    no_contact_ids = []
+    no_contact_samples = []
+    for l in leads:
+        ph = (l.get("phone") or "").strip()
+        em = (l.get("email") or "").strip()
+        has_phone = bool(ph)
+        has_email = "@" in em and "." in em.split("@")[-1]
+        if has_phone or has_email:
+            continue
+        if l.get("assignedTo") or (l.get("total_calls") or 0) > 0:
+            continue
+        if l.get("status") and l.get("status") != "new":
+            continue
+        no_contact_ids.append(l["id"])
+        if len(no_contact_samples) < 12:
+            no_contact_samples.append({
+                "id": l["id"], "company": l.get("company"),
+                "city": l.get("city"), "source": l.get("source"),
+            })
+
     # ── Duplicate Apollo contacts ─────────────────────────────────────────
     # Same person at same company appearing in multiple rows — typically
     # caused by repeat Apollo bulk pulls before the pre-enrichment dedupe
@@ -2985,6 +3231,18 @@ def cleanup_preview(user: str = Depends(verify_admin)):
                 "count":   len(dup_apollo_ids),
                 "ids":     dup_apollo_ids,
                 "samples": dup_apollo_samples,
+            },
+            "bad_phone": {
+                "label":   "Bad / non-dialable phone (fails NANP) and no email backup — pure connectivity-rate drag",
+                "count":   len(bad_phone_ids),
+                "ids":     bad_phone_ids,
+                "samples": bad_phone_samples,
+            },
+            "no_contact": {
+                "label":   "No phone AND no email — totally unreachable (unworked rows only)",
+                "count":   len(no_contact_ids),
+                "ids":     no_contact_ids,
+                "samples": no_contact_samples,
             },
         },
     }
@@ -3054,6 +3312,461 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Last-contacted backfill + connectivity-rate analytics ──────────────────
+# log_call now bumps lead.updatedAt on every call, but that's only forward-
+# looking — the backfill walks call_outcomes once to retroactively pin
+# updatedAt to the most recent calledAt for each lead, so the cards show
+# accurate "last contacted" timestamps for historical data.
+
+# Local timezone for connectivity bucketing. Defaults to Phoenix (MST, no
+# DST) since Vision is in AZ; override with LEADFLOW_TZ_OFFSET_HOURS for
+# other deployments. UTC offset in hours, can be negative.
+LEADFLOW_TZ_OFFSET_HOURS = int(os.getenv("LEADFLOW_TZ_OFFSET_HOURS", "-7"))
+
+@app.post("/api/admin/leads/backfill-last-contacted")
+def backfill_last_contacted(user: str = Depends(verify_admin)):
+    """One-shot: walk call_outcomes, pin each lead's updatedAt to the most
+    recent calledAt. Idempotent (only updates when calledAt > current
+    updatedAt). Surfaces accurate 'last contacted' timestamps on lead cards
+    for leads that were called before the log_call updatedAt-bump fix."""
+    PAGE = 1000
+    last_call_per_lead = {}  # leadId → max calledAt ISO string
+
+    # Walk every call_outcome row in pages, build {leadId: max calledAt}
+    for page in range(100):  # 100K-call ceiling fail-safe
+        start = page * PAGE
+        end   = start + PAGE - 1
+        try:
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                f"?select=leadId,calledAt&order=calledAt.desc",
+                headers={**SB_HEADERS, "Range-Unit": "items", "Range": f"{start}-{end}"},
+                timeout=30,
+            )
+            batch = r.json() if r.status_code in (200, 206) else []
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"call_outcomes page {page} fetch failed: {e}")
+        if not isinstance(batch, list) or not batch:
+            break
+        for c in batch:
+            lid = c.get("leadId")
+            ts  = c.get("calledAt")
+            if not lid or not ts:
+                continue
+            cur = last_call_per_lead.get(lid)
+            if not cur or ts > cur:
+                last_call_per_lead[lid] = ts
+        if len(batch) < PAGE:
+            break
+
+    if not last_call_per_lead:
+        return {"calls_processed": 0, "leads_updated": 0,
+                "leads_with_calls": 0, "skipped_already_current": 0}
+
+    # Fetch current updatedAt for every affected lead in batches, then patch
+    # only the rows where the call timestamp is newer (idempotent re-runs).
+    BATCH = 50
+    lead_ids = list(last_call_per_lead.keys())
+    updated = 0
+    skipped_current = 0
+    failed = 0
+    for i in range(0, len(lead_ids), BATCH):
+        batch_ids = lead_ids[i:i+BATCH]
+        ids_filter = ",".join(str(x) for x in batch_ids)
+        try:
+            cr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})&select=id,updatedAt",
+                headers=SB_HEADERS, timeout=30,
+            )
+            current = cr.json() if cr.status_code == 200 else []
+        except Exception as e:
+            print(f"[BACKFILL-LC] fetch batch {i} failed: {e}")
+            failed += len(batch_ids)
+            continue
+        if not isinstance(current, list):
+            continue
+        for lead in current:
+            lid = lead.get("id")
+            current_ts = lead.get("updatedAt") or ""
+            new_ts = last_call_per_lead.get(lid)
+            if not new_ts:
+                continue
+            if new_ts <= current_ts:
+                skipped_current += 1
+                continue
+            try:
+                pr = req_lib.patch(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lid}",
+                    headers=SB_HEADERS,
+                    json={"updatedAt": new_ts},
+                    timeout=10,
+                )
+                if pr.status_code in (200, 204):
+                    updated += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"[BACKFILL-LC] patch lead {lid} failed: {e}")
+                failed += 1
+
+    audit_log(user, "backfill_last_contacted", "lead", None, {
+        "leads_with_calls": len(last_call_per_lead),
+        "leads_updated":    updated,
+        "skipped_current":  skipped_current,
+        "failed":           failed,
+    })
+    return {
+        "leads_with_calls":         len(last_call_per_lead),
+        "leads_updated":            updated,
+        "skipped_already_current":  skipped_current,
+        "failed":                   failed,
+    }
+
+@app.get("/api/analytics/connectivity")
+def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)):
+    """Day-of-week × hour-of-day connectivity heatmap from call_outcomes.
+
+    Bucketed by the *prospect's* local time (lead.state → IANA tz, DST-aware
+    via zoneinfo). Pickup rate is driven by what hour it is at the office
+    being dialed, not the caller's clock — a 9am AZ call to NY = noon
+    Eastern at the receptionist's desk, and that's the bucket that matters.
+
+    Reports total/pickup/voicemail/no_answer per bucket plus pickup_rate.
+    'Pickup' = real human (answered, interested, not_interested, callback,
+    converted); voicemail + no_answer split out so 'no one home' vs 'human
+    there but won't engage' are visible separately.
+
+    For calls whose lead has no state or an unknown state, falls back to
+    LEADFLOW_TZ_OFFSET_HOURS (default Phoenix). Counted in fallback_calls
+    so admins can see if the heatmap is being watered down.
+    """
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None  # type: ignore  # Python <3.9 fallback to fixed offset
+    days = max(1, min(int(days or 90), 365))
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    # Fetch calls (with leadId so we can join lead.state) and the leads they
+    # touched. Both paginated to dodge the 1000-row Supabase cap.
+    calls = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes"
+        f"?select=outcome,calledAt,leadId&calledAt=gte.{since}&order=calledAt.desc"
+    )
+
+    # Lead-state lookup: only the leadIds we actually saw, batched to keep
+    # the in.() filter URL under ~8KB. Builds {leadId: state} for tz lookup.
+    lead_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
+    lead_state = {}
+    BATCH = 200
+    for i in range(0, len(lead_ids), BATCH):
+        chunk = lead_ids[i:i+BATCH]
+        try:
+            ids_filter = ",".join(str(x) for x in chunk)
+            lr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})&select=id,state",
+                headers=SB_HEADERS, timeout=30,
+            )
+            rows = lr.json() if lr.status_code == 200 else []
+            if isinstance(rows, list):
+                for row in rows:
+                    if row.get("id"):
+                        lead_state[row["id"]] = (row.get("state") or "").strip()
+        except Exception as e:
+            print(f"[CONNECTIVITY] lead-state batch {i} fetch failed: {e}")
+
+    DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    PICKUP_OUTCOMES    = {"answered", "interested", "not_interested", "callback", "converted"}
+    VOICEMAIL_OUTCOMES = {"voicemail"}
+
+    # Cache ZoneInfo objects per tz string (cheap, but no need to re-build per call)
+    tz_cache = {}
+    def get_tz(tz_str):
+        if not ZoneInfo or not tz_str:
+            return None
+        z = tz_cache.get(tz_str)
+        if z is None:
+            try:
+                z = ZoneInfo(tz_str)
+            except Exception:
+                z = None
+            tz_cache[tz_str] = z
+        return z
+
+    buckets = {}
+    parse_failures = 0
+    fallback_calls = 0  # calls bucketed via fixed offset (state unknown / pre-3.9 Python)
+    state_counts = {}   # {state: bucketed_count} — observability
+    state_buckets = {}  # {state: {total, pickup, voicemail, no_answer}} — per-state pickup rate
+    for c in calls:
+        ts = c.get("calledAt") or ""
+        try:
+            clean_ts = ts.replace("Z", "").split("+")[0].split(".")[0]
+            dt_utc = datetime.fromisoformat(clean_ts).replace(tzinfo=timezone.utc)
+        except Exception:
+            parse_failures += 1
+            continue
+
+        lid = c.get("leadId")
+        state = lead_state.get(lid, "") if lid else ""
+        state_key = (state.upper() if len(state) == 2 else state) or "(unset)"
+        iana = state_to_iana_tz(state)
+        tz = get_tz(iana) if iana else None
+        if tz is not None:
+            dt_local = dt_utc.astimezone(tz)
+            state_counts[state_key] = state_counts.get(state_key, 0) + 1
+        else:
+            # Fallback: fixed offset (caller's tz default). Used when lead has
+            # no state, an unrecognized state, or zoneinfo is unavailable.
+            dt_local = (dt_utc + timedelta(hours=LEADFLOW_TZ_OFFSET_HOURS)).replace(tzinfo=None)
+            fallback_calls += 1
+
+        day_idx = dt_local.weekday()
+        hour    = dt_local.hour
+        key     = (day_idx, hour)
+        if key not in buckets:
+            buckets[key] = {"total": 0, "pickup": 0, "voicemail": 0, "no_answer": 0}
+        buckets[key]["total"] += 1
+        if state_key not in state_buckets:
+            state_buckets[state_key] = {"total": 0, "pickup": 0, "voicemail": 0, "no_answer": 0}
+        state_buckets[state_key]["total"] += 1
+        outcome = (c.get("outcome") or "").lower()
+        if outcome in PICKUP_OUTCOMES:
+            buckets[key]["pickup"] += 1
+            state_buckets[state_key]["pickup"] += 1
+        elif outcome in VOICEMAIL_OUTCOMES:
+            buckets[key]["voicemail"] += 1
+            state_buckets[state_key]["voicemail"] += 1
+        else:
+            buckets[key]["no_answer"] += 1
+            state_buckets[state_key]["no_answer"] += 1
+
+    windows = []
+    for (day_idx, hour), counts in sorted(buckets.items()):
+        rate = (counts["pickup"] / counts["total"] * 100) if counts["total"] else 0
+        windows.append({
+            "day":          DAYS[day_idx],
+            "day_idx":      day_idx,
+            "hour":         hour,
+            "total":        counts["total"],
+            "pickup":       counts["pickup"],
+            "voicemail":    counts["voicemail"],
+            "no_answer":    counts["no_answer"],
+            "pickup_rate":  round(rate, 1),
+        })
+
+    MIN_SAMPLE = 5
+    significant = [w for w in windows if w["total"] >= MIN_SAMPLE]
+    best  = sorted(significant, key=lambda w: -w["pickup_rate"])[:5]
+    worst = sorted(significant, key=lambda w:  w["pickup_rate"])[:5]
+
+    overall_total  = sum(w["total"]  for w in windows)
+    overall_pickup = sum(w["pickup"] for w in windows)
+    overall_rate   = (overall_pickup / overall_total * 100) if overall_total else 0
+
+    # Per-state rollup — sorted by volume so highest-impact states appear first.
+    # Pickup rate is meaningful at ≥10 dials per state to avoid noisy ranks.
+    state_rows = []
+    for st, b in state_buckets.items():
+        rate = (b["pickup"] / b["total"] * 100) if b["total"] else 0
+        state_rows.append({
+            "state":       st,
+            "total":       b["total"],
+            "pickup":      b["pickup"],
+            "voicemail":   b["voicemail"],
+            "no_answer":   b["no_answer"],
+            "pickup_rate": round(rate, 1),
+        })
+    state_rows.sort(key=lambda r: -r["total"])
+
+    return {
+        "since":           since,
+        "days_analyzed":   days,
+        "tz_strategy":     "prospect_local" if ZoneInfo else "fixed_offset_only",
+        "tz_offset_hours_fallback": LEADFLOW_TZ_OFFSET_HOURS,
+        "windows":         windows,
+        "best_windows":    best,
+        "worst_windows":   worst,
+        "state_counts":    state_counts,
+        "state_breakdown": state_rows,
+        "summary": {
+            "total_calls":          overall_total,
+            "overall_pickup_rate":  round(overall_rate, 1),
+            "min_sample_for_rank":  MIN_SAMPLE,
+            "parse_failures":       parse_failures,
+            "fallback_calls":       fallback_calls,
+        },
+    }
+
+@app.get("/api/analytics/insights")
+def get_insights(days: int = 90, user: str = Depends(verify_token)):
+    """Three insights bundled in one call (one paginated leads + calls fetch
+    feeds all three — cheaper than three separate endpoints):
+
+      1. Apollo ROI — conversion + engagement + contact rate, broken down by
+         lead source bucket (Apollo direct / Apollo-enriched Google Places /
+         Google-only / other). Tells you whether Apollo credits are paying off.
+
+      2. Touch-count to conversion — for every status=converted lead,
+         distribution of how many calls it took to convert. Median + mean +
+         cumulative %. Tells you when to give up vs keep dialing.
+
+      3. Stale callbacks — leads with status=callback whose callbackDate is in
+         the past and have no call logged since the callback was scheduled.
+         Direct leakage: scheduled commitments your caller forgot.
+    """
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    days = max(1, min(int(days or 90), 365))
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+
+    leads = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/leads"
+        f"?select=id,company,source,status,firstName,assignedTo,callbackDate,total_calls,createdAt"
+    )
+    calls = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes"
+        f"?select=leadId,outcome,calledAt&calledAt=gte.{since}"
+    )
+
+    # ── Apollo ROI ───────────────────────────────────────────────────────
+    # Source-bucket inference:
+    #   apollo_direct   = source="Apollo" (admin bulk pull of DM contacts)
+    #   apollo_enriched = source="Google Places" + has firstName (Apollo's
+    #                     auto-enrichment found a DM at the company)
+    #   gp_only         = source="Google Places" + no firstName (Apollo
+    #                     missed or wasn't run — switchboard-only contact)
+    #   other           = CSV imports, manual creates, anything else
+    bucket_defs = [
+        ("apollo_direct",   "Apollo direct (bulk DM pull)"),
+        ("apollo_enriched", "Apollo-enriched (Google Places + DM)"),
+        ("gp_only",         "Google Places only (no DM)"),
+        ("other",           "Manual / CSV / other"),
+    ]
+    buckets = {k: {"name": n, "total": 0, "converted": 0, "interested": 0,
+                   "callback": 0, "contacted": 0}
+               for k, n in bucket_defs}
+    for l in leads:
+        src     = (l.get("source") or "").strip()
+        has_dm  = bool((l.get("firstName") or "").strip())
+        if src == "Apollo":
+            key = "apollo_direct"
+        elif src == "Google Places":
+            key = "apollo_enriched" if has_dm else "gp_only"
+        else:
+            key = "other"
+        b = buckets[key]
+        b["total"] += 1
+        status = (l.get("status") or "").strip()
+        if status == "converted":   b["converted"]  += 1
+        elif status == "interested":b["interested"] += 1
+        elif status == "callback":  b["callback"]   += 1
+        if (l.get("total_calls") or 0) > 0:
+            b["contacted"] += 1
+
+    apollo_roi = []
+    for k, _name in bucket_defs:
+        b = buckets[k]
+        t = b["total"]
+        engaged = b["converted"] + b["interested"] + b["callback"]
+        apollo_roi.append({
+            "key":             k,
+            "name":            b["name"],
+            "total":           t,
+            "converted":       b["converted"],
+            "interested":      b["interested"],
+            "callback":        b["callback"],
+            "contacted":       b["contacted"],
+            "conv_rate":       round((b["converted"] / t * 100), 1) if t else 0.0,
+            "engagement_rate": round((engaged       / t * 100), 1) if t else 0.0,
+            "contact_rate":    round((b["contacted"]/ t * 100), 1) if t else 0.0,
+        })
+
+    # ── Touch-count to conversion ────────────────────────────────────────
+    calls_by_lead = {}
+    for c in calls:
+        lid = c.get("leadId")
+        if lid:
+            calls_by_lead.setdefault(lid, []).append(c)
+
+    converted_lead_ids = [l["id"] for l in leads
+                          if l.get("status") == "converted" and l.get("id")]
+    touch_counts = []
+    touch_dist = {}
+    for lid in converted_lead_ids:
+        n = len(calls_by_lead.get(lid, []))
+        if n == 0:
+            continue  # converted with no calls in the window — skip (probably outside our window)
+        touch_counts.append(n)
+        touch_dist[n] = touch_dist.get(n, 0) + 1
+
+    distribution = [{"touches": k, "count": v} for k, v in sorted(touch_dist.items())]
+    median_touches = 0
+    mean_touches   = 0.0
+    p75_touches    = 0
+    if touch_counts:
+        sorted_tc = sorted(touch_counts)
+        n = len(sorted_tc)
+        median_touches = sorted_tc[n//2] if n % 2 else (sorted_tc[n//2-1] + sorted_tc[n//2]) / 2
+        mean_touches   = round(sum(sorted_tc) / n, 1)
+        p75_idx        = max(0, int(n * 0.75) - 1)
+        p75_touches    = sorted_tc[p75_idx]
+
+    cumulative = []
+    if touch_counts:
+        running = 0
+        total_conv = len(touch_counts)
+        for k, v in sorted(touch_dist.items()):
+            running += v
+            cumulative.append({"by_touch": k,
+                              "pct": round(running / total_conv * 100, 1)})
+
+    # ── Stale callbacks ──────────────────────────────────────────────────
+    stale = []
+    for l in leads:
+        if l.get("status") != "callback":
+            continue
+        cb_date = (l.get("callbackDate") or "").strip()
+        if not cb_date or cb_date >= today_iso:
+            continue
+        # No call logged since the callback was due?
+        recent = [c for c in calls_by_lead.get(l.get("id"), [])
+                  if (c.get("calledAt") or "") >= cb_date + "T00:00:00"]
+        if recent:
+            continue
+        stale.append(l)
+    stale.sort(key=lambda x: x.get("callbackDate") or "")
+    stale_samples = [{
+        "id":           s["id"],
+        "company":      s.get("company"),
+        "callbackDate": s.get("callbackDate"),
+        "assignedTo":   s.get("assignedTo"),
+        "days_overdue": (datetime.strptime(today_iso, "%Y-%m-%d")
+                          - datetime.strptime(s.get("callbackDate"), "%Y-%m-%d")).days
+                          if s.get("callbackDate") else 0,
+    } for s in stale[:20]]
+
+    return {
+        "since":         since,
+        "days_analyzed": days,
+        "apollo_roi":    apollo_roi,
+        "touch_count": {
+            "distribution":    distribution,
+            "cumulative_pct":  cumulative,
+            "median":          median_touches,
+            "mean":            mean_touches,
+            "p75":             p75_touches,
+            "converted_count": len(touch_counts),
+        },
+        "stale_callbacks": {
+            "count":   len(stale),
+            "samples": stale_samples,
+        },
+    }
+
 @app.post("/api/admin/apollo/pull")
 def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     """Pull decision-maker contacts from Apollo and insert into leads.
@@ -3067,10 +3780,16 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     locations  = _to_str_list(body.locations)
     per_page   = max(1, min(body.per_page or 25, 100))
 
+    # US-only enforcement at the API layer. If the caller didn't pass any
+    # locations, Apollo returns global results — that's how Filipino /
+    # Indian / Canadian contacts were leaking in. Always anchor to US.
+    if not locations:
+        locations = ["United States"]
+
     payload = {"page": body.page or 1, "per_page": per_page}
     if titles:     payload["person_titles"] = titles
     if industries: payload["q_organization_industries"] = industries
-    if locations:  payload["person_locations"] = locations
+    payload["person_locations"] = locations
     if body.employee_min and body.employee_max:
         payload["organization_num_employees_ranges"] = [f"{body.employee_min},{body.employee_max}"]
 
@@ -3113,7 +3832,16 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     qualified_pairs = []  # list of (lead, original_person) — kept aligned for phone reveal step
     skipped_no_company = 0
     skipped_no_actionable = 0
+    skipped_non_us = 0
     for person in people:
+        # Drop non-US results BEFORE the /people/match credit spend. Apollo's
+        # location filter is permissive (matches "California" against e.g.
+        # "California, Wales"); the api_search response has `country` and
+        # `state` per person, so we double-check here.
+        if not _apollo_person_is_us(person):
+            skipped_non_us += 1
+            continue
+
         # Unlock email + last name via /people/match (~1 credit). api_search alone
         # masks these on Pro tier — match is the only way to make leads dialable.
         enriched = apollo_enrich_person(person)
@@ -3169,6 +3897,10 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
                 # Audit-log per reveal so the budget counter stays accurate
                 audit_log(user, "reveal_phone_requested", "lead", saved_row["id"],
                           {"company": lead.get("company"), "via": "bulk_pull"})
+        # Fire a single budget-threshold check after the whole batch (vs once
+        # per reveal) — minimizes Slack spam during a 25-lead bulk pull.
+        if phone_reveals_requested:
+            _check_apollo_budget_alert()
 
     audit_log(user, "apollo_pull", "lead", None, {
         "titles": titles, "industries": industries, "locations": locations,
@@ -3177,6 +3909,7 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "returned": len(people) + skipped_already_in_db,
         "qualified": len(leads), "saved": saved,
         "skipped_already_in_db":   skipped_already_in_db,
+        "skipped_non_us":          skipped_non_us,
         "skipped_no_company":      skipped_no_company,
         "skipped_no_actionable":   skipped_no_actionable,
         "phone_reveals_requested": phone_reveals_requested,
@@ -3203,7 +3936,8 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "qualified":       len(leads),
         "saved":           saved,
         "skipped":         {"already_in_db": skipped_already_in_db,
-                            "no_company": skipped_no_company,
+                            "non_us":        skipped_non_us,
+                            "no_company":    skipped_no_company,
                             "no_actionable": skipped_no_actionable},
         "phone_reveals":   {"requested": phone_reveals_requested,
                             "note": "phones arrive async via webhook within 30s"} if body.reveal_phones else None,
@@ -3406,6 +4140,7 @@ def reveal_phone(lead_id: str, user: str = Depends(verify_token)):
         return {"requested": False, "message": f"Apollo rejected the request: {detail}"}
 
     audit_log(user, "reveal_phone_requested", "lead", lead_id, {"company": lead.get("company")})
+    _check_apollo_budget_alert()
     return {"requested": True,
             "message": "Apollo is searching — phone will appear within 30 seconds. Refresh the lead to see it."}
 
@@ -4472,25 +5207,22 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
         else:
             since = today
 
-        # Calls (filtered by range or all-time)
+        # Paginate every Supabase fetch — single requests cap at 1000 rows,
+        # which silently truncated leaderboard totals once the team crossed
+        # 1000 lifetime calls (or 1000 in any window). Same root cause as
+        # the /api/leads + /api/stats fix in commit 6142f2c.
         calls_url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration"
         if since:
             calls_url += f"&calledAt=gte.{since}T00:00:00"
-        r1 = req_lib.get(calls_url, headers=SB_HEADERS, timeout=30)
-        # Leads for assignment + population tracking
-        r2 = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo,status,score,createdBy,createdAt",
-            headers=SB_HEADERS, timeout=30)
-        # Sessions for sign-in tracking
+        calls = _paginated_get(calls_url)
+        leads = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo,status,score,createdBy,createdAt"
+        )
         sess_url = f"{SUPABASE_URL}/rest/v1/user_sessions?select=username,signed_in,signed_out"
         if since:
             sess_url += f"&signed_in=gte.{since}T00:00:00"
         sess_url += "&order=signed_in.desc"
-        r3 = req_lib.get(sess_url, headers=SB_HEADERS, timeout=30)
-
-        calls = r1.json() if r1.status_code == 200 else []
-        leads = r2.json() if r2.status_code == 200 else []
-        sessions = r3.json() if r3.status_code == 200 else []
+        sessions = _paginated_get(sess_url)
         if not isinstance(sessions, list):
             sessions = []
 

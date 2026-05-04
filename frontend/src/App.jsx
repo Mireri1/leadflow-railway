@@ -83,6 +83,22 @@ const emptyForm = {
   assignedTo:"",notes:"",source:"",callbackDate:"",
 }
 
+// NANP-format check for US phones — mirrors backend is_valid_us_phone().
+// Used to skip bad-phone leads from the dialer view so the caller never
+// sees a guaranteed-fail dial. Same rules as backend (10/11 digits, area
+// code + exchange first digit 2-9, no all-same, no 555 exchange).
+function isValidUsPhone(phone){
+  if(!phone) return false
+  let d = String(phone).replace(/\D/g,"")
+  if(d.length===11 && d[0]==="1") d = d.slice(1)
+  if(d.length!==10) return false
+  if(d[0]==="0"||d[0]==="1") return false
+  if(d[3]==="0"||d[3]==="1") return false
+  if(new Set(d).size===1) return false
+  if(d.slice(3,6)==="555") return false
+  return true
+}
+
 function scoreLead(lead) {
   let s = 5
   if ((lead.company||"").trim())   s+=8
@@ -439,8 +455,15 @@ function LeadFinder({onFound, industries}){
         <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#a3a6ff"}}/>Pulling records…
       </div>}
       {lastResult&&!loading&&(
-        <div style={{marginTop:14,padding:"10px 14px",background:"#69f6b815",border:"1px solid #69f6b830",borderRadius:8,fontSize:12,color:"#69f6b8"}}>
+        <div style={{marginTop:14,padding:"10px 14px",background:"#69f6b815",border:"1px solid #69f6b830",borderRadius:8,fontSize:12,color:"#69f6b8",lineHeight:1.5}}>
           ✓ {lastResult.saved} leads saved — ready to call
+          {(lastResult.apolloEnriched>0||lastResult.droppedUncallable>0)&&(
+            <div style={{marginTop:4,fontSize:10,color:"#a3aac4"}}>
+              {lastResult.apolloEnriched>0&&<>📞 {lastResult.apolloEnriched} enriched with DM info via Apollo</>}
+              {lastResult.apolloEnriched>0&&lastResult.droppedUncallable>0&&" · "}
+              {lastResult.droppedUncallable>0&&<>🚫 {lastResult.droppedUncallable} dropped (no working phone or DM email)</>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -488,9 +511,10 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
 
   // Build Apollo's person_locations array from structured state+cities. This
   // is the whole point of the refactor — avoids matching "California" against
-  // South Wales etc. Always anchors to US.
+  // South Wales etc. Always anchors to US (last week empty-state was sending
+  // [] which Apollo treated as "any country" → Filipino/Indian leaks).
   function buildLocations(){
-    if(!state) return []  // empty = nationwide US (handled by titles+industries)
+    if(!state) return ["United States"]
     const fullState = STATE_NAMES[state] || state
     const cityList = cities.split(",").map(c=>c.trim()).filter(Boolean)
     if(cityList.length===0) return [`${fullState}, US`]
@@ -2669,6 +2693,15 @@ export default function App(){
                               {lead.total_calls>0&&<span style={{marginLeft:4}}>· {lead.total_calls} call{lead.total_calls!==1?"s":""}</span>}
                             </div>
                           )}
+                          {lead.updatedAt&&(
+                            <div style={{marginTop:2,fontSize:10,color:"#40485d"}}
+                              title="Bumps every time the lead is updated — use to vary dial timing for non-answers">
+                              {lead.total_calls>0?"last contacted ":"updated "}
+                              {new Date(lead.updatedAt).toLocaleDateString([],{month:"short",day:"numeric"})}
+                              {" "}
+                              {new Date(lead.updatedAt).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                            </div>
+                          )}
                         </div>
                         <div>
                           <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>
@@ -2904,7 +2937,15 @@ export default function App(){
               </p>
               </div>
               {(()=>{
-                const dialerLeads=leads.filter(l=>(!l.assignedTo||l.assignedTo===user)&&!NO_DIAL_STATUSES.has(l.status))
+                // Skip bad-phone leads — caller dialing a non-NANP number is
+                // a guaranteed disconnect that drags down connectivity rate.
+                // The lead still exists in the DB (admin can review/clean via
+                // the Lead Cleanup panel) but won't surface in the dial queue.
+                const dialerLeads=leads.filter(l=>
+                  (!l.assignedTo||l.assignedTo===user)
+                  && !NO_DIAL_STATUSES.has(l.status)
+                  && isValidUsPhone(l.phone)
+                )
                 if(dialerLeads.length===0) return(
                   <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
                     <div style={{fontSize:40,marginBottom:12}}>✅</div>
@@ -3823,6 +3864,12 @@ export default function App(){
               {/* ── Lead Cleanup (admin only) ── */}
               {isAdmin()&&<LeadCleanupPanel onCleanup={loadLeads}/>}
 
+              {/* ── Connectivity Heatmap (admin only) ── */}
+              {isAdmin()&&<ConnectivityPanel/>}
+
+              {/* ── Insights: Apollo ROI + Touch-count + Stale callbacks (admin only) ── */}
+              {isAdmin()&&<InsightsPanel/>}
+
               {/* ── Team Management (admin only) ── */}
               {isAdmin()&&<div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
                 <div style={{padding:"18px 24px",borderBottom:"1px solid #40485d20",
@@ -4619,13 +4666,24 @@ function LeadCleanupPanel({onCleanup}){
                       </div>
                       {cat.samples.map((s,i)=>(
                         <div key={i} style={{padding:"3px 0"}}>
-                          {s.phone ? (
+                          {s.kept && s.phone ? (
                             <>
                               📞 <b>{s.phone}</b> — keeping {s.kept?.company} ({s.kept?.createdAt}, {s.kept?.source}),
                               deleting {s.delete?.length} older copy{s.delete?.length!==1?"ies":""}
                             </>
+                          ) : s.kept && s.person ? (
+                            <>
+                              👤 <b>{s.person}</b> — keeping #{String(s.kept?.id||"").slice(0,8)} ({s.kept?.total_calls||0} calls),
+                              deleting {s.delete?.length} unworked extra{s.delete?.length!==1?"s":""}
+                            </>
                           ) : (
-                            <>· {s.company || "(no company)"} — state={s.state!==undefined?<i>{String(s.state||"empty")}</i>:""}{s.city?` · ${s.city}`:""}{s.source?` · ${s.source}`:""}</>
+                            <>
+                              · {s.company || "(no company)"}
+                              {s.phone?<> — 📞 <b>{s.phone}</b></>:null}
+                              {s.state!==undefined?<> — state=<i>{String(s.state||"empty")}</i></>:null}
+                              {s.city?` · ${s.city}`:""}
+                              {s.source?` · ${s.source}`:""}
+                            </>
                           )}
                         </div>
                       ))}
@@ -4646,6 +4704,493 @@ function LeadCleanupPanel({onCleanup}){
                 </div>
               )}
             </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── ConnectivityPanel (admin only) ──────────────────────────────────────────
+// Day × hour heatmap of pickup rate (real human picked up / total dials).
+// Helps the caller pick better dial windows — a 9am Tuesday with 50% pickup
+// beats a 4pm Friday with 8%, so don't keep retrying the same hour after
+// no-answers. Also includes a one-shot backfill button for retroactively
+// pinning lead.updatedAt to the most recent calledAt for legacy leads.
+
+function ConnectivityPanel(){
+  const [data,setData]   = useState(null)
+  const [open,setOpen]   = useState(false)
+  const [loading,setLoad]= useState(false)
+  const [windowDays,setWindowDays] = useState(90)
+  const [backfilling,setBackfilling] = useState(false)
+  const [bfResult,setBfResult] = useState(null)
+
+  const loadData = (d=windowDays)=>{
+    setLoad(true)
+    api(`/api/analytics/connectivity?days=${d}`)
+      .then(setData).catch(()=>setData(null)).finally(()=>setLoad(false))
+  }
+  useEffect(()=>{ if(open && !data) loadData() },[open])
+
+  async function runBackfill(){
+    if(!window.confirm("Walk every call_outcome and pin each lead's updatedAt to the most recent calledAt? Idempotent — safe to re-run.")) return
+    setBackfilling(true); setBfResult(null)
+    try{
+      const r = await api("/api/admin/leads/backfill-last-contacted",{method:"POST"})
+      setBfResult(r)
+    }catch(ex){
+      setBfResult({error: ex.message||"backfill failed"})
+    }finally{ setBackfilling(false) }
+  }
+
+  // Heatmap rendering: 7 rows × 13 hours (7am-7pm covers the calling day).
+  // Colors: red ≤15%, orange 15-25%, yellow 25-40%, green ≥40%, gray for <5 sample.
+  const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+  const HOURS = [7,8,9,10,11,12,13,14,15,16,17,18,19]
+  const cellByKey = {}
+  ;(data?.windows||[]).forEach(w=>{ cellByKey[`${w.day_idx}-${w.hour}`] = w })
+
+  function cellColor(w){
+    if(!w || w.total<5) return {bg:"#192540",fg:"#40485d"}
+    const r = w.pickup_rate
+    if(r>=40) return {bg:"#69f6b830",fg:"#69f6b8"}
+    if(r>=25) return {bg:"#ffe08328",fg:"#ffe083"}
+    if(r>=15) return {bg:"#ffa44a25",fg:"#ffa44a"}
+    return {bg:"#ff6e8420",fg:"#ff6e84"}
+  }
+
+  function fmtHour(h){
+    if(h===0)  return "12a"
+    if(h===12) return "12p"
+    return h<12 ? `${h}a` : `${h-12}p`
+  }
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>setOpen(o=>!o)}
+        style={{padding:"18px 24px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+            📊 Connectivity Heatmap <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
+          </div>
+          {data?.summary&&(
+            <span style={{fontSize:11,color:"#a3a6ff",background:"#a3a6ff18",padding:"2px 8px",borderRadius:4,fontWeight:700}}>
+              {data.summary.overall_pickup_rate}% pickup · {data.summary.total_calls} calls
+            </span>
+          )}
+        </div>
+        <span style={{color:"#a3aac4",fontSize:14}}>{open?"▾":"▸"}</span>
+      </div>
+      {open&&(
+        <div style={{padding:"0 24px 20px",borderTop:"1px solid #40485d20"}}>
+          {/* Window picker + backfill button */}
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+            paddingTop:14,paddingBottom:10,gap:12,flexWrap:"wrap"}}>
+            <div style={{display:"flex",gap:6}}>
+              {[30,90,180,365].map(d=>(
+                <button key={d}
+                  onClick={()=>{setWindowDays(d);loadData(d)}}
+                  className="btn"
+                  style={{fontSize:11,padding:"4px 10px",
+                    background:windowDays===d?"#a3a6ff":"transparent",
+                    color:windowDays===d?"#000011":"#a3aac4",
+                    border:`1px solid ${windowDays===d?"#a3a6ff":"#40485d40"}`,
+                    fontWeight:windowDays===d?700:500}}>
+                  {d}d
+                </button>
+              ))}
+            </div>
+            <button className="btn" onClick={runBackfill} disabled={backfilling}
+              style={{fontSize:11,padding:"5px 12px",background:"#40485d20",
+                color:"#a3aac4",border:"1px solid #40485d40",fontWeight:600}}
+              title="One-shot: pin every lead's updatedAt to its most recent calledAt. Idempotent.">
+              {backfilling?"Backfilling…":"⏪ Backfill last contacted"}
+            </button>
+          </div>
+
+          {bfResult&&(
+            <div style={{padding:"8px 12px",fontSize:11,marginBottom:10,
+              background:bfResult.error?"#ff6e8418":"#69f6b818",
+              border:`1px solid ${bfResult.error?"#ff6e8430":"#69f6b830"}`,
+              borderRadius:6,
+              color:bfResult.error?"#ff6e84":"#69f6b8"}}>
+              {bfResult.error
+                ? `⚠ ${bfResult.error}`
+                : `✓ Backfilled ${bfResult.leads_updated} leads (${bfResult.skipped_already_current} already current, ${bfResult.failed||0} failed)`}
+            </div>
+          )}
+
+          {loading?(
+            <div style={{padding:"30px",textAlign:"center",color:"#40485d",fontSize:12}}>Loading call history…</div>
+          ):!data?(
+            <div style={{padding:"20px",textAlign:"center",color:"#40485d",fontSize:12}}>
+              <button className="btn btn-g" style={{fontSize:12}} onClick={()=>loadData()}>Load heatmap</button>
+            </div>
+          ):data.summary.total_calls===0?(
+            <div style={{padding:"30px",textAlign:"center",color:"#a3aac4",fontSize:12}}>
+              No calls in the last {windowDays} days yet — heatmap fills in once your caller starts dialing.
+            </div>
+          ):(
+            <>
+              {/* Heatmap grid */}
+              <div style={{overflowX:"auto",marginTop:6}}>
+                <table style={{borderCollapse:"separate",borderSpacing:2,fontSize:10,
+                  fontFamily:"'Space Grotesk',sans-serif"}}>
+                  <thead>
+                    <tr>
+                      <th style={{padding:"4px 6px",color:"#40485d",fontWeight:600,letterSpacing:".06em",textTransform:"uppercase"}}>
+                        day / hr
+                      </th>
+                      {HOURS.map(h=>(
+                        <th key={h} style={{padding:"4px 0",color:"#40485d",fontWeight:600,minWidth:36,textAlign:"center"}}>
+                          {fmtHour(h)}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {DAYS.map((day,di)=>(
+                      <tr key={day}>
+                        <td style={{padding:"4px 6px",color:"#a3aac4",fontWeight:600,textAlign:"right"}}>{day}</td>
+                        {HOURS.map(h=>{
+                          const w = cellByKey[`${di}-${h}`]
+                          const c = cellColor(w)
+                          const tip = w
+                            ? `${day} ${fmtHour(h)} · ${w.pickup_rate}% pickup · ${w.pickup}/${w.total} dials (${w.voicemail} vm, ${w.no_answer} no-ans)`
+                            : `${day} ${fmtHour(h)} · no dials`
+                          return(
+                            <td key={h} title={tip}
+                              style={{background:c.bg,borderRadius:4,padding:"6px 0",
+                                textAlign:"center",color:c.fg,fontWeight:700,minWidth:36,
+                                fontSize:10}}>
+                              {w&&w.total>=5 ? `${Math.round(w.pickup_rate)}` : (w?".":"·")}
+                            </td>
+                          )
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Legend */}
+              <div style={{display:"flex",gap:14,fontSize:10,color:"#40485d",
+                marginTop:10,flexWrap:"wrap",alignItems:"center"}}>
+                <span>Pickup rate %:</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:"#ff6e8420",border:"1px solid #ff6e8460",borderRadius:2,verticalAlign:"middle"}}/> &lt;15</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:"#ffa44a25",border:"1px solid #ffa44a60",borderRadius:2,verticalAlign:"middle"}}/> 15-25</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:"#ffe08328",border:"1px solid #ffe08360",borderRadius:2,verticalAlign:"middle"}}/> 25-40</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:"#69f6b830",border:"1px solid #69f6b860",borderRadius:2,verticalAlign:"middle"}}/> ≥40</span>
+                <span style={{color:"#40485d"}}>· "·" = no dials, "." = &lt;5 sample (gray)</span>
+              </div>
+
+              {/* Best/worst windows */}
+              {(data.best_windows?.length>0||data.worst_windows?.length>0)&&(
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginTop:16}}>
+                  <div style={{background:"#060e20",borderRadius:8,padding:12,border:"1px solid #69f6b820"}}>
+                    <div style={{fontSize:10,color:"#69f6b8",fontWeight:700,letterSpacing:".08em",
+                      textTransform:"uppercase",marginBottom:8}}>
+                      🟢 Best dial windows
+                    </div>
+                    {(data.best_windows||[]).map((w,i)=>(
+                      <div key={i} style={{fontSize:11,color:"#dee5ff",padding:"3px 0"}}>
+                        <b>{w.day} {fmtHour(w.hour)}</b>
+                        <span style={{color:"#69f6b8",marginLeft:6}}>{w.pickup_rate}%</span>
+                        <span style={{color:"#40485d",marginLeft:6}}>· {w.pickup}/{w.total} dials</span>
+                      </div>
+                    ))}
+                    {data.best_windows?.length===0&&<div style={{fontSize:11,color:"#40485d"}}>Need more dials (min 5/window)</div>}
+                  </div>
+                  <div style={{background:"#060e20",borderRadius:8,padding:12,border:"1px solid #ff6e8420"}}>
+                    <div style={{fontSize:10,color:"#ff6e84",fontWeight:700,letterSpacing:".08em",
+                      textTransform:"uppercase",marginBottom:8}}>
+                      🔴 Worst dial windows — avoid
+                    </div>
+                    {(data.worst_windows||[]).map((w,i)=>(
+                      <div key={i} style={{fontSize:11,color:"#dee5ff",padding:"3px 0"}}>
+                        <b>{w.day} {fmtHour(w.hour)}</b>
+                        <span style={{color:"#ff6e84",marginLeft:6}}>{w.pickup_rate}%</span>
+                        <span style={{color:"#40485d",marginLeft:6}}>· {w.pickup}/{w.total} dials</span>
+                      </div>
+                    ))}
+                    {data.worst_windows?.length===0&&<div style={{fontSize:11,color:"#40485d"}}>Need more dials (min 5/window)</div>}
+                  </div>
+                </div>
+              )}
+
+              {/* Per-state pickup-rate breakdown — tells caller which states
+                  are pickup-rich vs pickup-poor independent of timing. */}
+              {data.state_breakdown?.length>1&&(
+                <div style={{marginTop:18,background:"#060e20",borderRadius:8,
+                  padding:12,border:"1px solid #40485d20"}}>
+                  <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,
+                    letterSpacing:".08em",textTransform:"uppercase",marginBottom:8}}>
+                    📍 Pickup rate by state (top 12 by volume)
+                  </div>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                    <thead>
+                      <tr style={{color:"#40485d",fontSize:10,letterSpacing:".06em",textTransform:"uppercase"}}>
+                        <th style={{textAlign:"left",padding:"4px 6px",fontWeight:600}}>State</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Total</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Pickup</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>VM</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>No-Ans</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Pickup %</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.state_breakdown.slice(0,12).map(s=>{
+                        const significant = s.total >= 10
+                        const rate = s.pickup_rate
+                        const color = !significant?"#40485d":rate>=40?"#69f6b8":rate>=25?"#ffe083":rate>=15?"#ffa44a":"#ff6e84"
+                        return(
+                          <tr key={s.state} style={{borderTop:"1px solid #40485d12"}}>
+                            <td style={{padding:"4px 6px",color:"#dee5ff",fontWeight:600}}>{s.state}</td>
+                            <td style={{padding:"4px 6px",color:"#a3aac4",textAlign:"right"}}>{s.total}</td>
+                            <td style={{padding:"4px 6px",color:"#69f6b8",textAlign:"right"}}>{s.pickup}</td>
+                            <td style={{padding:"4px 6px",color:"#ffe083",textAlign:"right"}}>{s.voicemail}</td>
+                            <td style={{padding:"4px 6px",color:"#ff6e84",textAlign:"right"}}>{s.no_answer}</td>
+                            <td style={{padding:"4px 6px",color:color,textAlign:"right",fontWeight:700}}
+                              title={significant?"":"<10 dials — too small to rank reliably"}>
+                              {significant?`${rate}%`:`${rate}%*`}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                  <div style={{marginTop:6,fontSize:9,color:"#40485d"}}>
+                    * needs ≥10 dials per state to read as significant. Use this to decide where to focus Apollo enrichment.
+                  </div>
+                </div>
+              )}
+
+              <div style={{marginTop:14,fontSize:10,color:"#40485d",lineHeight:1.5}}>
+                Bucketed by <b>prospect's local time</b> (lead state → IANA tz, DST-aware).
+                {data.summary.fallback_calls>0&&(
+                  <> {data.summary.fallback_calls} call{data.summary.fallback_calls===1?"":"s"} fell back to caller-tz (UTC{data.tz_offset_hours_fallback>=0?"+":""}{data.tz_offset_hours_fallback}h) — usually leads with no state set.</>
+                )}
+                {" "}Min 5 dials per window for ranking.
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── InsightsPanel (admin only) ──────────────────────────────────────────
+// Three insights bundled in one collapsible card:
+//   1. Apollo ROI — conv/engagement/contact rate by source bucket
+//   2. Touch-count to conversion — distribution + percentiles
+//   3. Stale callbacks — leads with overdue callbackDate and no recent call
+
+function InsightsPanel(){
+  const [data,setData]   = useState(null)
+  const [open,setOpen]   = useState(false)
+  const [loading,setLoad]= useState(false)
+  const [windowDays,setWindowDays] = useState(90)
+
+  const loadData = (d=windowDays)=>{
+    setLoad(true)
+    api(`/api/analytics/insights?days=${d}`)
+      .then(setData).catch(()=>setData(null)).finally(()=>setLoad(false))
+  }
+  useEffect(()=>{ if(open && !data) loadData() },[open])
+
+  const stale = data?.stale_callbacks
+  const tc    = data?.touch_count
+  const roi   = data?.apollo_roi || []
+
+  // Summary chip on the header — best ROI bucket name + stale count if any
+  let headerHint = ""
+  if(roi.length){
+    const meaningful = roi.filter(r=>r.total>=20).sort((a,b)=>b.conv_rate-a.conv_rate)
+    if(meaningful[0]) headerHint = `top: ${meaningful[0].name} ${meaningful[0].conv_rate}%`
+  }
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>setOpen(o=>!o)}
+        style={{padding:"18px 24px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+          <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+            🧠 Insights <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
+          </div>
+          {headerHint&&(
+            <span style={{fontSize:11,color:"#a3a6ff",background:"#a3a6ff18",padding:"2px 8px",borderRadius:4,fontWeight:700}}>
+              {headerHint}
+            </span>
+          )}
+          {stale?.count>0&&(
+            <span style={{fontSize:11,color:"#ff6e84",background:"#ff6e8418",padding:"2px 8px",borderRadius:4,fontWeight:700}}>
+              {stale.count} stale callback{stale.count===1?"":"s"}
+            </span>
+          )}
+        </div>
+        <span style={{color:"#a3aac4",fontSize:14}}>{open?"▾":"▸"}</span>
+      </div>
+      {open&&(
+        <div style={{padding:"0 24px 20px",borderTop:"1px solid #40485d20"}}>
+          <div style={{display:"flex",gap:6,paddingTop:14,paddingBottom:10}}>
+            {[30,90,180,365].map(d=>(
+              <button key={d}
+                onClick={()=>{setWindowDays(d);loadData(d)}}
+                className="btn"
+                style={{fontSize:11,padding:"4px 10px",
+                  background:windowDays===d?"#a3a6ff":"transparent",
+                  color:windowDays===d?"#000011":"#a3aac4",
+                  border:`1px solid ${windowDays===d?"#a3a6ff":"#40485d40"}`,
+                  fontWeight:windowDays===d?700:500}}>
+                {d}d
+              </button>
+            ))}
+          </div>
+
+          {loading?(
+            <div style={{padding:"30px",textAlign:"center",color:"#40485d",fontSize:12}}>Crunching numbers…</div>
+          ):!data?(
+            <div style={{padding:"20px",textAlign:"center",color:"#40485d",fontSize:12}}>
+              <button className="btn btn-g" style={{fontSize:12}} onClick={()=>loadData()}>Load insights</button>
+            </div>
+          ):(
+            <>
+              {/* ── Apollo ROI ────────────────────────────────────── */}
+              <div style={{background:"#060e20",borderRadius:8,padding:14,border:"1px solid #40485d20",marginBottom:14}}>
+                <div style={{fontSize:11,color:"#8b5cf6",fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",marginBottom:10}}>
+                  📞 Apollo ROI — does enrichment pay off?
+                </div>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                  <thead>
+                    <tr style={{color:"#40485d",fontSize:10,letterSpacing:".06em",textTransform:"uppercase"}}>
+                      <th style={{textAlign:"left",padding:"4px 6px",fontWeight:600}}>Source</th>
+                      <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Total</th>
+                      <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Conv</th>
+                      <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Eng</th>
+                      <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Contacted</th>
+                      <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Conv %</th>
+                      <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Eng %</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {roi.map(r=>{
+                      const significant = r.total >= 20
+                      const convColor = !significant?"#40485d":r.conv_rate>=5?"#69f6b8":r.conv_rate>=2?"#ffe083":"#ff6e84"
+                      const engColor  = !significant?"#40485d":r.engagement_rate>=15?"#69f6b8":r.engagement_rate>=8?"#ffe083":"#ff6e84"
+                      return(
+                        <tr key={r.key} style={{borderTop:"1px solid #40485d12"}}>
+                          <td style={{padding:"5px 6px",color:"#dee5ff",fontWeight:600}}>{r.name}</td>
+                          <td style={{padding:"5px 6px",color:"#a3aac4",textAlign:"right"}}>{r.total}</td>
+                          <td style={{padding:"5px 6px",color:"#69f6b8",textAlign:"right"}}>{r.converted}</td>
+                          <td style={{padding:"5px 6px",color:"#ffe083",textAlign:"right"}}>{r.interested+r.callback}</td>
+                          <td style={{padding:"5px 6px",color:"#a3aac4",textAlign:"right"}}>{r.contacted}</td>
+                          <td style={{padding:"5px 6px",color:convColor,textAlign:"right",fontWeight:700}}
+                            title={significant?"":"<20 leads — too small to rank"}>
+                            {r.conv_rate}{significant?"%":"%*"}
+                          </td>
+                          <td style={{padding:"5px 6px",color:engColor,textAlign:"right",fontWeight:700}}>
+                            {r.engagement_rate}{significant?"%":"%*"}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+                <div style={{marginTop:8,fontSize:9,color:"#40485d",lineHeight:1.5}}>
+                  Eng = converted + interested + callback. * = &lt;20 leads, not statistically meaningful yet.
+                  Compare Apollo-enriched vs Google-only — if rates are flat, the credit spend isn't paying off.
+                </div>
+              </div>
+
+              {/* ── Touch count ────────────────────────────────────── */}
+              <div style={{background:"#060e20",borderRadius:8,padding:14,border:"1px solid #40485d20",marginBottom:14}}>
+                <div style={{fontSize:11,color:"#69f6b8",fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",marginBottom:10}}>
+                  📊 Touch-count to conversion
+                </div>
+                {tc?.converted_count>0?(
+                  <>
+                    <div style={{display:"flex",gap:24,fontSize:12,color:"#dee5ff",marginBottom:12,flexWrap:"wrap"}}>
+                      <span><b>{tc.converted_count}</b> conversions analyzed</span>
+                      <span>median: <b style={{color:"#69f6b8"}}>{tc.median}</b> calls</span>
+                      <span>mean: <b style={{color:"#69f6b8"}}>{tc.mean}</b> calls</span>
+                      <span>p75: <b style={{color:"#69f6b8"}}>{tc.p75}</b> calls</span>
+                    </div>
+                    {/* Mini bar chart of distribution */}
+                    {tc.distribution?.length>0&&(()=>{
+                      const maxCount = Math.max(...tc.distribution.map(d=>d.count))
+                      return(
+                        <div style={{display:"flex",alignItems:"flex-end",gap:3,height:60,marginBottom:6}}>
+                          {tc.distribution.map(d=>(
+                            <div key={d.touches} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2,minWidth:18}}
+                              title={`${d.count} converters needed exactly ${d.touches} call${d.touches===1?"":"s"}`}>
+                              <div style={{
+                                background:"#69f6b8",
+                                width:"100%",
+                                maxWidth:36,
+                                height:`${(d.count/maxCount)*100}%`,
+                                minHeight:2,
+                                borderRadius:"2px 2px 0 0",
+                                opacity:0.7+(d.count/maxCount)*0.3,
+                              }}/>
+                              <div style={{fontSize:9,color:"#a3aac4"}}>{d.touches}</div>
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    })()}
+                    <div style={{fontSize:10,color:"#40485d"}}>
+                      Number of calls before conversion. If most converters land by call <b>{tc.p75}</b>,
+                      caller can de-prioritize leads past that count.
+                    </div>
+                  </>
+                ):(
+                  <div style={{fontSize:11,color:"#a3aac4",fontStyle:"italic"}}>
+                    No conversions in the last {windowDays} days yet — distribution fills in as deals close.
+                  </div>
+                )}
+              </div>
+
+              {/* ── Stale callbacks ────────────────────────────────── */}
+              <div style={{background:"#060e20",borderRadius:8,padding:14,
+                border:`1px solid ${stale?.count>0?"#ff6e8430":"#40485d20"}`}}>
+                <div style={{fontSize:11,color:stale?.count>0?"#ff6e84":"#69f6b8",fontWeight:700,
+                  letterSpacing:".08em",textTransform:"uppercase",marginBottom:10}}>
+                  ⏰ Stale callbacks {stale?.count>0&&`— ${stale.count} need attention`}
+                </div>
+                {stale?.count===0?(
+                  <div style={{fontSize:11,color:"#69f6b8"}}>✓ No stale callbacks — caller is keeping commitments.</div>
+                ):(
+                  <>
+                    <div style={{fontSize:11,color:"#a3aac4",marginBottom:8,lineHeight:1.5}}>
+                      These leads have <b>callbackDate in the past</b> with <b>no call logged since</b> —
+                      direct conversion leakage. Reassign or recycle.
+                    </div>
+                    <div style={{maxHeight:200,overflowY:"auto",fontSize:11}}>
+                      {(stale.samples||[]).map(s=>(
+                        <div key={s.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                          padding:"4px 0",borderTop:"1px solid #40485d12",gap:8}}>
+                          <div style={{flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:"#dee5ff"}}>
+                            {s.company||"(no company)"}
+                            {s.assignedTo&&<span style={{color:"#40485d",fontSize:10,marginLeft:6}}>· {s.assignedTo}</span>}
+                          </div>
+                          <span style={{fontSize:10,color:"#ff6e84",fontWeight:600,whiteSpace:"nowrap"}}>
+                            {s.days_overdue}d overdue
+                          </span>
+                          <span style={{fontSize:10,color:"#40485d",whiteSpace:"nowrap"}}>{s.callbackDate}</span>
+                        </div>
+                      ))}
+                      {stale.count>stale.samples.length&&(
+                        <div style={{padding:"6px 0",fontSize:10,color:"#40485d",fontStyle:"italic"}}>
+                          + {stale.count-stale.samples.length} more not shown
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            </>
           )}
         </div>
       )}
