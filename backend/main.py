@@ -2594,18 +2594,75 @@ def _paginated_get(url: str, headers: dict = None, page_size: int = 1000, max_pa
 def list_leads(status: str = "", search: str = "", sort: str = "score",
                callbacks: str = "", source: str = "", user: str = Depends(verify_token)):
     try:
-        url = f"{SUPABASE_URL}/rest/v1/leads?select=*"
-        if status:   url += f"&status=eq.{status}"
-        if source:   url += f"&source=eq.{url_quote(source)}"
+        order_map = {"score":"score.desc","newest":"createdAt.desc","company":"company.asc","callbacks":"callbackDate.asc"}
+        order = order_map.get(sort, "score.desc")
+
+        # Build base URL (filters that aren't search)
+        base_url = f"{SUPABASE_URL}/rest/v1/leads?select=*"
+        if status:   base_url += f"&status=eq.{status}"
+        if source:   base_url += f"&source=eq.{url_quote(source)}"
         if callbacks == "true":
             today = datetime.utcnow().strftime("%Y-%m-%d")
-            url += f"&callbackDate=lte.{today}&callbackDate=neq.&status=neq.converted"
-        if search:
-            s = search.replace(" ", "%20")
-            url += f"&or=(company.ilike.%25{s}%25,firstName.ilike.%25{s}%25,lastName.ilike.%25{s}%25,phone.ilike.%25{s}%25)"
-        order_map = {"score":"score.desc","newest":"createdAt.desc","company":"company.asc","callbacks":"callbackDate.asc"}
-        url += f"&order={order_map.get(sort,'score.desc')}"
-        return _paginated_get(url)
+            base_url += f"&callbackDate=lte.{today}&callbackDate=neq.&status=neq.converted"
+
+        if not search:
+            return _paginated_get(f"{base_url}&order={order}")
+
+        # ── Two-phase search ───────────────────────────────────────────
+        # Old search only matched company/firstName/lastName/phone — missed
+        # notes, email, assignedTo, and call_outcomes entirely. So "Cristine"
+        # (a former caller's name living in call_outcomes.calledBy) and
+        # "contract" (a phrase typed into a per-call note) returned zero hits
+        # even though the lead existed. Phase 1 widens the leads-table OR;
+        # phase 2 looks at call_outcomes and pulls in any leadIds whose
+        # calls match — handles "find the lead my ex-rep worked" and
+        # "find the lead with that note in call history".
+        s = search.replace(" ", "%20")
+        leads_or = (
+            f"company.ilike.%25{s}%25,"
+            f"firstName.ilike.%25{s}%25,"
+            f"lastName.ilike.%25{s}%25,"
+            f"phone.ilike.%25{s}%25,"
+            f"email.ilike.%25{s}%25,"
+            f"notes.ilike.%25{s}%25,"
+            f"city.ilike.%25{s}%25,"
+            f"address.ilike.%25{s}%25,"
+            f"assignedTo.ilike.%25{s}%25,"
+            f"createdBy.ilike.%25{s}%25"
+        )
+        leads = _paginated_get(f"{base_url}&or=({leads_or})&order={order}")
+
+        # Phase 2: search call_outcomes for matching calledBy or notes,
+        # collect those leadIds, and merge in any leads we didn't catch.
+        try:
+            call_url = (
+                f"{SUPABASE_URL}/rest/v1/call_outcomes?select=leadId"
+                f"&or=(calledBy.ilike.%25{s}%25,notes.ilike.%25{s}%25)"
+            )
+            calls = _paginated_get(call_url)
+            extra_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
+            existing = {l.get("id") for l in leads}
+            missing  = [lid for lid in extra_ids if lid not in existing]
+            if missing:
+                # Re-apply non-search filters on the lookup so a user filtering
+                # status=interested doesn't get callbacks pulled in via Phase 2.
+                BATCH = 100
+                for i in range(0, len(missing), BATCH):
+                    chunk = missing[i:i+BATCH]
+                    ids_filter = ",".join(str(x) for x in chunk)
+                    extra_url = f"{base_url}&id=in.({ids_filter})&order={order}"
+                    leads.extend(_paginated_get(extra_url))
+        except Exception as e:
+            print(f"[SEARCH] call_outcomes phase failed: {e}")
+
+        # Sort the merged result so phase-2 inserts land in the right spot.
+        sort_key, _, dir_ = order.partition(".")
+        if sort_key in ("score", "createdAt", "company", "callbackDate"):
+            leads.sort(
+                key=lambda x: (x.get(sort_key) or 0) if sort_key == "score" else (x.get(sort_key) or ""),
+                reverse=(dir_ == "desc"),
+            )
+        return leads
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
