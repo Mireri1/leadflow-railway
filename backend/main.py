@@ -1004,6 +1004,115 @@ def load_email_template(name: str = "tried-to-call") -> dict:
         print(f"[EMAIL-TEMPLATE] load failed for '{name}': {e}")
     return dict(DEFAULT_EMAIL_TEMPLATES.get(name, DEFAULT_EMAIL_TEMPLATE))
 
+# Cross-system suppression sync — when LeadFlow sees a "no/stop/not now"
+# reply, push that signal to vlm-scraper so the email scraper also adds
+# the address to its own suppression_list. Fire-and-forget; remote
+# unavailability must not stall the reply-poll loop.
+VLM_SCRAPER_URL     = os.getenv("VLM_SCRAPER_URL", "").rstrip("/")
+VLM_SCRAPER_API_KEY = os.getenv("VLM_SCRAPER_API_KEY", "").strip()
+
+# Soft-negative phrases (e.g. "not now", "maybe later") classify as
+# negative for suppression purposes. Erring toward over-suppression is
+# cheaper than the complaint cost of a second cold email after a soft no.
+_NEGATIVE_PHRASES = (
+    "not interested", "no thanks", "no thank you", "no, thanks",
+    "please remove", "unsubscribe", "stop emailing", "stop contacting",
+    "do not contact", "do not email", "take me off", "remove me",
+    "already have", "have a vendor", "under contract", "go away",
+    "leave me alone", "this is spam", "cease",
+    "not now", "maybe later", "not at this time", "no interest",
+)
+_POSITIVE_PHRASES = (
+    "interested", "tell me more", "how much", "pricing", "quote",
+    "sounds good", "let's talk", "lets talk", "call me", "schedule",
+    "available", "when can", "set up a", "would like", "send me",
+    "more info", "more information",
+)
+
+def classify_reply_sentiment(text: str) -> str:
+    """Cheap keyword classifier matching vlm-scraper's
+    classifyReplySentiment so the two systems agree on what counts as a
+    negative reply. Bare 'stop' / 'no' on its own line counts as negative
+    — those are the bulk of soft-opt-outs."""
+    t = (text or "").lower().strip()
+    if not t:
+        return "neutral"
+    # Single-word "stop" or "no" replies (very common opt-out style).
+    first_line = t.splitlines()[0].strip(" .!?")
+    if first_line in ("stop", "no", "remove", "unsubscribe"):
+        return "negative"
+    for phrase in _NEGATIVE_PHRASES:
+        if phrase in t:
+            return "negative"
+    for phrase in _POSITIVE_PHRASES:
+        if phrase in t:
+            return "positive"
+    return "neutral"
+
+def email_is_suppressed(email: str) -> bool:
+    """Is this email on the global lead_suppressions table? Used as the
+    last-line gate inside send_lead_to_campaign. Fail-open on error: a
+    transient Supabase blip should not silently block legitimate sends.
+    A duplicate email is much cheaper than the suppression table being
+    unreachable during a cron tick."""
+    if not email:
+        return False
+    addr = email.strip().lower()
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/lead_suppressions"
+            f"?email=eq.{url_quote(addr)}&select=email&limit=1",
+            headers=SB_ADMIN_HEADERS, timeout=5,
+        )
+        if r.status_code != 200:
+            return False
+        rows = r.json() if r.content else []
+        return isinstance(rows, list) and len(rows) > 0
+    except Exception as e:
+        print(f"[SUPPRESSION] check failed for {addr}: {e}")
+        return False
+
+def add_to_suppression(email: str, reason: str = "negative_reply",
+                       source: str = "imap_poller", notes: str = "") -> bool:
+    """Upsert (email is PK) into lead_suppressions. Idempotent — calling
+    twice with the same email is a no-op on the second call."""
+    if not email:
+        return False
+    addr = email.strip().lower()
+    try:
+        r = req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/lead_suppressions",
+            headers={**SB_ADMIN_HEADERS,
+                     "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"email": addr, "reason": reason, "source": source,
+                  "notes": (notes or None)},
+            timeout=10,
+        )
+        return r.status_code in (200, 201, 204)
+    except Exception as e:
+        print(f"[SUPPRESSION] add failed for {addr}: {e}")
+        return False
+
+def _push_vlm_suppression(email: str, snippet: str = "") -> None:
+    """Tell vlm-scraper to add this email to its own suppression_list for
+    both pipelines. Fire-and-forget — vlm-scraper unavailability must
+    not block our reply processing."""
+    if not (VLM_SCRAPER_URL and VLM_SCRAPER_API_KEY and email):
+        return
+    try:
+        req_lib.post(
+            f"{VLM_SCRAPER_URL}/api/suppression/cross-sync",
+            headers={"x-api-key": VLM_SCRAPER_API_KEY,
+                     "Content-Type": "application/json"},
+            json={"email": email.strip().lower(),
+                  "reason": "negative_reply",
+                  "source": "leadflow_imap",
+                  "notes": (snippet or "")[:200]},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[SUPPRESSION] vlm cross-sync failed for {email}: {e}")
+
 def lead_already_in_campaign(lead_id: str, campaign: str = "tried-to-call") -> bool:
     """Suppression: don't re-send the same lead to the same campaign within
     CAMPAIGN_SUPPRESSION_DAYS. Returns True if a recent send is on file."""
@@ -1039,6 +1148,20 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str,
         return (False, f"invalid step {step}")
     if step == 1 and not bypass_suppression and lead_already_in_campaign(lead.get("id"), campaign):
         return (False, f"already sent to '{campaign}' within last {CAMPAIGN_SUPPRESSION_DAYS} days")
+
+    # Global do-not-contact gate. Applies to ALL steps (including
+    # auto-fired follow-ups that pass bypass_suppression=True for the
+    # campaign-dedup check). A negative reply earlier in the sequence
+    # adds the email here, so step 2/3 won't fire to someone who said
+    # "stop" after step 1.
+    if email_is_suppressed(lead.get("email")):
+        return (False, "lead is on global suppression list")
+
+    # Belt-and-suspenders: never email a lead whose status was flipped
+    # to do_not_contact (manual flag, or set by IMAP poller before this
+    # tick's suppression_list write committed).
+    if (lead.get("status") or "").lower() == "do_not_contact":
+        return (False, "lead.status is do_not_contact")
 
     template_name = "tried-to-call" if step == 1 else f"tried-to-call-{step}"
     tpl   = load_email_template(template_name)
@@ -1398,14 +1521,24 @@ def imap_poll_replies():
                 target = next((l for l in leads if l.get("status") == "awaiting_email_reply"), leads[0])
                 lead_id = target.get("id")
                 snippet = (body or "")[:300].replace("\n", " ").strip()
-                reply_note = f"📧 Reply ({datetime.utcnow().date().isoformat()}): {snippet}"
+                sentiment = classify_reply_sentiment(body or "")
+                is_negative = (sentiment == "negative")
+
+                # Negative replies → status=do_not_contact + suppression
+                # row so future sequence steps (and any other campaign)
+                # won't re-touch this address. Positive/neutral keep the
+                # legacy "interested" handoff so reps can follow up.
+                new_status = "do_not_contact" if is_negative else "interested"
+                note_prefix = "🛑 Negative reply" if is_negative else "📧 Reply"
+                reply_note = (f"{note_prefix} ({datetime.utcnow().date().isoformat()}, "
+                              f"sentiment={sentiment}): {snippet}")
 
                 try:
                     req_lib.patch(
                         f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id))}",
                         headers=SB_HEADERS,
                         json={
-                            "status":    "interested",
+                            "status":    new_status,
                             "notes":     (reply_note + "\n\n" + (target.get("notes") or ""))[:4000],
                             "updatedAt": datetime.utcnow().isoformat(),
                         },
@@ -1416,16 +1549,35 @@ def imap_poll_replies():
                     stats["errors"] += 1
                     continue
 
+                # Suppress + cross-sync to vlm-scraper. Both are fire-and-
+                # forget enough that a failure here doesn't block lead
+                # status patching above.
+                if is_negative:
+                    add_to_suppression(
+                        from_addr,
+                        reason="negative_reply",
+                        source="imap_poller",
+                        notes=f"reply: {snippet[:200]}",
+                    )
+                    _push_vlm_suppression(from_addr, snippet)
+                    stats["negative"] = stats.get("negative", 0) + 1
+
                 audit_log("imap_poller", "campaign_event", "lead", lead_id, {
-                    "event": "reply", "from": from_addr, "subject": subject[:200], "snippet": snippet,
+                    "event": "negative_reply" if is_negative else "reply",
+                    "from": from_addr, "subject": subject[:200],
+                    "snippet": snippet, "sentiment": sentiment,
                 })
                 send_slack(
-                    ":incoming_envelope: Email Reply",
-                    f"*{target.get('firstName','')} {target.get('lastName','')}* at *{target.get('company','')}* replied.",
+                    ":no_entry_sign: Negative Reply" if is_negative else ":incoming_envelope: Email Reply",
+                    (f"*{target.get('firstName','')} {target.get('lastName','')}* at "
+                     f"*{target.get('company','')}* "
+                     + ("said NO — added to suppression list. "
+                        "Do NOT call." if is_negative else "replied.")),
                     fields=[
-                        {"label": "From",     "value": from_addr},
-                        {"label": "Assigned", "value": target.get("assignedTo") or "unassigned"},
-                        {"label": "Snippet",  "value": snippet[:200] or "(empty)"},
+                        {"label": "From",      "value": from_addr},
+                        {"label": "Sentiment", "value": sentiment},
+                        {"label": "Assigned",  "value": target.get("assignedTo") or "unassigned"},
+                        {"label": "Snippet",   "value": snippet[:200] or "(empty)"},
                     ],
                     actions=[{"label": "📋 Open LeadFlow",
                               "url": os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app"),
