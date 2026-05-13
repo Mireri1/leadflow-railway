@@ -1984,6 +1984,10 @@ export default function App(){
   const [fIndustry,setFIndustry]   = useState("")
   const [fState,setFState]         = useState("")
   const [fCity,setFCity]           = useState("")
+  const [fSource,setFSource]       = useState("")
+  const [fPulled,setFPulled]       = useState("all")   // all|today|yesterday|7d|30d|custom
+  const [fPulledFrom,setFPulledFrom] = useState("")     // YYYY-MM-DD (only used when fPulled==="custom")
+  const [fPulledTo,setFPulledTo]     = useState("")     // YYYY-MM-DD
   const [availableOnly,setAvailOnly] = useState(false)
   const [emailedOnly,setEmailedOnly] = useState(false)
   const [activeNav,setNav]         = useState("dashboard")
@@ -2190,6 +2194,26 @@ export default function App(){
     return(order[a.urgency]||4)-(order[b.urgency]||4)
   })
 
+  // Resolve the "Pulled" preset into a concrete [from, to] window in
+  // LOCAL date space. createdAt is UTC, but the user thinks in local days
+  // — so we parse each lead's createdAt and bucket by local Y-M-D.
+  const pulledWindow = (()=>{
+    if(fPulled==="all") return null
+    const n=new Date()
+    const ymd=(d)=>localDate(d)
+    if(fPulled==="today")     return {from:ymd(n),to:ymd(n)}
+    if(fPulled==="yesterday"){const y=new Date(n);y.setDate(y.getDate()-1);return{from:ymd(y),to:ymd(y)}}
+    if(fPulled==="7d"){const f=new Date(n);f.setDate(f.getDate()-6);return{from:ymd(f),to:ymd(n)}}
+    if(fPulled==="30d"){const f=new Date(n);f.setDate(f.getDate()-29);return{from:ymd(f),to:ymd(n)}}
+    if(fPulled==="custom") return {from:fPulledFrom||"",to:fPulledTo||""}
+    return null
+  })()
+  const leadLocalDay = (createdAt)=>{
+    if(!createdAt) return ""
+    const d=new Date(createdAt); if(isNaN(d.getTime())) return ""
+    return localDate(d)
+  }
+
   const displayLeads=leads.filter(l=>{
     if(fIndustry&&l.industry!==fIndustry) return false
     if(fState&&l.state!==fState) return false
@@ -2197,6 +2221,20 @@ export default function App(){
       const cityLower = l.city?.toLowerCase()||""
       const filterLower = fCity.toLowerCase().trim()
       if(!cityLower.startsWith(filterLower) && cityLower !== filterLower) return false
+    }
+    if(fSource){
+      const src=(l.source||"").toLowerCase()
+      if(fSource==="manual"){
+        // Manual = anything that isn't a known auto-source. Leaves room
+        // for CSV imports + ad-hoc inserts that don't tag a source.
+        if(src==="apollo"||src==="google places"||src==="vcc") return false
+      }else if(src!==fSource.toLowerCase()) return false
+    }
+    if(pulledWindow){
+      const day=leadLocalDay(l.createdAt)
+      if(!day) return false
+      if(pulledWindow.from && day<pulledWindow.from) return false
+      if(pulledWindow.to   && day>pulledWindow.to)   return false
     }
     if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
     if(emailedOnly&&!emailedFlags[l.id]) return false
@@ -2225,7 +2263,7 @@ export default function App(){
   // state variable on the /warm nav tab (VCC-source filtered).
   const pipelineWarm   = sortNewFirst(displayLeads.filter(l=>!isApolloLead(l)))
 
-  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false)}
+  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false);setFSource("");setFPulled("all");setFPulledFrom("");setFPulledTo("")}
 
   return(
     <div style={{minHeight:"100vh",background:"#060e20"}}>
@@ -2601,6 +2639,33 @@ export default function App(){
                     <option value="all">Status: All</option>
                     {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
                   </select>
+                  <select className="sel" value={fSource} onChange={e=>setFSource(e.target.value)}
+                    title="Filter by where the lead came from">
+                    <option value="">Source: All</option>
+                    <option value="Apollo">Apollo (DM)</option>
+                    <option value="Google Places">Google Places</option>
+                    <option value="VCC">VCC Warm</option>
+                    <option value="manual">Manual / CSV</option>
+                  </select>
+                  <select className="sel" value={fPulled} onChange={e=>setFPulled(e.target.value)}
+                    title="Filter by when the lead was pulled (createdAt)">
+                    <option value="all">Pulled: Any time</option>
+                    <option value="today">Pulled: Today</option>
+                    <option value="yesterday">Pulled: Yesterday</option>
+                    <option value="7d">Pulled: Last 7 days</option>
+                    <option value="30d">Pulled: Last 30 days</option>
+                    <option value="custom">Pulled: Custom range…</option>
+                  </select>
+                  {fPulled==="custom"&&(
+                    <>
+                      <input type="date" className="sel" value={fPulledFrom}
+                        onChange={e=>setFPulledFrom(e.target.value)}
+                        style={{width:140}} title="From (inclusive)"/>
+                      <input type="date" className="sel" value={fPulledTo}
+                        onChange={e=>setFPulledTo(e.target.value)}
+                        style={{width:140}} title="To (inclusive)"/>
+                    </>
+                  )}
                   <select className="sel" value={sortBy} onChange={e=>setSort(e.target.value)}>
                     <option value="score">Highest Score</option>
                     <option value="newest">Newest First</option>
