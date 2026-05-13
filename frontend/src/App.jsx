@@ -2163,6 +2163,17 @@ export default function App(){
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
   const localDate=d=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");return`${y}-${m}-${day}`}
   const today=localDate(new Date())
+  // createdAt is a UTC ISO string from the backend (datetime.utcnow().isoformat()).
+  // Comparing its YYYY-MM-DD prefix to local `today` misclassifies leads pulled
+  // in the evening (PST) — UTC date has already rolled over, so today's Apollo
+  // pulls were getting bucketed as "older" and mixed into the list. Parse the
+  // timestamp into a Date and compare local Y/M/D components instead.
+  const isCreatedToday=(createdAt)=>{
+    if(!createdAt) return false
+    const d=new Date(createdAt); if(isNaN(d.getTime())) return false
+    const n=new Date()
+    return d.getFullYear()===n.getFullYear()&&d.getMonth()===n.getMonth()&&d.getDate()===n.getDate()
+  }
   const tomorrow=(()=>{const d=new Date();d.setDate(d.getDate()+1);return localDate(d)})()
   const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return localDate(d)})()
 
@@ -2191,8 +2202,8 @@ export default function App(){
     if(emailedOnly&&!emailedFlags[l.id]) return false
     return true
   })
-  const newTodayLeads = displayLeads.filter(l=>(l.createdAt||"").startsWith(today))
-  const olderLeads = displayLeads.filter(l=>!(l.createdAt||"").startsWith(today))
+  const newTodayLeads = displayLeads.filter(l=>isCreatedToday(l.createdAt))
+  const olderLeads = displayLeads.filter(l=>!isCreatedToday(l.createdAt))
 
   // Source-based segmentation for the Leads tab — keeps Apollo-pulled
   // decision-maker contacts visually separate from Google Places / manual
@@ -2205,8 +2216,8 @@ export default function App(){
   // Within each segment, surface "new today" first (preserves the prior
   // newest-first behavior — just nested inside each section).
   const sortNewFirst = (arr) => {
-    const newToday = arr.filter(l=>(l.createdAt||"").startsWith(today))
-    const older    = arr.filter(l=>!(l.createdAt||"").startsWith(today))
+    const newToday = arr.filter(l=>isCreatedToday(l.createdAt))
+    const older    = arr.filter(l=>!isCreatedToday(l.createdAt))
     return [...newToday, ...older]
   }
   const dmLeads        = sortNewFirst(displayLeads.filter(isApolloLead))
@@ -2777,8 +2788,25 @@ export default function App(){
                       {subtitle&&<span style={{fontSize:11,color:"#a3aac4",marginLeft:4}}>{subtitle}</span>}
                     </div>
                   )
-                  const today_count_dm   = dmLeads.filter(l=>(l.createdAt||"").startsWith(today)).length
-                  const today_count_warm = pipelineWarm.filter(l=>(l.createdAt||"").startsWith(today)).length
+                  const dmToday   = dmLeads.filter(l=>isCreatedToday(l.createdAt))
+                  const dmOlder   = dmLeads.filter(l=>!isCreatedToday(l.createdAt))
+                  const warmToday = pipelineWarm.filter(l=>isCreatedToday(l.createdAt))
+                  const warmOlder = pipelineWarm.filter(l=>!isCreatedToday(l.createdAt))
+                  // Lighter-weight inline banner that splits a segment into
+                  // "Pulled today" vs "Earlier" so today's pulls are visually
+                  // grouped instead of mixed into the main list.
+                  const SubBanner = ({label,count,accent}) => (
+                    <div style={{padding:"8px 24px",background:"#0a1428",borderBottom:"1px solid #40485d20",
+                      display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{width:6,height:6,borderRadius:"50%",background:accent}}/>
+                      <span style={{fontSize:10,fontWeight:700,color:accent,letterSpacing:".08em",textTransform:"uppercase"}}>
+                        {label}
+                      </span>
+                      <span style={{fontSize:10,color:accent,background:`${accent}22`,padding:"1px 7px",borderRadius:8,fontWeight:700}}>
+                        {count}
+                      </span>
+                    </div>
+                  )
                   return (
                     <div>
                       {dmLeads.length>0&&(
@@ -2786,8 +2814,19 @@ export default function App(){
                           <Banner color="#8b5cf6" icon="🎯"
                             label="Decision Makers (Apollo)"
                             count={dmLeads.length}
-                            subtitle={today_count_dm>0?`+${today_count_dm} new today`:"Direct contacts pulled from Apollo"}/>
-                          {dmLeads.map(renderRow)}
+                            subtitle={dmToday.length>0?`+${dmToday.length} pulled today`:"Direct contacts pulled from Apollo"}/>
+                          {dmToday.length>0&&(
+                            <>
+                              <SubBanner label="Pulled Today" count={dmToday.length} accent="#69f6b8"/>
+                              {dmToday.map(renderRow)}
+                            </>
+                          )}
+                          {dmOlder.length>0&&(
+                            <>
+                              {dmToday.length>0&&<SubBanner label="Earlier" count={dmOlder.length} accent="#a3aac4"/>}
+                              {dmOlder.map(renderRow)}
+                            </>
+                          )}
                         </>
                       )}
                       {pipelineWarm.length>0&&(
@@ -2795,8 +2834,19 @@ export default function App(){
                           <Banner color="#ffe083" icon="🌡️"
                             label="Warm Leads"
                             count={pipelineWarm.length}
-                            subtitle={today_count_warm>0?`+${today_count_warm} new today`:"Companies — call switchboard, ask for the DM by name if known"}/>
-                          {pipelineWarm.map(renderRow)}
+                            subtitle={warmToday.length>0?`+${warmToday.length} pulled today`:"Companies — call switchboard, ask for the DM by name if known"}/>
+                          {warmToday.length>0&&(
+                            <>
+                              <SubBanner label="Pulled Today" count={warmToday.length} accent="#69f6b8"/>
+                              {warmToday.map(renderRow)}
+                            </>
+                          )}
+                          {warmOlder.length>0&&(
+                            <>
+                              {warmToday.length>0&&<SubBanner label="Earlier" count={warmOlder.length} accent="#a3aac4"/>}
+                              {warmOlder.map(renderRow)}
+                            </>
+                          )}
                         </>
                       )}
                     </div>
