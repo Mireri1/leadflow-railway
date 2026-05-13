@@ -4071,23 +4071,80 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     leads = [l for l, _ in qualified_pairs]
 
     # Save and capture row IDs for downstream phone-reveal webhook routing.
+    # Use an isolated timestamp BEFORE the insert so we can verify-by-requery
+    # which rows actually hit the DB (independent of what the POST response
+    # claims). Apollo pulls have been "silently failing" — meaning the POST
+    # returns success-shaped but no rows show in the leads list. The requery
+    # is the only way to tell whether rows reached Supabase at all.
+    pre_insert_ts = datetime.utcnow().isoformat()
     saved_rows = []
     insert_error = None
+    insert_status = None
+    insert_body_preview = None
     if leads:
         try:
             sr = req_lib.post(
                 f"{SUPABASE_URL}/rest/v1/leads",
                 headers=SB_HEADERS, json=leads, timeout=30,
             )
+            insert_status = sr.status_code
+            insert_body_preview = sr.text[:500] if sr.text else ""
+            print(f"[APOLLO-PULL] insert HTTP {sr.status_code} body[:500]={insert_body_preview}")
             if sr.status_code in (200, 201):
-                body_json = sr.json()
-                saved_rows = body_json if isinstance(body_json, list) else []
+                try:
+                    body_json = sr.json()
+                    saved_rows = body_json if isinstance(body_json, list) else []
+                except Exception as je:
+                    insert_error = f"Supabase returned 2xx but body wasn't JSON: {je}"
+                    print(f"[APOLLO-PULL] {insert_error}")
             else:
                 insert_error = f"Supabase {sr.status_code}: {sr.text[:300]}"
                 print(f"[APOLLO-PULL] supabase insert HTTP {sr.status_code}: {sr.text[:200]}")
         except Exception as e:
             insert_error = f"Supabase request failed: {e}"
             print(f"[APOLLO-PULL] supabase insert failed: {e}")
+
+    # Verify-by-requery: ask Supabase how many Apollo rows landed since
+    # `pre_insert_ts`. If this is >0 but `saved_rows` is empty, the response
+    # parsing was wrong (we're missing the return body). If it's 0 and the
+    # POST claimed success, the rows never reached the DB (likely a CHECK
+    # constraint or RLS silently dropping them — Supabase will sometimes
+    # return 201 + [] in edge cases).
+    verified_saved = None
+    try:
+        vr = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers={**SB_HEADERS, "Prefer": "count=exact"},
+            params={"select": "id", "source": "eq.Apollo",
+                    "createdAt": f"gte.{pre_insert_ts}", "limit": "1"},
+            timeout=10,
+        )
+        cr = vr.headers.get("content-range", "")
+        if "/" in cr:
+            verified_saved = int(cr.split("/")[-1])
+        print(f"[APOLLO-PULL] verify-requery content-range={cr} verified_saved={verified_saved}")
+    except Exception as e:
+        print(f"[APOLLO-PULL] verify-requery failed: {e}")
+
+    # If the requery confirms rows landed but our parsed list was empty,
+    # treat verified_saved as the truth — and re-fetch the rows so the
+    # downstream phone-reveal loop still has IDs to use.
+    if (verified_saved or 0) > 0 and not saved_rows:
+        try:
+            fr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads",
+                headers=SB_HEADERS,
+                params={"select": "*", "source": "eq.Apollo",
+                        "createdAt": f"gte.{pre_insert_ts}",
+                        "order": "createdAt.asc"},
+                timeout=10,
+            )
+            if fr.status_code == 200:
+                saved_rows = fr.json() or []
+                print(f"[APOLLO-PULL] recovered {len(saved_rows)} rows via requery")
+        except Exception as e:
+            print(f"[APOLLO-PULL] recovery requery failed: {e}")
+
     saved = len(saved_rows)
     # If qualified leads exist but none saved AND no insert error, every row
     # collided with an existing unique constraint (ignore-duplicates silently
@@ -4157,6 +4214,9 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
                             "no_company":    skipped_no_company,
                             "no_actionable": skipped_no_actionable},
         "insert_error":    insert_error,
+        "insert_status":   insert_status,
+        "insert_body_preview": insert_body_preview,
+        "verified_saved":  verified_saved,
         "silently_deduped": silently_deduped,
         "phone_reveals":   {"requested": phone_reveals_requested,
                             "note": "phones arrive async via webhook within 30s"} if body.reveal_phones else None,

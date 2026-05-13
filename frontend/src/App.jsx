@@ -677,6 +677,19 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
               (likely duplicate email/phone) and were silently dropped. Try different titles/locations.
             </div>
           )}
+          {(result.qualified>0)&&(
+            <details style={{marginTop:10,fontSize:11,color:"#a3aac4"}}>
+              <summary style={{cursor:"pointer",color:"#a3a6ff"}}>Debug — Supabase response</summary>
+              <div style={{marginTop:6,padding:"8px 10px",background:"#000011",borderRadius:6,
+                fontFamily:"'Space Grotesk',monospace",fontSize:10,lineHeight:1.6}}>
+                <div>insert HTTP: <b>{result.insert_status ?? "(n/a)"}</b></div>
+                <div>verified_saved (re-query of leads where source=Apollo and createdAt&gt;=pull-start): <b>{result.verified_saved ?? "(n/a)"}</b></div>
+                <div style={{whiteSpace:"pre-wrap",wordBreak:"break-all",marginTop:4,color:"#dee5ff"}}>
+                  body[:500]: {result.insert_body_preview || "(empty)"}
+                </div>
+              </div>
+            </details>
+          )}
           {result.phone_reveals&&(
             <div style={{marginTop:6,color:"#ffe083",fontSize:11}}>
               📱 Requested {result.phone_reveals.requested} phone reveals — phones will arrive async within ~30s, refresh the leads list to see them
