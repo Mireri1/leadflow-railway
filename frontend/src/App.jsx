@@ -539,7 +539,10 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
         reveal_phones: revealPhones,
       })})
       setResult(res)
-      if(res.saved>0) onFound&&onFound()
+      // Refresh on any saved row OR on a silent dedupe so the user can see
+      // the leads that already exist in their list (vs feeling like the
+      // pull did nothing).
+      if(res.saved>0||res.silently_deduped) onFound&&onFound()
     }catch(ex){
       setError(ex.message||"Apollo pull failed — check API key in Railway.")
     }finally{ setLoad(false) }
@@ -658,7 +661,22 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
           borderRadius:8,fontSize:12,color:"#dee5ff",lineHeight:1.6}}>
           ✓ <b style={{color:"#8b5cf6"}}>{result.saved}</b> new leads saved
           (Apollo returned {result.returned}, {result.qualified} were actionable,
-          {result.skipped?.no_company||0} missing company, {result.skipped?.no_actionable||0} no name/phone/email)
+          {result.skipped?.already_in_db||0} already in DB,
+          {result.skipped?.non_us||0} non-US,
+          {result.skipped?.no_company||0} missing company,
+          {result.skipped?.no_actionable||0} no name/phone/email)
+          {result.insert_error&&(
+            <div style={{marginTop:8,padding:"8px 10px",background:"#ff6e8418",border:"1px solid #ff6e8440",
+              borderRadius:6,color:"#ff6e84",fontSize:11}}>
+              ⚠ Supabase rejected the insert — {result.insert_error}
+            </div>
+          )}
+          {result.silently_deduped&&(
+            <div style={{marginTop:8,color:"#ffe083",fontSize:11}}>
+              ⚠ All {result.qualified} qualified leads matched an existing unique constraint in Supabase
+              (likely duplicate email/phone) and were silently dropped. Try different titles/locations.
+            </div>
+          )}
           {result.phone_reveals&&(
             <div style={{marginTop:6,color:"#ffe083",fontSize:11}}>
               📱 Requested {result.phone_reveals.requested} phone reveals — phones will arrive async within ~30s, refresh the leads list to see them
@@ -2089,6 +2107,25 @@ export default function App(){
     loadHistory(histRange,histCaller)
   },[activeNav,user])
 
+  // Browser notification on load if overdue — declared here (before any
+  // early return) so hook order stays stable across the Login → app
+  // transition. Otherwise React errors and the app white-screens until
+  // refresh.
+  useEffect(()=>{
+    if(!user||!leads.length) return
+    const d=new Date()
+    const todayStr=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`
+    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<todayStr&&l.status!=="converted")
+    if(overdue.length>0&&"Notification" in window){
+      if(Notification.permission==="granted"){
+        new Notification(`LeadFlow: ${overdue.length} overdue follow-up${overdue.length>1?"s":""}`,{
+          body:overdue.slice(0,3).map(l=>l.company||l.firstName).join(", "),icon:"/favicon.ico"})
+      }else if(Notification.permission!=="denied"){
+        Notification.requestPermission()
+      }
+    }
+  },[user,leads.length])
+
   async function quickStatus(lead,status){
     let cbDate=""
     if(status==="callback") cbDate=window.prompt("Callback date (YYYY-MM-DD):",new Date().toISOString().split("T")[0])||""
@@ -2128,20 +2165,6 @@ export default function App(){
     const order={overdue:0,today:1,tomorrow:2,soon:3}
     return(order[a.urgency]||4)-(order[b.urgency]||4)
   })
-
-  // Browser notification on load if overdue
-  useEffect(()=>{
-    if(!leads.length) return
-    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
-    if(overdue.length>0&&"Notification" in window){
-      if(Notification.permission==="granted"){
-        new Notification(`LeadFlow: ${overdue.length} overdue follow-up${overdue.length>1?"s":""}`,{
-          body:overdue.slice(0,3).map(l=>l.company||l.firstName).join(", "),icon:"/favicon.ico"})
-      }else if(Notification.permission!=="denied"){
-        Notification.requestPermission()
-      }
-    }
-  },[leads.length, today])
 
   const displayLeads=leads.filter(l=>{
     if(fIndustry&&l.industry!==fIndustry) return false
@@ -2224,9 +2247,10 @@ export default function App(){
               fontFamily:"'Inter',sans-serif",outline:"none",width:220}}/>
         </div>
 
-        {/* Callbacks badge */}
+        {/* Callbacks badge — opens the notifications dropdown so clicking
+            either this or the bell icon surfaces the follow-up list. */}
         {stats?.callbacksDue>0&&(
-          <button className="btn btn-amber" onClick={()=>setCbOnly(p=>!p)}>
+          <button className="btn btn-amber" onClick={()=>setShowNotifs(p=>!p)}>
             🔔 {stats.callbacksDue}
           </button>
         )}

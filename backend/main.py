@@ -4072,6 +4072,7 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
 
     # Save and capture row IDs for downstream phone-reveal webhook routing.
     saved_rows = []
+    insert_error = None
     if leads:
         try:
             sr = req_lib.post(
@@ -4082,10 +4083,17 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
                 body_json = sr.json()
                 saved_rows = body_json if isinstance(body_json, list) else []
             else:
+                insert_error = f"Supabase {sr.status_code}: {sr.text[:300]}"
                 print(f"[APOLLO-PULL] supabase insert HTTP {sr.status_code}: {sr.text[:200]}")
         except Exception as e:
+            insert_error = f"Supabase request failed: {e}"
             print(f"[APOLLO-PULL] supabase insert failed: {e}")
     saved = len(saved_rows)
+    # If qualified leads exist but none saved AND no insert error, every row
+    # collided with an existing unique constraint (ignore-duplicates silently
+    # drops them). Surface this so the UI can show a useful message instead
+    # of just "0 saved".
+    silently_deduped = (len(leads) > 0 and saved == 0 and insert_error is None)
 
     # Fire phone reveals (async via webhook) if requested. Apollo posts back to
     # /api/webhooks/apollo/{secret}/{lead_id} when ready.
@@ -4148,6 +4156,8 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
                             "non_us":        skipped_non_us,
                             "no_company":    skipped_no_company,
                             "no_actionable": skipped_no_actionable},
+        "insert_error":    insert_error,
+        "silently_deduped": silently_deduped,
         "phone_reveals":   {"requested": phone_reveals_requested,
                             "note": "phones arrive async via webhook within 30s"} if body.reveal_phones else None,
         "total_available": pagination.get("total_entries"),
