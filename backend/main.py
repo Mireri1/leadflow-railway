@@ -1799,7 +1799,13 @@ def find_phone_dupe_groups(leads: list) -> list:
 def _reparent_call_outcomes(keep_to_extras: dict) -> int:
     """Move call_outcomes rows from extra leadIds → keep leadId, in chunks of 50
     per kept lead. Returns total rows re-parented. Shared by manual cleanup
-    and the auto sweep so dial history never orphans on dedupe."""
+    and the auto sweep so dial history never orphans on dedupe.
+
+    After re-parenting, the kept lead's total_calls + last_called_at on the
+    leads table are now stale (history inherited but counters didn't move).
+    Refresh them from the new call_outcomes count so the next time the lead
+    surfaces in the dialer, the card shows the correct '4 total · last call
+    Mar 12' instead of the pre-merge numbers."""
     reparented = 0
     for keep_id, extra_ids in keep_to_extras.items():
         for i in range(0, len(extra_ids), 50):
@@ -1817,6 +1823,28 @@ def _reparent_call_outcomes(keep_to_extras: dict) -> int:
                     print(f"[DEDUPE-SWEEP] reparent HTTP {rp.status_code}: {rp.text[:200]}")
             except Exception as e:
                 print(f"[DEDUPE-SWEEP] reparent exception: {e}")
+        # Recompute the keeper's counters now that history has moved over.
+        try:
+            cr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=eq.{keep_id}&select=calledAt"
+                f"&order=calledAt.desc&limit=1",
+                headers={**SB_HEADERS, "Prefer": "count=exact"}, timeout=15,
+            )
+            cr_range = cr.headers.get("content-range", "*/0")
+            new_count = int(cr_range.split("/")[-1]) if "/" in cr_range else None
+            last_at_rows = cr.json() if cr.status_code in (200, 206) else []
+            new_last = (last_at_rows[0].get("calledAt") if last_at_rows else None)
+            if new_count is not None:
+                patch = {"total_calls": new_count}
+                if new_last:
+                    patch["last_called_at"] = new_last
+                req_lib.patch(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=eq.{keep_id}",
+                    headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                    json=patch, timeout=15,
+                )
+        except Exception as e:
+            print(f"[DEDUPE-SWEEP] counter refresh failed for keep_id={keep_id}: {e}")
     return reparented
 
 # Hard cap per sweep so a runaway can't wipe the table. Configurable.
@@ -3132,15 +3160,42 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                 headers=SB_HEADERS, timeout=30)
             rows = lr.json() if lr.status_code == 200 else []
             lead_full = rows[0] if rows else {}
-            # Bump updatedAt AND last_called_at AND total_calls so the lead card
-            # surfaces "last contacted N days ago" and the smart-sort can push
-            # never-dialed leads to the front of the queue. Auto-claim if unassigned.
+
+            # total_calls comes from a COUNT on call_outcomes — the ground
+            # truth. Avoids three previous-design failures:
+            #   1. Read-modify-write race: two concurrent log_call hits would
+            #      both read N and both write N+1, losing one increment.
+            #   2. GET-on-leads failure silently overwriting total_calls with
+            #      1 (`(lead_full.get('total_calls') or 0) + 1` collapses to 1
+            #      when lead_full = {}, wiping a 50-call history).
+            #   3. Drift from the dedup-reparent path — when call_outcomes get
+            #      moved from a duplicate row to the kept row, the count is
+            #      automatically correct on the next log_call.
+            new_count = None
+            try:
+                cr = req_lib.get(
+                    f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=eq.{lead_id}&select=id",
+                    headers={**SB_HEADERS, "Prefer": "count=exact"}, timeout=10)
+                cr_range = cr.headers.get("content-range", "*/0")
+                if "/" in cr_range:
+                    new_count = int(cr_range.split("/")[-1])
+            except Exception as e:
+                print(f"[LOG-CALL] count query failed for lead {lead_id}: {e}")
+
+            # Frontend captures call start in call.calledAt — prefer it over
+            # server PATCH time so a back-dated log (call earlier in shift,
+            # logged at EOD) records the right moment instead of "now."
             now_iso = datetime.utcnow().isoformat()
+            called_at = (call.get("calledAt") or "").strip() or now_iso
             patch_payload = {
-                "updatedAt": now_iso,
-                "last_called_at": now_iso,
-                "total_calls": (lead_full.get("total_calls") or 0) + 1,
+                "updatedAt":      now_iso,
+                "last_called_at": called_at,
             }
+            # Only update total_calls when we have a trustworthy count.
+            # Skipping (vs. writing a wrong value) is the safe failure mode —
+            # the next successful log_call self-heals the counter.
+            if new_count is not None:
+                patch_payload["total_calls"] = new_count
             if lead_full and not lead_full.get("assignedTo"):
                 patch_payload["assignedTo"] = caller
             req_lib.patch(
