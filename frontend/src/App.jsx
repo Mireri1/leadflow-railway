@@ -706,25 +706,88 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
       </div>
       {error&&<div style={{marginTop:14,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
         borderRadius:8,fontSize:12,color:"#ff6e84"}}>{error}</div>}
-      {loading&&<div style={{marginTop:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
-        <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#8b5cf6"}}/>
-        Searching Apollo…
-      </div>}
+      {loading&&(
+        <div style={{marginTop:14,padding:"12px 14px",background:"#8b5cf612",border:"1px solid #8b5cf625",
+          borderRadius:8,fontSize:12,color:"#a3aac4",lineHeight:1.6}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#8b5cf6"}}/>
+            <b style={{color:"#dee5ff"}}>Searching Apollo…</b>
+          </div>
+          <div style={{fontSize:11,marginTop:6,color:"#40485d"}}>
+            1. Query Apollo · 2. Filter US-only · 3. Enrich with /people/match (~1 credit each)
+            · 4. Dedupe against your DB · 5. Save remainder. Usually 20–45s for 25 contacts.
+          </div>
+        </div>
+      )}
       {result&&!loading&&(
-        <div style={{marginTop:14,padding:"12px 14px",background:"#8b5cf615",border:"1px solid #8b5cf630",
+        <div style={{marginTop:14,padding:"12px 14px",
+          background:result.saved>0?"#8b5cf615":"#ffe08315",
+          border:`1px solid ${result.saved>0?"#8b5cf630":"#ffe08340"}`,
           borderRadius:8,fontSize:12,color:"#dee5ff",lineHeight:1.6}}>
-          ✓ <b style={{color:"#8b5cf6"}}>{result.saved}</b> new leads saved
-          (Apollo returned {result.returned}, {result.qualified} were actionable,
-          {result.skipped?.no_company||0} missing company, {result.skipped?.no_actionable||0} no name/phone/email)
+          {/* Headline — varies by outcome so "0 saved" doesn't look like a
+              failure when it's just "all already in DB". */}
+          {result.saved>0?(
+            <div>
+              ✓ <b style={{color:"#8b5cf6",fontSize:14}}>{result.saved}</b> new lead{result.saved===1?"":"s"} saved
+              {" "}<span style={{color:"#a3aac4"}}>· {result.returned} contacts checked</span>
+            </div>
+          ):result.returned===0?(
+            <div style={{color:"#ffe083"}}>
+              ⚠ Apollo returned <b>0 contacts</b> for this search. Try widening titles/locations or bumping page.
+            </div>
+          ):(
+            <div style={{color:"#ffe083"}}>
+              ⓘ <b>0 new leads</b> — all {result.returned} contacts were filtered out (see breakdown below). This is normal on repeat searches.
+            </div>
+          )}
+
+          {/* Full skip-category breakdown. Each row only renders if non-zero. */}
+          {result.skipped&&(()=>{
+            const cats = [
+              {k:"already_in_db",   label:"already in DB (caught pre-Apollo)",  color:"#a3aac4"},
+              {k:"phone_dup_in_db", label:"duplicate phone (caught post-Apollo)", color:"#a3aac4"},
+              {k:"non_us",          label:"non-US contacts",                     color:"#a3aac4"},
+              {k:"no_company",      label:"missing company",                     color:"#a3aac4"},
+              {k:"no_actionable",   label:"no name + phone + email combo",       color:"#a3aac4"},
+            ].filter(c=>(result.skipped[c.k]||0)>0)
+            if(cats.length===0) return null
+            return (
+              <div style={{marginTop:8,fontSize:11,color:"#a3aac4",lineHeight:1.7}}>
+                <div style={{fontSize:10,letterSpacing:".08em",textTransform:"uppercase",
+                  color:"#40485d",marginBottom:3}}>Filtered out:</div>
+                {cats.map(c=>(
+                  <div key={c.k}>· <b style={{color:c.color}}>{result.skipped[c.k]}</b> {c.label}</div>
+                ))}
+              </div>
+            )
+          })()}
+
+          {/* Show a few sample saved leads so the caller can verify what
+              actually landed. Without this, "5 saved" was abstract. */}
+          {result.sample&&result.sample.length>0&&result.saved>0&&(
+            <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid #40485d20"}}>
+              <div style={{fontSize:10,letterSpacing:".08em",textTransform:"uppercase",
+                color:"#40485d",marginBottom:4}}>Sample saved:</div>
+              {result.sample.slice(0,5).map((s,i)=>(
+                <div key={i} style={{fontSize:11,color:"#dee5ff",lineHeight:1.5}}>
+                  · <b>{s.name||"—"}</b>{s.title?` · ${s.title}`:""}
+                  {s.company?` @ ${s.company}`:""}
+                  {s.phone?<span style={{color:"#69f6b8"}}> · 📞 {s.phone}</span>:""}
+                  {s.email?<span style={{color:"#a3a6ff"}}> · ✉ {s.email}</span>:""}
+                </div>
+              ))}
+            </div>
+          )}
+
           {result.phone_reveals&&(
-            <div style={{marginTop:6,color:"#ffe083",fontSize:11}}>
-              📱 Requested {result.phone_reveals.requested} phone reveals — phones will arrive async within ~30s, refresh the leads list to see them
+            <div style={{marginTop:8,color:"#ffe083",fontSize:11}}>
+              📱 Requested {result.phone_reveals.requested} phone reveals — arrive async within ~30s, refresh the leads list to see them
             </div>
           )}
           {result.total_available>0&&(
-            <div style={{marginTop:6,color:"#a3aac4",fontSize:11}}>
+            <div style={{marginTop:8,color:"#40485d",fontSize:11}}>
               {result.total_available.toLocaleString()} total contacts match this search
-              ({result.total_pages} pages of {perPage} each — bump page param to pull more)
+              ({result.total_pages} pages of {perPage} each — bump page to pull more)
             </div>
           )}
         </div>

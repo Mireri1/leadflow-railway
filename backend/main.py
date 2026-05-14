@@ -4790,6 +4790,53 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
 
     leads = [l for l, _ in qualified_pairs]
 
+    # Phone normalization — same canonical (NNN) NNN-NNNN format used by
+    # save_to_supabase. Without this an Apollo phone like "+1 203 863 3000"
+    # gets stored differently than a Google Places phone "(203) 863-3000"
+    # for the same business, and the cross-run dedup misses the collision.
+    for l in leads:
+        np = normalize_us_phone(l.get("phone"))
+        if np:
+            l["phone"] = np
+
+    # Cross-run dedup against existing DB phones. Apollo's pre-enrichment
+    # filter_apollo_dupes already checks (name, company), but two scrapes a
+    # week apart can pull the same person under slightly different name
+    # spellings — and Apollo's `q_organization_industries` returns the same
+    # 25 contacts repeatedly across page=1 calls. This catches both.
+    skipped_phone_dup_in_db = 0
+    if leads:
+        incoming_phones = list({(l.get("phone") or "").strip() for l in leads if (l.get("phone") or "").strip()})
+        existing_phones = set()
+        if incoming_phones:
+            CHUNK = 100
+            for i in range(0, len(incoming_phones), CHUNK):
+                chunk = incoming_phones[i:i+CHUNK]
+                in_list = ",".join(f'"{p}"' for p in chunk)
+                try:
+                    dq = req_lib.get(
+                        f"{SUPABASE_URL}/rest/v1/leads?select=phone&phone=in.({in_list})",
+                        headers=SB_HEADERS, timeout=20,
+                    )
+                    if dq.status_code == 200:
+                        for row in dq.json():
+                            ph = (row.get("phone") or "").strip()
+                            if ph: existing_phones.add(ph)
+                except Exception as e:
+                    print(f"[APOLLO-PULL] phone dedup pre-check failed: {e}")
+        if existing_phones:
+            before = len(leads)
+            # Realign qualified_pairs with the filtered leads so the reveal-
+            # phone webhook step still pairs each saved row with the right
+            # Apollo person record.
+            kept_pairs = [(l, p) for l, p in qualified_pairs
+                          if (l.get("phone") or "").strip() not in existing_phones]
+            skipped_phone_dup_in_db = before - len(kept_pairs)
+            qualified_pairs = kept_pairs
+            leads = [l for l, _ in qualified_pairs]
+            if skipped_phone_dup_in_db:
+                print(f"[APOLLO-PULL] phone dedup dropped {skipped_phone_dup_in_db} rows already in DB")
+
     # Save and capture row IDs for downstream phone-reveal webhook routing.
     saved_rows = []
     if leads:
@@ -4841,6 +4888,7 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "skipped_non_us":          skipped_non_us,
         "skipped_no_company":      skipped_no_company,
         "skipped_no_actionable":   skipped_no_actionable,
+        "skipped_phone_dup_in_db": skipped_phone_dup_in_db,
         "phone_reveals_requested": phone_reveals_requested,
         "total_entries":           pagination.get("total_entries"),
         "total_pages":             pagination.get("total_pages"),
@@ -4860,14 +4908,30 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
             actions=[{"label": "📋 View Leads", "url": app_url, "style": "primary"}],
         )
 
+    # Build a human-readable summary so the frontend doesn't have to re-derive
+    # "where did the 25 contacts go?" from skip categories. Apollo pulls are
+    # often "0 saved" because every contact was already in the DB — that's
+    # not a failure, but the old message made it look like one.
+    total_in = len(people) + skipped_already_in_db
+    summary_parts = []
+    if saved:                    summary_parts.append(f"{saved} saved")
+    if skipped_already_in_db:    summary_parts.append(f"{skipped_already_in_db} already in DB (pre-enrich)")
+    if skipped_phone_dup_in_db:  summary_parts.append(f"{skipped_phone_dup_in_db} duplicate phone")
+    if skipped_non_us:           summary_parts.append(f"{skipped_non_us} non-US")
+    if skipped_no_company:       summary_parts.append(f"{skipped_no_company} missing company")
+    if skipped_no_actionable:    summary_parts.append(f"{skipped_no_actionable} no contact info")
+    summary = (f"Apollo returned {total_in} · " + " · ".join(summary_parts)) if summary_parts \
+              else f"Apollo returned {total_in} · all filtered out"
     return {
-        "returned":        len(people) + skipped_already_in_db,
+        "returned":        total_in,
         "qualified":       len(leads),
         "saved":           saved,
-        "skipped":         {"already_in_db": skipped_already_in_db,
-                            "non_us":        skipped_non_us,
-                            "no_company":    skipped_no_company,
-                            "no_actionable": skipped_no_actionable},
+        "summary":         summary,
+        "skipped":         {"already_in_db":   skipped_already_in_db,
+                            "phone_dup_in_db": skipped_phone_dup_in_db,
+                            "non_us":          skipped_non_us,
+                            "no_company":      skipped_no_company,
+                            "no_actionable":   skipped_no_actionable},
         "phone_reveals":   {"requested": phone_reveals_requested,
                             "note": "phones arrive async via webhook within 30s"} if body.reveal_phones else None,
         "total_available": pagination.get("total_entries"),
@@ -4875,7 +4939,7 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "total_pages":     pagination.get("total_pages"),
         "sample":          [{"company": l.get("company"), "name": f"{l.get('firstName','')} {l.get('lastName','')}".strip(),
                              "title": l.get("title"), "phone": l.get("phone"), "email": l.get("email")}
-                            for l in leads[:3]],
+                            for l in (saved_rows or leads)[:5]],
     }
 
 @app.get("/api/admin/apollo/webhook-url")
