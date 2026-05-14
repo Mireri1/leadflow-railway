@@ -3221,10 +3221,13 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
     snooze_hours = max(0, min(int(snooze_hours or 0), 168))
 
     # Filters at the PostgREST level; one paginated GET covers worst case.
+    # NOTE: leads.assignedTo stores unassigned as empty string "", not NULL —
+    # legacy data convention. So the "mine or unassigned" filter needs the
+    # eq.<empty> branch as well as is.null. Tested both branches in prod.
     base = (f"{SUPABASE_URL}/rest/v1/leads?select=*"
-            f"&or=(assignedTo.eq.{url_quote(user)},assignedTo.is.null)"
+            f"&or=(assignedTo.eq.{url_quote(user)},assignedTo.is.null,assignedTo.eq.)"
             f"&status=not.in.(awaiting_email_reply,do_not_contact)"
-            f"&phone=not.is.null"
+            f"&phone=neq."  # empty-string check matches the legacy convention
             f"&order=total_calls.asc.nullsfirst,last_called_at.asc.nullsfirst,score.desc")
     rows = _paginated_get(base, page_size=1000, max_pages=5)
     if not isinstance(rows, list):
