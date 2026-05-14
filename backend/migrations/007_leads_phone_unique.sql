@@ -26,9 +26,26 @@
 --      or wait for the weekly auto sweep, to collapse any remaining dupes.
 --   5. THEN apply this migration.
 --
--- If any duplicates remain when this runs, Postgres will refuse to create the
+-- If duplicates remain when this runs, Postgres will refuse to create the
 -- constraint. That's intentional — better to surface remaining dupes than
 -- silently lose them.
+--
+-- IMPORTANT: many Apollo / contact-import rows have phone='' (empty string),
+-- not NULL. Postgres treats two empty strings as equal, so a plain UNIQUE
+-- constraint fails immediately with `Key (phone)=() is duplicated.`
+--
+-- Two ways to handle it:
+--   A) Partial unique index — preferred. Only enforces uniqueness on rows
+--      where phone is meaningfully set; leaves all the "no phone yet"
+--      contact-only leads alone. PostgREST upserts with `on_conflict=phone`
+--      will still resolve correctly because the partial index covers exactly
+--      the rows we'd ever want to merge.
+--   B) Rewrite empty-string phones to NULL first, then add a vanilla UNIQUE
+--      (since NULL ≠ NULL in unique-constraint semantics). Heavier — touches
+--      every empty-phone row + has to update the codebase to handle NULL.
+--
+-- We do (A). Run as a single statement:
 
-ALTER TABLE leads
-  ADD CONSTRAINT leads_phone_unique UNIQUE (phone);
+CREATE UNIQUE INDEX IF NOT EXISTS leads_phone_unique
+  ON leads (phone)
+  WHERE phone IS NOT NULL AND phone <> '';
