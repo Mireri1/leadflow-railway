@@ -99,6 +99,25 @@ function isValidUsPhone(phone){
   return true
 }
 
+// "3h", "2d", "5mo" — compact relative-past for last-contacted labels.
+// Lead cards and the dialer use this so the caller knows whether a lead
+// is freshly worked vs. been resting for a month.
+function pastAgo(dateStr){
+  if(!dateStr) return ""
+  const ms = Date.now() - new Date(dateStr).getTime()
+  if(!isFinite(ms) || ms < 0) return ""
+  const mins = Math.floor(ms/60000)
+  if(mins < 1)   return "just now"
+  if(mins < 60)  return `${mins}m`
+  const hrs = Math.floor(mins/60)
+  if(hrs < 24)   return `${hrs}h`
+  const days = Math.floor(hrs/24)
+  if(days < 30)  return `${days}d`
+  const mos = Math.floor(days/30)
+  if(mos < 12)   return `${mos}mo`
+  return `${Math.floor(mos/12)}y`
+}
+
 function scoreLead(lead) {
   let s = 5
   if ((lead.company||"").trim())   s+=8
@@ -1948,7 +1967,7 @@ export default function App(){
   const [showScripts,setShowScripts] = useState(false)
   const [search,setSearch]         = useState("")
   const [fStatus,setFStatus]       = useState("all")
-  const [sortBy,setSort]           = useState("score")
+  const [sortBy,setSort]           = useState("smart")
   const [cbOnly,setCbOnly]         = useState(false)
   const [fIndustry,setFIndustry]   = useState("")
   const [fState,setFState]         = useState("")
@@ -2554,8 +2573,10 @@ export default function App(){
                     {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
                   </select>
                   <select className="sel" value={sortBy} onChange={e=>setSort(e.target.value)}>
+                    <option value="smart">Smart (fresh + rested first)</option>
                     <option value="score">Highest Score</option>
                     <option value="newest">Newest First</option>
+                    <option value="oldest_contact">Longest Since Last Call</option>
                     <option value="company">Company A–Z</option>
                     <option value="callbacks">Callbacks Due</option>
                   </select>
@@ -2693,15 +2714,22 @@ export default function App(){
                               {lead.total_calls>0&&<span style={{marginLeft:4}}>· {lead.total_calls} call{lead.total_calls!==1?"s":""}</span>}
                             </div>
                           )}
-                          {lead.updatedAt&&(
-                            <div style={{marginTop:2,fontSize:10,color:"#40485d"}}
-                              title="Bumps every time the lead is updated — use to vary dial timing for non-answers">
-                              {lead.total_calls>0?"last contacted ":"updated "}
-                              {new Date(lead.updatedAt).toLocaleDateString([],{month:"short",day:"numeric"})}
-                              {" "}
-                              {new Date(lead.updatedAt).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                          {lead.last_called_at?(
+                            <div style={{marginTop:2,fontSize:10,color:"#a3aac4",lineHeight:1.35}}
+                              title={"Exact: "+new Date(lead.last_called_at).toLocaleString()+
+                                     "\nVary timing for non-answers — don't keep retrying the same hour."}>
+                              <div>📞 {pastAgo(lead.last_called_at)} ago</div>
+                              <div style={{color:"#40485d",fontSize:9}}>
+                                {new Date(lead.last_called_at).toLocaleDateString([],{month:"short",day:"numeric",year:"2-digit"})}
+                                {" · "}
+                                {new Date(lead.last_called_at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                              </div>
                             </div>
-                          )}
+                          ):(lead.total_calls||0)===0?(
+                            <div style={{marginTop:2,fontSize:10,color:"#69f6b8",fontWeight:600}}>
+                              ✨ Never called
+                            </div>
+                          ):null}
                         </div>
                         <div>
                           <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>
@@ -2941,11 +2969,23 @@ export default function App(){
                 // a guaranteed disconnect that drags down connectivity rate.
                 // The lead still exists in the DB (admin can review/clean via
                 // the Lead Cleanup panel) but won't surface in the dial queue.
+                //
+                // Always smart-sort the dialer pool regardless of the leads
+                // view's sort dropdown: fresh (never dialed) first, then
+                // longest-since-last-call, then highest score. This is the
+                // fix for "leads feel like they're repeating" — the same
+                // no_answer rows kept rising to the top under score.desc.
                 const dialerLeads=leads.filter(l=>
                   (!l.assignedTo||l.assignedTo===user)
                   && !NO_DIAL_STATUSES.has(l.status)
                   && isValidUsPhone(l.phone)
-                )
+                ).slice().sort((a,b)=>{
+                  const ca=a.total_calls||0, cb=b.total_calls||0
+                  if(ca!==cb) return ca-cb                              // fewest calls first
+                  const la=a.last_called_at||"", lb=b.last_called_at||""
+                  if(la!==lb) return la<lb?-1:1                         // oldest contact first ("" sorts before any date)
+                  return (b.score||0)-(a.score||0)                      // tiebreak: highest score
+                })
                 if(dialerLeads.length===0) return(
                   <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
                     <div style={{fontSize:40,marginBottom:12}}>✅</div>
@@ -2978,10 +3018,32 @@ export default function App(){
                         color:"#dee5ff",marginBottom:4}}>
                         {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
                       <div style={{color:"#a3aac4",fontSize:15,marginBottom:16}}>{lead.company}</div>
-                      <div style={{display:"flex",justifyContent:"center",gap:10,marginBottom:24,flexWrap:"wrap"}}>
+                      <div style={{display:"flex",justifyContent:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
                         <ScoreRing score={score}/>
                         <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>{info.label}</span>
                         {lead.industry&&<span className="pill" style={{background:"#a3a6ff18",color:"#a3a6ff"}}>{lead.industry}</span>}
+                      </div>
+                      {/* Contact history line — fresh leads get a green badge,
+                          previously-worked leads show how long it's been so
+                          the caller can vary timing instead of dialing the
+                          same hour twice. */}
+                      <div style={{marginBottom:18,fontSize:12,color:"#a3aac4",
+                        fontFamily:"'Space Grotesk',sans-serif",lineHeight:1.5}}
+                        title={lead.last_called_at?"Exact: "+new Date(lead.last_called_at).toLocaleString():""}>
+                        {lead.last_called_at?(
+                          <>
+                            <div>📞 Last call {pastAgo(lead.last_called_at)} ago
+                              {lead.total_calls>0&&<span style={{color:"#40485d"}}> · {lead.total_calls} total</span>}
+                            </div>
+                            <div style={{color:"#40485d",fontSize:11,marginTop:2}}>
+                              {new Date(lead.last_called_at).toLocaleDateString([],{weekday:"short",month:"short",day:"numeric",year:"numeric"})}
+                              {" at "}
+                              {new Date(lead.last_called_at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})}
+                            </div>
+                          </>
+                        ):(
+                          <span style={{color:"#69f6b8",fontWeight:600}}>✨ Never called — fresh lead</span>
+                        )}
                       </div>
                       {lead.phone&&(
                         <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:32,fontWeight:700,
@@ -4569,6 +4631,20 @@ function LeadCleanupPanel({onCleanup}){
   const [loading,setLoad]= useState(false)
   const [busy,setBusy]   = useState(null)  // category currently being deleted
   const [result,setRes]  = useState(null)
+  const [backfilling,setBackfilling] = useState(false)
+  const [backfillResult,setBackfillResult] = useState(null)
+
+  async function runBackfill(){
+    if(!window.confirm("Rebuild total_calls + last_called_at on every lead from call_outcomes history?\n\nSafe to re-run.")) return
+    setBackfilling(true); setBackfillResult(null)
+    try{
+      const r = await api("/api/admin/leads/backfill-call-stats",{method:"POST"})
+      setBackfillResult(r)
+      onCleanup&&onCleanup()
+    }catch(ex){
+      setBackfillResult({error: ex.message||"backfill failed"})
+    }finally{ setBackfilling(false) }
+  }
 
   const loadPreview = ()=>{
     setLoad(true)
@@ -4584,6 +4660,10 @@ function LeadCleanupPanel({onCleanup}){
     try{
       const r = await api("/api/admin/leads/cleanup-execute",{method:"POST",body:JSON.stringify({
         ids: data.categories[catKey].ids, reason: catKey,
+        // For duplicate_phones, pass the {extra_id: keep_id} map so the
+        // backend re-parents call_outcomes before deleting the extra rows
+        // (otherwise dial history orphans).
+        reparent_map: data.categories[catKey].reparent_map || {},
       })})
       setRes({cat: label, ...r})
       loadPreview()
@@ -4614,6 +4694,35 @@ function LeadCleanupPanel({onCleanup}){
       </div>
       {open&&(
         <div style={{padding:"0 24px 20px",borderTop:"1px solid #40485d20"}}>
+          {/* Dynamic-cleanup notice + manual backfill — sits above the
+              category list so admins know auto-dedupe is on. */}
+          <div style={{background:"#192540",borderRadius:8,padding:"12px 14px",margin:"14px 0",
+            border:"1px solid #69f6b820"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
+              <div style={{flex:1,minWidth:240}}>
+                <div style={{fontSize:11,color:"#69f6b8",fontWeight:700,marginBottom:3}}>
+                  🤖 AUTO-DEDUPE ACTIVE
+                </div>
+                <div style={{fontSize:11,color:"#a3aac4",lineHeight:1.5}}>
+                  Phone + Apollo duplicates are auto-cleaned weekly (safe extras only — engaged rows preserved, call history re-parented).
+                  Slack-alerts on every run. New scrapes also dedupe against the DB before insert.
+                </div>
+              </div>
+              <button className="btn btn-g" style={{fontSize:11,padding:"7px 14px",whiteSpace:"nowrap"}}
+                disabled={backfilling} onClick={runBackfill}
+                title="Rebuilds total_calls + last_called_at on every lead from call_outcomes history. Run this once after deploying the timestamp fix.">
+                {backfilling?"Rebuilding…":"⟳ Rebuild call stats"}
+              </button>
+            </div>
+            {backfillResult&&(
+              <div style={{marginTop:8,fontSize:11,
+                color: backfillResult.error?"#ff6e84":"#69f6b8"}}>
+                {backfillResult.error
+                  ? `✗ ${backfillResult.error}`
+                  : `✓ Scanned ${backfillResult.scanned_calls?.toLocaleString()} calls · updated ${backfillResult.updated?.toLocaleString()} leads`}
+              </div>
+            )}
+          </div>
           {loading?(
             <div style={{padding:"30px",textAlign:"center",color:"#40485d",fontSize:12}}>Scanning leads…</div>
           ):!data?(

@@ -874,6 +874,43 @@ def save_to_supabase(leads):
     if not leads:
         return 0
     try:
+        # Cross-run dedup: the per-scrape `seen_phones` set in run_scrape only
+        # dedupes within one Places run. Two runs over the same city/keyword
+        # (e.g. caller searched "schools, CT" Monday and "private schools, CT"
+        # Wednesday) bypass the (city,keyword) Places cache and re-insert the
+        # same business as a fresh row, giving the dialer "repeating leads."
+        # Filter incoming rows whose phone already exists in the leads table.
+        incoming_phones = list({(l.get("phone") or "").strip() for l in leads if (l.get("phone") or "").strip()})
+        existing_phones = set()
+        if incoming_phones:
+            # Chunk to avoid URL-length cap (~2KB). 100 phones * ~20 chars each = ~2KB.
+            CHUNK = 100
+            for i in range(0, len(incoming_phones), CHUNK):
+                chunk = incoming_phones[i:i+CHUNK]
+                # Each phone is quoted to keep commas-in-format safe.
+                in_list = ",".join(f'"{p}"' for p in chunk)
+                try:
+                    r = req_lib.get(
+                        f"{SUPABASE_URL}/rest/v1/leads?select=phone&phone=in.({in_list})",
+                        headers=SB_HEADERS, timeout=20,
+                    )
+                    if r.status_code == 200:
+                        for row in r.json():
+                            ph = (row.get("phone") or "").strip()
+                            if ph:
+                                existing_phones.add(ph)
+                except Exception as e:
+                    print(f"[SUPABASE] dedup pre-check failed: {e}")
+                    # Fail open — better to risk a dup than drop the whole batch.
+
+        if existing_phones:
+            before = len(leads)
+            leads = [l for l in leads if (l.get("phone") or "").strip() not in existing_phones]
+            print(f"[SUPABASE] cross-run phone dedup: {before - len(leads)} of {before} dropped (already in DB)")
+
+        if not leads:
+            return 0
+
         r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/leads",
             headers=SB_HEADERS, json=leads, timeout=30
@@ -1628,6 +1665,12 @@ def _bg_maintenance_loop():
         except Exception as e:
             print(f"[EMAIL-SEQ] auto-process exception: {e}")
         # Self-healing weekly dedupe — internal cooldown, no-ops most ticks.
+        # Apollo (name+company) and phone-based sweeps share the same cooldown
+        # row, so they run together; the cooldown is updated once at the end.
+        try:
+            run_phone_dedupe_sweep_if_due()
+        except Exception as e:
+            print(f"[PHONE-DEDUPE] loop exception: {e}")
         try:
             run_dedupe_sweep_if_due()
         except Exception as e:
@@ -1686,7 +1729,9 @@ def find_apollo_dupe_groups(leads: list) -> list:
 
 def _fetch_all_leads_for_dedupe() -> list:
     """Paginated full-table read for the dedupe sweep. Mirrors the loop
-    pattern in cleanup_preview but returns only the columns dedupe needs."""
+    pattern in cleanup_preview but returns only the columns dedupe needs.
+    Includes `phone` so the same fetch powers both Apollo (name+company) and
+    phone-based dedupe."""
     leads = []
     PAGE = 1000
     MAX_PAGES = 50
@@ -1696,7 +1741,7 @@ def _fetch_all_leads_for_dedupe() -> list:
         try:
             r = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads"
-                f"?select=id,company,firstName,lastName,createdAt,assignedTo,status,total_calls"
+                f"?select=id,company,firstName,lastName,phone,createdAt,assignedTo,status,total_calls"
                 f"&order=id.asc",
                 headers={**SB_HEADERS, "Range-Unit": "items", "Range": f"{start}-{end}"},
                 timeout=30,
@@ -1711,6 +1756,150 @@ def _fetch_all_leads_for_dedupe() -> list:
             print(f"[DEDUPE-SWEEP] fetch page {page} failed: {e}")
             break
     return leads
+
+# Statuses we never auto-delete a duplicate of — the row carries real
+# engagement value (or compliance signal) that mustn't be discarded.
+ENGAGED_STATUSES = {"interested", "converted", "callback", "awaiting_email_reply", "do_not_contact"}
+
+def find_phone_dupe_groups(leads: list) -> list:
+    """Group by exact phone match. For each group, pick the row to keep
+    (engaged status wins → highest total_calls → newest) and split the
+    extras into safe-to-delete (non-engaged) vs risky (engaged — preserve).
+
+    Returns list of {phone, kept, safe_extras, risky_extras}."""
+    by_phone = {}
+    for l in leads:
+        ph = (l.get("phone") or "").strip()
+        if ph:
+            by_phone.setdefault(ph, []).append(l)
+    out = []
+    for ph, group in by_phone.items():
+        if len(group) < 2:
+            continue
+        def _priority(l):
+            engaged = (l.get("status") or "") in ENGAGED_STATUSES
+            return (engaged, l.get("total_calls") or 0, l.get("createdAt") or "")
+        sorted_group = sorted(group, key=_priority, reverse=True)
+        keep = sorted_group[0]
+        safe_extras  = []
+        risky_extras = []
+        for e in sorted_group[1:]:
+            if (e.get("status") or "") in ENGAGED_STATUSES:
+                risky_extras.append(e)
+            else:
+                safe_extras.append(e)
+        out.append({
+            "phone":         ph,
+            "kept":          keep,
+            "safe_extras":   safe_extras,
+            "risky_extras":  risky_extras,
+        })
+    return out
+
+def _reparent_call_outcomes(keep_to_extras: dict) -> int:
+    """Move call_outcomes rows from extra leadIds → keep leadId, in chunks of 50
+    per kept lead. Returns total rows re-parented. Shared by manual cleanup
+    and the auto sweep so dial history never orphans on dedupe."""
+    reparented = 0
+    for keep_id, extra_ids in keep_to_extras.items():
+        for i in range(0, len(extra_ids), 50):
+            chunk = [str(x) for x in extra_ids[i:i+50]]
+            try:
+                rp = req_lib.patch(
+                    f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=in.({','.join(chunk)})",
+                    headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                    json={"leadId": keep_id},
+                    timeout=30,
+                )
+                if rp.status_code in (200, 204):
+                    reparented += len(chunk)
+                else:
+                    print(f"[DEDUPE-SWEEP] reparent HTTP {rp.status_code}: {rp.text[:200]}")
+            except Exception as e:
+                print(f"[DEDUPE-SWEEP] reparent exception: {e}")
+    return reparented
+
+# Hard cap per sweep so a runaway can't wipe the table. Configurable.
+PHONE_DEDUPE_MAX_PER_RUN = int(os.getenv("PHONE_DEDUPE_MAX_PER_RUN", "300"))
+
+def run_phone_dedupe_sweep_if_due():
+    """Weekly self-healing phone dedupe. Same cooldown row as Apollo dedupe
+    (`last_dedupe_sweep`) so the two stay in lock-step — one fetch, two
+    sweeps per cycle. Skips silently if not due."""
+    # Re-uses the Apollo cooldown row so the two sweeps share a tick.
+    # If Apollo just ran, this is the same cycle and we run too.
+    if not _dedupe_sweep_due():
+        return
+    print("[PHONE-DEDUPE] starting weekly phone-dedup sweep")
+    leads = _fetch_all_leads_for_dedupe()
+    if not leads:
+        print("[PHONE-DEDUPE] empty fetch — aborting")
+        return
+
+    groups = find_phone_dupe_groups(leads)
+    auto_ids   = []
+    reparent   = {}  # keep_id -> [extra_id, ...]
+    borderline = [g for g in groups if g["risky_extras"]]
+    for g in groups:
+        if not g["safe_extras"]:
+            continue
+        keep_id = g["kept"]["id"]
+        for e in g["safe_extras"]:
+            auto_ids.append(e["id"])
+            reparent.setdefault(keep_id, []).append(e["id"])
+            if len(auto_ids) >= PHONE_DEDUPE_MAX_PER_RUN:
+                break
+        if len(auto_ids) >= PHONE_DEDUPE_MAX_PER_RUN:
+            print(f"[PHONE-DEDUPE] hit per-run cap ({PHONE_DEDUPE_MAX_PER_RUN}) — stopping")
+            break
+
+    reparented = 0
+    deleted = 0
+    if auto_ids:
+        # Re-parent call history before delete so we don't orphan call_outcomes.
+        reparented = _reparent_call_outcomes(reparent)
+        BATCH = 50
+        for i in range(0, len(auto_ids), BATCH):
+            batch = [str(x) for x in auto_ids[i:i+BATCH]]
+            try:
+                r = req_lib.delete(
+                    f"{SUPABASE_URL}/rest/v1/leads?id=in.({','.join(batch)})",
+                    headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                    timeout=30,
+                )
+                if r.status_code in (200, 204):
+                    deleted += len(batch)
+                else:
+                    print(f"[PHONE-DEDUPE] batch delete HTTP {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                print(f"[PHONE-DEDUPE] batch delete exception: {e}")
+        audit_log("system", "leads_cleanup", "lead", None, {
+            "reason":   "weekly_phone_dedupe_sweep",
+            "deleted":  deleted,
+            "reparented_calls": reparented,
+            "borderline_groups": len(borderline),
+        })
+
+    if deleted > 0 or borderline:
+        fields = [{"label": "Auto-cleaned",
+                   "value": f":white_check_mark: {deleted} duplicate phones "
+                            f"(reparented {reparented} call history rows)"}]
+        if borderline:
+            sample_lines = []
+            for b in borderline[:5]:
+                others = ", ".join(str(o["id"])[:8] for o in b["risky_extras"])
+                sample_lines.append(f"• `{b['phone']}` (kept `{str(b['kept']['id'])[:8]}`, engaged extras: `{others}`)")
+            more = f"\n…and {len(borderline) - 5} more" if len(borderline) > 5 else ""
+            fields.append({
+                "label": f"Need review ({len(borderline)})",
+                "value": "\n".join(sample_lines) + more,
+            })
+        summary = f"Auto-cleaned {deleted} duplicate-phone rows"
+        if borderline:
+            summary += f" — {len(borderline)} group(s) need review (engaged duplicates preserved)"
+        send_slack(":broom: Weekly phone-dedupe sweep", summary, fields=fields)
+
+    print(f"[PHONE-DEDUPE] done — deleted={deleted} reparented={reparented} borderline={len(borderline)}")
 
 def _dedupe_sweep_due() -> bool:
     """Read app_settings.last_dedupe_sweep; True if ≥ INTERVAL_DAYS have passed
@@ -2743,11 +2932,22 @@ def _paginated_get(url: str, headers: dict = None, page_size: int = 1000, max_pa
     return rows
 
 @app.get("/api/leads")
-def list_leads(status: str = "", search: str = "", sort: str = "score",
+def list_leads(status: str = "", search: str = "", sort: str = "smart",
                callbacks: str = "", source: str = "", user: str = Depends(verify_token)):
     try:
-        order_map = {"score":"score.desc","newest":"createdAt.desc","company":"company.asc","callbacks":"callbackDate.asc"}
-        order = order_map.get(sort, "score.desc")
+        # "smart" is the new default: fresh (never-dialed) leads first, then
+        # leads not dialed in the longest time, then highest-score within ties.
+        # Stops the caller from re-spinning through the same recently-dialed
+        # no_answer rows over and over.
+        order_map = {
+            "smart":     "total_calls.asc.nullsfirst,last_called_at.asc.nullsfirst,score.desc",
+            "score":     "score.desc",
+            "newest":    "createdAt.desc",
+            "oldest_contact": "last_called_at.asc.nullsfirst",
+            "company":   "company.asc",
+            "callbacks": "callbackDate.asc",
+        }
+        order = order_map.get(sort, order_map["smart"])
 
         # Build base URL (filters that aren't search)
         base_url = f"{SUPABASE_URL}/rest/v1/leads?select=*"
@@ -2808,8 +3008,18 @@ def list_leads(status: str = "", search: str = "", sort: str = "score",
             print(f"[SEARCH] call_outcomes phase failed: {e}")
 
         # Sort the merged result so phase-2 inserts land in the right spot.
-        sort_key, _, dir_ = order.partition(".")
-        if sort_key in ("score", "createdAt", "company", "callbackDate"):
+        # Match the multi-column smart sort (fresh first → oldest contact → score).
+        def _smart_key(l):
+            return (
+                l.get("total_calls") or 0,
+                l.get("last_called_at") or "",  # empty string sorts first → fresh top
+                -(l.get("score") or 0),         # negate so desc-by-score via asc sort
+            )
+        first_col = order.split(",")[0]
+        sort_key, _, dir_ = first_col.partition(".")
+        if sort == "smart" or order.startswith("total_calls"):
+            leads.sort(key=_smart_key)
+        elif sort_key in ("score", "createdAt", "company", "callbackDate", "last_called_at"):
             leads.sort(
                 key=lambda x: (x.get(sort_key) or 0) if sort_key == "score" else (x.get(sort_key) or ""),
                 reverse=(dir_ == "desc"),
@@ -2922,10 +3132,15 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                 headers=SB_HEADERS, timeout=30)
             rows = lr.json() if lr.status_code == 200 else []
             lead_full = rows[0] if rows else {}
-            # Always bump updatedAt so the lead card surfaces "last contacted"
-            # date+time — caller uses this to adjust dial timing for non-answers
-            # (don't keep retrying at the same hour). Auto-claim if unassigned.
-            patch_payload = {"updatedAt": datetime.utcnow().isoformat()}
+            # Bump updatedAt AND last_called_at AND total_calls so the lead card
+            # surfaces "last contacted N days ago" and the smart-sort can push
+            # never-dialed leads to the front of the queue. Auto-claim if unassigned.
+            now_iso = datetime.utcnow().isoformat()
+            patch_payload = {
+                "updatedAt": now_iso,
+                "last_called_at": now_iso,
+                "total_calls": (lead_full.get("total_calls") or 0) + 1,
+            }
             if lead_full and not lead_full.get("assignedTo"):
                 patch_payload["assignedTo"] = caller
             req_lib.patch(
@@ -3308,9 +3523,19 @@ def cleanup_preview(user: str = Depends(verify_admin)):
                 })
 
     # ── Duplicate by phone ──────────────────────────────────────────────
-    # Group by exact phone match. Keep the newest createdAt; mark older
-    # extras for deletion ONLY if they have no caller activity (otherwise
-    # we'd lose call-history attached to a worked lead).
+    # Group by exact phone match. The dialer queue surfaces every row
+    # individually, so duplicate-phone rows make the caller dial the same
+    # business N times and feel like "the leads are repeating."
+    #
+    # Keep rule: prefer the row with an engaged status (interested / converted /
+    # callback / awaiting_email_reply / do_not_contact), then highest total_calls,
+    # then newest createdAt. Extras are safe to delete UNLESS they themselves
+    # carry an engaged status (don't drop a separate "interested" row just
+    # because the keeper is "converted" — both records are meaningful).
+    #
+    # cleanup-execute will re-parent call_outcomes from delete→keep before
+    # deleting, so dial history doesn't get orphaned.
+    # ENGAGED_STATUSES defined at module level — same set as the auto sweep.
     phone_groups = {}
     for l in leads:
         ph = (l.get("phone") or "").strip()
@@ -3318,34 +3543,34 @@ def cleanup_preview(user: str = Depends(verify_admin)):
             phone_groups.setdefault(ph, []).append(l)
     dup_phone_ids = []
     dup_phone_samples = []
+    dup_phone_reparent = {}  # extra_id -> keep_id, used by cleanup-execute
     for ph, group in phone_groups.items():
         if len(group) < 2:
             continue
-        group_sorted = sorted(group, key=lambda x: x.get("createdAt") or "", reverse=True)
+        def _keep_priority(l):
+            engaged = (l.get("status") or "") in ENGAGED_STATUSES
+            return (engaged, l.get("total_calls") or 0, l.get("createdAt") or "")
+        group_sorted = sorted(group, key=_keep_priority, reverse=True)
         keep = group_sorted[0]
         extras = group_sorted[1:]
-        worth_deleting = []
-        for e in extras:
-            # Skip if worked: assigned, calls logged, or status moved past 'new'
-            if e.get("assignedTo"):
-                continue
-            if (e.get("total_calls") or 0) > 0:
-                continue
-            if e.get("status") and e.get("status") != "new":
-                continue
-            worth_deleting.append(e)
+        worth_deleting = [e for e in extras if (e.get("status") or "") not in ENGAGED_STATUSES]
         if not worth_deleting:
             continue
         for e in worth_deleting:
             dup_phone_ids.append(e["id"])
+            dup_phone_reparent[str(e["id"])] = keep["id"]
         if len(dup_phone_samples) < 8:
             dup_phone_samples.append({
                 "phone": ph,
                 "kept":  {"id": keep["id"], "company": keep.get("company"),
                           "createdAt": (keep.get("createdAt") or "")[:10],
+                          "status": keep.get("status"),
+                          "total_calls": keep.get("total_calls") or 0,
                           "source": keep.get("source")},
                 "delete":[{"id": e["id"], "company": e.get("company"),
                            "createdAt": (e.get("createdAt") or "")[:10],
+                           "status": e.get("status"),
+                           "total_calls": e.get("total_calls") or 0,
                            "source": e.get("source")} for e in worth_deleting],
             })
 
@@ -3430,10 +3655,13 @@ def cleanup_preview(user: str = Depends(verify_admin)):
                 "samples": foreign_samples,
             },
             "duplicate_phones": {
-                "label":   "Duplicate phone numbers (newer copy kept; only deletes unworked extras)",
+                "label":   "Duplicate phone numbers (best copy kept; call history re-parented before delete)",
                 "count":   len(dup_phone_ids),
                 "ids":     dup_phone_ids,
                 "samples": dup_phone_samples,
+                # Map of {extra_id -> keep_id} so cleanup-execute can re-parent
+                # call_outcomes before deleting the extra rows.
+                "reparent_map": dup_phone_reparent,
             },
             "duplicate_apollo_contacts": {
                 "label":   "Same person (firstName+lastName) at same company across multiple rows — keeps most-worked copy, deletes unworked extras",
@@ -3458,12 +3686,43 @@ def cleanup_preview(user: str = Depends(verify_admin)):
 
 @app.post("/api/admin/leads/cleanup-execute")
 def cleanup_execute(body: dict, user: str = Depends(verify_admin)):
-    """Delete leads by ID list. Body: {ids: [...], reason: 'foreign'|'duplicate_phones'|...}.
-    Batched by 50 because Supabase URL length limits."""
+    """Delete leads by ID list. Body: {ids: [...], reason: 'foreign'|'duplicate_phones'|...,
+    reparent_map?: {extra_id: keep_id}}.
+
+    For reason='duplicate_phones', the optional reparent_map tells us where to
+    move each extra row's call_outcomes BEFORE we delete the extra row — so
+    dial history follows the surviving lead instead of orphaning. Batched by
+    50 because Supabase URL length limits."""
     ids = body.get("ids") or []
     reason = (body.get("reason") or "manual").strip()
+    reparent_map = body.get("reparent_map") or {}
     if not ids:
         return {"deleted": 0, "requested": 0}
+
+    # Re-parent call_outcomes from extras to the kept row before deleting.
+    # Group by keep_id so we issue one PATCH per kept row instead of one per
+    # extra (cuts request count when a lead has 10+ duplicates).
+    reparented = 0
+    if reparent_map and reason == "duplicate_phones":
+        keep_to_extras = {}
+        for extra_id, keep_id in reparent_map.items():
+            keep_to_extras.setdefault(keep_id, []).append(extra_id)
+        for keep_id, extra_ids in keep_to_extras.items():
+            for i in range(0, len(extra_ids), 50):
+                chunk = [str(x) for x in extra_ids[i:i+50]]
+                try:
+                    rp = req_lib.patch(
+                        f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=in.({','.join(chunk)})",
+                        headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                        json={"leadId": keep_id},
+                        timeout=30,
+                    )
+                    if rp.status_code in (200, 204):
+                        reparented += len(chunk)
+                    else:
+                        print(f"[CLEANUP] reparent HTTP {rp.status_code}: {rp.text[:200]}")
+                except Exception as e:
+                    print(f"[CLEANUP] reparent exception: {e}")
 
     deleted = 0
     failed_batches = 0
@@ -3488,8 +3747,81 @@ def cleanup_execute(body: dict, user: str = Depends(verify_admin)):
     audit_log(user, "leads_cleanup", "lead", None, {
         "reason": reason, "requested": len(ids),
         "deleted": deleted, "failed_batches": failed_batches,
+        "reparented_calls": reparented,
     })
-    return {"deleted": deleted, "requested": len(ids), "failed_batches": failed_batches}
+    return {"deleted": deleted, "requested": len(ids), "failed_batches": failed_batches, "reparented_calls": reparented}
+
+@app.post("/api/admin/leads/backfill-call-stats")
+def backfill_call_stats(user: str = Depends(verify_admin)):
+    """One-shot: aggregate call_outcomes per leadId and write the totals back
+    to the leads table. Until `log_call` was patched to bump total_calls /
+    last_called_at, every lead had `total_calls=0` and `last_called_at=NULL`
+    regardless of how many times it had actually been dialed — which broke
+    the smart sort (every lead looked 'fresh') and hid timestamps on cards.
+
+    This rebuilds those columns from call_outcomes, the ground-truth log."""
+    print(f"[BACKFILL] starting call-stats backfill (triggered by {user})")
+    # Pull all call_outcomes — id+leadId+calledAt is enough. Paginate via Range
+    # because the table is well past 1000 rows.
+    rows = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes?select=leadId,calledAt&order=calledAt.asc",
+        page_size=1000, max_pages=100,
+    )
+    if not rows:
+        return {"updated": 0, "scanned_calls": 0, "note": "no call_outcomes found"}
+
+    # Aggregate in Python: per leadId, count + most-recent calledAt.
+    agg = {}
+    for c in rows:
+        lid = c.get("leadId")
+        if not lid:
+            continue
+        called_at = c.get("calledAt") or ""
+        cur = agg.get(lid)
+        if not cur:
+            agg[lid] = {"total_calls": 1, "last_called_at": called_at}
+        else:
+            cur["total_calls"] += 1
+            if called_at and called_at > cur["last_called_at"]:
+                cur["last_called_at"] = called_at
+
+    # Bulk upsert on `id` — PostgREST merges only the fields we send when
+    # Prefer: resolution=merge-duplicates is set. 500/batch keeps payload size
+    # under Supabase's request limit comfortably.
+    payload = [{"id": lid, "total_calls": v["total_calls"], "last_called_at": v["last_called_at"]}
+               for lid, v in agg.items()]
+    BATCH = 500
+    updated = 0
+    failed_batches = 0
+    for i in range(0, len(payload), BATCH):
+        batch = payload[i:i+BATCH]
+        try:
+            r = req_lib.post(
+                f"{SUPABASE_URL}/rest/v1/leads?on_conflict=id",
+                headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                json=batch, timeout=60,
+            )
+            if r.status_code in (200, 201, 204):
+                updated += len(batch)
+            else:
+                failed_batches += 1
+                print(f"[BACKFILL] batch {i//BATCH} HTTP {r.status_code}: {r.text[:300]}")
+        except Exception as e:
+            failed_batches += 1
+            print(f"[BACKFILL] batch {i//BATCH} exception: {e}")
+
+    audit_log(user, "backfill_call_stats", "lead", None, {
+        "scanned_calls": len(rows), "leads_updated": updated,
+        "failed_batches": failed_batches,
+    })
+    print(f"[BACKFILL] done — scanned {len(rows)} calls across {len(agg)} leads, "
+          f"updated {updated}, failed_batches={failed_batches}")
+    return {
+        "scanned_calls": len(rows),
+        "leads_with_calls": len(agg),
+        "updated": updated,
+        "failed_batches": failed_batches,
+    }
 
 @app.post("/api/leads/recycle-stale")
 def recycle_stale_leads(user: str = Depends(verify_admin)):
