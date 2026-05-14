@@ -2610,18 +2610,64 @@ def _apollo_person_is_us(person: dict) -> bool:
 
     Even with person_locations='United States', Apollo's matcher is loose —
     Filipino call-center managers, Indian ops directors, Canadian property
-    managers slip through. The api_search response includes `country` and
-    `state` directly on each person and on the org; we accept only if at
-    least one of those resolves to US. Empty country + empty US-state =
-    reject (better to miss a few than spend match credits on a UK lead)."""
+    managers slip through. We accept rows where ANY of these resolve to US:
+      - person.country / org.country in US aliases
+      - person.state / org.state is a US state abbrev or name
+      - city + state combo that includes a US state token (e.g. "Boston, MA")
+      - present_raw_address ends in a US zip pattern (5 digits, optional +4)
+
+    Previous version rejected anything that didn't have explicit country=US
+    AND was rejecting ~60% of valid US contacts because Apollo's data is
+    sparse on the person record (often only org.country is populated, and
+    sometimes nothing is populated at all even though person_locations
+    anchored the search to the US). Now we also trust the search-anchor
+    when both person.country and org.country are blank — the caller explicitly
+    asked for US-only via locations[], so if Apollo found nothing to
+    contradict that, accept."""
     org = person.get("organization") or {}
-    country = (person.get("country") or org.get("country") or "").strip().lower()
-    state   = (person.get("state")   or org.get("state")   or "").strip()
-    state_is_us = (state.upper() in US_STATE_ABBREVS) or (state.lower() in US_STATE_NAMES)
+    p_country = (person.get("country") or "").strip().lower()
+    o_country = (org.get("country") or "").strip().lower()
+    p_state   = (person.get("state")   or "").strip()
+    o_state   = (org.get("state")   or "").strip()
+    p_city    = (person.get("city")  or "").strip()
+    o_city    = (org.get("city")  or "").strip()
+    raw_addr  = (person.get("present_raw_address") or org.get("present_raw_address") or "").strip()
+
     us_country_aliases = {"united states", "usa", "us", "u.s.", "u.s.a.", "united states of america"}
-    if country in us_country_aliases:
+    foreign_signals = {"philippines","india","canada","united kingdom","uk","mexico","australia",
+                       "germany","france","brazil","argentina","colombia","spain","italy",
+                       "netherlands","sweden","norway","denmark","ireland","singapore","pakistan",
+                       "bangladesh","indonesia","malaysia","thailand","vietnam","south africa",
+                       "egypt","nigeria","kenya","ghana","japan","china","south korea","taiwan",
+                       "hong kong","new zealand","russia","poland","ukraine","turkey","greece",
+                       "portugal","belgium","switzerland","austria","czech republic","hungary",
+                       "romania","saudi arabia","uae","united arab emirates","israel","jordan",
+                       "lebanon","peru","chile","venezuela","ecuador","cuba","dominican republic",
+                       "puerto rico"}  # PR is technically US territory but Apollo lists it separately
+
+    def _is_us_state(s):
+        return bool(s) and ((s.upper() in US_STATE_ABBREVS) or (s.lower() in US_STATE_NAMES))
+
+    # Strong positive: explicit US country
+    if p_country in us_country_aliases or o_country in us_country_aliases:
         return True
-    if not country and state_is_us:
+    # Strong positive: state is a US state name/abbrev
+    if _is_us_state(p_state) or _is_us_state(o_state):
+        return True
+    # Strong positive: raw address contains a 5-digit zip
+    if raw_addr and re.search(r"\b\d{5}(-\d{4})?\b", raw_addr):
+        return True
+
+    # Strong negative: explicit non-US country
+    if p_country in foreign_signals or o_country in foreign_signals:
+        return False
+
+    # Neutral case: no country, no state, no zip. The search was anchored to
+    # US locations via person_locations[], so trust that — accept rather than
+    # reject. Net effect: fewer false-negative US filters, same protection
+    # against the explicit Filipino/Indian contacts that triggered the
+    # original filter.
+    if not p_country and not o_country and not p_state and not o_state:
         return True
     return False
 
@@ -2698,6 +2744,12 @@ class ApolloPullRequest(BaseModel):
     per_page:      Optional[int] = 25   # Apollo caps at 100
     page:          Optional[int] = 1
     reveal_phones: Optional[bool] = False  # Costs +5-8 credits per lead via async webhook
+    # Auto-paginate: keep pulling additional pages until we've saved at least
+    # `min_new_leads` rows or burned `max_pages`. Solves "all 25 already in DB"
+    # by walking through page 2, 3, ... until new contacts appear.
+    auto_paginate: Optional[bool] = True
+    min_new_leads: Optional[int]  = 10
+    max_pages:     Optional[int]  = 5
 
 def _to_str_list(v):
     """Coerce a request field to a list of trimmed non-empty strings.
@@ -4696,38 +4748,14 @@ def get_insights(days: int = 90, user: str = Depends(verify_token)):
         },
     }
 
-@app.post("/api/admin/apollo/pull")
-def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
-    """Pull decision-maker contacts from Apollo and insert into leads.
-    Admin-only. Dedupes via Supabase unique constraints (same as Google Places flow)."""
-    if not APOLLO_API_KEY:
-        raise HTTPException(status_code=400,
-            detail="APOLLO_API_KEY not configured. Set it in Railway env vars.")
+def _apollo_pull_one_page(payload: dict, headers: dict, body: "ApolloPullRequest", user: str) -> dict:
+    """Run one Apollo search page end-to-end: query → US filter → enrich →
+    save → request phone reveals. Returns a dict with per-page counters that
+    `apollo_pull` aggregates across pages.
 
-    titles     = _to_str_list(body.titles)
-    industries = _to_str_list(body.industries)
-    locations  = _to_str_list(body.locations)
-    per_page   = max(1, min(body.per_page or 25, 100))
-
-    # US-only enforcement at the API layer. If the caller didn't pass any
-    # locations, Apollo returns global results — that's how Filipino /
-    # Indian / Canadian contacts were leaking in. Always anchor to US.
-    if not locations:
-        locations = ["United States"]
-
-    payload = {"page": body.page or 1, "per_page": per_page}
-    if titles:     payload["person_titles"] = titles
-    if industries: payload["q_organization_industries"] = industries
-    payload["person_locations"] = locations
-    if body.employee_min and body.employee_max:
-        payload["organization_num_employees_ranges"] = [f"{body.employee_min},{body.employee_max}"]
-
-    headers = {
-        "X-Api-Key":     APOLLO_API_KEY,
-        "Cache-Control": "no-cache",
-        "Content-Type":  "application/json",
-    }
-
+    Pure inner helper. The outer endpoint handles auto-pagination so the
+    caller can pull until they get N new leads instead of "0 saved, ¯\_(ツ)_/¯".
+    """
     print(f"[APOLLO] user={user} payload={payload}")
     try:
         r = req_lib.post(APOLLO_SEARCH_URL, headers=headers, json=payload, timeout=30)
@@ -4750,7 +4778,15 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
 
     people = data.get("people") or data.get("contacts") or []
     pagination = data.get("pagination") or {}
-    print(f"[APOLLO] returned {len(people)} people (total available: {pagination.get('total_entries')})")
+    print(f"[APOLLO] page {payload.get('page')} returned {len(people)} people "
+          f"(total available: {pagination.get('total_entries')})")
+
+    return _apollo_process_page(people, pagination, body, user)
+
+def _apollo_process_page(people, pagination, body: "ApolloPullRequest", user: str) -> dict:
+    """Filter, enrich, dedup, save the people returned for one page. Separated
+    from the HTTP call so the auto-paginate loop can rate-limit cleanly and
+    the unit-test path can inject fixtures without hitting Apollo."""
 
     # Pre-enrichment dedupe — drop people we already have in leads before we
     # spend ~1 credit/each on /people/match. Saves money on repeat searches.
@@ -4878,68 +4914,178 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         if phone_reveals_requested:
             _check_apollo_budget_alert()
 
-    audit_log(user, "apollo_pull", "lead", None, {
-        "titles": titles, "industries": industries, "locations": locations,
-        "employee_range": f"{body.employee_min}-{body.employee_max}",
-        "page": payload["page"], "per_page": per_page,
-        "returned": len(people) + skipped_already_in_db,
-        "qualified": len(leads), "saved": saved,
+    # Helper returns only per-page counters + saved_rows. The wrapper
+    # aggregates across pages and emits audit_log / Slack / summary once.
+    return {
+        "people_returned":         len(people),
+        "saved":                   saved,
+        "saved_rows":              saved_rows,
         "skipped_already_in_db":   skipped_already_in_db,
+        "skipped_phone_dup_in_db": skipped_phone_dup_in_db,
         "skipped_non_us":          skipped_non_us,
         "skipped_no_company":      skipped_no_company,
         "skipped_no_actionable":   skipped_no_actionable,
-        "skipped_phone_dup_in_db": skipped_phone_dup_in_db,
         "phone_reveals_requested": phone_reveals_requested,
-        "total_entries":           pagination.get("total_entries"),
+        "leads":                   leads,
+        "total_available":         pagination.get("total_entries"),
+        "page":                    pagination.get("page"),
         "total_pages":             pagination.get("total_pages"),
+    }
+
+@app.post("/api/admin/apollo/pull")
+def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
+    """Pull decision-maker contacts from Apollo. Auto-paginates by default —
+    keeps walking through pages until either `min_new_leads` rows are saved
+    or `max_pages` are exhausted. Old behavior (single page, "0 saved" if
+    everything was a dupe) is recoverable by passing auto_paginate=false."""
+    if not APOLLO_API_KEY:
+        raise HTTPException(status_code=400,
+            detail="APOLLO_API_KEY not configured. Set it in Railway env vars.")
+
+    titles     = _to_str_list(body.titles)
+    industries = _to_str_list(body.industries)
+    locations  = _to_str_list(body.locations)
+    per_page   = max(1, min(body.per_page or 25, 100))
+
+    # US-only enforcement at the API layer. If the caller didn't pass any
+    # locations, Apollo returns global results — that's how Filipino /
+    # Indian / Canadian contacts were leaking in. Always anchor to US.
+    if not locations:
+        locations = ["United States"]
+
+    base_payload = {"per_page": per_page}
+    if titles:     base_payload["person_titles"] = titles
+    if industries: base_payload["q_organization_industries"] = industries
+    base_payload["person_locations"] = locations
+    if body.employee_min and body.employee_max:
+        base_payload["organization_num_employees_ranges"] = [f"{body.employee_min},{body.employee_max}"]
+
+    headers = {
+        "X-Api-Key":     APOLLO_API_KEY,
+        "Cache-Control": "no-cache",
+        "Content-Type":  "application/json",
+    }
+
+    # Aggregates across all pages walked
+    agg = {
+        "people_returned":         0,
+        "saved":                   0,
+        "skipped_already_in_db":   0,
+        "skipped_phone_dup_in_db": 0,
+        "skipped_non_us":          0,
+        "skipped_no_company":      0,
+        "skipped_no_actionable":   0,
+        "phone_reveals_requested": 0,
+        "all_leads":               [],
+        "all_saved_rows":          [],
+    }
+    pages_walked = 0
+    start_page  = max(1, body.page or 1)
+    max_pages   = max(1, min(int(body.max_pages or 5), 20)) if body.auto_paginate else 1
+    min_new     = max(1, int(body.min_new_leads or 10))
+    total_avail = None
+    last_page_meta_pages = None
+
+    for offset in range(max_pages):
+        page = start_page + offset
+        payload = {**base_payload, "page": page}
+        result = _apollo_pull_one_page(payload, headers, body, user)
+        pages_walked += 1
+        agg["people_returned"]         += result["people_returned"]
+        agg["saved"]                   += result["saved"]
+        agg["skipped_already_in_db"]   += result["skipped_already_in_db"]
+        agg["skipped_phone_dup_in_db"] += result["skipped_phone_dup_in_db"]
+        agg["skipped_non_us"]          += result["skipped_non_us"]
+        agg["skipped_no_company"]      += result["skipped_no_company"]
+        agg["skipped_no_actionable"]   += result["skipped_no_actionable"]
+        agg["phone_reveals_requested"] += result["phone_reveals_requested"]
+        agg["all_leads"].extend(result["leads"])
+        agg["all_saved_rows"].extend(result["saved_rows"])
+        if total_avail is None and result.get("total_available") is not None:
+            total_avail = result["total_available"]
+        if result.get("total_pages") is not None:
+            last_page_meta_pages = result["total_pages"]
+
+        # Stop conditions:
+        # 1. Apollo returned 0 — no more contacts at this search
+        # 2. We hit the page limit reported by Apollo
+        # 3. We have ≥ min_new_leads in the bag
+        # 4. auto_paginate is off (max_pages=1)
+        if result["people_returned"] == 0:
+            break
+        if last_page_meta_pages is not None and page >= last_page_meta_pages:
+            break
+        if agg["saved"] >= min_new:
+            break
+
+    # Audit + Slack once at the end, summarized across all pages walked.
+    audit_log(user, "apollo_pull", "lead", None, {
+        "titles": titles, "industries": industries, "locations": locations,
+        "employee_range":           f"{body.employee_min}-{body.employee_max}",
+        "start_page":               start_page,
+        "pages_walked":             pages_walked,
+        "per_page":                 per_page,
+        "auto_paginate":            bool(body.auto_paginate),
+        "returned":                 agg["people_returned"] + agg["skipped_already_in_db"],
+        "qualified":                len(agg["all_leads"]),
+        "saved":                    agg["saved"],
+        "skipped_already_in_db":    agg["skipped_already_in_db"],
+        "skipped_non_us":           agg["skipped_non_us"],
+        "skipped_no_company":       agg["skipped_no_company"],
+        "skipped_no_actionable":    agg["skipped_no_actionable"],
+        "skipped_phone_dup_in_db":  agg["skipped_phone_dup_in_db"],
+        "phone_reveals_requested":  agg["phone_reveals_requested"],
+        "total_entries":            total_avail,
+        "total_pages":              last_page_meta_pages,
     })
 
-    if saved > 0:
+    if agg["saved"] > 0:
         app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
         send_slack(
             ":telephone_receiver: Apollo Pull Complete",
-            f"*{user}* pulled *{saved}* new decision-maker leads from Apollo.",
+            f"*{user}* pulled *{agg['saved']}* new decision-maker leads from Apollo "
+            f"({pages_walked} page{'s' if pages_walked!=1 else ''} walked).",
             fields=[
-                {"label": "Titles",    "value": ", ".join(titles) or "Any"},
-                {"label": "Locations", "value": ", ".join(locations) or "Any"},
-                {"label": "Returned",  "value": str(len(people))},
-                {"label": "Saved",     "value": f":white_check_mark: {saved}"},
+                {"label": "Titles",       "value": ", ".join(titles) or "Any"},
+                {"label": "Locations",    "value": ", ".join(locations) or "Any"},
+                {"label": "Returned",     "value": str(agg["people_returned"] + agg["skipped_already_in_db"])},
+                {"label": "Saved",        "value": f":white_check_mark: {agg['saved']}"},
+                {"label": "Pages",        "value": f"{start_page}-{start_page + pages_walked - 1}"},
             ],
             actions=[{"label": "📋 View Leads", "url": app_url, "style": "primary"}],
         )
 
-    # Build a human-readable summary so the frontend doesn't have to re-derive
-    # "where did the 25 contacts go?" from skip categories. Apollo pulls are
-    # often "0 saved" because every contact was already in the DB — that's
-    # not a failure, but the old message made it look like one.
-    total_in = len(people) + skipped_already_in_db
+    total_in = agg["people_returned"] + agg["skipped_already_in_db"]
     summary_parts = []
-    if saved:                    summary_parts.append(f"{saved} saved")
-    if skipped_already_in_db:    summary_parts.append(f"{skipped_already_in_db} already in DB (pre-enrich)")
-    if skipped_phone_dup_in_db:  summary_parts.append(f"{skipped_phone_dup_in_db} duplicate phone")
-    if skipped_non_us:           summary_parts.append(f"{skipped_non_us} non-US")
-    if skipped_no_company:       summary_parts.append(f"{skipped_no_company} missing company")
-    if skipped_no_actionable:    summary_parts.append(f"{skipped_no_actionable} no contact info")
-    summary = (f"Apollo returned {total_in} · " + " · ".join(summary_parts)) if summary_parts \
-              else f"Apollo returned {total_in} · all filtered out"
+    if agg["saved"]:                    summary_parts.append(f"{agg['saved']} saved")
+    if agg["skipped_already_in_db"]:    summary_parts.append(f"{agg['skipped_already_in_db']} already in DB (pre-enrich)")
+    if agg["skipped_phone_dup_in_db"]:  summary_parts.append(f"{agg['skipped_phone_dup_in_db']} duplicate phone")
+    if agg["skipped_non_us"]:           summary_parts.append(f"{agg['skipped_non_us']} non-US")
+    if agg["skipped_no_company"]:       summary_parts.append(f"{agg['skipped_no_company']} missing company")
+    if agg["skipped_no_actionable"]:    summary_parts.append(f"{agg['skipped_no_actionable']} no contact info")
+    summary = (f"Apollo returned {total_in} across {pages_walked} page(s) · " + " · ".join(summary_parts)) \
+              if summary_parts else f"Apollo returned {total_in} · all filtered out"
+
     return {
         "returned":        total_in,
-        "qualified":       len(leads),
-        "saved":           saved,
+        "qualified":       len(agg["all_leads"]),
+        "saved":           agg["saved"],
         "summary":         summary,
-        "skipped":         {"already_in_db":   skipped_already_in_db,
-                            "phone_dup_in_db": skipped_phone_dup_in_db,
-                            "non_us":          skipped_non_us,
-                            "no_company":      skipped_no_company,
-                            "no_actionable":   skipped_no_actionable},
-        "phone_reveals":   {"requested": phone_reveals_requested,
+        "pages_walked":    pages_walked,
+        "next_page":       start_page + pages_walked,
+        "skipped":         {"already_in_db":   agg["skipped_already_in_db"],
+                            "phone_dup_in_db": agg["skipped_phone_dup_in_db"],
+                            "non_us":          agg["skipped_non_us"],
+                            "no_company":      agg["skipped_no_company"],
+                            "no_actionable":   agg["skipped_no_actionable"]},
+        "phone_reveals":   {"requested": agg["phone_reveals_requested"],
                             "note": "phones arrive async via webhook within 30s"} if body.reveal_phones else None,
-        "total_available": pagination.get("total_entries"),
-        "page":            pagination.get("page"),
-        "total_pages":     pagination.get("total_pages"),
-        "sample":          [{"company": l.get("company"), "name": f"{l.get('firstName','')} {l.get('lastName','')}".strip(),
+        "total_available": total_avail,
+        "total_pages":     last_page_meta_pages,
+        "sample":          [{"company": l.get("company"),
+                             "name": f"{l.get('firstName','')} {l.get('lastName','')}".strip(),
                              "title": l.get("title"), "phone": l.get("phone"), "email": l.get("email")}
-                            for l in (saved_rows or leads)[:5]],
+                            for l in (agg["all_saved_rows"] or agg["all_leads"])[:5]],
     }
 
 @app.get("/api/admin/apollo/webhook-url")

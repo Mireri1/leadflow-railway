@@ -548,6 +548,11 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
   const [loading,setLoad]          = useState(false)
   const [result,setResult]         = useState(null)
   const [error,setError]           = useState("")
+  // Persistent page cursor — successive "Pull from Apollo" clicks advance
+  // through Apollo's catalog instead of always restarting at page 1.
+  // Resets whenever titles/industries/locations change (different search).
+  const [pullStartPage,setPullStartPage] = useState(1)
+  useEffect(()=>{ setPullStartPage(1) },[titles,selIndustries,state,cities])
   const [budget,setBudget]         = useState(null)
   useEffect(()=>{
     api("/api/admin/apollo/budget").then(setBudget).catch(()=>{})
@@ -592,9 +597,19 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
         employee_min:  Number(empMin)||50,
         employee_max:  Number(empMax)||500,
         per_page:      Number(perPage)||25,
-        page:          1,
+        page:          pullStartPage,    // resumes from where last pull left off
         reveal_phones: revealPhones,
+        // Auto-paginate so the user sees real new leads rather than "0 saved"
+        // when every contact on page 1 is already in the DB. Walks up to 5
+        // pages or until 10 new are saved, whichever first.
+        auto_paginate: true,
+        min_new_leads: 10,
+        max_pages:     5,
       })})
+      // Persist the next-page cursor so a second "Pull from Apollo" click on
+      // the same filters advances through Apollo's catalog instead of
+      // re-hitting page 1.
+      if(res.next_page) setPullStartPage(res.next_page)
       setResult(res)
       if(res.saved>0) onFound&&onFound()
     }catch(ex){
@@ -694,10 +709,17 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
           <input type="range" min={5} max={100} step={5} value={perPage} onChange={e=>setPerPage(Number(e.target.value))}/>
           <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#40485d"}}><span>5</span><span>100</span></div>
         </div>
-        <button className="btn btn-p" onClick={pull} disabled={loading}
-          style={{padding:"10px 22px",whiteSpace:"nowrap",alignSelf:"flex-end",background:"#8b5cf6"}}>
-          {loading?"Pulling…":"Pull from Apollo →"}
-        </button>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4,alignSelf:"flex-end"}}>
+          <button className="btn btn-p" onClick={pull} disabled={loading}
+            style={{padding:"10px 22px",whiteSpace:"nowrap",background:"#8b5cf6"}}>
+            {loading?"Pulling…":(pullStartPage>1?`Pull next 5 pages (from p${pullStartPage}) →`:"Pull from Apollo →")}
+          </button>
+          {pullStartPage>1&&(
+            <button onClick={()=>setPullStartPage(1)}
+              style={{background:"none",border:"none",color:"#a3aac4",fontSize:10,cursor:"pointer",padding:0,textDecoration:"underline"}}
+              title="Reset to Apollo page 1">↺ Reset to page 1</button>
+          )}
+        </div>
         <label style={{gridColumn:"1 / -1",display:"flex",alignItems:"center",gap:8,fontSize:11,color:"#a3aac4",cursor:"pointer"}}>
           <input type="checkbox" checked={revealPhones} onChange={e=>setRevealPh(e.target.checked)}
             style={{cursor:"pointer"}}/>
@@ -729,15 +751,27 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
           {result.saved>0?(
             <div>
               ✓ <b style={{color:"#8b5cf6",fontSize:14}}>{result.saved}</b> new lead{result.saved===1?"":"s"} saved
-              {" "}<span style={{color:"#a3aac4"}}>· {result.returned} contacts checked</span>
+              {" "}<span style={{color:"#a3aac4"}}>· {result.returned} contacts checked across {result.pages_walked||1} page{(result.pages_walked||1)===1?"":"s"}</span>
+              {result.next_page&&result.total_pages&&result.next_page<=result.total_pages&&(
+                <span style={{color:"#40485d",fontSize:11,marginLeft:6}}>
+                  · next click pulls page {result.next_page}/{result.total_pages}
+                </span>
+              )}
             </div>
           ):result.returned===0?(
             <div style={{color:"#ffe083"}}>
-              ⚠ Apollo returned <b>0 contacts</b> for this search. Try widening titles/locations or bumping page.
+              ⚠ Apollo returned <b>0 contacts</b> across {result.pages_walked||1} page(s) for this search.
+              Try widening titles, removing the state filter, or bumping employee range.
             </div>
           ):(
             <div style={{color:"#ffe083"}}>
-              ⓘ <b>0 new leads</b> — all {result.returned} contacts were filtered out (see breakdown below). This is normal on repeat searches.
+              ⓘ <b>0 new leads</b> — all {result.returned} contacts across {result.pages_walked||1} page(s) were filtered out.
+              {result.total_pages&&result.next_page&&result.next_page<=result.total_pages?(
+                <div style={{marginTop:6,fontSize:11,color:"#a3aac4"}}>
+                  {result.total_pages.toLocaleString()} total contacts match this search.
+                  Click "Pull from Apollo" again to walk pages {result.next_page}–{Math.min(result.next_page+4, result.total_pages)} (next 5).
+                </div>
+              ):null}
             </div>
           )}
 
