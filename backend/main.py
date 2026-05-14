@@ -696,6 +696,23 @@ def is_us_address(addr):
             return True
     return False
 
+def normalize_us_phone(phone):
+    """Canonical `(NNN) NNN-NNNN` for any US phone string with 10 digits, or
+    11 digits starting with 1. Returns None for unparseable input.
+
+    Stops the dedupe gap where `(203) 863-3000`, `203-863-3000`, `203.863.3000`
+    and `+1 203 863 3000` were all stored as different strings and slipped
+    past the cross-run phone check. Run on every lead write so the leads
+    table only ever holds canonical strings."""
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", str(phone))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return None
+    return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+
 def is_valid_us_phone(phone) -> bool:
     """NANP-format check for US phones. Connectivity-rate complaints from
     callers traced back to Google Places returning rows with empty / 7-digit /
@@ -874,6 +891,14 @@ def save_to_supabase(leads):
     if not leads:
         return 0
     try:
+        # Canonicalize phones BEFORE dedup. Otherwise `(203) 863-3000`,
+        # `203-863-3000`, and `+1 203 863 3000` would each look unique to the
+        # cross-run check below and create three rows for the same business.
+        for l in leads:
+            np = normalize_us_phone(l.get("phone"))
+            if np:
+                l["phone"] = np
+
         # Cross-run dedup: the per-scrape `seen_phones` set in run_scrape only
         # dedupes within one Places run. Two runs over the same city/keyword
         # (e.g. caller searched "schools, CT" Monday and "private schools, CT"
@@ -1675,6 +1700,13 @@ def _bg_maintenance_loop():
             run_dedupe_sweep_if_due()
         except Exception as e:
             print(f"[DEDUPE-SWEEP] loop exception: {e}")
+        # Daily-cadence hot-lead-at-risk digest. Internal cooldown so this is
+        # a no-op until ≥20h since the last run; bundling the check here
+        # keeps the bg-loop scheduling simple (one thread, one loop).
+        try:
+            run_hot_lead_digest_if_due()
+        except Exception as e:
+            print(f"[HOT-DIGEST] loop exception: {e}")
         time.sleep(IMAP_POLL_INTERVAL_MINUTES * 60)
 
 # ── Apollo dedupe — shared detection + self-healing weekly sweep ─────────
@@ -1927,6 +1959,11 @@ def run_phone_dedupe_sweep_if_due():
             summary += f" — {len(borderline)} group(s) need review (engaged duplicates preserved)"
         send_slack(":broom: Weekly phone-dedupe sweep", summary, fields=fields)
 
+    # Defense-in-depth: record cooldown here too. The Apollo sweep also
+    # records at its end, but if Apollo errors out, phone sweep alone has
+    # already paid for the dedupe + Slack noise — don't let it re-fire next
+    # tick. Shared cooldown row.
+    _record_dedupe_sweep_run()
     print(f"[PHONE-DEDUPE] done — deleted={deleted} reparented={reparented} borderline={len(borderline)}")
 
 def _dedupe_sweep_due() -> bool:
@@ -1953,10 +1990,121 @@ def _dedupe_sweep_due() -> bool:
         print(f"[DEDUPE-SWEEP] cooldown check failed: {e}")
         return False
 
-def _record_dedupe_sweep_run():
+HOT_DIGEST_INTERVAL_HOURS = int(os.getenv("HOT_DIGEST_INTERVAL_HOURS", "20"))
+HOT_LEAD_STALE_DAYS       = int(os.getenv("HOT_LEAD_STALE_DAYS", "5"))
+
+def _hot_digest_due() -> bool:
+    """Returns True if HOT_DIGEST_INTERVAL_HOURS have elapsed since the last
+    digest (or never run). Same cooldown pattern as the dedup sweep — read
+    from app_settings, fail closed on errors so we don't double-post."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_hot_digest&select=value",
+            headers=SB_HEADERS, timeout=10,
+        )
+        if r.status_code != 200: return False
+        rows = r.json()
+        if not rows: return True
+        last_iso = (rows[0].get("value") or "").replace("Z", "")
+        try:
+            last_dt = datetime.fromisoformat(last_iso)
+        except Exception:
+            return True
+        return (datetime.utcnow() - last_dt).total_seconds() >= HOT_DIGEST_INTERVAL_HOURS * 3600
+    except Exception as e:
+        print(f"[HOT-DIGEST] cooldown check failed: {e}")
+        return False
+
+def _record_hot_digest_run():
     try:
         req_lib.post(
-            f"{SUPABASE_URL}/rest/v1/app_settings",
+            f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"key": "last_hot_digest", "value": datetime.utcnow().isoformat() + "Z"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[HOT-DIGEST] failed to record last-run: {e}")
+
+def run_hot_lead_digest_if_due():
+    """Surface engaged leads (interested / callback) that have gone quiet —
+    last_called_at older than HOT_LEAD_STALE_DAYS — and post them to Slack so
+    the admin can re-prioritize. Quiet by default: if there's nothing to flag,
+    skip Slack entirely. Also catches overdue callbacks (callbackDate < today)."""
+    if not _hot_digest_due():
+        return
+    cutoff_dt   = datetime.utcnow() - timedelta(days=HOT_LEAD_STALE_DAYS)
+    cutoff_iso  = cutoff_dt.isoformat()
+    today_str   = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        # Engaged + stale (not contacted within window). nullsfirst on
+        # last_called_at would also catch "never called engaged leads."
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,company,phone,status,assignedTo,"
+            f"last_called_at,callbackDate,score,total_calls"
+            f"&status=in.(interested,callback)"
+            f"&or=(last_called_at.is.null,last_called_at.lt.{cutoff_iso})",
+            headers=SB_HEADERS, timeout=30,
+        )
+        stale = r.json() if r.status_code == 200 else []
+
+        # Overdue callbacks (callbackDate < today and status not converted)
+        r2 = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,company,phone,status,assignedTo,"
+            f"callbackDate,last_called_at,score"
+            f"&callbackDate=lt.{today_str}&callbackDate=neq.&status=neq.converted",
+            headers=SB_HEADERS, timeout=30,
+        )
+        overdue_cb = r2.json() if r2.status_code == 200 else []
+    except Exception as e:
+        print(f"[HOT-DIGEST] fetch exception: {e}")
+        return
+
+    if not stale and not overdue_cb:
+        # Nothing to say. Still record so we don't re-check every 10 min.
+        _record_hot_digest_run()
+        return
+
+    fields = []
+    if stale:
+        stale_sorted = sorted(stale, key=lambda l: -(l.get("score") or 0))[:8]
+        lines = []
+        for l in stale_sorted:
+            when = (l.get("last_called_at") or "never")[:10] if l.get("last_called_at") else "never"
+            lines.append(f"• `{l.get('id')}` {l.get('company') or '?'} — {l.get('status')} · last contact {when}"
+                         f"{' · ' + l['assignedTo'] if l.get('assignedTo') else ''}")
+        if len(stale) > 8:
+            lines.append(f"…and {len(stale) - 8} more")
+        fields.append({"label": f"💤 Interested/callback gone quiet ({len(stale)})",
+                       "value": "\n".join(lines)})
+    if overdue_cb:
+        cb_sorted = sorted(overdue_cb, key=lambda l: l.get("callbackDate") or "")[:8]
+        lines = []
+        for l in cb_sorted:
+            lines.append(f"• `{l.get('id')}` {l.get('company') or '?'} — callback {l.get('callbackDate')}"
+                         f"{' · ' + l['assignedTo'] if l.get('assignedTo') else ''}")
+        if len(overdue_cb) > 8:
+            lines.append(f"…and {len(overdue_cb) - 8} more")
+        fields.append({"label": f"⏰ Overdue callbacks ({len(overdue_cb)})",
+                       "value": "\n".join(lines)})
+
+    send_slack(
+        ":fire: Hot leads at risk",
+        f"{len(stale)} engaged lead(s) gone quiet + {len(overdue_cb)} overdue callback(s)",
+        fields=fields,
+    )
+    _record_hot_digest_run()
+    print(f"[HOT-DIGEST] posted: {len(stale)} stale + {len(overdue_cb)} overdue")
+
+def _record_dedupe_sweep_run():
+    """Upsert the cooldown row. Without `?on_conflict=key` the merge-duplicates
+    Prefer header has no idea what to merge on, so the POST hits a primary-key
+    violation and the cooldown is never recorded — which caused the dedupe
+    sweeps to silently re-fire every 10 minutes (the bg-loop interval) instead
+    of weekly. Confirmed by audit on 2026-05-14."""
+    try:
+        req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
             headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={"key": "last_dedupe_sweep", "value": datetime.utcnow().isoformat() + "Z"},
             timeout=10,
@@ -3056,9 +3204,59 @@ def list_leads(status: str = "", search: str = "", sort: str = "smart",
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/dialer/queue")
+def dialer_queue(limit: int = 50, snooze_hours: int = 4,
+                 user: str = Depends(verify_token)):
+    """Server-side dialer queue. Returns at most `limit` leads, already
+    smart-sorted and filtered against:
+      - assigned to me OR unassigned
+      - status not in NO_DIAL set (awaiting_email_reply, do_not_contact)
+      - valid US/NANP phone (caller never sees a guaranteed-fail dial)
+      - not snoozed (no_answer/voicemail within last `snooze_hours`)
+
+    Replaces the old pattern of fetching every lead and filtering client-side
+    (a 1MB+ payload on every dialer-tab open). 50 leads is more than one
+    caller can churn through in a shift, with room to skip."""
+    limit = max(1, min(int(limit or 50), 200))
+    snooze_hours = max(0, min(int(snooze_hours or 0), 168))
+
+    # Filters at the PostgREST level; one paginated GET covers worst case.
+    base = (f"{SUPABASE_URL}/rest/v1/leads?select=*"
+            f"&or=(assignedTo.eq.{url_quote(user)},assignedTo.is.null)"
+            f"&status=not.in.(awaiting_email_reply,do_not_contact)"
+            f"&phone=not.is.null"
+            f"&order=total_calls.asc.nullsfirst,last_called_at.asc.nullsfirst,score.desc")
+    rows = _paginated_get(base, page_size=1000, max_pages=5)
+    if not isinstance(rows, list):
+        rows = []
+
+    # NANP guard (PostgREST regex would need a function; keep in Python).
+    NO_DIAL = {"awaiting_email_reply", "do_not_contact"}
+    SNOOZED_OUTCOMES = {"no_answer", "voicemail", "called", "not_interested"}
+    cutoff_iso = None
+    if snooze_hours > 0:
+        cutoff_iso = (datetime.utcnow() - timedelta(hours=snooze_hours)).isoformat()
+
+    out = []
+    for l in rows:
+        if (l.get("status") or "") in NO_DIAL: continue
+        if not is_valid_us_phone(l.get("phone")): continue
+        if cutoff_iso:
+            lca = l.get("last_called_at") or ""
+            if lca and lca >= cutoff_iso and (l.get("status") or "") in SNOOZED_OUTCOMES:
+                continue
+        out.append(l)
+        if len(out) >= limit:
+            break
+    return {"queue": out, "fetched": len(rows), "returned": len(out),
+            "user": user, "snooze_hours": snooze_hours}
+
 @app.post("/api/leads")
 def create_lead(lead: dict, user: str = Depends(verify_token)):
     try:
+        np = normalize_us_phone(lead.get("phone"))
+        if np:
+            lead["phone"] = np
         lead["score"] = score_lead(lead)
         lead["createdBy"] = user
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=lead, timeout=30)
@@ -3071,21 +3269,58 @@ def create_lead(lead: dict, user: str = Depends(verify_token)):
 
 @app.post("/api/leads/import")
 def import_leads(leads: list, user: str = Depends(verify_token)):
+    """CSV import. Canonicalizes phones and dedups against existing DB phones
+    BEFORE insert — same cross-run guard `save_to_supabase` uses for scrape
+    output. Stops a re-imported CSV from doubling up the leads table."""
     try:
         for lead in leads:
+            np = normalize_us_phone(lead.get("phone"))
+            if np:
+                lead["phone"] = np
             lead["score"] = score_lead(lead)
             lead["createdBy"] = user
+
+        # Cross-run dedup against existing DB phones.
+        incoming_phones = list({(l.get("phone") or "").strip() for l in leads if (l.get("phone") or "").strip()})
+        existing = set()
+        if incoming_phones:
+            CHUNK = 100
+            for i in range(0, len(incoming_phones), CHUNK):
+                chunk = incoming_phones[i:i+CHUNK]
+                in_list = ",".join(f'"{p}"' for p in chunk)
+                try:
+                    rq = req_lib.get(
+                        f"{SUPABASE_URL}/rest/v1/leads?select=phone&phone=in.({in_list})",
+                        headers=SB_HEADERS, timeout=20,
+                    )
+                    if rq.status_code == 200:
+                        for row in rq.json():
+                            ph = (row.get("phone") or "").strip()
+                            if ph: existing.add(ph)
+                except Exception as e:
+                    print(f"[IMPORT] dedup pre-check failed: {e}")
+        skipped = 0
+        if existing:
+            before = len(leads)
+            leads = [l for l in leads if (l.get("phone") or "").strip() not in existing]
+            skipped = before - len(leads)
+        if not leads:
+            return {"count": 0, "skipped": skipped, "reason": "all rows already in DB"}
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=leads, timeout=30)
         saved = r.json()
         count = len(saved) if isinstance(saved, list) else 0
-        audit_log(user, "import_leads", "lead", None, {"count": count, "source": "csv"})
-        return {"count": count}
+        audit_log(user, "import_leads", "lead", None, {"count": count, "skipped": skipped, "source": "csv"})
+        return {"count": count, "skipped": skipped}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/api/leads/{lead_id}")
 def update_lead(lead_id: str, data: dict, user: str = Depends(verify_token)):
     try:
+        if "phone" in data:
+            np = normalize_us_phone(data.get("phone"))
+            if np:
+                data["phone"] = np
         r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
                          headers=SB_HEADERS, json=data, timeout=30)
         return r.json()
@@ -3877,6 +4112,82 @@ def backfill_call_stats(user: str = Depends(verify_admin)):
         "updated": updated,
         "failed_batches": failed_batches,
     }
+
+@app.get("/api/admin/audit-log")
+def admin_audit_log(limit: int = 200, action: str = "", username: str = "",
+                    user: str = Depends(verify_admin)):
+    """Browse recent audit_log rows. Optional filters: action (e.g.
+    'leads_cleanup', 'login_success', 'scrape_leads') and username. Default
+    200 newest rows. Used by the admin Audit Log panel for post-mortems —
+    every cleanup, scrape, login, kill-switch toggle, etc. lands here."""
+    limit = max(1, min(int(limit or 200), 1000))
+    url = (f"{SUPABASE_URL}/rest/v1/audit_log?select=*"
+           f"&order=created_at.desc&limit={limit}")
+    if action:   url += f"&action=eq.{url_quote(action)}"
+    if username: url += f"&username=eq.{url_quote(username)}"
+    try:
+        r = req_lib.get(url, headers=SB_HEADERS, timeout=20)
+        return {"entries": r.json() if r.status_code == 200 else [], "limit": limit}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/insights/best-call-time")
+def insights_best_call_time(industry: str = "", days: int = 60,
+                            user: str = Depends(verify_token)):
+    """Hour-of-day contact-rate heuristic. Buckets call_outcomes from the
+    last `days` days by hour-of-day (caller's local clock, UTC for now —
+    good enough for relative-best, not absolute legal). Returns a 24-bucket
+    array of (calls, contacts, rate%) so the dialer card can hint "best hour
+    for healthcare is 10-11am."
+
+    Without an industry filter, returns a global ranking across all calls."""
+    days = max(1, min(int(days or 60), 365))
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    contacted_set = {"answered", "interested", "converted", "callback"}
+
+    # If filtering by industry, first resolve leadIds matching that industry,
+    # then pull their calls. PostgREST can't join directly.
+    lead_filter = ""
+    if industry:
+        rl = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id&industry=eq.{url_quote(industry)}&limit=10000",
+            headers=SB_HEADERS, timeout=30,
+        )
+        ids = [str(x.get("id")) for x in (rl.json() if rl.status_code == 200 else []) if x.get("id")]
+        if not ids:
+            return {"industry": industry, "days": days, "hours": [], "total_calls": 0}
+        # Chunk to keep the URL length reasonable
+        chunks = [ids[i:i+200] for i in range(0, len(ids), 200)]
+    else:
+        chunks = [None]
+
+    by_hour = [{"hour": h, "calls": 0, "contacts": 0} for h in range(24)]
+    total_calls = 0
+    for chunk in chunks:
+        url = (f"{SUPABASE_URL}/rest/v1/call_outcomes?select=calledAt,outcome"
+               f"&calledAt=gte.{cutoff}")
+        if chunk is not None:
+            url += f"&leadId=in.({','.join(chunk)})"
+        rows = _paginated_get(url, page_size=1000, max_pages=20)
+        for c in rows:
+            cat = c.get("calledAt") or ""
+            if len(cat) < 13: continue
+            try:
+                hr = int(cat[11:13])
+            except Exception:
+                continue
+            by_hour[hr]["calls"] += 1
+            if (c.get("outcome") or "") in contacted_set:
+                by_hour[hr]["contacts"] += 1
+            total_calls += 1
+
+    for b in by_hour:
+        b["rate"] = round((b["contacts"] / b["calls"] * 100), 1) if b["calls"] else 0.0
+    # Best hour = highest rate with at least 5 calls' worth of signal.
+    eligible = [b for b in by_hour if b["calls"] >= 5]
+    best = max(eligible, key=lambda b: b["rate"]) if eligible else None
+    return {"industry": industry or "all", "days": days, "total_calls": total_calls,
+            "best_hour": best, "hours": by_hour}
 
 @app.post("/api/leads/recycle-stale")
 def recycle_stale_leads(user: str = Depends(verify_admin)):

@@ -1,0 +1,34 @@
+-- Enforce phone uniqueness at the DB level.
+--
+-- This is the strongest dedupe guarantee — once in place, `save_to_supabase`
+-- and `import_leads` can switch from the current "pre-query + filter" pattern
+-- to a clean `?on_conflict=phone` upsert, which is atomic and cheaper.
+--
+-- PREREQUISITES — do these in order:
+--   1. Run migration 006 (phone normalization index).
+--   2. Deploy normalize_us_phone changes — every NEW write now stores
+--      `(NNN) NNN-NNNN` canonical.
+--   3. Backfill existing rows so they're also canonical (one-shot):
+--        UPDATE leads
+--           SET phone = '(' || substring(regexp_replace(phone, '\D', '', 'g'), 1, 3) || ') '
+--                            || substring(regexp_replace(phone, '\D', '', 'g'), 4, 3) || '-'
+--                            || substring(regexp_replace(phone, '\D', '', 'g'), 7, 4)
+--         WHERE phone IS NOT NULL
+--           AND length(regexp_replace(phone, '\D', '', 'g')) = 10;
+--        UPDATE leads
+--           SET phone = '(' || substring(regexp_replace(phone, '\D', '', 'g'), 2, 3) || ') '
+--                            || substring(regexp_replace(phone, '\D', '', 'g'), 5, 3) || '-'
+--                            || substring(regexp_replace(phone, '\D', '', 'g'), 9, 4)
+--         WHERE phone IS NOT NULL
+--           AND length(regexp_replace(phone, '\D', '', 'g')) = 11
+--           AND substring(regexp_replace(phone, '\D', '', 'g'), 1, 1) = '1';
+--   4. Run the duplicate-phone cleanup sweep (manual via the admin panel)
+--      or wait for the weekly auto sweep, to collapse any remaining dupes.
+--   5. THEN apply this migration.
+--
+-- If any duplicates remain when this runs, Postgres will refuse to create the
+-- constraint. That's intentional — better to surface remaining dupes than
+-- silently lose them.
+
+ALTER TABLE leads
+  ADD CONSTRAINT leads_phone_unique UNIQUE (phone);

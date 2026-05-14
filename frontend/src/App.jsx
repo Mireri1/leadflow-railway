@@ -34,6 +34,12 @@ const STATUS_OPTIONS = [
   { value:"awaiting_email_reply",  label:"Awaiting Email Reply",  color:"#a3a6ff" },
   { value:"do_not_contact",        label:"Do Not Contact",        color:"#ff6e84" },
 ]
+// Hours to suppress a lead from the dialer after a no-answer/voicemail.
+// Caller's "leads repeating" complaint partly came from re-dialing the same
+// number within the same shift. Fresh + long-rested still come up; only
+// recent dead-ends get snoozed. Configurable from the dialer UI.
+const DIALER_SNOOZE_HOURS_DEFAULT = 4
+
 // Statuses callers should NEVER auto-dial — used to filter the dialer queue
 // and to show a "don't call" warning in the call modal.
 const NO_DIAL_STATUSES = new Set(["awaiting_email_reply","do_not_contact"])
@@ -97,6 +103,38 @@ function isValidUsPhone(phone){
   if(new Set(d).size===1) return false
   if(d.slice(3,6)==="555") return false
   return true
+}
+
+// Rough US-state → IANA timezone. Pacific time states use Los_Angeles, etc.
+// Used by the dialer's "local time" badge so the caller doesn't dial MD at
+// 5am Pacific. Some states span two zones — we pick the dominant one (e.g.
+// FL→Eastern even though the panhandle is Central). Good enough for "is it
+// safe to call?", not for legal compliance.
+const STATE_TZ = {
+  AL:"America/Chicago",AK:"America/Anchorage",AZ:"America/Phoenix",AR:"America/Chicago",
+  CA:"America/Los_Angeles",CO:"America/Denver",CT:"America/New_York",DE:"America/New_York",
+  FL:"America/New_York",GA:"America/New_York",HI:"Pacific/Honolulu",ID:"America/Boise",
+  IL:"America/Chicago",IN:"America/Indiana/Indianapolis",IA:"America/Chicago",KS:"America/Chicago",
+  KY:"America/New_York",LA:"America/Chicago",ME:"America/New_York",MD:"America/New_York",
+  MA:"America/New_York",MI:"America/Detroit",MN:"America/Chicago",MS:"America/Chicago",
+  MO:"America/Chicago",MT:"America/Denver",NE:"America/Chicago",NV:"America/Los_Angeles",
+  NH:"America/New_York",NJ:"America/New_York",NM:"America/Denver",NY:"America/New_York",
+  NC:"America/New_York",ND:"America/Chicago",OH:"America/New_York",OK:"America/Chicago",
+  OR:"America/Los_Angeles",PA:"America/New_York",RI:"America/New_York",SC:"America/New_York",
+  SD:"America/Chicago",TN:"America/Chicago",TX:"America/Chicago",UT:"America/Denver",
+  VT:"America/New_York",VA:"America/New_York",WA:"America/Los_Angeles",WV:"America/New_York",
+  WI:"America/Chicago",WY:"America/Denver",DC:"America/New_York",
+}
+function localTimeAt(state){
+  const tz = STATE_TZ[(state||"").toUpperCase()]
+  if(!tz) return null
+  try{
+    const now = new Date()
+    const t = now.toLocaleTimeString("en-US",{timeZone:tz,hour:"numeric",minute:"2-digit",hour12:true})
+    const hourNum = parseInt(now.toLocaleTimeString("en-US",{timeZone:tz,hour:"numeric",hour12:false}),10)
+    const tzShort = now.toLocaleTimeString("en-US",{timeZone:tz,timeZoneName:"short"}).split(" ").pop()
+    return {time:t, hour:hourNum, tzShort, tz}
+  }catch{ return null }
 }
 
 // "3h", "2d", "5mo" — compact relative-past for last-contacted labels.
@@ -1983,6 +2021,10 @@ export default function App(){
   const [histTo,setHistTo]           = useState("")
   const [histRange,setHistRange]     = useState("week")
   const [dialerIdx,setDialerIdx]   = useState(0)
+  // Snooze: hide leads dialed within the last N hours where the outcome was
+  // a non-engagement (no_answer / voicemail / called). Default 4h; caller
+  // can override per-session via the dialer toolbar.
+  const [snoozeHours,setSnoozeHours] = useState(DIALER_SNOOZE_HOURS_DEFAULT)
   const [showNotifs,setShowNotifs]  = useState(false)
   const [quota,setQuota]            = useState({quota:60,my_calls_today:0})
   const [leaderboard,setLeaderboard] = useState([])
@@ -2000,6 +2042,13 @@ export default function App(){
   const [warmLeads,setWarmLeads] = useState([])
   const [warmLoading,setWarmLoading] = useState(false)
   const [emailModal,setEmailModal] = useState(null)
+  // Industry → top script lookup. Populated lazily when the dialer opens.
+  // Cached per industry so we don't hammer /api/scripts on every navigation.
+  const [scriptCache,setScriptCache] = useState({})  // {industry: script}
+  // Best-call-time hint per industry. Computed server-side from the last
+  // 60 days of call_outcomes — picks the hour-of-day with the highest
+  // contact rate (≥5 calls of signal). Cached per industry.
+  const [bestTimeCache,setBestTimeCache] = useState({})  // {industry: {best_hour, ...}}
 
   // Auto-load warm leads when switching to warm tab
   useEffect(()=>{
@@ -2010,6 +2059,28 @@ export default function App(){
       }).catch(()=>{}).finally(()=>setWarmLoading(false))
     }
   },[activeNav])
+
+  // Lazy-load the top script per industry so the dialer card can show the
+  // matching opener inline. We fetch only the industries the caller actually
+  // sees on the active dialer lead, cache forever per session.
+  function ensureScript(industry){
+    if(!industry || scriptCache[industry] !== undefined) return
+    api(`/api/scripts?industry=${encodeURIComponent(industry)}`)
+      .then(rows => {
+        const top = Array.isArray(rows) && rows.length ? rows[0] : null
+        setScriptCache(c => ({...c, [industry]: top}))
+      })
+      .catch(()=>{
+        setScriptCache(c => ({...c, [industry]: null}))
+      })
+  }
+
+  function ensureBestTime(industry){
+    if(!industry || bestTimeCache[industry] !== undefined) return
+    api(`/api/insights/best-call-time?industry=${encodeURIComponent(industry)}&days=60`)
+      .then(r => setBestTimeCache(c => ({...c, [industry]: r})))
+      .catch(()=>setBestTimeCache(c => ({...c, [industry]: null})))
+  }
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
@@ -2075,7 +2146,33 @@ export default function App(){
   useEffect(()=>{
     if(activeNav!=="analytics"||!user) return
     setLbLoading(true)
-    api(`/api/leaderboard?range=${lbRange}`).then(r=>setLeaderboard(Array.isArray(r)?r:[])).catch(()=>{}).finally(()=>setLbLoading(false))
+    let cancelled = false
+    const fetchLb = ()=>{
+      api(`/api/leaderboard?range=${lbRange}`)
+        .then(r=>{ if(!cancelled) setLeaderboard(Array.isArray(r)?r:[]) })
+        .catch(()=>{})
+        .finally(()=>{ if(!cancelled) setLbLoading(false) })
+    }
+    fetchLb()
+    // Live refresh on the analytics tab: poll every 30s while the tab is
+    // focused, pause when the browser tab is hidden so we don't burn API
+    // calls. Admin sees Kathrine's call count tick up in near-real-time
+    // without a manual refresh. Stops on unmount / tab switch via cancelled.
+    const POLL_MS = 30_000
+    let timer = null
+    const tick = ()=>{
+      if(cancelled) return
+      if(document.visibilityState === "visible") fetchLb()
+      timer = setTimeout(tick, POLL_MS)
+    }
+    timer = setTimeout(tick, POLL_MS)
+    const onVis = ()=>{ if(document.visibilityState === "visible") fetchLb() }
+    document.addEventListener("visibilitychange", onVis)
+    return ()=>{
+      cancelled = true
+      if(timer) clearTimeout(timer)
+      document.removeEventListener("visibilitychange", onVis)
+    }
   },[activeNav,user,lbRange])
 
   useEffect(()=>{
@@ -2948,21 +3045,38 @@ export default function App(){
           {/* ── DIALER ──────────────────────────────────────────────────────── */}
           {activeNav==="dialer"&&(
             <div>
-              <div style={{marginBottom:24}}>
-                <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
-                  color:"#dee5ff",letterSpacing:"-.02em"}}>Dialer</h1>
-                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
-                Focused calling mode — only showing unclaimed leads
-                {(()=>{
-                  const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
-                  return overdue.length>0?(
-                    <span style={{marginLeft:12,background:"#ff6e8430",color:"#ff6e84",padding:"3px 10px",
-                      borderRadius:20,fontSize:12,fontWeight:700}}>
-                      {overdue.length} overdue
-                    </span>
-                  ):null
-                })()}
-              </p>
+              <div style={{marginBottom:24,display:"flex",alignItems:"flex-end",justifyContent:"space-between",
+                gap:16,flexWrap:"wrap"}}>
+                <div>
+                  <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                    color:"#dee5ff",letterSpacing:"-.02em"}}>Dialer</h1>
+                  <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                  Focused calling mode — only showing unclaimed leads
+                  {(()=>{
+                    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                    return overdue.length>0?(
+                      <span style={{marginLeft:12,background:"#ff6e8430",color:"#ff6e84",padding:"3px 10px",
+                        borderRadius:20,fontSize:12,fontWeight:700}}>
+                        {overdue.length} overdue
+                      </span>
+                    ):null
+                  })()}
+                  </p>
+                </div>
+                {/* Per-session snooze toggle — hide dead-end outcomes dialed in
+                    the last N hours so caller doesn't re-spin through what they
+                    just tried this shift. Off = show everything. */}
+                <div style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
+                  <span title="Hide no_answer/voicemail leads dialed in the last N hours">😴 Snooze recent</span>
+                  <select className="sel" value={snoozeHours} onChange={e=>setSnoozeHours(+e.target.value)}
+                    style={{padding:"6px 10px",fontSize:12,minWidth:70}}>
+                    <option value={0}>Off</option>
+                    <option value={2}>2h</option>
+                    <option value={4}>4h</option>
+                    <option value={8}>8h</option>
+                    <option value={24}>24h</option>
+                  </select>
+                </div>
               </div>
               {(()=>{
                 // Skip bad-phone leads — caller dialing a non-NANP number is
@@ -2975,10 +3089,25 @@ export default function App(){
                 // longest-since-last-call, then highest score. This is the
                 // fix for "leads feel like they're repeating" — the same
                 // no_answer rows kept rising to the top under score.desc.
+                // Snooze cutoff: dead-end outcomes (no_answer/voicemail/called)
+                // dialed within `snoozeHours` are hidden from the queue. Engaged
+                // statuses (interested/callback/converted) bypass snooze — those
+                // we DO want to surface again.
+                const snoozeCutoff = snoozeHours>0
+                  ? new Date(Date.now()-snoozeHours*3600*1000).toISOString()
+                  : null
+                const SNOOZED_OUTCOMES = new Set(["no_answer","voicemail","called","not_interested"])
+                const isSnoozed = (l)=>{
+                  if(!snoozeCutoff) return false
+                  if(!l.last_called_at) return false
+                  if(!SNOOZED_OUTCOMES.has(l.status)) return false
+                  return l.last_called_at >= snoozeCutoff
+                }
                 const dialerLeads=leads.filter(l=>
                   (!l.assignedTo||l.assignedTo===user)
                   && !NO_DIAL_STATUSES.has(l.status)
                   && isValidUsPhone(l.phone)
+                  && !isSnoozed(l)
                 ).slice().sort((a,b)=>{
                   const ca=a.total_calls||0, cb=b.total_calls||0
                   if(ca!==cb) return ca-cb                              // fewest calls first
@@ -3003,6 +3132,13 @@ export default function App(){
                 const score=lead.score||scoreLead(lead)||0
                 const ac=avatarColor(lead.company||lead.firstName||"?")
                 const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
+                // Resolve the local time at the lead's location and the
+                // industry-specific script for the call. Both are pure
+                // lookups against state already loaded; the script cache
+                // gets populated by the dialer-render effect below.
+                const lt = localTimeAt(lead.state)
+                const offHours = lt && (lt.hour < 8 || lt.hour >= 19)  // outside 8am-7pm local
+                const industryScript = lead.industry ? scriptCache[lead.industry] : null
                 return(
                   <div style={{maxWidth:520,margin:"0 auto"}}>
                     <div style={{textAlign:"center",color:"#a3aac4",fontSize:13,marginBottom:24,
@@ -3022,6 +3158,18 @@ export default function App(){
                         <ScoreRing score={score}/>
                         <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>{info.label}</span>
                         {lead.industry&&<span className="pill" style={{background:"#a3a6ff18",color:"#a3a6ff"}}>{lead.industry}</span>}
+                        {/* Local-time-at-lead chip — turns red outside business
+                            hours (before 8am / after 7pm local) so the caller
+                            doesn't ring MD businesses at 5am Pacific. */}
+                        {lt&&(
+                          <span className="pill"
+                            title={`${lead.state} local time · ${lt.tz}`}
+                            style={{background:offHours?"#ff6e8420":"#69f6b818",
+                                    color:offHours?"#ff6e84":"#69f6b8",
+                                    border:`1px solid ${offHours?"#ff6e8430":"#69f6b830"}`}}>
+                            🕐 {lt.time} {lt.tzShort}{offHours?" · off-hours":""}
+                          </span>
+                        )}
                       </div>
                       {/* Contact history line — fresh leads get a green badge,
                           previously-worked leads show how long it's been so
@@ -3073,6 +3221,29 @@ export default function App(){
                         <IconMail/> Send Email
                       </button>
                     </div>
+                    {/* Trigger lazy script + best-time load for this industry */}
+                    {lead.industry && (ensureScript(lead.industry), ensureBestTime(lead.industry), null)}
+                    {/* Best-call-time hint — green if the local hour matches
+                        the historical sweet spot, dim grey otherwise. Only
+                        shows when there's enough signal (≥5 calls). */}
+                    {(()=>{
+                      const bt = lead.industry ? bestTimeCache[lead.industry] : null
+                      const best = bt?.best_hour
+                      if(!best || !lt) return null
+                      const matches = best.hour === lt.hour
+                      const fmtHr = (h)=>{
+                        const ap = h>=12?"PM":"AM"; const h12 = ((h+11)%12)+1
+                        return `${h12}${ap}`
+                      }
+                      return (
+                        <div style={{marginBottom:14,fontSize:11,textAlign:"center",
+                          color:matches?"#69f6b8":"#a3aac4"}}>
+                          💡 Best hour for {lead.industry}: <b>{fmtHr(best.hour)}–{fmtHr((best.hour+1)%24)}</b>
+                          {" "}({best.rate}% contact rate, n={best.calls})
+                          {matches&&<span style={{marginLeft:6,fontWeight:700}}>· you're in the window now</span>}
+                        </div>
+                      )
+                    })()}
                     <div style={{display:"flex",gap:12}}>
                       <button className="btn btn-g" style={{flex:1,padding:11}}
                         onClick={()=>setDialerIdx(i=>Math.max(0,i-1))}
@@ -3081,6 +3252,45 @@ export default function App(){
                         onClick={()=>setDialerIdx(i=>Math.min(dialerLeads.length-1,i+1))}
                         disabled={idx>=dialerLeads.length-1}>Skip →</button>
                     </div>
+                    {/* Bad-Number quick-action: caller heard "number not in
+                        service" or got a fax tone. One click flips the status
+                        and removes from dialer pool — different from
+                        do_not_contact which implies the prospect asked us to
+                        stop. Bad number is a data-quality problem, not consent. */}
+                    <button className="btn btn-g" style={{width:"100%",padding:9,marginTop:8,
+                      fontSize:11,color:"#ff6e84",borderColor:"#ff6e8430"}}
+                      title="Mark this phone as out-of-service / wrong number — removes from dialer"
+                      onClick={async()=>{
+                        if(!window.confirm(`Mark ${lead.phone} as out-of-service for ${lead.company}?\n\nLead stays in DB (admin Lead Cleanup can purge later) but won't surface in the dialer.`)) return
+                        try{
+                          await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
+                            status:"do_not_contact",
+                            notes:[(lead.notes||"").trim(),
+                              `[${new Date().toISOString().slice(0,16)}] bad-phone flagged by ${user}: ${lead.phone}`]
+                              .filter(Boolean).join("\n"),
+                            updatedAt:new Date().toISOString(),
+                          })})
+                          setLeads(p=>p.map(l=>l.id===lead.id?{...l,status:"do_not_contact"}:l))
+                          notify("Phone flagged as bad","success")
+                        }catch(ex){ notify("Failed to flag: "+(ex.message||"error"),"error") }
+                      }}>
+                      📵 Bad Number / Not in Service
+                    </button>
+                    {/* Industry-script opener — top-used script for this
+                        industry, lazy-loaded. Shown collapsed until clicked
+                        so it doesn't crowd the call card on first glance. */}
+                    {industryScript&&(
+                      <details style={{marginTop:16,background:"#0f1930",borderRadius:12,padding:"12px 16px"}}>
+                        <summary style={{cursor:"pointer",fontSize:"0.6rem",color:"#a3a6ff",fontWeight:700,
+                          letterSpacing:".1em",textTransform:"uppercase"}}>
+                          📜 Script: {industryScript.title || industryScript.industry} {industryScript.usage_count>0?`· used ${industryScript.usage_count}×`:""}
+                        </summary>
+                        <div style={{fontSize:13,color:"#dee5ff",lineHeight:1.6,marginTop:10,
+                          whiteSpace:"pre-wrap",fontFamily:"'Inter',sans-serif"}}>
+                          {industryScript.body || industryScript.content || industryScript.script || ""}
+                        </div>
+                      </details>
+                    )}
                     {lead.notes&&(
                       <div style={{marginTop:16,background:"#0f1930",borderRadius:12,padding:16}}>
                         <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
@@ -3925,6 +4135,9 @@ export default function App(){
 
               {/* ── Lead Cleanup (admin only) ── */}
               {isAdmin()&&<LeadCleanupPanel onCleanup={loadLeads}/>}
+
+              {/* ── Audit Log (admin only) ── */}
+              {isAdmin()&&<AuditLogPanel/>}
 
               {/* ── Connectivity Heatmap (admin only) ── */}
               {isAdmin()&&<ConnectivityPanel/>}
@@ -6148,6 +6361,86 @@ function CampaignActivityPanel(){
               })}
             </div>
           )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Audit log viewer. Every action that writes to audit_log (cleanups,
+// scrapes, kill-switch toggles, logins, backfills, dedupe sweeps,
+// reassignments) is browsable here. Post-mortems for "who deleted X"
+// stop needing direct Supabase access.
+function AuditLogPanel(){
+  const [entries,setEntries] = useState([])
+  const [open,setOpen]       = useState(false)
+  const [loading,setLoad]    = useState(false)
+  const [filterAction,setFilterAction] = useState("")
+  const [filterUser,setFilterUser]     = useState("")
+
+  const load = ()=>{
+    setLoad(true)
+    const params = new URLSearchParams({limit:"200"})
+    if(filterAction) params.set("action", filterAction)
+    if(filterUser)   params.set("username", filterUser)
+    api(`/api/admin/audit-log?${params}`)
+      .then(r => setEntries(r?.entries || []))
+      .catch(()=>setEntries([]))
+      .finally(()=>setLoad(false))
+  }
+  useEffect(()=>{ if(open) load() },[open, filterAction, filterUser])
+
+  const fmt = (iso)=>iso?new Date(iso).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""
+
+  // Distinct actions in the visible set, so the dropdown is data-driven.
+  const actions = Array.from(new Set(entries.map(e=>e.action).filter(Boolean))).sort()
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>setOpen(o=>!o)}
+        style={{padding:"18px 24px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
+          📜 Audit Log <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
+        </div>
+        <span style={{color:"#a3aac4",fontSize:14}}>{open?"▾":"▸"}</span>
+      </div>
+      {open&&(
+        <div style={{borderTop:"1px solid #40485d20"}}>
+          <div style={{padding:"12px 24px",display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",
+            borderBottom:"1px solid #40485d10"}}>
+            <select className="sel" value={filterAction} onChange={e=>setFilterAction(e.target.value)}
+              style={{fontSize:11,padding:"5px 10px"}}>
+              <option value="">All actions</option>
+              {actions.map(a=><option key={a} value={a}>{a}</option>)}
+            </select>
+            <input className="inp" placeholder="username" value={filterUser}
+              onChange={e=>setFilterUser(e.target.value)}
+              style={{fontSize:11,padding:"5px 10px",width:160}}/>
+            <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}} onClick={load}
+              disabled={loading}>{loading?"…":"↻ Refresh"}</button>
+            <div style={{fontSize:11,color:"#40485d",marginLeft:"auto"}}>
+              {entries.length} most recent
+            </div>
+          </div>
+          <div style={{maxHeight:480,overflowY:"auto"}}>
+            {loading?(
+              <div style={{padding:24,textAlign:"center",color:"#40485d",fontSize:12}}>Loading…</div>
+            ):entries.length===0?(
+              <div style={{padding:24,textAlign:"center",color:"#40485d",fontSize:12}}>No audit entries</div>
+            ):entries.map((e,i)=>(
+              <div key={e.id||i} style={{padding:"10px 24px",borderBottom:"1px solid #40485d08",
+                display:"grid",gridTemplateColumns:"140px 140px 160px 1fr",gap:12,alignItems:"start",fontSize:12}}>
+                <div style={{color:"#40485d"}}>{fmt(e.created_at)}</div>
+                <div style={{color:"#a3a6ff",fontWeight:600}}>{e.action}</div>
+                <div style={{color:"#a3aac4"}}>{e.username}</div>
+                <div style={{color:"#a3aac4",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",
+                  fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>
+                  {e.resource_type&&<span style={{color:"#40485d"}}>{e.resource_type}{e.resource_id?` ${e.resource_id}`:""} · </span>}
+                  {e.details?JSON.stringify(e.details).slice(0,300):""}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
