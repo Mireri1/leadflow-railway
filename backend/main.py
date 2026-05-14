@@ -1990,8 +1990,12 @@ def _dedupe_sweep_due() -> bool:
         print(f"[DEDUPE-SWEEP] cooldown check failed: {e}")
         return False
 
-HOT_DIGEST_INTERVAL_HOURS = int(os.getenv("HOT_DIGEST_INTERVAL_HOURS", "20"))
+HOT_DIGEST_INTERVAL_HOURS = int(os.getenv("HOT_DIGEST_INTERVAL_HOURS", "24"))
 HOT_LEAD_STALE_DAYS       = int(os.getenv("HOT_LEAD_STALE_DAYS", "5"))
+# Off by default — the digest is Slack-spammy at 1-caller scale and the
+# admin can already see overdue callbacks on the dashboard. Set
+# HOT_DIGEST_ENABLED=1 in Railway env vars to turn it back on.
+HOT_DIGEST_ENABLED        = os.getenv("HOT_DIGEST_ENABLED", "0") == "1"
 
 def _hot_digest_due() -> bool:
     """Returns True if HOT_DIGEST_INTERVAL_HOURS have elapsed since the last
@@ -2016,13 +2020,18 @@ def _hot_digest_due() -> bool:
         return False
 
 def _record_hot_digest_run():
+    """Upsert cooldown row. Logs the status code on non-2xx so we can spot
+    silent failures (which were the original cause of dedupe firing every
+    10 min). req_lib.post doesn't raise on HTTP 4xx/5xx — must check r.status_code."""
     try:
-        req_lib.post(
+        r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
             headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={"key": "last_hot_digest", "value": datetime.utcnow().isoformat() + "Z"},
             timeout=10,
         )
+        if r.status_code not in (200, 201, 204):
+            print(f"[HOT-DIGEST] cooldown upsert HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[HOT-DIGEST] failed to record last-run: {e}")
 
@@ -2030,7 +2039,12 @@ def run_hot_lead_digest_if_due():
     """Surface engaged leads (interested / callback) that have gone quiet —
     last_called_at older than HOT_LEAD_STALE_DAYS — and post them to Slack so
     the admin can re-prioritize. Quiet by default: if there's nothing to flag,
-    skip Slack entirely. Also catches overdue callbacks (callbackDate < today)."""
+    skip Slack entirely. Also catches overdue callbacks (callbackDate < today).
+
+    OFF by default (HOT_DIGEST_ENABLED env var). At 1-caller scale the admin
+    already sees this on the dashboard; turning it on means daily Slack noise."""
+    if not HOT_DIGEST_ENABLED:
+        return
     if not _hot_digest_due():
         return
     cutoff_dt   = datetime.utcnow() - timedelta(days=HOT_LEAD_STALE_DAYS)
@@ -2101,14 +2115,19 @@ def _record_dedupe_sweep_run():
     Prefer header has no idea what to merge on, so the POST hits a primary-key
     violation and the cooldown is never recorded — which caused the dedupe
     sweeps to silently re-fire every 10 minutes (the bg-loop interval) instead
-    of weekly. Confirmed by audit on 2026-05-14."""
+    of weekly. Confirmed by audit on 2026-05-14.
+
+    req_lib.post doesn't raise on 4xx/5xx, so we log non-2xx explicitly —
+    otherwise the silent-fail mode is invisible from outside Supabase."""
     try:
-        req_lib.post(
+        r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
             headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={"key": "last_dedupe_sweep", "value": datetime.utcnow().isoformat() + "Z"},
             timeout=10,
         )
+        if r.status_code not in (200, 201, 204):
+            print(f"[DEDUPE-SWEEP] cooldown upsert HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[DEDUPE-SWEEP] failed to record last-run: {e}")
 
