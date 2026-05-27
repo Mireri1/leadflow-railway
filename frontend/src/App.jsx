@@ -284,6 +284,51 @@ function ScoreRing({score=0}){
   )
 }
 
+// ─── Best-region nudge banner ────────────────────────────────────────────────
+// Renders only when the server returned a state currently in its peak-pickup
+// window and the caller hasn't dismissed that state's banner today.
+function BestRegionBanner({region, dismissed, onSwitch, onDismiss, switching}){
+  if(!region || !region.state) return null
+  const today = new Date().toISOString().slice(0,10)
+  if(dismissed && dismissed[region.state] === today) return null
+  const hr = region.current_local_hour
+  const hrLabel = hr==null ? "" :
+    (hr===0?"12am":hr<12?`${hr}am`:hr===12?"12pm":`${hr-12}pm`)
+  return (
+    <div style={{
+      background:"linear-gradient(135deg,#1a3a5c 0%,#2a4a6c 100%)",
+      border:"1px solid #4a8ac440", borderRadius:14,
+      padding:"14px 18px", marginBottom:20,
+      display:"flex", alignItems:"center", gap:14, flexWrap:"wrap"}}>
+      <span style={{fontSize:22}}>📞</span>
+      <div style={{flex:"1 1 280px"}}>
+        <div style={{color:"#dee5ff",fontWeight:600,fontSize:14,
+                     fontFamily:"'Space Grotesk',sans-serif"}}>
+          {region.state_name} is in its best connectivity window
+          {hrLabel && ` (${hrLabel} local)`}
+        </div>
+        <div style={{color:"#a3aac4",fontSize:12,marginTop:3}}>
+          {region.answer_rate}% answer rate this hour vs {region.state_avg_rate}% daily avg
+          {" · "}{region.sample_size} calls of signal
+          {region.queued_leads>0
+            ? ` · ${region.queued_leads} leads ready`
+            : " · queue empty — pull will run"}
+        </div>
+      </div>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <button className="btn btn-p" disabled={switching}
+          onClick={()=>onSwitch(region.state)}>
+          {switching ? "Switching…" : `Switch to ${region.state} →`}
+        </button>
+        <button onClick={()=>onDismiss(region.state)}
+          style={{background:"transparent",border:"none",color:"#a3aac4",
+                  fontSize:20,cursor:"pointer",padding:"0 6px"}}
+          title="Hide for today">×</button>
+      </div>
+    </div>
+  )
+}
+
 // ─── Login ───────────────────────────────────────────────────────────────────
 
 function Login({onLogin}){
@@ -2147,6 +2192,53 @@ export default function App(){
   // contact rate (≥5 calls of signal). Cached per industry.
   const [bestTimeCache,setBestTimeCache] = useState({})  // {industry: {best_hour, ...}}
 
+  // Soft "where to call now" nudge. Server returns a state currently in its
+  // peak-pickup window, or null. Refetched every 15 min. Dismissed banners
+  // remember their dismissal for the rest of the calendar day per state.
+  const [bestRegion,setBestRegion]       = useState(null)
+  const [bestRegionDismissed,setBestRegionDismissed] = useState(()=>{
+    try { return JSON.parse(localStorage.getItem("lf_region_dismissed")||"{}") }
+    catch(_) { return {} }
+  })
+  const [switchingRegion,setSwitchingRegion] = useState(false)
+
+  useEffect(()=>{
+    if(!user) return
+    let live = true
+    const load = () => api("/api/guidance/best-region")
+      .then(r => { if(live) setBestRegion(r && r.state ? r : null) })
+      .catch(()=>{ if(live) setBestRegion(null) })
+    load()
+    const t = setInterval(load, 15*60*1000)
+    return () => { live=false; clearInterval(t) }
+  },[user])
+
+  function dismissBestRegion(state){
+    const today = new Date().toISOString().slice(0,10)
+    const next = {...bestRegionDismissed, [state]: today}
+    setBestRegionDismissed(next)
+    try { localStorage.setItem("lf_region_dismissed", JSON.stringify(next)) }
+    catch(_){}
+  }
+
+  async function switchToRegion(state){
+    setSwitchingRegion(true)
+    try {
+      const r = await api("/api/guidance/switch",
+        {method:"POST", body: JSON.stringify({state})})
+      setFState(state)
+      setFCity("")
+      setNav("leads")
+      notify(r?.message || `Switched to ${state}.`)
+      // Refresh the lead list so the new Apollo pulls (if any) show up.
+      if(r?.apollo_new_leads > 0) loadLeads()
+    } catch(e) {
+      notify(`Switch failed: ${e.message||e}`, "error")
+    } finally {
+      setSwitchingRegion(false)
+    }
+  }
+
   // Auto-load warm leads when switching to warm tab
   useEffect(()=>{
     if(activeNav==="warm"&&user&&warmLeads.length===0){
@@ -2584,6 +2676,9 @@ export default function App(){
                 </h1>
                 <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Here's what's happening today</p>
               </div>
+              <BestRegionBanner region={bestRegion} dismissed={bestRegionDismissed}
+                onSwitch={switchToRegion} onDismiss={dismissBestRegion}
+                switching={switchingRegion}/>
               <StatsBar stats={stats} onCallbacks={()=>{setNav("leads");setCbOnly(p=>!p)}}/>
 
               {/* Daily Call Quota */}
@@ -2720,6 +2815,9 @@ export default function App(){
           {/* ── LEADS ───────────────────────────────────────────────────────── */}
           {activeNav==="leads"&&(
             <div>
+              <BestRegionBanner region={bestRegion} dismissed={bestRegionDismissed}
+                onSwitch={switchToRegion} onDismiss={dismissBestRegion}
+                switching={switchingRegion}/>
               <div style={{marginBottom:28}}>
                 <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
                   color:"#dee5ff",letterSpacing:"-.02em",lineHeight:1.1}}>Leads</h1>

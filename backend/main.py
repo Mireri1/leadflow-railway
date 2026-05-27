@@ -4263,6 +4263,215 @@ def insights_best_call_time(industry: str = "", days: int = 60,
     return {"industry": industry or "all", "days": days, "total_calls": total_calls,
             "best_hour": best, "hours": by_hour}
 
+# Soft guidance: tells a caller which state is in its peak-pickup hour right
+# now, based on last `days` of call_outcomes bucketed by lead-state local hour.
+# Returns null when no state has a meaningfully-better-than-average bucket at
+# its current local hour — UI then hides the banner and the caller just keeps
+# working her existing queue.
+GUIDANCE_PULL_COOLDOWN_HOURS = 4    # per caller × state
+GUIDANCE_PULL_QUEUE_THRESHOLD = 30  # only pull Apollo when queue is below this
+
+@app.get("/api/guidance/best-region")
+def guidance_best_region(days: int = 30, min_sample: int = 20,
+                         user: str = Depends(verify_token)):
+    """Returns the state whose *current local hour* has the best historical
+    answer rate AND beats that state's own daily average by ≥5pp. Null when
+    no state qualifies. Caller frontend uses this to show a soft 'switch to
+    X' banner; absence of recommendation = silent."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return None
+    days = max(7, min(int(days or 30), 90))
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    calls = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledAt,leadId"
+        f"&calledAt=gte.{since}&order=calledAt.desc"
+    )
+    if not calls:
+        return None
+
+    lead_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
+    lead_state = {}
+    for i in range(0, len(lead_ids), 200):
+        chunk = lead_ids[i:i+200]
+        try:
+            ids_f = ",".join(str(x) for x in chunk)
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_f})&select=id,state",
+                headers=SB_HEADERS, timeout=30,
+            )
+            rows = r.json() if r.status_code == 200 else []
+            if isinstance(rows, list):
+                for row in rows:
+                    s = (row.get("state") or "").strip().upper()
+                    if row.get("id") and s in US_STATE_TIMEZONES:
+                        lead_state[row["id"]] = s
+        except Exception:
+            pass
+
+    PICKUP = {"answered", "interested", "not_interested", "callback", "converted"}
+    tz_cache = {}
+    def gtz(tz_str):
+        if tz_str not in tz_cache:
+            try: tz_cache[tz_str] = ZoneInfo(tz_str)
+            except Exception: tz_cache[tz_str] = None
+        return tz_cache[tz_str]
+
+    # buckets[state][local_hour] -> {"calls", "pickups"}
+    buckets = {}
+    for c in calls:
+        st = lead_state.get(c.get("leadId"))
+        if not st: continue
+        cat = c.get("calledAt") or ""
+        if len(cat) < 19: continue
+        tz = gtz(US_STATE_TIMEZONES[st])
+        if not tz: continue
+        try:
+            ts = datetime.fromisoformat(cat.replace("Z","+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=ZoneInfo("UTC"))
+            local_hr = ts.astimezone(tz).hour
+        except Exception:
+            continue
+        b = buckets.setdefault(st, {}).setdefault(local_hr,
+                                                  {"calls": 0, "pickups": 0})
+        b["calls"] += 1
+        if (c.get("outcome") or "") in PICKUP:
+            b["pickups"] += 1
+
+    candidates = []
+    for st, hours in buckets.items():
+        tz = gtz(US_STATE_TIMEZONES[st])
+        if not tz: continue
+        now_hr = datetime.now(tz).hour
+        cur = hours.get(now_hr)
+        if not cur or cur["calls"] < min_sample: continue
+        rate = cur["pickups"] / cur["calls"]
+        total_c = sum(b["calls"] for b in hours.values())
+        total_p = sum(b["pickups"] for b in hours.values())
+        avg = (total_p / total_c) if total_c else 0
+        # Require ≥25% absolute and ≥5pp lift over state avg — keeps signal
+        # high so the banner doesn't nag with marginal recommendations.
+        if rate < 0.25 or (rate - avg) < 0.05: continue
+        candidates.append({
+            "state": st,
+            "state_name": US_STATES_FULL.get(st, st),
+            "current_local_hour": now_hr,
+            "answer_rate": round(rate * 100, 1),
+            "state_avg_rate": round(avg * 100, 1),
+            "sample_size": cur["calls"],
+        })
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x["answer_rate"], reverse=True)
+    top = candidates[0]
+
+    # Available (unclaimed) leads with phone in that state, excluding closed.
+    try:
+        ql = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?select=id&state=eq.{top['state']}"
+            f"&or=(assignedTo.is.null,assignedTo.eq.)"
+            f"&phone=not.is.null"
+            f"&status=not.in.(converted,interested)"
+            "&limit=1000",
+            headers=SB_HEADERS, timeout=20,
+        )
+        top["queued_leads"] = len(ql.json()) if ql.status_code == 200 else 0
+    except Exception:
+        top["queued_leads"] = 0
+    return top
+
+@app.post("/api/guidance/switch")
+def guidance_switch(body: dict, user: str = Depends(verify_token)):
+    """Caller clicked 'Switch to <state>' on the guidance banner. If the
+    unclaimed queue for that state is below threshold AND this caller hasn't
+    pulled it in the cooldown window, triggers a strict-capped Apollo pull
+    (1 page × 25 contacts, no phone reveal). Otherwise just confirms the
+    filter switch."""
+    state = (body.get("state") or "").strip().upper()
+    if state not in US_STATE_TIMEZONES:
+        raise HTTPException(status_code=400, detail="Unknown state")
+
+    try:
+        ql = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?select=id&state=eq.{state}"
+            f"&or=(assignedTo.is.null,assignedTo.eq.)"
+            f"&phone=not.is.null"
+            f"&status=not.in.(converted,interested)"
+            "&limit=1000",
+            headers=SB_HEADERS, timeout=20,
+        )
+        queued = len(ql.json()) if ql.status_code == 200 else 0
+    except Exception:
+        queued = 0
+
+    resp = {"state": state, "queued": queued,
+            "apollo_pulled": False, "apollo_new_leads": 0, "message": ""}
+
+    if queued >= GUIDANCE_PULL_QUEUE_THRESHOLD:
+        resp["message"] = f"{queued} {state} leads already in queue — switched."
+        return resp
+
+    ck = f"guidance_pull_{user}_{state}".lower()
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{ck}&select=value",
+            headers=SB_HEADERS, timeout=10,
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if rows:
+            try:
+                last_ts = datetime.fromisoformat(
+                    rows[0].get("value","").replace("Z","+00:00"))
+                if last_ts.tzinfo: last_ts = last_ts.replace(tzinfo=None)
+                elapsed_h = (datetime.utcnow() - last_ts).total_seconds() / 3600
+                if elapsed_h < GUIDANCE_PULL_COOLDOWN_HOURS:
+                    resp["message"] = (f"Switched to {state}. Last pull "
+                                       f"{round(elapsed_h,1)}h ago — cooldown active.")
+                    return resp
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not APOLLO_API_KEY:
+        resp["message"] = f"Switched to {state}. (Apollo not configured.)"
+        return resp
+
+    pull_body = ApolloPullRequest(
+        titles=["Facility Manager","Director of Operations",
+                "Operations Manager","Property Manager"],
+        industries=[],
+        locations=[US_STATES_FULL.get(state, state)],
+        per_page=25, page=1, reveal_phones=False,
+        auto_paginate=False, min_new_leads=10, max_pages=1,
+    )
+    try:
+        pull_result = apollo_pull(pull_body, user)
+        resp["apollo_pulled"] = True
+        resp["apollo_new_leads"] = int(pull_result.get("saved", 0))
+        resp["message"] = (f"Switched to {state}. Pulled "
+                           f"{resp['apollo_new_leads']} fresh contacts.")
+        try:
+            req_lib.post(
+                f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+                json={"key": ck, "value": datetime.utcnow().isoformat()},
+                timeout=10,
+            )
+        except Exception:
+            pass
+    except HTTPException as e:
+        resp["message"] = f"Switched to {state}. Apollo pull failed: {e.detail}"
+    except Exception as e:
+        resp["message"] = f"Switched to {state}. Apollo pull error: {e}"
+    return resp
+
 @app.post("/api/leads/recycle-stale")
 def recycle_stale_leads(user: str = Depends(verify_admin)):
     """Unassign leads that haven't been touched in 7+ days"""
