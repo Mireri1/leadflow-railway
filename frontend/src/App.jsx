@@ -590,6 +590,10 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
   const [empMax,setEmpMax]         = useState(500)
   const [perPage,setPerPage]       = useState(25)
   const [revealPhones,setRevealPh] = useState(false)
+  // Rotate through decision-maker title groups (Owner → CEO → GM → Ops → …) so
+  // repeat pulls of the same city surface fresh budget-holders instead of
+  // re-hitting the same Owners that are already in the DB.
+  const [rotateTitles,setRotateTitles] = useState(false)
   const [loading,setLoad]          = useState(false)
   const [result,setResult]         = useState(null)
   const [error,setError]           = useState("")
@@ -597,7 +601,7 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
   // through Apollo's catalog instead of always restarting at page 1.
   // Resets whenever titles/industries/locations change (different search).
   const [pullStartPage,setPullStartPage] = useState(1)
-  useEffect(()=>{ setPullStartPage(1) },[titles,selIndustries,state,cities])
+  useEffect(()=>{ setPullStartPage(1) },[titles,selIndustries,state,cities,rotateTitles])
   const [budget,setBudget]         = useState(null)
   useEffect(()=>{
     api("/api/admin/apollo/budget").then(setBudget).catch(()=>{})
@@ -630,7 +634,7 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
 
   async function pull(){
     setError(""); setResult(null)
-    if(!titles.trim()){ setError("Enter at least one job title."); return }
+    if(!titles.trim()&&!rotateTitles){ setError("Enter at least one job title (or turn on title rotation)."); return }
     if(cities.trim()&&!state){ setError("Pick a state when targeting specific cities."); return }
     setLoad(true)
     try{
@@ -646,10 +650,13 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
         reveal_phones: revealPhones,
         // Auto-paginate so the user sees real new leads rather than "0 saved"
         // when every contact on page 1 is already in the DB. Walks up to 5
-        // pages or until 10 new are saved, whichever first.
+        // pages (8 when rotating, to sample more title groups) or until 10
+        // new are saved, whichever first.
         auto_paginate: true,
         min_new_leads: 10,
-        max_pages:     5,
+        max_pages:     rotateTitles?8:5,
+        // Cycle decision-maker title groups to keep repeat pulls fresh.
+        rotate_titles: rotateTitles,
       })})
       // Persist the next-page cursor so a second "Pull from Apollo" click on
       // the same filters advances through Apollo's catalog instead of
@@ -770,6 +777,17 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
             style={{cursor:"pointer"}}/>
           <span>Also reveal direct mobile phones <span style={{color:"#ffe083"}}>(+5-8 credits per lead, async via webhook ~30s)</span></span>
         </label>
+        <label style={{gridColumn:"1 / -1",display:"flex",alignItems:"flex-start",gap:8,fontSize:11,color:"#a3aac4",cursor:"pointer"}}>
+          <input type="checkbox" checked={rotateTitles} onChange={e=>setRotateTitles(e.target.checked)}
+            style={{cursor:"pointer",marginTop:2}}/>
+          <span>🔄 Rotate decision-maker titles <span style={{color:"#69f6b8"}}>(keeps leads fresh)</span>
+            <span style={{display:"block",color:"#40485d",fontSize:10,marginTop:1}}>
+              Cycles Owner → CEO/President → COO/Ops → GM → Facilities → Office Mgr → Property Mgr.
+              Surfaces new buyers in cities you've already pulled, instead of re-hitting the same people.
+              {titles.trim()?" Your titles above are tried first.":" (your title box can be left blank)"}
+            </span>
+          </span>
+        </label>
       </div>
       {error&&<div style={{marginTop:14,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
         borderRadius:8,fontSize:12,color:"#ff6e84"}}>{error}</div>}
@@ -808,15 +826,45 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
               ⚠ Apollo returned <b>0 contacts</b> across {result.pages_walked||1} page(s) for this search.
               Try widening titles, removing the state filter, or bumping employee range.
             </div>
-          ):(
+          ):(()=>{
+            const dupes=(result.skipped?.already_in_db||0)+(result.skipped?.phone_dup_in_db||0)
+            const dupeDominant=dupes>0&&dupes>=result.returned*0.6
+            return (
             <div style={{color:"#ffe083"}}>
-              ⓘ <b>0 new leads</b> — all {result.returned} contacts across {result.pages_walked||1} page(s) were filtered out.
-              {result.total_pages&&result.next_page&&result.next_page<=result.total_pages?(
+              ⓘ <b>0 new leads</b> — all {result.returned} contacts across {result.pages_walked||1} page{(result.pages_walked||1)===1?"":"s"} were filtered out.
+              {dupeDominant&&(
+                <div style={{marginTop:6,fontSize:11,color:"#a3aac4"}}>
+                  Most ({dupes}) were <b style={{color:"#dee5ff"}}>already in your pipeline</b> — you've pulled
+                  these people before, so the dedup is doing its job (not a bug).
+                  {!rotateTitles&&(
+                    <div style={{marginTop:6,padding:"8px 10px",background:"#69f6b812",border:"1px solid #69f6b830",borderRadius:6,color:"#dee5ff"}}>
+                      💡 You've tapped out these titles in this area. Turn on
+                      <b style={{color:"#69f6b8"}}> 🔄 Rotate decision-maker titles</b> below and pull again —
+                      it'll grab the GMs, Ops Directors, and Facilities Managers at companies whose
+                      Owner you already have.
+                    </div>
+                  )}
+                  {rotateTitles&&(
+                    <div style={{marginTop:6,color:"#a3aac4"}}>
+                      Even with rotation every title group here is exhausted. Try a nearby city,
+                      a wider employee range, or a different industry.
+                    </div>
+                  )}
+                </div>
+              )}
+              {!dupeDominant&&result.total_pages&&result.next_page&&result.next_page<=result.total_pages?(
                 <div style={{marginTop:6,fontSize:11,color:"#a3aac4"}}>
                   {result.total_pages.toLocaleString()} total contacts match this search.
-                  Click "Pull from Apollo" again to walk pages {result.next_page}–{Math.min(result.next_page+4, result.total_pages)} (next 5).
+                  Click "Pull from Apollo" again to walk pages {result.next_page}–{Math.min(result.next_page+4, result.total_pages)} (next batch).
                 </div>
               ):null}
+            </div>
+          )})()}
+
+          {/* Title groups walked this pull (rotation only). */}
+          {result.rotated&&result.titles_tried&&result.titles_tried.length>0&&(
+            <div style={{marginTop:8,fontSize:11,color:"#a3aac4"}}>
+              🔄 Rotated through: <span style={{color:"#69f6b8"}}>{result.titles_tried.join(" → ")}</span>
             </div>
           )}
 

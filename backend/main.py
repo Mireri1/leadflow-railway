@@ -95,6 +95,34 @@ APOLLO_ENRICH_TITLES = [t.strip() for t in os.getenv("APOLLO_ENRICH_TITLES",
 # which is fine; the worst case is paying for a few duplicate lookups.
 APOLLO_ENRICH_CACHE_TTL_HOURS = int(os.getenv("APOLLO_ENRICH_CACHE_TTL_HOURS", "720"))  # 30 days
 
+# Decision-maker title rotation. When a bulk pull turns up "all already in DB"
+# it's because Apollo returns the SAME top-ranked people for the same titles
+# every run — once you've pulled the Owners in a city, re-pulling Owners just
+# re-hits them. Rotating through *different* decision-maker title groups surfaces
+# fresh people (the GM, the Ops Director, the Facilities Manager at companies
+# whose Owner you already have). Every group below is a budget-holder / buyer
+# for Vision's services — no gatekeepers, no ICs. Ordered most-likely-buyer
+# first. Override via APOLLO_DM_TITLE_GROUPS as "Owner|Founder;CEO|President;..."
+# (groups separated by ';', titles within a group by '|').
+def _parse_dm_title_groups(raw: str):
+    groups = []
+    for grp in raw.split(";"):
+        titles = [t.strip() for t in grp.split("|") if t.strip()]
+        if titles:
+            groups.append(titles)
+    return groups
+
+APOLLO_DM_TITLE_GROUPS = _parse_dm_title_groups(os.getenv("APOLLO_DM_TITLE_GROUPS", "")) or [
+    ["Owner", "Founder", "Co-Founder", "Proprietor"],
+    ["CEO", "Chief Executive Officer", "President"],
+    ["COO", "Chief Operating Officer", "VP of Operations", "Vice President of Operations"],
+    ["General Manager", "Managing Director", "Managing Partner", "Managing Member"],
+    ["Director of Operations", "Operations Manager", "Head of Operations"],
+    ["Facilities Manager", "Facility Manager", "Director of Facilities", "Facilities Director"],
+    ["Office Manager", "Business Manager", "Administrator", "Practice Manager"],
+    ["Property Manager", "Regional Manager", "Site Manager"],
+]
+
 # ── Google Places cost controls ─────────────────────────────────────────────
 # PLACES_KILL_SWITCH=1 halts every Places call instantly (same env name as
 # vlm/recruitnil scrapers so one flip stops the bleeding across all repos).
@@ -2750,6 +2778,14 @@ class ApolloPullRequest(BaseModel):
     auto_paginate: Optional[bool] = True
     min_new_leads: Optional[int]  = 10
     max_pages:     Optional[int]  = 5
+    # Title rotation: when True, cycle through APOLLO_DM_TITLE_GROUPS (different
+    # decision-maker title slices) instead of hammering one title set. Solves
+    # "all already in DB" on repeat pulls of the same city — each group surfaces
+    # fresh budget-holders. The user's `titles` (if any) are tried first, then
+    # the rotation groups. `max_pages` becomes the TOTAL Apollo-call budget
+    # spread across groups (round-robin), not per-group, so credit spend is
+    # bounded exactly as before.
+    rotate_titles: Optional[bool] = False
 
 def _to_str_list(v):
     """Coerce a request field to a list of trimmed non-empty strings.
@@ -5163,7 +5199,6 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         locations = ["United States"]
 
     base_payload = {"per_page": per_page}
-    if titles:     base_payload["person_titles"] = titles
     if industries: base_payload["q_organization_industries"] = industries
     base_payload["person_locations"] = locations
     if body.employee_min and body.employee_max:
@@ -5174,6 +5209,29 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "Cache-Control": "no-cache",
         "Content-Type":  "application/json",
     }
+
+    # Build the title groups to walk. Without rotation it's a single group (the
+    # user's titles, or [] = "any title"). With rotation we append the
+    # decision-maker roster after the user's titles, so repeat pulls of the same
+    # city surface *different* budget-holders (the GM, the Ops Director, the
+    # Facilities Manager) instead of re-hitting the same Owners that are already
+    # in the DB. Exact-duplicate groups are dropped so we don't pay twice.
+    def _norm_group(g):
+        return tuple(sorted(t.lower() for t in g))
+    if body.rotate_titles:
+        title_groups, seen_groups = [], set()
+        for g in (([titles] if titles else []) + APOLLO_DM_TITLE_GROUPS):
+            if not g:
+                continue
+            k = _norm_group(g)
+            if k in seen_groups:
+                continue
+            seen_groups.add(k)
+            title_groups.append(g)
+        if not title_groups:
+            title_groups = [titles]
+    else:
+        title_groups = [titles]
 
     # Aggregates across all pages walked
     agg = {
@@ -5195,11 +5253,30 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     total_avail = None
     last_page_meta_pages = None
 
-    for offset in range(max_pages):
-        page = start_page + offset
+    # Round-robin across title groups, each with its own page cursor, sharing a
+    # single `max_pages` Apollo-call budget. Non-rotation (1 group) degenerates
+    # to the old sequential page walk — identical behavior + credit spend.
+    n_groups     = len(title_groups)
+    group_cursor = [start_page] * n_groups
+    exhausted    = [False] * n_groups
+    titles_tried = []   # human-readable groups actually queried, in order
+    gi = 0
+    while pages_walked < max_pages and not all(exhausted):
+        if exhausted[gi]:
+            gi = (gi + 1) % n_groups
+            continue
+        grp  = title_groups[gi]
+        page = group_cursor[gi]
         payload = {**base_payload, "page": page}
+        if grp:
+            payload["person_titles"] = grp
         result = _apollo_pull_one_page(payload, headers, body, user)
         pages_walked += 1
+        group_cursor[gi] += 1
+        label = ", ".join(grp) if grp else "(any title)"
+        if label not in titles_tried:
+            titles_tried.append(label)
+
         agg["people_returned"]         += result["people_returned"]
         agg["saved"]                   += result["saved"]
         agg["skipped_already_in_db"]   += result["skipped_already_in_db"]
@@ -5215,17 +5292,22 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         if result.get("total_pages") is not None:
             last_page_meta_pages = result["total_pages"]
 
-        # Stop conditions:
-        # 1. Apollo returned 0 — no more contacts at this search
-        # 2. We hit the page limit reported by Apollo
-        # 3. We have ≥ min_new_leads in the bag
-        # 4. auto_paginate is off (max_pages=1)
+        # Per-group exhaustion: Apollo returned 0, or we hit this group's last
+        # page. A group going dry just drops out of the rotation; others go on.
         if result["people_returned"] == 0:
-            break
-        if last_page_meta_pages is not None and page >= last_page_meta_pages:
-            break
+            exhausted[gi] = True
+        elif result.get("total_pages") is not None and page >= result["total_pages"]:
+            exhausted[gi] = True
+
+        # Global stop: enough fresh leads in the bag.
         if agg["saved"] >= min_new:
             break
+        gi = (gi + 1) % n_groups
+
+    # Resume cursor: lowest page reached across groups so the next click doesn't
+    # skip pages we never fetched (round-robin keeps cursors within 1 of each
+    # other). For a single group this is just start_page + pages_walked.
+    next_page_cursor = min(group_cursor) if group_cursor else start_page
 
     # Audit + Slack once at the end, summarized across all pages walked.
     audit_log(user, "apollo_pull", "lead", None, {
@@ -5246,6 +5328,8 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "phone_reveals_requested":  agg["phone_reveals_requested"],
         "total_entries":            total_avail,
         "total_pages":              last_page_meta_pages,
+        "rotate_titles":            bool(body.rotate_titles),
+        "titles_tried":             titles_tried,
     })
 
     if agg["saved"] > 0:
@@ -5255,11 +5339,11 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
             f"*{user}* pulled *{agg['saved']}* new decision-maker leads from Apollo "
             f"({pages_walked} page{'s' if pages_walked!=1 else ''} walked).",
             fields=[
-                {"label": "Titles",       "value": ", ".join(titles) or "Any"},
+                {"label": "Titles",       "value": (" → ".join(titles_tried) if body.rotate_titles else (", ".join(titles) or "Any"))},
                 {"label": "Locations",    "value": ", ".join(locations) or "Any"},
                 {"label": "Returned",     "value": str(agg["people_returned"] + agg["skipped_already_in_db"])},
                 {"label": "Saved",        "value": f":white_check_mark: {agg['saved']}"},
-                {"label": "Pages",        "value": f"{start_page}-{start_page + pages_walked - 1}"},
+                {"label": "Pages",        "value": f"{pages_walked} ({'rotated' if body.rotate_titles else f'{start_page}-{start_page + pages_walked - 1}'})"},
             ],
             actions=[{"label": "📋 View Leads", "url": app_url, "style": "primary"}],
         )
@@ -5272,8 +5356,10 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
     if agg["skipped_non_us"]:           summary_parts.append(f"{agg['skipped_non_us']} non-US")
     if agg["skipped_no_company"]:       summary_parts.append(f"{agg['skipped_no_company']} missing company")
     if agg["skipped_no_actionable"]:    summary_parts.append(f"{agg['skipped_no_actionable']} no contact info")
-    summary = (f"Apollo returned {total_in} across {pages_walked} page(s) · " + " · ".join(summary_parts)) \
-              if summary_parts else f"Apollo returned {total_in} · all filtered out"
+    walk_desc = (f"{pages_walked} page(s) across {len(titles_tried)} title group(s)"
+                 if body.rotate_titles else f"{pages_walked} page(s)")
+    summary = (f"Apollo returned {total_in} across {walk_desc} · " + " · ".join(summary_parts)) \
+              if summary_parts else f"Apollo returned {total_in} across {walk_desc} · all filtered out"
 
     return {
         "returned":        total_in,
@@ -5281,7 +5367,9 @@ def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
         "saved":           agg["saved"],
         "summary":         summary,
         "pages_walked":    pages_walked,
-        "next_page":       start_page + pages_walked,
+        "next_page":       next_page_cursor,
+        "rotated":         bool(body.rotate_titles),
+        "titles_tried":    titles_tried,
         "skipped":         {"already_in_db":   agg["skipped_already_in_db"],
                             "phone_dup_in_db": agg["skipped_phone_dup_in_db"],
                             "non_us":          agg["skipped_non_us"],
