@@ -69,7 +69,8 @@ const SECONDARY_OUTCOMES = [
   // reached the actual decision-maker. Tracked as engaged (surfaces for
   // follow-up, exempt from the once-called recycle) but no qual is forced
   // since the DM conversation hasn't happened yet.
-  { value:"interested_no_dm", label:"Interested · No DM", color:"#5ec8ff", icon:"🚪", needsQual:false },
+  { value:"interested_no_dm", label:"Interested · No DM", color:"#5ec8ff", icon:"🚪", needsQual:false,
+    hint:"Someone seemed interested, but you didn't reach the decision-maker (e.g. gatekeeper, assistant). We'll keep it warm for a follow-up." },
   { value:"callback",       label:"Callback",       color:"#8b5cf6", icon:"📅", needsQual:true },
   { value:"converted",      label:"Converted!",     color:"#69f6b8", icon:"🎉", needsQual:true },
 ]
@@ -1396,7 +1397,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
             </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
               {SECONDARY_OUTCOMES.map(s=>(
-                <button key={s.value} onClick={()=>setSecondary(s.value)}
+                <button key={s.value} onClick={()=>setSecondary(s.value)} title={s.hint||s.label}
                   style={{padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",
                     textAlign:"center",fontSize:13,fontWeight:600,transition:"all .15s",
                     background:secondary===s.value?s.color+"25":"#060e20",
@@ -1406,6 +1407,15 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                 </button>
               ))}
             </div>
+            {/* Plain-language explainer for the selected result so the caller
+                is never guessing what an option means. */}
+            {secDef?.hint&&(
+              <div style={{marginTop:10,padding:"8px 12px",borderRadius:8,fontSize:12,
+                lineHeight:1.5,color:"#dee5ff",background:secDef.color+"12",
+                border:`1px solid ${secDef.color}30`}}>
+                <span style={{marginRight:6}}>{secDef.icon}</span>{secDef.hint}
+              </div>
+            )}
           </div>
         )}
 
@@ -2901,7 +2911,8 @@ export default function App(){
                 <div style={{flex:"1 1 200px",position:"relative",display:"flex",alignItems:"center"}}>
                   <span style={{position:"absolute",left:12,color:"#40485d",display:"flex"}}><IconFilter/></span>
                   <input value={search} onChange={e=>setSearch(e.target.value)}
-                    placeholder="Filter by company or contact…"
+                    placeholder="Search by name, phone, company, email, or notes…"
+                    title="Look up a lead by contact name, phone number, company, email, city, notes — even past call history. Forgot the name? Paste the phone number."
                     style={{width:"100%",background:"#000011",border:"1px solid #40485d30",
                       borderRadius:8,padding:"8px 12px 8px 32px",color:"#dee5ff",
                       fontSize:13,fontFamily:"'Inter',sans-serif",outline:"none"}}/>
@@ -3147,19 +3158,30 @@ export default function App(){
                           <div key={sk} style={{marginBottom:14,border:"1px solid #1c2740",
                             borderRadius:12,overflow:"hidden"}}>
                             <button onClick={()=>toggleState(sk)}
+                              title={collapsed?`Click to show ${fullName} leads`:`Click to hide ${fullName} leads`}
                               style={{width:"100%",display:"flex",alignItems:"center",gap:12,
                                 padding:"14px 20px",background:"#0f1930",border:"none",cursor:"pointer",
                                 fontFamily:"inherit",textAlign:"left"}}>
-                              <span style={{fontSize:13,transition:"transform .15s",
+                              <span style={{fontSize:13,transition:"transform .15s",width:14,flexShrink:0,
                                 transform:collapsed?"rotate(-90deg)":"rotate(0)",color:"#a3a6ff"}}>▼</span>
-                              <span style={{fontSize:15}}>🗺️</span>
-                              <span style={{fontSize:15,fontWeight:700,color:"#dee5ff",
+                              <span style={{fontSize:16}}>🗺️</span>
+                              <span style={{fontSize:16,fontWeight:700,color:"#dee5ff",
                                 fontFamily:"'Space Grotesk',sans-serif"}}>{fullName}</span>
                               <span style={{fontSize:12,color:"#a3a6ff",background:"#a3a6ff20",
-                                padding:"2px 10px",borderRadius:10,fontWeight:700}}>{list.length}</span>
+                                padding:"2px 10px",borderRadius:10,fontWeight:700}}>
+                                {list.length.toLocaleString()} lead{list.length===1?"":"s"}</span>
+                              {/* DM / warm split so the caller knows the mix at a glance */}
+                              {stDm.length>0&&(
+                                <span style={{fontSize:11,color:"#b69cff"}}>🎯 {stDm.length.toLocaleString()} decision-maker{stDm.length===1?"":"s"}</span>
+                              )}
+                              {stWarm.length>0&&(
+                                <span style={{fontSize:11,color:"#ffe083"}}>🌡️ {stWarm.length.toLocaleString()} warm</span>
+                              )}
                               {newToday>0&&(
                                 <span style={{fontSize:11,color:"#69f6b8",fontWeight:600}}>+{newToday} new today</span>
                               )}
+                              <span style={{marginLeft:"auto",fontSize:11,color:"#56607f"}}>
+                                {collapsed?"Show ▾":"Hide ▴"}</span>
                             </button>
                             {!collapsed&&(
                               <div>
