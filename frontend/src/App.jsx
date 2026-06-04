@@ -28,6 +28,7 @@ const STATUS_OPTIONS = [
   { value:"called",                label:"Called",                color:"#ffe083" },
   { value:"no_answer",             label:"No Answer",             color:"#a3aac4" },
   { value:"interested",            label:"Interested",            color:"#69f6b8" },
+  { value:"interested_no_dm",      label:"Interested · No DM",    color:"#5ec8ff" },
   { value:"not_interested",        label:"Not Interested",        color:"#ff6e84" },
   { value:"callback",              label:"Callback",              color:"#8b5cf6" },
   { value:"converted",             label:"Converted",             color:"#06d6a0" },
@@ -50,6 +51,7 @@ const CALL_OUTCOMES = [
   { value:"voicemail",      label:"Left Voicemail" },
   { value:"callback",       label:"Requested Callback" },
   { value:"interested",     label:"Interested" },
+  { value:"interested_no_dm", label:"Interested · No DM" },
   { value:"not_interested", label:"Not Interested" },
   { value:"converted",      label:"Converted!" },
 ]
@@ -63,6 +65,11 @@ const PRIMARY_OUTCOMES = [
 const SECONDARY_OUTCOMES = [
   { value:"not_interested", label:"Not Interested", color:"#40485d", icon:"👎", needsQual:false },
   { value:"interested",     label:"Interested",     color:"#ffe083", icon:"👍", needsQual:true },
+  // Gatekeeper warm: prospect/gatekeeper seems interested but the caller never
+  // reached the actual decision-maker. Tracked as engaged (surfaces for
+  // follow-up, exempt from the once-called recycle) but no qual is forced
+  // since the DM conversation hasn't happened yet.
+  { value:"interested_no_dm", label:"Interested · No DM", color:"#5ec8ff", icon:"🚪", needsQual:false },
   { value:"callback",       label:"Callback",       color:"#8b5cf6", icon:"📅", needsQual:true },
   { value:"converted",      label:"Converted!",     color:"#69f6b8", icon:"🎉", needsQual:true },
 ]
@@ -1111,7 +1118,8 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         api(`/api/scripts/${scriptId}/use`,{method:"POST",body:JSON.stringify({})}).catch(()=>{})
       }
       const statusMap={answered:"called",no_answer:"no_answer",voicemail:"no_answer",
-        callback:"callback",interested:"interested",not_interested:"not_interested",converted:"converted"}
+        callback:"callback",interested:"interested",interested_no_dm:"interested_no_dm",
+        not_interested:"not_interested",converted:"converted"}
       const fuDays = FOLLOW_UP_DAYS[followUpSeq]
       const nextFollowUp = fuDays ? addDays(fuDays[0]) : (secondary==="callback"?cbDate:"")
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
@@ -2202,6 +2210,10 @@ export default function App(){
   const [fCity,setFCity]           = useState("")
   const [availableOnly,setAvailOnly] = useState(false)
   const [emailedOnly,setEmailedOnly] = useState(false)
+  // Per-state collapse for the state-grouped Leads view. Key = state code (or
+  // "__none__" for leads with no state). Empty = all expanded.
+  const [collapsedStates,setCollapsedStates] = useState({})
+  const toggleState = (k)=>setCollapsedStates(p=>({...p,[k]:!p[k]}))
   const [activeNav,setNav]         = useState("dashboard")
   const [callHistory,setCallHistory] = useState([])
   const [histData,setHistData]       = useState(null)
@@ -2521,15 +2533,13 @@ export default function App(){
   const isApolloLead = (l) => (l.source||"").toLowerCase() === "apollo"
   // Within each segment, surface "new today" first (preserves the prior
   // newest-first behavior — just nested inside each section).
+  // Leads are grouped by state below; within each state the Apollo / Warm
+  // split is applied with "new today" surfaced first inside each sub-section.
   const sortNewFirst = (arr) => {
     const newToday = arr.filter(l=>(l.createdAt||"").startsWith(today))
     const older    = arr.filter(l=>!(l.createdAt||"").startsWith(today))
     return [...newToday, ...older]
   }
-  const dmLeads        = sortNewFirst(displayLeads.filter(isApolloLead))
-  // Named pipelineWarm to avoid collision with the existing `warmLeads`
-  // state variable on the /warm nav tab (VCC-source filtered).
-  const pipelineWarm   = sortNewFirst(displayLeads.filter(l=>!isApolloLead(l)))
 
   function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false)}
 
@@ -2571,10 +2581,11 @@ export default function App(){
             <IconSearch/>
           </span>
           <input value={search} onChange={e=>setSearch(e.target.value)}
-            placeholder="Global Search…"
+            placeholder="Search name, phone, company, email…"
+            title="Search by contact name, phone number, company, email, city, notes — even past call history"
             style={{background:"#000011",border:"none",borderRadius:12,
               padding:"8px 16px 8px 36px",color:"#dee5ff",fontSize:13,
-              fontFamily:"'Inter',sans-serif",outline:"none",width:220}}/>
+              fontFamily:"'Inter',sans-serif",outline:"none",width:260}}/>
         </div>
 
         {/* Callbacks badge */}
@@ -3108,28 +3119,71 @@ export default function App(){
                       {subtitle&&<span style={{fontSize:11,color:"#a3aac4",marginLeft:4}}>{subtitle}</span>}
                     </div>
                   )
-                  const today_count_dm   = dmLeads.filter(l=>(l.createdAt||"").startsWith(today)).length
-                  const today_count_warm = pipelineWarm.filter(l=>(l.createdAt||"").startsWith(today)).length
+                  // ── State-grouped, collapsible sections ──────────────
+                  // Primary grouping is by state so the caller can work one
+                  // state at a time. The original Apollo / Warm split is kept
+                  // nested inside each state section.
+                  const stateOf = (l)=>(l.state||"").trim().toUpperCase()
+                  const groups = {}
+                  displayLeads.forEach(l=>{
+                    const k = stateOf(l) || "__none__"
+                    ;(groups[k] = groups[k] || []).push(l)
+                  })
+                  const stateKeys = Object.keys(groups).sort((a,b)=>{
+                    if(a==="__none__") return 1
+                    if(b==="__none__") return -1
+                    return groups[b].length - groups[a].length   // busiest state first
+                  })
                   return (
                     <div>
-                      {dmLeads.length>0&&(
-                        <>
-                          <Banner color="#8b5cf6" icon="🎯"
-                            label="Decision Makers (Apollo)"
-                            count={dmLeads.length}
-                            subtitle={today_count_dm>0?`+${today_count_dm} new today`:"Direct contacts pulled from Apollo"}/>
-                          {dmLeads.map(renderRow)}
-                        </>
-                      )}
-                      {pipelineWarm.length>0&&(
-                        <>
-                          <Banner color="#ffe083" icon="🌡️"
-                            label="Warm Leads"
-                            count={pipelineWarm.length}
-                            subtitle={today_count_warm>0?`+${today_count_warm} new today`:"Companies — call switchboard, ask for the DM by name if known"}/>
-                          {pipelineWarm.map(renderRow)}
-                        </>
-                      )}
+                      {stateKeys.map(sk=>{
+                        const list = groups[sk]
+                        const fullName = sk==="__none__" ? "No State / Unknown" : (STATE_NAMES[sk]||sk)
+                        const collapsed = !!collapsedStates[sk]
+                        const newToday = list.filter(l=>(l.createdAt||"").startsWith(today)).length
+                        const stDm   = sortNewFirst(list.filter(isApolloLead))
+                        const stWarm = sortNewFirst(list.filter(l=>!isApolloLead(l)))
+                        return (
+                          <div key={sk} style={{marginBottom:14,border:"1px solid #1c2740",
+                            borderRadius:12,overflow:"hidden"}}>
+                            <button onClick={()=>toggleState(sk)}
+                              style={{width:"100%",display:"flex",alignItems:"center",gap:12,
+                                padding:"14px 20px",background:"#0f1930",border:"none",cursor:"pointer",
+                                fontFamily:"inherit",textAlign:"left"}}>
+                              <span style={{fontSize:13,transition:"transform .15s",
+                                transform:collapsed?"rotate(-90deg)":"rotate(0)",color:"#a3a6ff"}}>▼</span>
+                              <span style={{fontSize:15}}>🗺️</span>
+                              <span style={{fontSize:15,fontWeight:700,color:"#dee5ff",
+                                fontFamily:"'Space Grotesk',sans-serif"}}>{fullName}</span>
+                              <span style={{fontSize:12,color:"#a3a6ff",background:"#a3a6ff20",
+                                padding:"2px 10px",borderRadius:10,fontWeight:700}}>{list.length}</span>
+                              {newToday>0&&(
+                                <span style={{fontSize:11,color:"#69f6b8",fontWeight:600}}>+{newToday} new today</span>
+                              )}
+                            </button>
+                            {!collapsed&&(
+                              <div>
+                                {stDm.length>0&&(
+                                  <>
+                                    <Banner color="#8b5cf6" icon="🎯"
+                                      label="Decision Makers (Apollo)" count={stDm.length}
+                                      subtitle="Direct contacts pulled from Apollo"/>
+                                    {stDm.map(renderRow)}
+                                  </>
+                                )}
+                                {stWarm.length>0&&(
+                                  <>
+                                    <Banner color="#ffe083" icon="🌡️"
+                                      label="Warm Leads" count={stWarm.length}
+                                      subtitle="Companies — call switchboard, ask for the DM by name if known"/>
+                                    {stWarm.map(renderRow)}
+                                  </>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
                     </div>
                   )
                 })()}

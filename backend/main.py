@@ -1735,6 +1735,11 @@ def _bg_maintenance_loop():
             run_hot_lead_digest_if_due()
         except Exception as e:
             print(f"[HOT-DIGEST] loop exception: {e}")
+        # Daily once-called recycle — internal cooldown, no-ops most ticks.
+        try:
+            run_once_called_recycle_if_due()
+        except Exception as e:
+            print(f"[ONCE-RECYCLE] loop exception: {e}")
         time.sleep(IMAP_POLL_INTERVAL_MINUTES * 60)
 
 # ── Apollo dedupe — shared detection + self-healing weekly sweep ─────────
@@ -1819,7 +1824,7 @@ def _fetch_all_leads_for_dedupe() -> list:
 
 # Statuses we never auto-delete a duplicate of — the row carries real
 # engagement value (or compliance signal) that mustn't be discarded.
-ENGAGED_STATUSES = {"interested", "converted", "callback", "awaiting_email_reply", "do_not_contact"}
+ENGAGED_STATUSES = {"interested", "interested_no_dm", "converted", "callback", "awaiting_email_reply", "do_not_contact"}
 
 def find_phone_dupe_groups(leads: list) -> list:
     """Group by exact phone match. For each group, pick the row to keep
@@ -2137,6 +2142,114 @@ def run_hot_lead_digest_if_due():
     )
     _record_hot_digest_run()
     print(f"[HOT-DIGEST] posted: {len(stale)} stale + {len(overdue_cb)} overdue")
+
+# ── Nightly once-called recycle ──────────────────────────────────────────────
+# Rotate leads that were dialed exactly once with NO contact (no-answer /
+# voicemail) back into the shared pool after a grace window, so a single missed
+# dial doesn't park a lead under one caller forever. Engaged outcomes
+# (interested / interested_no_dm / callback / converted) are never touched —
+# only status="no_answer" (voicemail maps to no_answer too). Runs on a daily
+# cadence from the bg-maintenance loop with a DB-tracked cooldown.
+ONCE_CALLED_RECYCLE_ENABLED        = os.getenv("ONCE_CALLED_RECYCLE_ENABLED", "1") == "1"
+# Don't yank a lead the instant the caller logs one no-answer — give them a
+# window to follow up themselves first. Default 48h.
+ONCE_CALLED_RECYCLE_GRACE_HOURS    = int(os.getenv("ONCE_CALLED_RECYCLE_GRACE_HOURS", "48"))
+ONCE_CALLED_RECYCLE_INTERVAL_HOURS = int(os.getenv("ONCE_CALLED_RECYCLE_INTERVAL_HOURS", "20"))
+
+def _once_called_recycle_due() -> bool:
+    """True if INTERVAL_HOURS elapsed since last run (or never). Same cooldown
+    pattern as the hot digest — fail closed so we don't double-run."""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_once_called_recycle&select=value",
+            headers=SB_HEADERS, timeout=10,
+        )
+        if r.status_code != 200: return False
+        rows = r.json()
+        if not rows: return True
+        last_iso = (rows[0].get("value") or "").replace("Z", "")
+        try:
+            last_dt = datetime.fromisoformat(last_iso)
+        except Exception:
+            return True
+        return (datetime.utcnow() - last_dt).total_seconds() >= ONCE_CALLED_RECYCLE_INTERVAL_HOURS * 3600
+    except Exception as e:
+        print(f"[ONCE-RECYCLE] cooldown check failed: {e}")
+        return False
+
+def _record_once_called_recycle_run():
+    try:
+        r = req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"key": "last_once_called_recycle", "value": datetime.utcnow().isoformat() + "Z"},
+            timeout=10,
+        )
+        if r.status_code not in (200, 201, 204):
+            print(f"[ONCE-RECYCLE] cooldown upsert HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[ONCE-RECYCLE] failed to record last-run: {e}")
+
+def run_once_called_recycle_if_due():
+    """Unassign once-called, never-contacted leads back to the pool. No-op
+    unless enabled + due. Quiet (no Slack) when nothing qualifies."""
+    if not ONCE_CALLED_RECYCLE_ENABLED:
+        return
+    if not _once_called_recycle_due():
+        return
+    cutoff_iso = (datetime.utcnow() - timedelta(hours=ONCE_CALLED_RECYCLE_GRACE_HOURS)).isoformat()
+    try:
+        # status=no_answer (covers voicemail too — both map to no_answer),
+        # exactly 1 call, currently assigned, last dial older than the grace
+        # window. last_called_at=lt also excludes nulls.
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?select=id,company,assignedTo,total_calls,last_called_at,status"
+            f"&status=eq.no_answer&total_calls=eq.1&assignedTo=neq."
+            f"&last_called_at=lt.{cutoff_iso}",
+            headers=SB_HEADERS, timeout=30,
+        )
+        leads = r.json() if r.status_code == 200 else []
+        if not isinstance(leads, list):
+            leads = []
+        recycled = [{"id": l["id"], "company": l.get("company"),
+                     "was_assigned_to": l.get("assignedTo")} for l in leads if l.get("id")]
+        ids = [item["id"] for item in recycled]
+        if not ids:
+            _record_once_called_recycle_run()
+            return
+        # Bulk unassign in chunks (keep the in.() URL well under limits).
+        now_iso = datetime.utcnow().isoformat()
+        done = 0
+        for i in range(0, len(ids), 200):
+            chunk = ids[i:i+200]
+            ids_filter = ",".join(str(x) for x in chunk)
+            pr = req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})",
+                headers=SB_HEADERS,
+                json={"assignedTo": "", "updatedAt": now_iso},
+                timeout=30,
+            )
+            if pr.status_code in (200, 204):
+                done += len(chunk)
+            else:
+                print(f"[ONCE-RECYCLE] patch HTTP {pr.status_code}: {pr.text[:200]}")
+        audit_log("system", "recycle_once_called", "lead", None,
+                  {"recycled": done, "grace_hours": ONCE_CALLED_RECYCLE_GRACE_HOURS,
+                   "leads": recycled[:20]})
+        print(f"[ONCE-RECYCLE] unassigned {done} once-called no-contact lead(s)")
+        if done:
+            try:
+                send_slack(
+                    ":recycle: Once-called leads recycled",
+                    f"Rotated *{done}* lead(s) dialed once with no contact "
+                    f"(>{ONCE_CALLED_RECYCLE_GRACE_HOURS}h ago) back into the shared pool.",
+                )
+            except Exception as e:
+                print(f"[ONCE-RECYCLE] slack failed: {e}")
+        _record_once_called_recycle_run()
+    except Exception as e:
+        print(f"[ONCE-RECYCLE] run failed: {e}")
 
 def _record_dedupe_sweep_run():
     """Upsert the cooldown row. Without `?on_conflict=key` the merge-duplicates
@@ -3789,7 +3902,7 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
         lead_first_call = {}  # leadId -> earliest calledAt
 
         # Build summary stats
-        contacted = ["answered", "interested", "converted", "callback"]
+        contacted = ["answered", "interested", "interested_no_dm", "converted", "callback"]
         summary = {"total": len(calls), "converted": 0, "interested": 0,
                    "no_answer": 0, "callback": 0, "voicemail": 0, "answered": 0,
                    "total_talk_time": 0, "first_calls": 0, "follow_ups": 0}
@@ -6556,7 +6669,7 @@ def get_stats(user: str = Depends(verify_token)):
             "callbacksDue": len([l for l in sl if l.get("callbackDate","")<=today and l.get("callbackDate") and l.get("status")!="converted"]),
             "callsToday": len(sc),
             "conversionRate": f"{(converted/total*100):.1f}" if total else "0.0",
-            "contactRate": f"{(len([c for c in sc if c.get('outcome') in ('answered','interested','converted','callback')])/len(sc)*100):.1f}" if sc else "0.0",
+            "contactRate": f"{(len([c for c in sc if c.get('outcome') in ('answered','interested','interested_no_dm','converted','callback')])/len(sc)*100):.1f}" if sc else "0.0",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -6693,7 +6806,7 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             if (c.get("calledAt") or "").startswith(today):
                 u["calls_today"] += 1
             outcome = c.get("outcome", "")
-            if outcome in ("answered", "interested", "converted", "callback"):
+            if outcome in ("answered", "interested", "interested_no_dm", "converted", "callback"):
                 u["contacted"] += 1
             if outcome == "converted":
                 u["conversions"] += 1
