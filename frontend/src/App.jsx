@@ -3405,10 +3405,24 @@ export default function App(){
                               {lead.total_calls>0?`${lead.total_calls} call${lead.total_calls!==1?"s":""}`:"never called"}
                               {lead.assignedTo?` · assigned to ${lead.assignedTo}`:" · unassigned"}
                             </div>
+                            {lead.last_call&&(
+                              <div style={{marginTop:8,paddingTop:8,borderTop:"1px solid #40485d20",
+                                color:"#a3aac4",fontSize:12}}>
+                                <span style={{color:"#69f6b8",fontWeight:600}}>Last call:</span>{" "}
+                                {(si(lead.last_call.outcome).label)||lead.last_call.outcome}
+                                {lead.last_call.calledBy?` by ${lead.last_call.calledBy}`:""}
+                                {lead.last_call.calledAt?` · ${String(lead.last_call.calledAt).slice(0,10)}`:""}
+                                {lead.last_call.notes?<div style={{color:"#8893ad",marginTop:2,fontStyle:"italic"}}>"{lead.last_call.notes}"</div>:null}
+                              </div>
+                            )}
                           </div>
                           <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:8}}>
                             <span style={{background:info.color+"22",color:info.color,padding:"3px 10px",
                               borderRadius:20,fontSize:12,fontWeight:700}}>{info.label}</span>
+                            <button className="btn btn-p" style={{fontSize:12,background:"#8b5cf6"}}
+                              onClick={()=>setCallModal(lead)}>
+                              📞 Log this call
+                            </button>
                             <button className="btn btn-g" style={{fontSize:12}}
                               onClick={()=>{ setSearch(lead.phone||lookupQuery); setNav("leads") }}>
                               Open in Leads →

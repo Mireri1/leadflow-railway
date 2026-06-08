@@ -3409,6 +3409,26 @@ def lookup_by_phone(phone: str = "", user: str = Depends(verify_token)):
         matches = [r for r in rows if re.sub(r"\D", "", r.get("phone") or "")[-n:] == t]
         # Most-recently-touched first so the live record surfaces on top.
         matches.sort(key=lambda r: (r.get("last_called_at") or r.get("updatedAt") or ""), reverse=True)
+        # Attach each match's most recent call (outcome + notes) so the caller
+        # sees the last interaction without leaving the lookup.
+        ids = [str(m["id"]) for m in matches if m.get("id") is not None]
+        if ids:
+            try:
+                cr = req_lib.get(
+                    f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                    f"?leadId=in.({','.join(ids)})"
+                    f"&select=leadId,outcome,notes,calledBy,calledAt&order=calledAt.desc",
+                    headers=SB_HEADERS, timeout=20)
+                calls = cr.json() if cr.status_code == 200 else []
+                latest = {}
+                for c in (calls if isinstance(calls, list) else []):
+                    lid = c.get("leadId")
+                    if lid not in latest:   # ordered desc → first seen is newest
+                        latest[lid] = c
+                for m in matches:
+                    m["last_call"] = latest.get(m.get("id"))
+            except Exception as e:
+                print(f"[LOOKUP] last-call enrich failed: {e}")
         return {"query": phone, "digits": digits, "count": len(matches),
                 "candidates": len(rows), "matchedOn": f"last {n} digits", "matches": matches}
     except Exception as e:
