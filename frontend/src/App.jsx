@@ -606,10 +606,22 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
   const [result,setResult]         = useState(null)
   const [error,setError]           = useState("")
   // Persistent page cursor — successive "Pull from Apollo" clicks advance
-  // through Apollo's catalog instead of always restarting at page 1.
-  // Resets whenever titles/industries/locations change (different search).
-  const [pullStartPage,setPullStartPage] = useState(1)
-  useEffect(()=>{ setPullStartPage(1) },[titles,selIndustries,state,cities,rotateTitles])
+  // through Apollo's catalog instead of always restarting at page 1. Keyed
+  // per search-criteria in localStorage so the cursor survives page reloads /
+  // navigating away AND resumes per-city. This is the fix for "no new leads
+  // even for major cities": the cursor used to be ephemeral React state that
+  // snapped back to page 1 on every remount or field tweak, so each re-pull
+  // re-fetched page 1 and the backend deduped every contact as already-in-DB.
+  const cursorKey = ()=>"apolloPg:"+JSON.stringify({
+    s:state, c:(cities||"").trim().toLowerCase(), t:(titles||"").trim().toLowerCase(),
+    i:[...selIndustries].sort(), r:rotateTitles
+  })
+  const readCursor = ()=>{ try{ const v=Number(localStorage.getItem(cursorKey())); return v>0?v:1 }catch{ return 1 } }
+  const [pullStartPage,setPullStartPage] = useState(readCursor)
+  // On mount and whenever the search criteria change, load THAT criteria's
+  // saved cursor (default 1) instead of blindly resetting — so switching
+  // city A→B→A resumes A's page rather than starting over at 1.
+  useEffect(()=>{ setPullStartPage(readCursor()) },[titles,selIndustries,state,cities,rotateTitles])  // eslint-disable-line react-hooks/exhaustive-deps
   const [budget,setBudget]         = useState(null)
   useEffect(()=>{
     api("/api/admin/apollo/budget").then(setBudget).catch(()=>{})
@@ -666,10 +678,13 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
         // Cycle decision-maker title groups to keep repeat pulls fresh.
         rotate_titles: rotateTitles,
       })})
-      // Persist the next-page cursor so a second "Pull from Apollo" click on
-      // the same filters advances through Apollo's catalog instead of
-      // re-hitting page 1.
-      if(res.next_page) setPullStartPage(res.next_page)
+      // Persist the next-page cursor (in state AND localStorage) so the next
+      // "Pull from Apollo" click — even after a reload or navigating away —
+      // advances through Apollo's catalog instead of re-hitting page 1.
+      if(res.next_page){
+        setPullStartPage(res.next_page)
+        try{ localStorage.setItem(cursorKey(),String(res.next_page)) }catch{}
+      }
       setResult(res)
       if(res.saved>0) onFound&&onFound()
     }catch(ex){
@@ -775,7 +790,7 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
             {loading?"Pulling…":(pullStartPage>1?`Pull next 5 pages (from p${pullStartPage}) →`:"Pull from Apollo →")}
           </button>
           {pullStartPage>1&&(
-            <button onClick={()=>setPullStartPage(1)}
+            <button onClick={()=>{ setPullStartPage(1); try{ localStorage.removeItem(cursorKey()) }catch{} }}
               style={{background:"none",border:"none",color:"#a3aac4",fontSize:10,cursor:"pointer",padding:0,textDecoration:"underline"}}
               title="Reset to Apollo page 1">↺ Reset to page 1</button>
           )}
@@ -2220,6 +2235,9 @@ export default function App(){
   const [fCity,setFCity]           = useState("")
   const [availableOnly,setAvailOnly] = useState(false)
   const [emailedOnly,setEmailedOnly] = useState(false)
+  // "Needs Another Call" quick-filter: unanswered leads (no_answer) with under
+  // 4 attempts — the pool to work when there's nothing fresh (4×-before-giveup).
+  const [needsAttemptOnly,setNeedsAttemptOnly] = useState(false)
   // Per-state collapse for the state-grouped Leads view. Key = state code (or
   // "__none__" for leads with no state). Empty = all expanded.
   const [collapsedStates,setCollapsedStates] = useState({})
@@ -2465,6 +2483,14 @@ export default function App(){
   },[activeNav,user])
 
   async function quickStatus(lead,status){
+    // 4×-contact rule: don't let a lead that's never been reached get dumped to
+    // "Not Interested" before 4 attempts. Scoped to never-answered leads only
+    // (current status no_answer) — a lead where a human actually declined is a
+    // legitimate Not Interested regardless of attempt count. Warn + allow override.
+    if(status==="not_interested" && lead.status==="no_answer" && (lead.total_calls||0)<4){
+      const n = lead.total_calls||0
+      if(!window.confirm(`${lead.company||lead.firstName||"This lead"} hasn't answered yet — only ${n} of 4 attempts.\n\nTeam rule: try unanswered leads at least 4× before marking Not Interested.\n\nMark Not Interested anyway?`)) return
+    }
     let cbDate=""
     if(status==="callback") cbDate=window.prompt("Callback date (YYYY-MM-DD):",new Date().toISOString().split("T")[0])||""
     try{
@@ -2528,6 +2554,7 @@ export default function App(){
     }
     if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
     if(emailedOnly&&!emailedFlags[l.id]) return false
+    if(needsAttemptOnly&&!(l.status==="no_answer"&&(l.total_calls||0)<4)) return false
     return true
   })
   const newTodayLeads = displayLeads.filter(l=>(l.createdAt||"").startsWith(today))
@@ -2551,7 +2578,7 @@ export default function App(){
     return [...newToday, ...older]
   }
 
-  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false)}
+  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false);setNeedsAttemptOnly(false)}
 
   return(
     <div style={{minHeight:"100vh",background:"#060e20"}}>
@@ -2977,6 +3004,20 @@ export default function App(){
                           background:emailedOnly?"#a3a6ff":"#192540",
                           color:emailedOnly?"#000011":"#a3aac4"}}>
                         📧 Emailed Previously{everEmailedCount>0?` (${everEmailedCount})`:""}
+                      </button>
+                    )
+                  })()}
+                  {(()=>{
+                    const needCount = leads.filter(l=>l.status==="no_answer"&&(l.total_calls||0)<4).length
+                    return (
+                      <button
+                        onClick={()=>setNeedsAttemptOnly(p=>!p)}
+                        title="Unanswered leads with fewer than 4 attempts. Team rule: try these at least 4× before giving up. Great pool to work when there are no fresh leads."
+                        style={{fontSize:12,padding:"8px 14px",borderRadius:8,border:"none",cursor:"pointer",
+                          fontFamily:"'Inter',sans-serif",fontWeight:600,transition:"all .15s",
+                          background:needsAttemptOnly?"#ffe083":"#192540",
+                          color:needsAttemptOnly?"#3a2e00":"#a3aac4"}}>
+                        📞 Needs Another Call{needCount>0?` (${needCount})`:""}
                       </button>
                     )
                   })()}
@@ -3434,18 +3475,33 @@ export default function App(){
                   if(la!==lb) return la<lb?-1:1                         // oldest contact first ("" sorts before any date)
                   return (b.score||0)-(a.score||0)                      // tiebreak: highest score
                 })
-                if(dialerLeads.length===0) return(
+                if(dialerLeads.length===0){
+                  // Fallback when nothing fresh is in the queue: surface
+                  // unanswered leads that still need attempts (no_answer, <4
+                  // calls). They may be hidden here by the snooze window, but
+                  // the caller can still work them — the 4×-before-giveup rule.
+                  const needAttempt = leads.filter(l=>(!l.assignedTo||l.assignedTo===user)&&l.status==="no_answer"&&(l.total_calls||0)<4)
+                  return(
                   <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
-                    <div style={{fontSize:40,marginBottom:12}}>✅</div>
+                    <div style={{fontSize:40,marginBottom:12}}>{needAttempt.length>0?"📞":"✅"}</div>
                     <div style={{color:"#a3aac4",fontSize:14,marginBottom:8}}>
-                      {leads.length>0?"All leads have been claimed by your team!":"No leads to dial yet"}
+                      {leads.length>0?"No fresh leads in the dialer right now":"No leads to dial yet"}
                     </div>
                     <div style={{color:"#40485d",fontSize:12,marginBottom:20}}>
-                      {leads.length>0?`${leads.length} lead${leads.length!==1?"s":""} total, all assigned`:"Import a CSV or use Find Leads to get started"}
+                      {needAttempt.length>0
+                        ? `${needAttempt.length} unanswered lead${needAttempt.length!==1?"s":""} still need another attempt (under 4 tries)`
+                        : (leads.length>0?`${leads.length} lead${leads.length!==1?"s":""} total, all assigned`:"Import a CSV or use Find Leads to get started")}
                     </div>
-                    <button className="btn btn-p" onClick={()=>setNav("leads")}>View All Leads</button>
+                    {needAttempt.length>0&&(
+                      <button className="btn btn-p" style={{marginRight:8}}
+                        onClick={()=>{ setNeedsAttemptOnly(true); setNav("leads") }}>
+                        📞 Work {needAttempt.length} unanswered lead{needAttempt.length!==1?"s":""}
+                      </button>
+                    )}
+                    <button className="btn btn-g" onClick={()=>setNav("leads")}>View All Leads</button>
                   </div>
-                )
+                  )
+                }
                 const idx=Math.min(dialerIdx,dialerLeads.length-1)
                 const lead=dialerLeads[idx]
                 const score=lead.score||scoreLead(lead)||0

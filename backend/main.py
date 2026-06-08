@@ -2835,18 +2835,39 @@ def filter_apollo_dupes(people: list) -> tuple:
     # company names ("Acme, Inc.") don't split the list. requests will
     # URL-encode the quotes for us.
     org_filter = ",".join('"' + o.replace('"', '\\"') + '"' for o in orgs)
+    # Fetch ALL existing leads for these companies — paginate so a company with
+    # hundreds of contacts can't silently overflow a single-page cap and let
+    # dupes through (the old code stopped at 5000 rows). PostgREST offset/limit;
+    # stop when a short page comes back. Fail-open on the first page, use
+    # partial data on a later-page error, 50k hard backstop against runaway loops.
+    existing = []
     try:
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads",
-            headers=SB_HEADERS,
-            params={
-                "select": "firstName,company,notes",
-                "company": f"in.({org_filter})",
-                "limit":   "5000",
-            },
-            timeout=15,
-        )
-        existing = r.json() if r.status_code == 200 else []
+        PAGE = 1000
+        offset = 0
+        while True:
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads",
+                headers=SB_HEADERS,
+                params={
+                    "select": "firstName,company,notes",
+                    "company": f"in.({org_filter})",
+                    "limit":   str(PAGE),
+                    "offset":  str(offset),
+                },
+                timeout=15,
+            )
+            if r.status_code != 200:
+                if offset == 0:
+                    return people, 0
+                break
+            batch = r.json() or []
+            existing.extend(batch)
+            if len(batch) < PAGE:
+                break
+            offset += PAGE
+            if offset >= 50000:
+                print("[APOLLO-DEDUPE] existing-lead lookup hit 50k backstop")
+                break
     except Exception as e:
         print(f"[APOLLO-DEDUPE] existing-lead lookup failed: {e}")
         return people, 0
