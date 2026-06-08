@@ -3419,6 +3419,23 @@ def list_leads(status: str = "", search: str = "", sort: str = "smart",
         if not search:
             return _paginated_get(f"{base_url}&order={order}")
 
+        # ── Reverse phone lookup ────────────────────────────────────────
+        # If the query is phone-like (only digits + phone punctuation), match
+        # by digit groups joined with wildcards so it resolves no matter how
+        # the number is stored — "(702) 485-3232", "702-485-3232", "7024853232",
+        # "+1 702 485 3232" all find the same lead. This is the inbound-call
+        # "who is this number?" case, and it also fixes pasting the full
+        # "(702) 485-3232" format (the parens used to break the OR filter → 0 hits).
+        _digits = re.sub(r"\D", "", search)
+        if len(_digits) >= 7 and re.fullmatch(r"[\d\s().+\-.]+", search.strip()):
+            if len(_digits) >= 10:
+                t = _digits[-10:]
+                pat = f"%25{t[0:3]}%25{t[3:6]}%25{t[6:10]}%25"   # %AAA%BBB%CCCC%
+            else:
+                t = _digits[-7:]
+                pat = f"%25{t[0:3]}%25{t[3:7]}%25"               # %BBB%CCCC%
+            return _paginated_get(f"{base_url}&phone=ilike.{pat}&order={order}")
+
         # ── Two-phase search ───────────────────────────────────────────
         # Old search only matched company/firstName/lastName/phone — missed
         # notes, email, assignedTo, and call_outcomes entirely. So "Cristine"
