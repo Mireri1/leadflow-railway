@@ -2752,13 +2752,20 @@ def apollo_person_to_lead(person: dict, user: str) -> dict:
     title = person.get("title") or ""
     linkedin = person.get("linkedin_url") or ""
 
+    # `company` stores the trimmed name (tagline stripped) for clean display;
+    # keep the FULL original in notes so search finds the lead by either form.
+    full_company = clean(org.get("name", ""))
+    company = clean(clean_company_name(org.get("name", "")))
+
     notes_parts = [f"Apollo: {title}".strip(": ")]
     if linkedin: notes_parts.append(f"LinkedIn: {linkedin}")
     if person.get("seniority"): notes_parts.append(f"Seniority: {person['seniority']}")
+    if full_company and full_company != company:
+        notes_parts.append(f"Full name: {full_company}")
 
     now = datetime.utcnow().isoformat()
     lead = {
-        "company":     clean(clean_company_name(org.get("name", ""))),
+        "company":     company,
         "industry":    clean(org.get("industry") or ""),
         "phone":       clean(phone),
         "address":     clean(addr),
