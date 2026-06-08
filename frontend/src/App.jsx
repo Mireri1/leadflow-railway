@@ -2255,8 +2255,9 @@ export default function App(){
   // unanswered (no_answer) leads — lets a caller "go back and call the CT
   // leads that never picked up" without leaving the dialer.
   const [dialerState,setDialerState] = useState("")
+  const [dialerCity,setDialerCity] = useState("")
   const [dialerUnanswered,setDialerUnanswered] = useState(false)
-  useEffect(()=>{ setDialerIdx(0) },[dialerState,dialerUnanswered])
+  useEffect(()=>{ setDialerIdx(0) },[dialerState,dialerCity,dialerUnanswered])
   // Snooze: hide leads dialed within the last N hours where the outcome was
   // a non-engagement (no_answer / voicemail / called). Default 4h; caller
   // can override per-session via the dialer toolbar.
@@ -3027,6 +3028,29 @@ export default function App(){
                       </button>
                     )
                   })()}
+                  {(()=>{
+                    // Bridge: carry the current Leads view (state + city +
+                    // unanswered intent) straight into the scoped Dialer so she
+                    // can start calling exactly what she's filtered to. Count
+                    // shows dial-eligible leads (assignable + valid phone).
+                    const wantUnanswered = fStatus==="no_answer" || needsAttemptOnly
+                    const eligible = displayLeads.filter(l=>
+                      (!l.assignedTo||l.assignedTo===user)
+                      && !NO_DIAL_STATUSES.has(l.status)
+                      && isValidUsPhone(l.phone)
+                      && (!wantUnanswered || l.status==="no_answer")
+                    ).length
+                    return (
+                      <button
+                        onClick={()=>{ setDialerState(fState||""); setDialerCity(fCity||""); setDialerUnanswered(wantUnanswered); setNav("dialer") }}
+                        title="Open the Dialer scoped to this exact view (state + city + unanswered) and start calling"
+                        style={{fontSize:12,padding:"8px 16px",borderRadius:8,border:"none",cursor:"pointer",
+                          fontFamily:"'Inter',sans-serif",fontWeight:700,transition:"all .15s",
+                          background:"#69f6b8",color:"#003d26"}}>
+                        📞 Call these in Dialer{eligible>0?` (${eligible})`:""}
+                      </button>
+                    )
+                  })()}
                 </div>
               </section>
 
@@ -3441,6 +3465,14 @@ export default function App(){
                       {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
                     </select>
                   </div>
+                  {dialerCity&&(
+                    <div style={{display:"flex",alignItems:"center",gap:6,fontSize:12,fontWeight:600,
+                      color:"#003d26",background:"#69f6b8",padding:"6px 10px",borderRadius:8}}>
+                      📍 {dialerCity}
+                      <span onClick={()=>setDialerCity("")} style={{cursor:"pointer",fontWeight:700}}
+                        title="Clear city scope">✕</span>
+                    </div>
+                  )}
                   <button
                     onClick={()=>setDialerUnanswered(p=>!p)}
                     title="Only dial leads that have never answered (No Answer / voicemail) — go back and re-try them"
@@ -3494,6 +3526,7 @@ export default function App(){
                   && isValidUsPhone(l.phone)
                   && !isSnoozed(l)
                   && (!dialerState || l.state===dialerState)
+                  && (!dialerCity || (l.city||"").toLowerCase().startsWith(dialerCity.toLowerCase().trim()))
                   && (!dialerUnanswered || l.status==="no_answer")
                 ).slice().sort((a,b)=>{
                   const ca=a.total_calls||0, cb=b.total_calls||0
@@ -3508,8 +3541,8 @@ export default function App(){
                   // calls). They may be hidden here by the snooze window, but
                   // the caller can still work them — the 4×-before-giveup rule.
                   const needAttempt = leads.filter(l=>(!l.assignedTo||l.assignedTo===user)&&l.status==="no_answer"&&(l.total_calls||0)<4)
-                  const scoped = dialerState||dialerUnanswered
-                  const scopeLabel = [dialerUnanswered?"unanswered":"",dialerState||""].filter(Boolean).join(" ")
+                  const scoped = dialerState||dialerCity||dialerUnanswered
+                  const scopeLabel = [dialerUnanswered?"unanswered":"",dialerCity||"",dialerState||""].filter(Boolean).join(" ")
                   return(
                   <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
                     <div style={{fontSize:40,marginBottom:12}}>{scoped?"🔍":(needAttempt.length>0?"📞":"✅")}</div>
@@ -3527,7 +3560,7 @@ export default function App(){
                     </div>
                     {scoped&&(
                       <button className="btn btn-p" style={{marginRight:8}}
-                        onClick={()=>{ setDialerState(""); setDialerUnanswered(false) }}>
+                        onClick={()=>{ setDialerState(""); setDialerCity(""); setDialerUnanswered(false) }}>
                         ✕ Clear dialer filters
                       </button>
                     )}
