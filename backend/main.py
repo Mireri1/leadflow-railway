@@ -649,6 +649,21 @@ US_STATES_FULL = {
 }
 US_STATE_ABBREVS = set(US_STATES_FULL.keys())
 US_STATE_NAMES = set(v.lower() for v in US_STATES_FULL.values())
+US_STATES_REVERSE = {v.lower(): k for k, v in US_STATES_FULL.items()}
+
+def normalize_state_abbrev(state) -> str:
+    """Normalize any state value (full name or 2-letter code) to the abbrev the
+    rest of the app keys on. Apollo returns full names ("Nevada"); Google Places
+    returns abbrevs ("NV"). Storing both broke the Leads state grouping + filter
+    — a "Nevada" lead never matched a state=NV filter and sat in its own
+    'NEVADA' group, so callers thought freshly-pulled leads vanished. Returns
+    the input unchanged if unrecognized."""
+    if not state:
+        return ""
+    s = str(state).strip()
+    if s.upper() in US_STATE_ABBREVS:
+        return s.upper()
+    return US_STATES_REVERSE.get(s.lower(), s)
 
 # State → IANA timezone mapping for connectivity-rate bucketing. We bucket
 # calls by the *prospect's* local time, not the caller's, because pickup rate
@@ -2728,7 +2743,7 @@ def apollo_person_to_lead(person: dict, user: str) -> dict:
         "phone":       clean(phone),
         "address":     clean(addr),
         "city":        clean(city),
-        "state":       clean(state),
+        "state":       normalize_state_abbrev(clean(state)),
         "website":     clean(org.get("website_url") or ""),
         "notes":       " | ".join(notes_parts),
         "source":      "Apollo",
