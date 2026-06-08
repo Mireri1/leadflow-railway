@@ -2202,6 +2202,7 @@ function IconBtn({onClick,children,title,hoverColor="#dee5ff",baseColor="#a3aac4
 const SIDEBAR_NAV = [
   { key:"dashboard", label:"Dashboard",       Icon:IconDashboard },
   { key:"leads",     label:"Leads",           Icon:IconPeople },
+  { key:"lookup",    label:"Phone Lookup",    Icon:IconSearch },
   { key:"warm",      label:"Warm Leads",      Icon:IconChart },
   { key:"dialer",    label:"Dialer",          Icon:IconPhone },
   { key:"followups", label:"Follow-Ups",      Icon:IconCalendarFar },
@@ -2243,6 +2244,10 @@ export default function App(){
   const [collapsedStates,setCollapsedStates] = useState({})
   const toggleState = (k)=>setCollapsedStates(p=>({...p,[k]:!p[k]}))
   const [activeNav,setNav]         = useState("dashboard")
+  // Reverse phone lookup (inbound-call "who is this number?")
+  const [lookupQuery,setLookupQuery]   = useState("")
+  const [lookupResult,setLookupResult] = useState(null)
+  const [lookupLoading,setLookupLoad]  = useState(false)
   const [callHistory,setCallHistory] = useState([])
   const [histData,setHistData]       = useState(null)
   const [histLoading,setHistLoading] = useState(false)
@@ -2514,6 +2519,18 @@ export default function App(){
       setLeads(p=>p.filter(l=>l.id!==id)); notify("Deleted","error")
       loadLeads()
     }catch(ex){ notify("Error","error") }
+  }
+
+  async function doLookup(){
+    const q=(lookupQuery||"").trim()
+    const digits=q.replace(/\D/g,"")
+    if(digits.length<7){ notify("Enter at least 7 digits of the phone number","error"); return }
+    setLookupLoad(true); setLookupResult(null)
+    try{
+      const r=await api(`/api/leads/lookup?phone=${encodeURIComponent(q)}`)
+      setLookupResult(r)
+    }catch(ex){ notify("Lookup failed","error"); setLookupResult({count:0,matches:[]}) }
+    finally{ setLookupLoad(false) }
   }
 
   if(!user) return <Login onLogin={u=>setUser(u)}/>
@@ -3321,6 +3338,88 @@ export default function App(){
                     border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}><IconChevRight/></button>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* ── PHONE LOOKUP (inbound-call reverse lookup) ──────────────── */}
+          {activeNav==="lookup"&&(
+            <div style={{maxWidth:720,margin:"0 auto"}}>
+              <div style={{marginBottom:24}}>
+                <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,
+                  color:"#dee5ff",letterSpacing:"-.02em"}}>Phone Lookup</h1>
+                <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+                  Inbound call? Paste the number to see who it is. Matches exactly on the digits —
+                  any format works: <span style={{color:"#69f6b8"}}>(702) 485-3232</span>, 7024853232, +1 702-485-3232.
+                </p>
+              </div>
+              <section style={{background:"#141f38",borderRadius:16,padding:"16px 20px",
+                display:"flex",gap:12,alignItems:"center",marginBottom:20}}>
+                <span style={{color:"#40485d",display:"flex"}}><IconSearch/></span>
+                <input autoFocus value={lookupQuery}
+                  onChange={e=>setLookupQuery(e.target.value)}
+                  onKeyDown={e=>{ if(e.key==="Enter") doLookup() }}
+                  placeholder="Paste or type a phone number…"
+                  style={{flex:1,background:"#000011",border:"1px solid #40485d30",borderRadius:8,
+                    padding:"10px 14px",color:"#dee5ff",fontSize:15,fontFamily:"'Inter',sans-serif",outline:"none"}}/>
+                <button className="btn btn-p" onClick={doLookup} disabled={lookupLoading}
+                  style={{background:"#8b5cf6",whiteSpace:"nowrap"}}>
+                  {lookupLoading?"Looking…":"Look up →"}
+                </button>
+              </section>
+
+              {lookupResult&&(
+                lookupResult.count===0 ? (
+                  <div style={{background:"#0f1930",borderRadius:16,padding:48,textAlign:"center"}}>
+                    <div style={{fontSize:36,marginBottom:10}}>🆕</div>
+                    <div style={{color:"#dee5ff",fontSize:15,marginBottom:6}}>No lead matches that number</div>
+                    <div style={{color:"#a3aac4",fontSize:13,maxWidth:460,margin:"0 auto",lineHeight:1.5}}>
+                      Looks like a brand-new inbound. Note: if they're calling from a different line
+                      than the one on file, it won't match — try their company name in{" "}
+                      <span style={{color:"#69f6b8",cursor:"pointer",textDecoration:"underline"}}
+                        onClick={()=>setNav("leads")}>Leads</span>.
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,
+                      color:"#69f6b8",fontSize:13,fontWeight:600}}>
+                      ✓ {lookupResult.count} exact match{lookupResult.count!==1?"es":""}
+                      <span style={{color:"#40485d",fontWeight:400}}>· verified on {lookupResult.matchedOn}</span>
+                    </div>
+                    {lookupResult.matches.map(lead=>{
+                      const info=si(lead.status)
+                      return (
+                        <div key={lead.id} style={{background:"#0f1930",borderRadius:12,padding:"16px 20px",
+                          marginBottom:12,display:"flex",justifyContent:"space-between",gap:16,flexWrap:"wrap"}}>
+                          <div style={{minWidth:0}}>
+                            <div style={{color:"#dee5ff",fontSize:17,fontWeight:700}}>{lead.company||"—"}</div>
+                            <div style={{color:"#a3aac4",fontSize:13,marginTop:2}}>
+                              {[lead.firstName,lead.lastName].filter(Boolean).join(" ")}
+                              {lead.title?<span style={{color:"#40485d"}}> · {lead.title}</span>:null}
+                            </div>
+                            <div style={{color:"#a3aac4",fontSize:13,marginTop:4}}>
+                              📞 {lead.phone||"—"}
+                              {lead.city?<span style={{color:"#40485d"}}> · {lead.city}{lead.state?`, ${lead.state}`:""}</span>:null}
+                            </div>
+                            <div style={{color:"#40485d",fontSize:12,marginTop:4}}>
+                              {lead.total_calls>0?`${lead.total_calls} call${lead.total_calls!==1?"s":""}`:"never called"}
+                              {lead.assignedTo?` · assigned to ${lead.assignedTo}`:" · unassigned"}
+                            </div>
+                          </div>
+                          <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:8}}>
+                            <span style={{background:info.color+"22",color:info.color,padding:"3px 10px",
+                              borderRadius:20,fontSize:12,fontWeight:700}}>{info.label}</span>
+                            <button className="btn btn-g" style={{fontSize:12}}
+                              onClick={()=>{ setSearch(lead.phone||lookupQuery); setNav("leads") }}>
+                              Open in Leads →
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+              )}
             </div>
           )}
 

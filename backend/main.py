@@ -3390,6 +3390,30 @@ def _paginated_get(url: str, headers: dict = None, page_size: int = 1000, max_pa
             break
     return rows
 
+@app.get("/api/leads/lookup")
+def lookup_by_phone(phone: str = "", user: str = Depends(verify_token)):
+    """Reverse phone lookup for inbound calls: paste a number, get the lead(s).
+    Accuracy is exact, not fuzzy — the wildcard ilike only narrows candidates;
+    we then keep only rows whose normalized digits EXACTLY equal the query's
+    last-N digits, so the result is never a wrong number. Returns ALL exact
+    matches (a company may have several contacts on the same main line)."""
+    try:
+        digits = re.sub(r"\D", "", phone or "")
+        if len(digits) < 7:
+            return {"query": phone, "digits": digits, "count": 0, "candidates": 0, "matchedOn": None, "matches": []}
+        n = 10 if len(digits) >= 10 else 7
+        t = digits[-n:]
+        pat = (f"%25{t[0:3]}%25{t[3:6]}%25{t[6:10]}%25" if n == 10
+               else f"%25{t[0:3]}%25{t[3:7]}%25")
+        rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=*&phone=ilike.{pat}")
+        matches = [r for r in rows if re.sub(r"\D", "", r.get("phone") or "")[-n:] == t]
+        # Most-recently-touched first so the live record surfaces on top.
+        matches.sort(key=lambda r: (r.get("last_called_at") or r.get("updatedAt") or ""), reverse=True)
+        return {"query": phone, "digits": digits, "count": len(matches),
+                "candidates": len(rows), "matchedOn": f"last {n} digits", "matches": matches}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/leads")
 def list_leads(status: str = "", search: str = "", sort: str = "smart",
                callbacks: str = "", source: str = "", user: str = Depends(verify_token)):
@@ -3428,13 +3452,15 @@ def list_leads(status: str = "", search: str = "", sort: str = "smart",
         # "(702) 485-3232" format (the parens used to break the OR filter → 0 hits).
         _digits = re.sub(r"\D", "", search)
         if len(_digits) >= 7 and re.fullmatch(r"[\d\s().+\-.]+", search.strip()):
-            if len(_digits) >= 10:
-                t = _digits[-10:]
-                pat = f"%25{t[0:3]}%25{t[3:6]}%25{t[6:10]}%25"   # %AAA%BBB%CCCC%
-            else:
-                t = _digits[-7:]
-                pat = f"%25{t[0:3]}%25{t[3:7]}%25"               # %BBB%CCCC%
-            return _paginated_get(f"{base_url}&phone=ilike.{pat}&order={order}")
+            n = 10 if len(_digits) >= 10 else 7
+            t = _digits[-n:]
+            pat = (f"%25{t[0:3]}%25{t[3:6]}%25{t[6:10]}%25" if n == 10   # %AAA%BBB%CCCC%
+                   else f"%25{t[0:3]}%25{t[3:7]}%25")                    # %BBB%CCCC%
+            rows = _paginated_get(f"{base_url}&phone=ilike.{pat}&order={order}")
+            # Accuracy: the wildcard is only a pre-filter — keep rows whose
+            # normalized digits EXACTLY equal the query's last-N, so a near-miss
+            # can't slip through.
+            return [r for r in rows if re.sub(r"\D", "", r.get("phone") or "")[-n:] == t]
 
         # ── Two-phase search ───────────────────────────────────────────
         # Old search only matched company/firstName/lastName/phone — missed
