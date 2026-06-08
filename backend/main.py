@@ -665,6 +665,26 @@ def normalize_state_abbrev(state) -> str:
         return s.upper()
     return US_STATES_REVERSE.get(s.lower(), s)
 
+def clean_company_name(name) -> str:
+    """Strip Apollo marketing taglines from an org name so the caller's script
+    reads cleanly ("bServed: Powering Real-Time Hospital Revenue" -> "bServed").
+    Conservative on purpose:
+      - splits on ':' (colons in org names are essentially always taglines)
+      - splits on '|' ONLY when it's space-adjacent ("Group | AMO® | CORFAC");
+        a bare pipe is part of the real name ("Jacobsen|Daniels") and is kept
+      - never splits on ' - ', because dashed Apollo names are often
+        acronym-first ("SFIA - Sports & Fitness Industry Association") where the
+        real name is AFTER the dash and truncating would make it worse.
+    Returns the input unchanged if no separator (or if stripping would empty it)."""
+    if not name:
+        return name
+    n = str(name)
+    if ":" in n:
+        n = n.split(":")[0]
+    n = re.split(r"\s+\|\s*|\|\s+", n, maxsplit=1)[0]
+    n = n.strip()
+    return n or str(name).strip()
+
 # State → IANA timezone mapping for connectivity-rate bucketing. We bucket
 # calls by the *prospect's* local time, not the caller's, because pickup rate
 # is driven by what time it is at the office being dialed (a 9am AZ call to
@@ -2738,7 +2758,7 @@ def apollo_person_to_lead(person: dict, user: str) -> dict:
 
     now = datetime.utcnow().isoformat()
     lead = {
-        "company":     clean(org.get("name", "")),
+        "company":     clean(clean_company_name(org.get("name", ""))),
         "industry":    clean(org.get("industry") or ""),
         "phone":       clean(phone),
         "address":     clean(addr),
@@ -3937,8 +3957,10 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
         # Track which leads have been called before for first-call detection
         lead_first_call = {}  # leadId -> earliest calledAt
 
-        # Build summary stats
-        contacted = ["answered", "interested", "interested_no_dm", "converted", "callback"]
+        # Build summary stats. "not_interested" counts as contacted: it's only
+        # reachable after "Answered" in the two-step flow, so the rep DID reach a
+        # person — excluding it undercounted contact rate.
+        contacted = ["answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"]
         summary = {"total": len(calls), "converted": 0, "interested": 0,
                    "no_answer": 0, "callback": 0, "voicemail": 0, "answered": 0,
                    "total_talk_time": 0, "first_calls": 0, "follow_ups": 0}
@@ -4402,7 +4424,7 @@ def insights_best_call_time(industry: str = "", days: int = 60,
     Without an industry filter, returns a global ranking across all calls."""
     days = max(1, min(int(days or 60), 365))
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    contacted_set = {"answered", "interested", "converted", "callback"}
+    contacted_set = {"answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"}
 
     # If filtering by industry, first resolve leadIds matching that industry,
     # then pull their calls. PostgREST can't join directly.
@@ -6608,6 +6630,35 @@ def reassign_leads(body: dict, user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/leads/assign-ids")
+def assign_leads_by_ids(body: dict, user: str = Depends(verify_admin)):
+    """Bulk-assign a specific set of leads (by id) to a rep, or to the pool if
+    to='' . Powers the 'Assign these to…' action on a filtered Leads view —
+    lets the admin hand a whole segment (e.g. the new Las Vegas pull) to a
+    caller in one click."""
+    try:
+        ids = [str(i) for i in (body.get("ids") or []) if str(i).strip()]
+        to_rep = (body.get("to") or "").strip()
+        if not ids:
+            return {"assigned": 0, "message": "No leads selected"}
+        now = datetime.utcnow().isoformat()
+        assigned = 0
+        CHUNK = 100
+        for i in range(0, len(ids), CHUNK):
+            chunk = ids[i:i+CHUNK]
+            ids_filter = ",".join(chunk)
+            rr = req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})",
+                headers=SB_HEADERS,
+                json={"assignedTo": to_rep, "updatedAt": now},
+                timeout=30)
+            if rr.status_code in (200, 204):
+                assigned += len(chunk)
+        audit_log(user, "assign_leads_by_ids", "lead", None, {"to": to_rep or "pool", "count": assigned})
+        return {"assigned": assigned, "to": to_rep or "unassigned pool"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/calls/flagged")
 def get_flagged_calls(user: str = Depends(verify_admin)):
     """Admin-only: get calls with anti-gaming flags"""
@@ -6705,7 +6756,7 @@ def get_stats(user: str = Depends(verify_token)):
             "callbacksDue": len([l for l in sl if l.get("callbackDate","")<=today and l.get("callbackDate") and l.get("status")!="converted"]),
             "callsToday": len(sc),
             "conversionRate": f"{(converted/total*100):.1f}" if total else "0.0",
-            "contactRate": f"{(len([c for c in sc if c.get('outcome') in ('answered','interested','interested_no_dm','converted','callback')])/len(sc)*100):.1f}" if sc else "0.0",
+            "contactRate": f"{(len([c for c in sc if c.get('outcome') in ('answered','interested','interested_no_dm','converted','callback','not_interested')])/len(sc)*100):.1f}" if sc else "0.0",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -6842,7 +6893,7 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             if (c.get("calledAt") or "").startswith(today):
                 u["calls_today"] += 1
             outcome = c.get("outcome", "")
-            if outcome in ("answered", "interested", "interested_no_dm", "converted", "callback"):
+            if outcome in ("answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"):
                 u["contacted"] += 1
             if outcome == "converted":
                 u["conversions"] += 1

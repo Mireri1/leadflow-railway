@@ -3051,6 +3051,32 @@ export default function App(){
                       </button>
                     )
                   })()}
+                  {isAdmin()&&(()=>{
+                    // Admin: hand the whole filtered view to a caller in one
+                    // click (e.g. the 99 new Las Vegas leads → cristine).
+                    const ids = displayLeads.map(l=>l.id)
+                    return (
+                      <button
+                        onClick={async()=>{
+                          if(ids.length===0){ notify("No leads in this view","error"); return }
+                          const raw = window.prompt(`Assign these ${ids.length} lead(s) to which caller?\n(leave blank = release to the unassigned pool)`)
+                          if(raw===null) return
+                          const to = raw.trim()
+                          if(!window.confirm(`Assign ${ids.length} lead${ids.length!==1?"s":""} to ${to||"the unassigned pool"}?`)) return
+                          try{
+                            const r=await api("/api/leads/assign-ids",{method:"POST",body:JSON.stringify({ids,to})})
+                            notify(`${r.assigned} lead${r.assigned!==1?"s":""} assigned to ${r.to}`)
+                            loadLeads()
+                          }catch(ex){ notify("Assign failed","error") }
+                        }}
+                        title="Assign every lead in this filtered view to a caller (admin only)"
+                        style={{fontSize:12,padding:"8px 16px",borderRadius:8,border:"none",cursor:"pointer",
+                          fontFamily:"'Inter',sans-serif",fontWeight:700,transition:"all .15s",
+                          background:"#8b5cf6",color:"#fff"}}>
+                        👤 Assign these to…{ids.length>0?` (${ids.length})`:""}
+                      </button>
+                    )
+                  })()}
                 </div>
               </section>
 
@@ -3553,13 +3579,21 @@ export default function App(){
                     </div>
                     <div style={{color:"#40485d",fontSize:12,marginBottom:20}}>
                       {scoped
-                        ? "Nothing matches this scope (they may be snoozed from recent calls, or assigned). Clear the filters to see everything."
+                        ? (snoozeHours>0
+                            ? `Nothing matches this scope right now — recently-dialed leads are hidden by the ${snoozeHours}h snooze. Turn off snooze to re-work them, or clear the filters.`
+                            : "Nothing matches this scope (they may all be assigned to other reps). Clear the filters to see everything.")
                         : (needAttempt.length>0
                             ? `${needAttempt.length} unanswered lead${needAttempt.length!==1?"s":""} still need another attempt (under 4 tries)`
                             : (leads.length>0?`${leads.length} lead${leads.length!==1?"s":""} total, all assigned`:"Import a CSV or use Find Leads to get started"))}
                     </div>
-                    {scoped&&(
+                    {scoped&&snoozeHours>0&&(
                       <button className="btn btn-p" style={{marginRight:8}}
+                        onClick={()=>setSnoozeHours(0)}>
+                        😴 Turn off snooze
+                      </button>
+                    )}
+                    {scoped&&(
+                      <button className="btn btn-g" style={{marginRight:8}}
                         onClick={()=>{ setDialerState(""); setDialerCity(""); setDialerUnanswered(false) }}>
                         ✕ Clear dialer filters
                       </button>
