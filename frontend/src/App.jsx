@@ -2251,6 +2251,12 @@ export default function App(){
   const [histTo,setHistTo]           = useState("")
   const [histRange,setHistRange]     = useState("week")
   const [dialerIdx,setDialerIdx]   = useState(0)
+  // Dialer scope: optionally restrict the queue to one state and/or to
+  // unanswered (no_answer) leads — lets a caller "go back and call the CT
+  // leads that never picked up" without leaving the dialer.
+  const [dialerState,setDialerState] = useState("")
+  const [dialerUnanswered,setDialerUnanswered] = useState(false)
+  useEffect(()=>{ setDialerIdx(0) },[dialerState,dialerUnanswered])
   // Snooze: hide leads dialed within the last N hours where the outcome was
   // a non-engagement (no_answer / voicemail / called). Default 4h; caller
   // can override per-session via the dialer toolbar.
@@ -3423,19 +3429,38 @@ export default function App(){
                   })()}
                   </p>
                 </div>
-                {/* Per-session snooze toggle — hide dead-end outcomes dialed in
-                    the last N hours so caller doesn't re-spin through what they
-                    just tried this shift. Off = show everything. */}
-                <div style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
-                  <span title="Hide no_answer/voicemail leads dialed in the last N hours">😴 Snooze recent</span>
-                  <select className="sel" value={snoozeHours} onChange={e=>setSnoozeHours(+e.target.value)}
-                    style={{padding:"6px 10px",fontSize:12,minWidth:70}}>
-                    <option value={0}>Off</option>
-                    <option value={2}>2h</option>
-                    <option value={4}>4h</option>
-                    <option value={8}>8h</option>
-                    <option value={24}>24h</option>
-                  </select>
+                {/* Scope + snooze controls. Scope lets the caller power through
+                    one state's unanswered leads ("go back and call the CT leads
+                    that never picked up"); snooze hides dead-ends dialed recently. */}
+                <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
+                    <span>📍 State</span>
+                    <select className="sel" value={dialerState} onChange={e=>setDialerState(e.target.value)}
+                      title="Only dial leads in this state" style={{padding:"6px 10px",fontSize:12,minWidth:90}}>
+                      <option value="">All states</option>
+                      {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </div>
+                  <button
+                    onClick={()=>setDialerUnanswered(p=>!p)}
+                    title="Only dial leads that have never answered (No Answer / voicemail) — go back and re-try them"
+                    style={{fontSize:12,padding:"6px 12px",borderRadius:8,border:"none",cursor:"pointer",
+                      fontFamily:"'Inter',sans-serif",fontWeight:600,transition:"all .15s",
+                      background:dialerUnanswered?"#ffe083":"#192540",
+                      color:dialerUnanswered?"#3a2e00":"#a3aac4"}}>
+                    📞 Unanswered only
+                  </button>
+                  <div style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
+                    <span title="Hide no_answer/voicemail leads dialed in the last N hours">😴 Snooze recent</span>
+                    <select className="sel" value={snoozeHours} onChange={e=>setSnoozeHours(+e.target.value)}
+                      style={{padding:"6px 10px",fontSize:12,minWidth:70}}>
+                      <option value={0}>Off</option>
+                      <option value={2}>2h</option>
+                      <option value={4}>4h</option>
+                      <option value={8}>8h</option>
+                      <option value={24}>24h</option>
+                    </select>
+                  </div>
                 </div>
               </div>
               {(()=>{
@@ -3468,6 +3493,8 @@ export default function App(){
                   && !NO_DIAL_STATUSES.has(l.status)
                   && isValidUsPhone(l.phone)
                   && !isSnoozed(l)
+                  && (!dialerState || l.state===dialerState)
+                  && (!dialerUnanswered || l.status==="no_answer")
                 ).slice().sort((a,b)=>{
                   const ca=a.total_calls||0, cb=b.total_calls||0
                   if(ca!==cb) return ca-cb                              // fewest calls first
@@ -3481,18 +3508,30 @@ export default function App(){
                   // calls). They may be hidden here by the snooze window, but
                   // the caller can still work them — the 4×-before-giveup rule.
                   const needAttempt = leads.filter(l=>(!l.assignedTo||l.assignedTo===user)&&l.status==="no_answer"&&(l.total_calls||0)<4)
+                  const scoped = dialerState||dialerUnanswered
+                  const scopeLabel = [dialerUnanswered?"unanswered":"",dialerState||""].filter(Boolean).join(" ")
                   return(
                   <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
-                    <div style={{fontSize:40,marginBottom:12}}>{needAttempt.length>0?"📞":"✅"}</div>
+                    <div style={{fontSize:40,marginBottom:12}}>{scoped?"🔍":(needAttempt.length>0?"📞":"✅")}</div>
                     <div style={{color:"#a3aac4",fontSize:14,marginBottom:8}}>
-                      {leads.length>0?"No fresh leads in the dialer right now":"No leads to dial yet"}
+                      {scoped
+                        ? `No ${scopeLabel} leads to dial right now`
+                        : (leads.length>0?"No fresh leads in the dialer right now":"No leads to dial yet")}
                     </div>
                     <div style={{color:"#40485d",fontSize:12,marginBottom:20}}>
-                      {needAttempt.length>0
-                        ? `${needAttempt.length} unanswered lead${needAttempt.length!==1?"s":""} still need another attempt (under 4 tries)`
-                        : (leads.length>0?`${leads.length} lead${leads.length!==1?"s":""} total, all assigned`:"Import a CSV or use Find Leads to get started")}
+                      {scoped
+                        ? "Nothing matches this scope (they may be snoozed from recent calls, or assigned). Clear the filters to see everything."
+                        : (needAttempt.length>0
+                            ? `${needAttempt.length} unanswered lead${needAttempt.length!==1?"s":""} still need another attempt (under 4 tries)`
+                            : (leads.length>0?`${leads.length} lead${leads.length!==1?"s":""} total, all assigned`:"Import a CSV or use Find Leads to get started"))}
                     </div>
-                    {needAttempt.length>0&&(
+                    {scoped&&(
+                      <button className="btn btn-p" style={{marginRight:8}}
+                        onClick={()=>{ setDialerState(""); setDialerUnanswered(false) }}>
+                        ✕ Clear dialer filters
+                      </button>
+                    )}
+                    {!scoped&&needAttempt.length>0&&(
                       <button className="btn btn-p" style={{marginRight:8}}
                         onClick={()=>{ setNeedsAttemptOnly(true); setNav("leads") }}>
                         📞 Work {needAttempt.length} unanswered lead{needAttempt.length!==1?"s":""}
