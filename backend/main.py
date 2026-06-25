@@ -3894,14 +3894,14 @@ def enrich_lookalike(user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
 
-    applied, matched, patch_err = 0, 0, ""
+    applied, already = 0, 0
     for lead in candidates:
         if "[INTENT:lookalike]" in (lead.get("notes") or ""):
+            already += 1   # already boosted on a prior run — idempotent
             continue
         ti = _fit_tier_index(lead)
         if ti not in win_tiers:
             continue
-        matched += 1
         # Vertical match required; same-state is a bonus reason, not a gate.
         why = "matches a vertical you convert"
         if (lead.get("state") or "").upper() in win_states:
@@ -3914,26 +3914,17 @@ def enrich_lookalike(user: str = Depends(verify_admin)):
                 json={"notes": lead["notes"], "score": score_lead(lead)}, timeout=15)
             if pr.status_code in (200, 204):
                 applied += 1
-            elif not patch_err:
-                patch_err = f"HTTP {pr.status_code}: {pr.text[:160]}"
         except Exception as e:
-            if not patch_err:
-                patch_err = str(e)[:160]
             print(f"[LOOKALIKE] patch failed for {lead.get('id')}: {e}")
 
     top_labels = [", ".join(CLEANING_FIT_TIERS[ti][1][:2]) for ti, _ in tier_ct.most_common(3)]
     audit_log(user, "enrich_lookalike", "lead", None,
               {"wins": len(wins), "applied": applied, "win_states": list(win_states)})
-    return {"applied": applied, "wins": len(wins),
+    already_note = f" ({already} already boosted earlier)" if already else ""
+    return {"applied": applied, "wins": len(wins), "alreadyBoosted": already,
             "winning_verticals": top_labels, "winning_states": sorted(win_states),
-            "debug": {"candidates": len(candidates), "matched": matched,
-                      "win_tiers": sorted(win_tiers), "patch_err": patch_err,
-                      "sample_candidates": [{"industry": c.get("industry"), "company": c.get("company"),
-                                             "tier": _fit_tier_index(c)} for c in candidates[:5]],
-                      "sample_wins": [{"industry": w.get("industry"), "company": w.get("company"),
-                                       "tier": _fit_tier_index(w)} for w in wins[:5]]},
-            "summary": f"Learned from {len(wins)} wins → boosted {applied} matching leads "
-                       f"(verticals like {'; '.join(top_labels)})"}
+            "summary": f"Learned from {len(wins)} wins → boosted {applied} new matching leads"
+                       f"{already_note} (verticals like {'; '.join(top_labels)})"}
 
 @app.get("/api/usage")
 def get_usage(days: int = 7, user: str = Depends(verify_token)):
