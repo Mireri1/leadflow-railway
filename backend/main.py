@@ -3582,6 +3582,216 @@ def source_npi(body: FreeSourceRequest, user: str = Depends(verify_token)):
                       f"{res['droppedUncallable']} uncallable · {res['saved']} new saved")
     return res
 
+# ════════════════════════════════════════════════════════════════════════════
+# GOOGLE-REVIEW CLEANLINESS INTENT — the out-of-the-box play. A business with a
+# recent review complaining about dirtiness has an ACUTE need and a built-in
+# pitch. We scan existing leads' Google reviews, stamp [INTENT:cleanliness] +
+# a quotable snippet, and re-score so they rocket up the dialer.
+# ════════════════════════════════════════════════════════════════════════════
+CLEANLINESS_COMPLAINT_TERMS = [
+    "dirty", "filthy", "unclean", "not clean", "wasn't clean", "disgusting",
+    "gross", "unsanitary", "grimy", "grime", "dusty", "mold", "mildew",
+    "stained", "sticky floor", "smelled", "smelly", "foul smell", "bad smell",
+    "dirty bathroom", "dirty restroom", "bathroom was", "restroom was",
+    "toilets were", "trash everywhere", "needs cleaning", "never cleaned",
+]
+
+def google_find_place_id(name: str, city: str, state: str) -> str:
+    """Resolve a business to a Google place_id via Find Place From Text."""
+    q = " ".join(x for x in [name, city, state] if x).strip()
+    try:
+        r = req_lib.get(
+            "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+            params={"input": q, "inputtype": "textquery", "fields": "place_id", "key": GOOGLE_KEY},
+            timeout=12)
+        cands = r.json().get("candidates", [])
+        return cands[0].get("place_id", "") if cands else ""
+    except Exception as e:
+        print(f"[REVIEWS] find_place failed: {e}")
+        return ""
+
+def google_place_reviews(place_id: str):
+    """Fetch up to ~5 reviews + rating for a place (Details Atmosphere data)."""
+    try:
+        r = req_lib.get(
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={"place_id": place_id, "fields": "reviews,rating,user_ratings_total",
+                    "key": GOOGLE_KEY}, timeout=12)
+        res = r.json().get("result", {})
+        return res.get("reviews", []) or [], res.get("rating"), res.get("user_ratings_total")
+    except Exception as e:
+        print(f"[REVIEWS] details failed: {e}")
+        return [], None, None
+
+def scan_cleanliness(reviews: list):
+    """Return (hit, quotable_snippet) if any recent-ish review complains about
+    cleanliness. Weight toward lower-rated reviews — a 5-star 'spotless!' that
+    contains 'dusty' shouldn't trigger."""
+    for rev in reviews:
+        text = (rev.get("text") or "").lower()
+        rating = rev.get("rating", 5)
+        if rating and rating <= 3 and any(term in text for term in CLEANLINESS_COMPLAINT_TERMS):
+            snippet = (rev.get("text") or "").strip().replace("\n", " ")
+            if len(snippet) > 140:
+                snippet = snippet[:137] + "…"
+            return True, f'"{snippet}" ({rating}★)'
+    return False, ""
+
+class ReviewScanRequest(BaseModel):
+    state:  Optional[str] = ""
+    cities: Optional[str] = ""
+    limit:  Optional[int] = 25   # max leads to scan this run (Google calls cost)
+
+@app.post("/api/enrich/reviews")
+def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
+    """Scan existing leads' Google reviews for cleanliness complaints and flag
+    the hits as hot intent. Admin-only (burns Google Places calls). Each lead =
+    1 Find Place + 1 Details call (~$0.05). Capped per run."""
+    on, _ = is_kill_switch_on()
+    if on:
+        raise HTTPException(status_code=503, detail="Google Places is disabled (kill switch).")
+    if not GOOGLE_KEY:
+        raise HTTPException(status_code=400, detail="GOOGLE_API_KEY not configured.")
+    scan_n = min(max(int(body.limit or 25), 1), 100)
+
+    # Pull candidate leads: have a company + city, not already cleanliness-tagged.
+    flt = "&state=eq." + url_quote(body.state) if body.state else ""
+    try:
+        r = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads"
+            f"?select=id,company,city,state,notes,score,phone,firstName,email,industry,title"
+            f"&company=not.is.null{flt}&order=createdAt.desc&limit={scan_n * 3}",
+            headers=SB_HEADERS, timeout=20)
+        candidates = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
+
+    flagged, scanned, samples = 0, 0, []
+    for lead in candidates:
+        if scanned >= scan_n:
+            break
+        if "[INTENT:cleanliness]" in (lead.get("notes") or ""):
+            continue
+        city = lead.get("city") or ""
+        if body.cities and city.lower() not in {c.strip().lower() for c in body.cities.split(",")}:
+            continue
+        scanned += 1
+        log_usage(user, "google_find_place", {"company": lead.get("company")})
+        pid = google_find_place_id(lead.get("company",""), city, lead.get("state",""))
+        if not pid:
+            continue
+        log_usage(user, "google_details", {"place_id": pid})
+        reviews, rating, _ = google_place_reviews(pid)
+        hit, snippet = scan_cleanliness(reviews)
+        if not hit:
+            continue
+        add_intent_marker(lead, "cleanliness", f"Recent review complaint: {snippet}")
+        new_score = score_lead(lead)
+        try:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead['id']))}",
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                json={"notes": lead["notes"], "score": new_score}, timeout=15)
+            flagged += 1
+            if len(samples) < 8:
+                samples.append({"company": lead.get("company"), "city": city,
+                                "score": new_score, "snippet": snippet})
+        except Exception as e:
+            print(f"[REVIEWS] patch failed for {lead.get('id')}: {e}")
+
+    audit_log(user, "enrich_reviews", "lead", None,
+              {"scanned": scanned, "flagged": flagged, "state": body.state})
+    if flagged:
+        send_slack("🔥 Cleanliness-complaint leads found",
+                   f"*{user}* scanned {scanned} leads → *{flagged}* have recent Google reviews "
+                   f"complaining about cleanliness. They're now top-scored in the dialer.",
+                   fields=[{"label": s["company"], "value": s["snippet"]} for s in samples[:5]])
+    return {"scanned": scanned, "flagged": flagged,
+            "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (now hot)",
+            "samples": samples}
+
+# ════════════════════════════════════════════════════════════════════════════
+# LOOKALIKE SCORING — your own wins become a free targeting model. Learn which
+# verticals actually convert, then boost matching un-worked leads. No API cost.
+# ════════════════════════════════════════════════════════════════════════════
+def _fit_tier_index(lead: dict) -> int:
+    """Which cleaning-fit tier a lead falls in (index into CLEANING_FIT_TIERS),
+    or -1 if none. Used as the 'vertical bucket' for lookalike matching."""
+    t = f"{lead.get('industry','')} {lead.get('company','')} {lead.get('title','')}".lower()
+    for i, (_pts, kws) in enumerate(CLEANING_FIT_TIERS):
+        if any(k in t for k in kws):
+            return i
+    return -1
+
+@app.post("/api/enrich/lookalike")
+def enrich_lookalike(user: str = Depends(verify_admin)):
+    """Profile the verticals + states that actually CONVERT, then stamp
+    [INTENT:lookalike] on un-worked leads that match — so your dialer favors
+    the kinds of accounts you've already won. Free; learns from your own data."""
+    MIN_WINS = 5
+    try:
+        rc = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=industry,company,title,state"
+            f"&status=eq.converted&limit=2000", headers=SB_HEADERS, timeout=20)
+        wins = rc.json() if rc.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Win fetch failed: {e}")
+    if len(wins) < MIN_WINS:
+        return {"applied": 0, "wins": len(wins),
+                "summary": f"Only {len(wins)} converted leads — need {MIN_WINS}+ before lookalike "
+                           f"targeting is meaningful. Keep closing; this sharpens as you win."}
+
+    from collections import Counter
+    tier_ct, state_ct = Counter(), Counter()
+    for w in wins:
+        ti = _fit_tier_index(w)
+        if ti >= 0:
+            tier_ct[ti] += 1
+        st = (w.get("state") or "").upper()
+        if st:
+            state_ct[st] += 1
+    # Winning verticals = tiers covering the bulk of wins (top tiers up to ~75%).
+    win_tiers = {ti for ti, _ in tier_ct.most_common(3)}
+    win_states = {s for s, _ in state_ct.most_common(8)}
+
+    # Scan un-worked leads (new, not already lookalike-tagged) and boost matches.
+    try:
+        rl = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,industry,company,title,state,notes,score,phone,firstName,email"
+            f"&status=eq.new&order=createdAt.desc&limit=3000", headers=SB_HEADERS, timeout=30)
+        candidates = rl.json() if rl.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
+
+    applied = 0
+    for lead in candidates:
+        if "[INTENT:lookalike]" in (lead.get("notes") or ""):
+            continue
+        ti = _fit_tier_index(lead)
+        if ti not in win_tiers:
+            continue
+        # Vertical match required; same-state is a bonus reason, not a gate.
+        why = "matches a vertical you convert"
+        if (lead.get("state") or "").upper() in win_states:
+            why += " in a state you win in"
+        add_intent_marker(lead, "lookalike", why)
+        try:
+            req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead['id']))}",
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                json={"notes": lead["notes"], "score": score_lead(lead)}, timeout=15)
+            applied += 1
+        except Exception as e:
+            print(f"[LOOKALIKE] patch failed for {lead.get('id')}: {e}")
+
+    top_labels = [", ".join(CLEANING_FIT_TIERS[ti][1][:2]) for ti, _ in tier_ct.most_common(3)]
+    audit_log(user, "enrich_lookalike", "lead", None,
+              {"wins": len(wins), "applied": applied, "win_states": list(win_states)})
+    return {"applied": applied, "wins": len(wins),
+            "winning_verticals": top_labels, "winning_states": sorted(win_states),
+            "summary": f"Learned from {len(wins)} wins → boosted {applied} matching leads "
+                       f"(verticals like {'; '.join(top_labels)})"}
+
 @app.get("/api/usage")
 def get_usage(days: int = 7, user: str = Depends(verify_token)):
     """Admin-only Places-API cost rollup. Shows who ran which queries and

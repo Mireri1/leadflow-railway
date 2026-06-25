@@ -597,6 +597,99 @@ function FreeSourceFinder({onFound}){
   )
 }
 
+// ─── IntentToolsPanel (admin) ────────────────────────────────────────────────
+// Two intelligence passes over leads you ALREADY have: scan Google reviews for
+// cleanliness complaints (urgent intent + a quotable pitch), and lookalike-boost
+// leads that match the verticals you actually convert.
+function IntentToolsPanel({onChange}){
+  const [state,setState]   = useState("")
+  const [limit,setLimit]   = useState(25)
+  const [rLoad,setRLoad]   = useState(false)
+  const [rRes,setRRes]     = useState(null)
+  const [lLoad,setLLoad]   = useState(false)
+  const [lRes,setLRes]     = useState(null)
+  const [err,setErr]       = useState("")
+
+  async function scanReviews(){
+    setErr(""); setRLoad(true); setRRes(null)
+    try{
+      const res = await api("/api/enrich/reviews",{method:"POST",body:JSON.stringify({state,limit:Number(limit)||25})})
+      setRRes(res); if(res.flagged>0) onChange&&onChange()
+    }catch(ex){ setErr(ex.message||"Review scan failed.") } finally{ setRLoad(false) }
+  }
+  async function runLookalike(){
+    setErr(""); setLLoad(true); setLRes(null)
+    try{
+      const res = await api("/api/enrich/lookalike",{method:"POST",body:JSON.stringify({})})
+      setLRes(res); if(res.applied>0) onChange&&onChange()
+    }catch(ex){ setErr(ex.message||"Lookalike scoring failed.") } finally{ setLLoad(false) }
+  }
+
+  return(
+    <div className="finder" style={{borderTop:"3px solid #ffb347"}}>
+      <div className="finder-title">🧠 Lead Intelligence <span style={{color:"#ffb347",fontSize:9,marginLeft:8,verticalAlign:"middle"}}>ADMIN</span></div>
+      <div className="finder-sub">Mine the leads you already have for urgency and fit — no new prospecting needed.</div>
+
+      {/* Cleanliness review scan */}
+      <div style={{padding:"12px 14px",background:"#0f1930",border:"1px solid #40485d40",borderRadius:10,marginBottom:12}}>
+        <div style={{fontSize:13,color:"#dee5ff",fontWeight:600,marginBottom:4}}>🔥 Cleanliness-complaint scan</div>
+        <div style={{fontSize:11,color:"#a3aac4",marginBottom:10}}>
+          Reads recent Google reviews and flags businesses whose customers complain about dirtiness.
+          Those leads jump to the top of the dialer with a quotable pitch in their notes. (~$0.05/lead in Google calls.)
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"flex-end",flexWrap:"wrap"}}>
+          <div className="ff" style={{minWidth:120}}>
+            <label>State (optional)</label>
+            <select value={state} onChange={e=>setState(e.target.value)} className="sel" style={{color:state?"#dee5ff":"#a3aac4"}}>
+              <option value="">All states</option>
+              {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div className="ff" style={{maxWidth:110}}>
+            <label>Scan how many</label>
+            <input className="sel" type="number" min={1} max={100} value={limit} onChange={e=>setLimit(e.target.value)}/>
+          </div>
+          <button className="btn btn-p" onClick={scanReviews} disabled={rLoad}
+            style={{padding:"9px 16px",background:"#ff6e84"}}>{rLoad?"Scanning…":"Scan reviews →"}</button>
+        </div>
+        {rRes&&(
+          <div style={{marginTop:10,fontSize:12,color: rRes.flagged>0?"#ff6e84":"#a3aac4"}}>
+            {rRes.summary}
+            {rRes.samples&&rRes.samples.length>0&&(
+              <div style={{marginTop:6,fontSize:11,color:"#dee5ff",lineHeight:1.6}}>
+                {rRes.samples.slice(0,5).map((s,i)=>(
+                  <div key={i}>🔥 <b>{s.company}</b> ({s.city}) → score {s.score} · <span style={{color:"#a3aac4"}}>{s.snippet}</span></div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Lookalike */}
+      <div style={{padding:"12px 14px",background:"#0f1930",border:"1px solid #40485d40",borderRadius:10}}>
+        <div style={{fontSize:13,color:"#dee5ff",fontWeight:600,marginBottom:4}}>🎯 Lookalike from your wins</div>
+        <div style={{fontSize:11,color:"#a3aac4",marginBottom:10}}>
+          Learns which verticals + states you actually convert, then boosts un-worked leads that match. Free; sharpens as you close more.
+        </div>
+        <button className="btn btn-p" onClick={runLookalike} disabled={lLoad}
+          style={{padding:"9px 16px",background:"#ffb347",color:"#1b1300",fontWeight:600}}>{lLoad?"Learning…":"Apply lookalike scoring →"}</button>
+        {lRes&&(
+          <div style={{marginTop:10,fontSize:12,color: lRes.applied>0?"#ffb347":"#a3aac4"}}>
+            {lRes.summary}
+            {lRes.winning_states&&lRes.winning_states.length>0&&(
+              <div style={{marginTop:4,fontSize:10,color:"#a3aac4"}}>Top states: {lRes.winning_states.join(", ")}</div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {err&&<div style={{marginTop:12,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
+        borderRadius:8,fontSize:12,color:"#ff6e84"}}>{err}</div>}
+    </div>
+  )
+}
+
 // ─── LeadFinder ──────────────────────────────────────────────────────────────
 
 function LeadFinder({onFound, industries}){
@@ -3140,6 +3233,7 @@ export default function App(){
               )}
               <div style={{marginTop:24}}><FreeSourceFinder onFound={loadLeads}/></div>
               <div style={{marginTop:24}}><ApolloFinder onFound={loadLeads} industries={industries}/></div>
+              {isAdmin()&&<div style={{marginTop:24}}><IntentToolsPanel onChange={loadLeads}/></div>}
             </div>
           )}
 
