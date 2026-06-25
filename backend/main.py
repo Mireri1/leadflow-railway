@@ -3470,7 +3470,7 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
         # abandoned fast and we move on — partial coverage beats a hung request.
         for ep in OVERPASS_MIRRORS:
             try:
-                r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS, timeout=22)
+                r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS, timeout=40)
                 if r.status_code == 200:
                     return r.json().get("elements", [])
                 print(f"[OSM] {ep.split('/')[2]} HTTP {r.status_code} — next mirror")
@@ -3488,7 +3488,7 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
             print(f"[OSM] fetch budget ({OSM_FETCH_BUDGET_SEC}s) hit — stopping at {cat}, partial result")
             break
         body = "\n".join(f"  nwr{sel}(area.a);" for sel in sels)
-        ql = (f"[out:json][timeout:25];\n"
+        ql = (f"[out:json][timeout:40];\n"
               f'area["ISO3166-2"="{iso}"]->.a;\n(' + body + "\n);\nout center 250;")
         els = _overpass(ql)
         if els is None:
