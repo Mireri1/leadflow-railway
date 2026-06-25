@@ -3927,7 +3927,11 @@ def enrich_lookalike(user: str = Depends(verify_admin)):
     return {"applied": applied, "wins": len(wins),
             "winning_verticals": top_labels, "winning_states": sorted(win_states),
             "debug": {"candidates": len(candidates), "matched": matched,
-                      "win_tiers": sorted(win_tiers), "patch_err": patch_err},
+                      "win_tiers": sorted(win_tiers), "patch_err": patch_err,
+                      "sample_candidates": [{"industry": c.get("industry"), "company": c.get("company"),
+                                             "tier": _fit_tier_index(c)} for c in candidates[:5]],
+                      "sample_wins": [{"industry": w.get("industry"), "company": w.get("company"),
+                                       "tier": _fit_tier_index(w)} for w in wins[:5]]},
             "summary": f"Learned from {len(wins)} wins → boosted {applied} matching leads "
                        f"(verticals like {'; '.join(top_labels)})"}
 
