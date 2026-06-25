@@ -130,6 +130,14 @@ PLACES_KILL_SWITCH = os.getenv("PLACES_KILL_SWITCH", "0") == "1"
 # Non-admin daily scrape cap. UTC midnight reset. Eric (in ADMIN_USERS) is
 # unlimited. Silently no-ops if usage_events table isn't migrated yet.
 NON_ADMIN_DAILY_SCRAPE_CAP = int(os.getenv("NON_ADMIN_DAILY_SCRAPE_CAP", "3"))
+# Non-admin daily Apollo-pull cap. Apollo burns ~1 credit per qualified contact
+# (the /people/match enrichment), so callers get a tighter leash than Eric, who
+# is unlimited. Phone reveals (5-8 credits each) are force-disabled for callers
+# regardless. UTC midnight reset; silently no-ops until usage_events exists.
+NON_ADMIN_APOLLO_PULL_CAP = int(os.getenv("NON_ADMIN_APOLLO_PULL_CAP", "5"))
+# Per-pull page/size ceilings applied to non-admins to bound credit spend.
+NON_ADMIN_APOLLO_MAX_PAGES = int(os.getenv("NON_ADMIN_APOLLO_MAX_PAGES", "5"))
+NON_ADMIN_APOLLO_MAX_PER_PAGE = int(os.getenv("NON_ADMIN_APOLLO_MAX_PER_PAGE", "25"))
 # Hard cap per scrape in dollars. Refuses the run if predicted spend exceeds.
 PLACES_MAX_SPEND_PER_RUN = float(os.getenv("PLACES_MAX_SPEND_PER_RUN", "2.0"))
 # Text Search cache TTL, days. Keyed on (pipeline='leadflow', city, keyword).
@@ -483,15 +491,15 @@ def set_kill_switch(on: bool):
     # keeps the DB as the single source of truth across multiple workers).
     _kill_switch_cache["expires"] = 0.0
 
-def scrapes_today(username: str) -> int:
-    """Count a user's scrape_call events since UTC midnight. Returns 0 if
-    usage_events isn't set up yet (so the cap silently doesn't apply)."""
+def events_today(username: str, event_type: str) -> int:
+    """Count a user's events of one type since UTC midnight. Returns 0 if
+    usage_events isn't set up yet (so any cap built on it silently no-ops)."""
     try:
         midnight = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         url = (
             f"{SUPABASE_URL}/rest/v1/usage_events"
             f"?select=id&username=eq.{url_quote(username)}"
-            f"&event_type=eq.scrape_call&created_at=gte.{midnight}"
+            f"&event_type=eq.{url_quote(event_type)}&created_at=gte.{midnight}"
         )
         r = req_lib.get(url, headers=SB_HEADERS, timeout=5)
         if r.status_code == 200:
@@ -501,6 +509,10 @@ def scrapes_today(username: str) -> int:
     except Exception as e:
         print(f"[RATE-LIMIT] count failed: {e}")
         return 0
+
+def scrapes_today(username: str) -> int:
+    """Count a user's scrape_call events since UTC midnight."""
+    return events_today(username, "scrape_call")
 
 def log_usage(username: str, event_type: str, metadata: Optional[dict] = None):
     """Fire-and-forget usage logger. Never raises — never blocks a scrape."""
@@ -622,6 +634,10 @@ INDUSTRY_MAP = {
     "Manufacturing":      "manufacturing company",
     "Finance":            "financial services",
     "Education":          "private school",
+    # Cleaning-company verticals. Concrete Google Places terms that surface
+    # facilities with heavy recurring janitorial needs.
+    "Industrial":         "warehouse",
+    "Entertainment":      "event venue",
 }
 
 def clean(v): return str(v).strip() if v else ""
@@ -951,8 +967,13 @@ def scrape_google_places(keyword="health clinic", state="", limit=25, username="
 _LAST_SCRAPE_PLACE_IDS = {}
 
 def save_to_supabase(leads):
+    """Insert leads, deduping by phone against rows already in the table.
+    Returns (saved_count, already_in_db_count) so callers can show a real
+    breakdown ('13 already in your DB · 2 new') instead of a bare 'saved=2'
+    that looks like a failure."""
     if not leads:
-        return 0
+        return 0, 0
+    already_in_db = 0
     try:
         # Canonicalize phones BEFORE dedup. Otherwise `(203) 863-3000`,
         # `203-863-3000`, and `+1 203 863 3000` would each look unique to the
@@ -994,10 +1015,11 @@ def save_to_supabase(leads):
         if existing_phones:
             before = len(leads)
             leads = [l for l in leads if (l.get("phone") or "").strip() not in existing_phones]
-            print(f"[SUPABASE] cross-run phone dedup: {before - len(leads)} of {before} dropped (already in DB)")
+            already_in_db = before - len(leads)
+            print(f"[SUPABASE] cross-run phone dedup: {already_in_db} of {before} dropped (already in DB)")
 
         if not leads:
-            return 0
+            return 0, already_in_db
 
         r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/leads",
@@ -1006,12 +1028,12 @@ def save_to_supabase(leads):
         print(f"[SUPABASE] POST {r.status_code}")
         if r.status_code not in (200, 201):
             print(f"[SUPABASE] Error: {r.text[:300]}")
-            return 0
+            return 0, already_in_db
         saved = r.json()
-        return len(saved) if isinstance(saved, list) else 1
+        return (len(saved) if isinstance(saved, list) else 1), already_in_db
     except Exception as e:
         print(f"[SUPABASE] Exception: {e}")
-        return 0
+        return 0, already_in_db
 
 # ── VCC campaign helpers ───────────────────────────────────────────────────
 
@@ -2376,6 +2398,11 @@ class ScrapeRequest(BaseModel):
     industries: Optional[str] = ""   # comma-separated list for multi-industry
     state:     Optional[str] = ""
     cities:    Optional[str] = ""
+    # Bulk multi-area search. A list of free-form location strings, each either
+    # a state ("TX", "Georgia") or a "City, ST" pair ("Tifton, GA", "San Diego,
+    # CA"). When present, this OVERRIDES state/cities and the scrape walks every
+    # location in the list. Lets a rep queue a whole territory in one run.
+    locations: Optional[object] = None
     limit:     Optional[int] = 25
     source:    Optional[str] = "places"
 
@@ -2992,7 +3019,10 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
                 detail=f"Daily scrape limit reached ({used}/{NON_ADMIN_DAILY_SCRAPE_CAP}). Resets at UTC midnight.",
             )
 
-    limit = min(max(body.limit or 25, 5), 60)
+    # "How many" is per-location. For a single area this is the total (legacy
+    # behavior). For a bulk multi-area run the total scales with the number of
+    # locations so each area gets a fair allocation instead of 60 split 9 ways.
+    per_location_limit = min(max(body.limit or 25, 5), 60)
 
     # Build list of keywords to search
     if body.industries:
@@ -3004,12 +3034,31 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
         # All industries — use "business" as a broad Google Places term
         keywords = [("All", "business")]
 
-    # Build list of locations to search
-    if body.cities:
+    # Build list of locations to search. Precedence:
+    #   1. Explicit bulk `locations` list (multi-state/multi-city territory)
+    #   2. Single state + comma-sep cities (legacy single-area form)
+    #   3. Single state (or nationwide if blank)
+    bulk = body.locations
+    if isinstance(bulk, str):  # tolerate a comma-sep string too
+        bulk = [s.strip() for s in bulk.split(",") if s.strip()]
+    if isinstance(bulk, list) and any(str(x).strip() for x in bulk):
+        # Dedupe case-insensitively while preserving order.
+        seen_loc, locations = set(), []
+        for x in bulk:
+            loc = str(x).strip()
+            if loc and loc.lower() not in seen_loc:
+                seen_loc.add(loc.lower())
+                locations.append(loc)
+    elif body.cities:
         city_list = [c.strip() for c in body.cities.split(",") if c.strip()]
         locations = [f"{city}, {body.state}".strip(", ") for city in city_list]
     else:
         locations = [body.state or ""]
+
+    # Total target scales with location count (per-location semantics above).
+    # Hard ceiling of 300 backstops a huge bulk list; the per-run $ spend cap
+    # below is the real guard and will reject anything too broad.
+    limit = min(per_location_limit * max(1, len(locations)), 300)
 
     # Calculate per-combo limit
     combos = len(keywords) * len(locations)
@@ -3124,14 +3173,38 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
     leads = callable_leads
     print(f"[SCRAPE] Callable filter: {len(leads)} kept, {dropped_uncallable} dropped (no phone + no DM email)")
 
-    saved = save_to_supabase(leads)
+    saved, already_in_db = save_to_supabase(leads)
+
+    # Plain-English breakdown so a "0 saved" result reads as "you already own
+    # these" rather than "the scraper is broken." Mirrors the Apollo pull
+    # summary. Built from the funnel: Google returned N businesses → some
+    # uncallable → some already in your DB → the rest saved.
+    cached_combos = len(cache_hits)
+    if cached_combos and cached_combos == len(all_combos):
+        summary = (f"All {cached_combos} search area(s) were already pulled in the last "
+                   f"{PLACES_CACHE_TTL_DAYS} days (cached) — no fresh Google call made. "
+                   f"Try new cities/industries, or widen the area.")
+    else:
+        parts = [f"Google returned {pre_filter_count} business(es)"]
+        if dropped_uncallable:
+            parts.append(f"{dropped_uncallable} uncallable (no phone or DM email)")
+        if already_in_db:
+            parts.append(f"{already_in_db} already in your DB")
+        if apollo_enriched:
+            parts.append(f"{apollo_enriched} enriched with DM info")
+        parts.append(f"{saved} new saved")
+        if cached_combos:
+            parts.append(f"{cached_combos}/{len(all_combos)} area(s) skipped (recently searched)")
+        summary = " · ".join(parts)
+
     audit_log(user, "scrape_leads", "lead", None, {
         "industries": [k[0] for k in keywords], "state": body.state,
         "cities": body.cities, "found": pre_filter_count, "saved": saved,
+        "already_in_db": already_in_db,
         "cache_hits": len(cache_hits), "uncached_combos": uncached,
         "apollo_enriched": apollo_enriched,
         "dropped_uncallable": dropped_uncallable})
-    print(f"[SCRAPE] Saved {saved} leads (cache_hits={len(cache_hits)}/{len(all_combos)}, apollo_enriched={apollo_enriched}, dropped={dropped_uncallable})")
+    print(f"[SCRAPE] Saved {saved} leads (already_in_db={already_in_db}, cache_hits={len(cache_hits)}/{len(all_combos)}, apollo_enriched={apollo_enriched}, dropped={dropped_uncallable})")
 
     # Slack notification
     if saved > 0:
@@ -3157,6 +3230,9 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
         "leads": leads,
         "count": len(leads),
         "saved": saved,
+        "alreadyInDb":       already_in_db,
+        "found":             pre_filter_count,
+        "summary":           summary,
         "cacheHits": len(cache_hits),
         "combos":    len(all_combos),
         "apolloEnriched":    apollo_enriched,
@@ -5419,14 +5495,38 @@ def _apollo_process_page(people, pagination, body: "ApolloPullRequest", user: st
     }
 
 @app.post("/api/admin/apollo/pull")
-def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_admin)):
+def apollo_pull(body: ApolloPullRequest, user: str = Depends(verify_token)):
     """Pull decision-maker contacts from Apollo. Auto-paginates by default —
     keeps walking through pages until either `min_new_leads` rows are saved
     or `max_pages` are exhausted. Old behavior (single page, "0 saved" if
-    everything was a dupe) is recoverable by passing auto_paginate=false."""
+    everything was a dupe) is recoverable by passing auto_paginate=false.
+
+    Open to callers, not just admins, so the floor can self-serve fresh
+    decision-maker leads. Non-admins are leashed: a daily pull cap, lower
+    page/size ceilings, and phone reveals (5-8 credits each) force-disabled.
+    Eric stays unlimited."""
     if not APOLLO_API_KEY:
         raise HTTPException(status_code=400,
             detail="APOLLO_API_KEY not configured. Set it in Railway env vars.")
+
+    # Non-admin guardrails. Bound credit spend without blocking self-service.
+    caller_is_admin = is_admin(user)
+    if not caller_is_admin:
+        used = events_today(user, "apollo_pull")
+        if used >= NON_ADMIN_APOLLO_PULL_CAP:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily Apollo pull limit reached ({used}/{NON_ADMIN_APOLLO_PULL_CAP}). "
+                       f"Resets at UTC midnight. Ask Eric if you need more.",
+            )
+        # Callers never trigger paid phone reveals — those are an admin spend.
+        body.reveal_phones = False
+        body.per_page = min(int(body.per_page or 25), NON_ADMIN_APOLLO_MAX_PER_PAGE)
+        body.max_pages = min(int(body.max_pages or 5), NON_ADMIN_APOLLO_MAX_PAGES)
+
+    # Log the pull so events_today() can enforce the daily cap. Fire-and-forget.
+    log_usage(user, "apollo_pull", {"locations": _to_str_list(body.locations),
+                                    "industries": _to_str_list(body.industries)})
 
     titles     = _to_str_list(body.titles)
     industries = _to_str_list(body.industries)
@@ -5898,12 +5998,18 @@ def apollo_budget(user: str = Depends(verify_token)):
     a budget meter and decide whether to display the Reveal Mobile button.
     Caller-readable so the call modal can hide the button when blocked."""
     used = phone_reveal_count_this_month()
+    caller_is_admin = is_admin(user)
     return {
         "monthly_cap":            APOLLO_PHONE_REVEAL_MONTHLY_CAP,
         "used_this_month":        used,
         "remaining":              max(0, APOLLO_PHONE_REVEAL_MONTHLY_CAP - used),
         "allowed_industries":     sorted(APOLLO_PHONE_REVEAL_INDUSTRIES),
         "credits_per_reveal_est": 8,
+        # Caller-facing pull policy so the UI can show "N pulls left today"
+        # and hide admin-only controls (phone reveal, backfill).
+        "is_admin":               caller_is_admin,
+        "daily_pull_cap":         None if caller_is_admin else NON_ADMIN_APOLLO_PULL_CAP,
+        "pulls_used_today":       0 if caller_is_admin else events_today(user, "apollo_pull"),
     }
 
 @app.get("/api/admin/apollo/webhook-hits")

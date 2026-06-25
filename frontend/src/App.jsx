@@ -481,6 +481,23 @@ function LeadFinder({onFound, industries}){
   const [loading,setLoad]      = useState(false)
   const [lastResult,setLast]   = useState(null)
   const [findError,setFindError] = useState("")
+  // Bulk multi-area list. Each entry is "ST" or "City, ST". Built from the
+  // state/cities inputs below via "Add area", then sent as `locations` so one
+  // run walks a whole territory.
+  const [bulkLocations,setBulkLocations] = useState([])
+
+  function addArea(){
+    setFindError("")
+    if(!state){ setFindError("Pick a state to add an area."); return }
+    const cityList = cities.split(",").map(c=>c.trim()).filter(Boolean)
+    const toAdd = cityList.length ? cityList.map(c=>`${c}, ${state}`) : [state]
+    setBulkLocations(prev=>{
+      const seen = new Set(prev.map(x=>x.toLowerCase()))
+      return [...prev, ...toAdd.filter(x=>!seen.has(x.toLowerCase()))]
+    })
+    setCities("")  // clear so the next area starts fresh; keep state selected
+  }
+  function removeArea(loc){ setBulkLocations(prev=>prev.filter(x=>x!==loc)) }
 
   function toggleIndustry(ind){
     if(ind==="_all_"){
@@ -492,15 +509,23 @@ function LeadFinder({onFound, industries}){
 
   async function find(){
     setFindError("")
-    if(cities.trim() && !state){ setFindError("Please select a state when targeting specific cities."); return }
+    if(cities.trim() && !state && bulkLocations.length===0){ setFindError("Please select a state when targeting specific cities."); return }
     if(selIndustries.length===0){ setFindError("Select at least one industry."); return }
     setLoad(true); setLast(null)
     try {
       const isAll = selIndustries.length===industries.length
+      // If the user staged a bulk area list, send it (overrides state/cities).
+      // Also fold in the currently-typed-but-not-yet-added area so a lone
+      // selection isn't silently ignored.
+      const pendingArea = !state ? []
+        : cities.trim() ? cities.split(",").map(c=>c.trim()).filter(Boolean).map(c=>`${c}, ${state}`)
+        : [state]
+      const allLocations = [...new Set([...bulkLocations, ...pendingArea])]
       const body = {
         industry: isAll?"_all_":selIndustries[0],
         industries: selIndustries.length>1&&!isAll?selIndustries.join(","):"",
-        state,cities,limit,source:"sam"
+        state,cities,limit,source:"sam",
+        ...(bulkLocations.length>0 ? {locations: allLocations} : {})
       }
       const res = await api("/api/scrape",{method:"POST",body:JSON.stringify(body)})
       setLast(res)
@@ -548,6 +573,39 @@ function LeadFinder({onFound, industries}){
           <CityAutocomplete value={cities} onChange={setCities} state={state} multi={true}
             placeholder="e.g. Stratford, Norwalk, Bridgeport — leave blank for entire state"/>
         </div>
+
+        {/* ── Bulk areas: queue several states / cities into one run ─────── */}
+        <div className="ff" style={{gridColumn:"1 / -1"}}>
+          <label style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span>Bulk Areas {bulkLocations.length>0&&<span style={{color:"#a3a6ff"}}>({bulkLocations.length} queued)</span>}</span>
+            <button type="button" onClick={addArea}
+              style={{background:"#a3a6ff18",border:"1px solid #a3a6ff40",color:"#a3a6ff",
+                fontSize:11,cursor:"pointer",padding:"3px 10px",borderRadius:6,fontFamily:"inherit"}}>
+              ＋ Add area from State/Cities above
+            </button>
+          </label>
+          <div style={{fontSize:10,color:"#40485d",marginTop:3}}>
+            Pick a state (and optionally cities) above, click Add. Repeat to stack a whole
+            territory — each area pulls ~{limit} leads. Leave empty to search just the single area above.
+          </div>
+          {bulkLocations.length>0&&(
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
+              {bulkLocations.map(loc=>(
+                <span key={loc} style={{display:"inline-flex",alignItems:"center",gap:6,padding:"4px 8px",
+                  borderRadius:6,fontSize:11,background:"#a3a6ff18",border:"1px solid #a3a6ff40",color:"#dee5ff"}}>
+                  📍 {loc}
+                  <button type="button" onClick={()=>removeArea(loc)}
+                    style={{background:"none",border:"none",color:"#a3aac4",cursor:"pointer",padding:0,fontSize:13,lineHeight:1}}
+                    title="Remove">×</button>
+                </span>
+              ))}
+              <button type="button" onClick={()=>setBulkLocations([])}
+                style={{background:"none",border:"none",color:"#ff6e84",fontSize:10,cursor:"pointer",
+                  padding:"4px 6px",textDecoration:"underline"}}>Clear all</button>
+            </div>
+          )}
+        </div>
+
         <div className="range-wrap">
           <label style={{fontSize:10,letterSpacing:".1em",textTransform:"uppercase",color:"#a3aac4",display:"flex",justifyContent:"space-between"}}>
             <span>How Many</span><span style={{color:"#a3a6ff"}}>{limit}</span>
@@ -556,7 +614,7 @@ function LeadFinder({onFound, industries}){
           <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#40485d"}}><span>25</span><span>200</span></div>
         </div>
         <button className="btn btn-p" onClick={find} disabled={loading} style={{padding:"10px 22px",whiteSpace:"nowrap",alignSelf:"flex-end"}}>
-          {loading?"Searching\u2026":"Find Leads \u2192"}
+          {loading?"Searching\u2026":(bulkLocations.length>0?`Find across ${bulkLocations.length} areas \u2192`:"Find Leads \u2192")}
         </button>
       </div>
       {findError&&<div style={{marginTop:14,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
@@ -564,18 +622,36 @@ function LeadFinder({onFound, industries}){
       {loading&&<div style={{marginTop:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
         <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#a3a6ff"}}/>Pulling records…
       </div>}
-      {lastResult&&!loading&&(
-        <div style={{marginTop:14,padding:"10px 14px",background:"#69f6b815",border:"1px solid #69f6b830",borderRadius:8,fontSize:12,color:"#69f6b8",lineHeight:1.5}}>
-          ✓ {lastResult.saved} leads saved — ready to call
-          {(lastResult.apolloEnriched>0||lastResult.droppedUncallable>0)&&(
-            <div style={{marginTop:4,fontSize:10,color:"#a3aac4"}}>
-              {lastResult.apolloEnriched>0&&<>📞 {lastResult.apolloEnriched} enriched with DM info via Apollo</>}
-              {lastResult.apolloEnriched>0&&lastResult.droppedUncallable>0&&" · "}
-              {lastResult.droppedUncallable>0&&<>🚫 {lastResult.droppedUncallable} dropped (no working phone or DM email)</>}
+      {lastResult&&!loading&&(()=>{
+        const saved=lastResult.saved||0
+        const dupes=lastResult.alreadyInDb||0
+        // "0 saved" reads as broken unless we explain why. When the area is
+        // tapped out (everything already owned, or all combos cached), say so.
+        const tappedOut = saved===0 && (dupes>0 || lastResult.cacheHits>=lastResult.combos)
+        return (
+        <div style={{marginTop:14,padding:"10px 14px",
+          background: saved>0?"#69f6b815":"#ffe08315",
+          border:`1px solid ${saved>0?"#69f6b830":"#ffe08340"}`,
+          borderRadius:8,fontSize:12,color: saved>0?"#69f6b8":"#ffe083",lineHeight:1.5}}>
+          {saved>0
+            ? <>✓ <b>{saved}</b> new lead{saved===1?"":"s"} saved — ready to call</>
+            : tappedOut
+              ? <>ⓘ <b>0 new leads</b> — you've already pulled this area. Not a bug; the dedup is working.</>
+              : <>ⓘ <b>0 new leads</b> from this search.</>}
+          {/* Full funnel breakdown straight from the backend summary. */}
+          {lastResult.summary&&(
+            <div style={{marginTop:4,fontSize:10,color:"#a3aac4"}}>{lastResult.summary}</div>
+          )}
+          {tappedOut&&(
+            <div style={{marginTop:6,padding:"8px 10px",background:"#a3a6ff12",border:"1px solid #a3a6ff30",
+              borderRadius:6,fontSize:10,color:"#dee5ff"}}>
+              💡 Try new cities or a different industry to reach fresh businesses — or use
+              <b style={{color:"#8b5cf6"}}> 📞 Pull from Apollo</b> below for decision-maker contacts.
             </div>
           )}
         </div>
-      )}
+        )
+      })()}
     </div>
   )
 }
@@ -710,12 +786,17 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
     <div className="finder" style={{borderTop:"3px solid #8b5cf6"}}>
       <div className="finder-title">
         📞 Pull from Apollo
-        <span style={{color:"#ff6e84",fontSize:9,marginLeft:8,verticalAlign:"middle"}}>ADMIN</span>
+        {!isAdmin()&&(
+          <span style={{color:"#8b5cf6",fontSize:9,marginLeft:8,verticalAlign:"middle"}}>NEW</span>
+        )}
       </div>
       <div className="finder-sub">
-        Decision-maker contacts: real names + titles + direct phones/emails. Burns Apollo credits.
+        Decision-maker contacts: real names + titles + direct emails — built to bypass gatekeepers.
+        {!isAdmin()&&budget?.daily_pull_cap&&(
+          ` ${Math.max(0,budget.daily_pull_cap-(budget.pulls_used_today||0))}/${budget.daily_pull_cap} pulls left today.`
+        )}
       </div>
-      {budget&&(
+      {isAdmin()&&budget&&(
         <div style={{marginBottom:14,padding:"8px 12px",background:"#0f1930",border:"1px solid #40485d40",
           borderRadius:8,fontSize:11,color:"#a3aac4",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
           <span>📱 Phone reveals this month: <b style={{color: budget.remaining<=0?"#ff6e84":"#8b5cf6"}}>{budget.used_this_month}/{budget.monthly_cap}</b>
@@ -795,11 +876,13 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
               title="Reset to Apollo page 1">↺ Reset to page 1</button>
           )}
         </div>
-        <label style={{gridColumn:"1 / -1",display:"flex",alignItems:"center",gap:8,fontSize:11,color:"#a3aac4",cursor:"pointer"}}>
-          <input type="checkbox" checked={revealPhones} onChange={e=>setRevealPh(e.target.checked)}
-            style={{cursor:"pointer"}}/>
-          <span>Also reveal direct mobile phones <span style={{color:"#ffe083"}}>(+5-8 credits per lead, async via webhook ~30s)</span></span>
-        </label>
+        {isAdmin()&&(
+          <label style={{gridColumn:"1 / -1",display:"flex",alignItems:"center",gap:8,fontSize:11,color:"#a3aac4",cursor:"pointer"}}>
+            <input type="checkbox" checked={revealPhones} onChange={e=>setRevealPh(e.target.checked)}
+              style={{cursor:"pointer"}}/>
+            <span>Also reveal direct mobile phones <span style={{color:"#ffe083"}}>(+5-8 credits per lead, async via webhook ~30s)</span></span>
+          </label>
+        )}
         <label style={{gridColumn:"1 / -1",display:"flex",alignItems:"flex-start",gap:8,fontSize:11,color:"#a3aac4",cursor:"pointer"}}>
           <input type="checkbox" checked={rotateTitles} onChange={e=>setRotateTitles(e.target.checked)}
             style={{cursor:"pointer",marginTop:2}}/>
@@ -943,7 +1026,9 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
         </div>
       )}
 
-      {/* ── Backfill: enrich existing leads with no DM info ─────────────── */}
+      {/* ── Backfill: enrich existing leads with no DM info (admin only —
+          bulk credit spend) ────────────────────────────────────────────── */}
+      {isAdmin()&&(
       <div style={{marginTop:18,paddingTop:18,borderTop:"1px solid #40485d30"}}>
         <div style={{fontSize:12,color:"#dee5ff",fontWeight:600,marginBottom:6}}>
           Enrich Existing Leads
@@ -973,6 +1058,7 @@ function ApolloFinder({onFound, industries: industryOptions = []}){
           </div>
         )}
       </div>
+      )}
     </div>
   )
 }
@@ -2926,9 +3012,7 @@ export default function App(){
               {industries.length>0&&(
                 <div style={{marginTop:32}}><LeadFinder onFound={loadLeads} industries={industries}/></div>
               )}
-              {isAdmin()&&(
-                <div style={{marginTop:24}}><ApolloFinder onFound={loadLeads} industries={industries}/></div>
-              )}
+              <div style={{marginTop:24}}><ApolloFinder onFound={loadLeads} industries={industries}/></div>
             </div>
           )}
 
