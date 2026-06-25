@@ -3449,32 +3449,44 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
             return (k.strip('"'), v.strip('"'))
         return (inner.strip('"'), None)
     cat_parsed = []  # [(category, key, value|None)] in priority order
-    body_lines = []
     for cat in categories:
         for sel in OSM_CATEGORY_SELECTORS.get(cat, []):
-            body_lines.append(f"  nwr{sel}(area.a);")
             k, v = _parse_sel(sel)
             cat_parsed.append((cat, k, v))
-    if not body_lines:
+    if not cat_parsed:
         return []
-    ql = (f"[out:json][timeout:90];\n"
-          f'area["ISO3166-2"="{iso}"]->.a;\n('
-          + "\n".join(body_lines) + "\n);\nout center 400;")
-    elements = None
-    for ep in OVERPASS_MIRRORS:
-        try:
-            # Raw QL body (not form-encoded) + User-Agent — public instances 406
-            # without a UA and prefer the raw body.
-            r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS, timeout=120)
-            if r.status_code == 200:
-                elements = r.json().get("elements", [])
-                break
-            print(f"[OSM] {ep.split('/')[2]} HTTP {r.status_code} — trying next mirror")
-        except Exception as e:
-            print(f"[OSM] {ep.split('/')[2]} failed ({e}) — trying next mirror")
-    if elements is None:
-        print("[OSM] all mirrors failed")
-        return []
+
+    # One Overpass call PER category — a whole-state query across all 6 verticals
+    # 504s on big states (TX/CA/GA). Per-category queries are small + reliable;
+    # we merge + dedup the elements. Free, so the extra calls cost nothing.
+    def _overpass(ql):
+        for ep in OVERPASS_MIRRORS:
+            try:
+                r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS, timeout=120)
+                if r.status_code == 200:
+                    return r.json().get("elements", [])
+                print(f"[OSM] {ep.split('/')[2]} HTTP {r.status_code} — next mirror")
+            except Exception as e:
+                print(f"[OSM] {ep.split('/')[2]} failed ({e}) — next mirror")
+        return None
+
+    seen_ids, elements = set(), []
+    for cat in categories:
+        sels = OSM_CATEGORY_SELECTORS.get(cat, [])
+        if not sels:
+            continue
+        body = "\n".join(f"  nwr{sel}(area.a);" for sel in sels)
+        ql = (f"[out:json][timeout:120];\n"
+              f'area["ISO3166-2"="{iso}"]->.a;\n(' + body + "\n);\nout center 300;")
+        els = _overpass(ql)
+        if els is None:
+            print(f"[OSM] {cat}: all mirrors failed — skipping")
+            continue
+        for el in els:
+            key = (el.get("type"), el.get("id"))
+            if key not in seen_ids:
+                seen_ids.add(key)
+                elements.append(el)
 
     city_l = city.strip().lower()
     leads = []
@@ -3505,9 +3517,14 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
         })
     return leads
 
-def fetch_npi(state_abbrev: str, city: str = "", taxonomy: str = "", limit: int = 200) -> list:
-    """Query the NPPES/NPI registry for healthcare ORGANIZATIONS (facilities).
-    Free public API, no key. Returns raw lead dicts for ingest_leads."""
+# NPPES rejects a state-only query ("requires additional search criteria"), so a
+# statewide pull (no city, no taxonomy) fans out across these facility types —
+# the high-cleaning-value healthcare verticals — to cover the whole state.
+NPI_STATEWIDE_TAXONOMIES = ["Clinic/Center", "Nursing", "Skilled Nursing", "Hospital",
+    "General Acute Care", "Assisted Living", "Home Health", "Dental", "Rehabilitation",
+    "Pharmacy", "Laboratory", "Urgent Care", "Surgical", "Dialysis"]
+
+def _npi_query(state_abbrev: str, city: str, taxonomy: str, limit: int) -> list:
     params = {"version": "2.1", "enumeration_type": "NPI-2",
               "state": state_abbrev.upper(), "limit": min(max(limit, 1), 200)}
     if city:     params["city"] = city
@@ -3515,12 +3532,29 @@ def fetch_npi(state_abbrev: str, city: str = "", taxonomy: str = "", limit: int 
     try:
         r = req_lib.get(NPI_API_URL, params=params, timeout=30)
         if r.status_code != 200:
-            print(f"[NPI] HTTP {r.status_code}: {r.text[:200]}")
+            print(f"[NPI] HTTP {r.status_code}: {r.text[:160]}")
             return []
-        results = r.json().get("results", []) or []
+        return r.json().get("results", []) or []
     except Exception as e:
         print(f"[NPI] fetch failed: {e}")
         return []
+
+def fetch_npi(state_abbrev: str, city: str = "", taxonomy: str = "", limit: int = 200) -> list:
+    """Query NPPES/NPI for healthcare ORGANIZATIONS (facilities). Free, no key.
+    A statewide pull (no city/taxonomy) fans out across facility taxonomies
+    because NPPES won't accept a state-only query. Returns raw lead dicts."""
+    if city or taxonomy:
+        results = _npi_query(state_abbrev, city, taxonomy, limit)
+    else:
+        results, seen = [], set()
+        for tx in NPI_STATEWIDE_TAXONOMIES:
+            for res in _npi_query(state_abbrev, "", tx, 200):
+                npi = res.get("number")
+                if npi and npi not in seen:
+                    seen.add(npi)
+                    results.append(res)
+            if len(results) >= FREE_SOURCE_MAX_ROWS:
+                break
 
     leads = []
     for res in results:

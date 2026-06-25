@@ -185,6 +185,37 @@ function getRole()  { return localStorage.getItem("lf_role") || "caller" }
 function isLoggedIn(){ return !!localStorage.getItem("lf_token") }
 function isAdmin()  { return getRole() === "admin" }
 
+// ── Lead segmentation metadata (shared by filters + cards) ───────────────────
+// Intent tags are stamped into a lead's notes as [INTENT:<kind>] by the
+// sourcing/enrichment endpoints. These drive the hot-lead badges + the Intent
+// filter so a caller instantly sees WHY a lead matters.
+const INTENT_META = {
+  cleanliness: { label: "🔥 Cleanliness complaint", color: "#ff6e84", pitch: "Their reviews mention dirtiness — lead with that." },
+  rfp:         { label: "📋 Active RFP",            color: "#ffb347", pitch: "Actively soliciting janitorial bids." },
+  contract:    { label: "⏳ Contract expiring",     color: "#ffb347", pitch: "Time the recompete." },
+  newbuild:    { label: "🏗️ New construction",       color: "#69b4f6", pitch: "Future cleaning need — time it to opening." },
+  competitor:  { label: "↔️ Unhappy w/ cleaner",     color: "#ff6e84", pitch: "Poach — they're unhappy now." },
+  lookalike:   { label: "🎯 Lookalike (you convert these)", color: "#ffe083", pitch: "Resembles accounts you've won." },
+}
+// Friendly source labels + colors so each origin reads at a glance.
+const SOURCE_META = {
+  "apollo":                    { label: "Apollo DM",      color: "#8b5cf6" },
+  "npi registry":              { label: "NPI Healthcare", color: "#69f6b8" },
+  "openstreetmap":             { label: "OpenStreetMap",  color: "#69f6b8" },
+  "permit (new construction)": { label: "Permit",         color: "#69b4f6" },
+  "google places":             { label: "Google Places",  color: "#a3a6ff" },
+}
+function parseIntents(notes){
+  const out = []
+  const s = (notes||"").toLowerCase()
+  for(const k in INTENT_META){ if(s.includes(`[intent:${k}]`)) out.push(k) }
+  return out
+}
+function sourceMeta(src){
+  const key = (src||"").toLowerCase()
+  return SOURCE_META[key] || { label: src||"—", color: "#5a6a8a" }
+}
+
 async function api(path, opts={}) {
   const token = getToken()
   const res = await fetch(`${API_BASE}${path}`, {
@@ -2559,6 +2590,8 @@ export default function App(){
   const [fIndustry,setFIndustry]   = useState("")
   const [fState,setFState]         = useState("")
   const [fCity,setFCity]           = useState("")
+  const [fSource,setFSource]       = useState("")   // segment by where the lead came from
+  const [fIntent,setFIntent]       = useState("")   // segment by hot-intent signal
   const [availableOnly,setAvailOnly] = useState(false)
   const [emailedOnly,setEmailedOnly] = useState(false)
   // "Needs Another Call" quick-filter: unanswered leads (no_answer) with under
@@ -2893,7 +2926,9 @@ export default function App(){
     }
   },[leads.length, today])
 
-  const displayLeads=leads.filter(l=>{
+  // segBase = everything EXCEPT the source/intent segment filters, so the
+  // quick-segment bar can show true totals per source/intent in this view.
+  const segBase=leads.filter(l=>{
     if(fIndustry&&l.industry!==fIndustry) return false
     if(fState&&l.state!==fState) return false
     if(fCity){
@@ -2905,6 +2940,18 @@ export default function App(){
     if(emailedOnly&&!emailedFlags[l.id]) return false
     if(needsAttemptOnly&&!(l.status==="no_answer"&&(l.total_calls||0)<4)) return false
     return true
+  })
+  const displayLeads=segBase.filter(l=>{
+    if(fSource&&(l.source||"").toLowerCase()!==fSource) return false
+    if(fIntent&&!parseIntents(l.notes).includes(fIntent)) return false
+    return true
+  })
+  // Counts for the quick-segment bar (over segBase so totals don't collapse
+  // when you click into one segment).
+  const segIntentCounts={}, segSourceCounts={}
+  segBase.forEach(l=>{
+    parseIntents(l.notes).forEach(k=>{segIntentCounts[k]=(segIntentCounts[k]||0)+1})
+    const s=(l.source||"").toLowerCase(); if(s) segSourceCounts[s]=(segSourceCounts[s]||0)+1
   })
   const newTodayLeads = displayLeads.filter(l=>(l.createdAt||"").startsWith(today))
   const olderLeads = displayLeads.filter(l=>!(l.createdAt||"").startsWith(today))
@@ -2927,7 +2974,7 @@ export default function App(){
     return [...newToday, ...older]
   }
 
-  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false);setNeedsAttemptOnly(false)}
+  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setFSource("");setFIntent("");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false);setNeedsAttemptOnly(false)}
 
   return(
     <div style={{minHeight:"100vh",background:"#060e20"}}>
@@ -3310,6 +3357,21 @@ export default function App(){
                     <option value="all">Status: All</option>
                     {STATUS_OPTIONS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
                   </select>
+                  <select className="sel" value={fSource} onChange={e=>setFSource(e.target.value)}
+                    title="Where the lead came from">
+                    <option value="">Source: All</option>
+                    <option value="npi registry">🏥 NPI Healthcare</option>
+                    <option value="openstreetmap">🗺️ OpenStreetMap</option>
+                    <option value="apollo">📞 Apollo DM</option>
+                    <option value="google places">📍 Google Places</option>
+                    <option value="permit (new construction)">🏗️ Permit</option>
+                  </select>
+                  <select className="sel" value={fIntent} onChange={e=>setFIntent(e.target.value)}
+                    title="Hot-intent signal — why this lead matters right now"
+                    style={{borderColor:fIntent?"#ff6e8455":""}}>
+                    <option value="">Intent: All</option>
+                    {Object.entries(INTENT_META).map(([k,m])=><option key={k} value={k}>{m.label}</option>)}
+                  </select>
                   <select className="sel" value={sortBy} onChange={e=>setSort(e.target.value)}>
                     <option value="smart">Smart (fresh + rested first)</option>
                     <option value="score">Highest Score</option>
@@ -3422,6 +3484,32 @@ export default function App(){
                 </div>
               </section>
 
+              {/* Quick-segment bar — counts by hot-intent + source for this view.
+                  Click a chip to filter; click again to clear. Gives the caller
+                  an instant "what's in here and what's hot" read. */}
+              {(()=>{
+                const intentChips=Object.entries(segIntentCounts).sort((a,b)=>b[1]-a[1])
+                const srcChips=Object.entries(segSourceCounts).sort((a,b)=>b[1]-a[1])
+                if(intentChips.length===0&&srcChips.length===0) return null
+                const chip=(color,on)=>({fontSize:11,fontWeight:600,fontFamily:"inherit",cursor:"pointer",
+                  padding:"4px 10px",borderRadius:6,transition:"all .12s",
+                  background:on?color:color+"18",color:on?"#000011":color,border:`1px solid ${color}${on?"":"40"}`})
+                const lbl={fontSize:9,color:"#40485d",textTransform:"uppercase",letterSpacing:".09em",fontWeight:700,marginRight:2}
+                return(
+                  <div style={{display:"flex",gap:7,flexWrap:"wrap",alignItems:"center",marginBottom:12,
+                    background:"#0f1930",border:"1px solid #40485d20",borderRadius:10,padding:"10px 14px"}}>
+                    {intentChips.length>0&&<span style={lbl}>🔥 Hot intent</span>}
+                    {intentChips.map(([k,n])=>{const m=INTENT_META[k];const on=fIntent===k;return(
+                      <button key={k} title={m.pitch} onClick={()=>setFIntent(on?"":k)} style={chip(m.color,on)}>{m.label} · {n}</button>
+                    )})}
+                    {srcChips.length>0&&<span style={{...lbl,marginLeft:intentChips.length?10:0}}>Source</span>}
+                    {srcChips.map(([s,n])=>{const m=sourceMeta(s);const on=fSource===s;return(
+                      <button key={s} onClick={()=>setFSource(on?"":s)} style={chip(m.color,on)}>{m.label} · {n}</button>
+                    )})}
+                  </div>
+                )
+              })()}
+
               <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
                 <div style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
                   padding:"10px 24px",fontSize:"0.6rem",fontWeight:700,
@@ -3480,10 +3568,17 @@ export default function App(){
                             )}
                             <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}{lead.city&&lead.state?` · ${lead.city}, ${lead.state}`:lead.state?` · ${lead.state}`:lead.city?` · ${lead.city}`:""}</div>
                             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
+                              {/* Hot-intent badges first — WHY this lead matters right now. */}
+                              {parseIntents(lead.notes).map(k=>{
+                                const m=INTENT_META[k]
+                                return <span key={k} title={m.pitch} style={{fontSize:9,fontWeight:700,
+                                  background:m.color+"22",color:m.color,padding:"2px 7px",borderRadius:4,
+                                  border:`1px solid ${m.color}55`,cursor:"help"}}>{m.label}</span>
+                              })}
                               {isNewToday&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4,border:"1px solid #69f6b830",fontWeight:700}}>NEW TODAY</span>}
                               {takenBy&&<span style={{fontSize:9,background:"#ff6e8420",color:"#ff6e84",padding:"2px 7px",borderRadius:4,border:"1px solid #ff6e8430"}}>🔒 {takenBy}</span>}
                               {!takenBy&&lead.assignedTo&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>✓ mine</span>}
-                              {lead.source&&<span className="src-tag">{lead.source}</span>}
+                              {lead.source&&(()=>{const sm=sourceMeta(lead.source);return <span style={{fontSize:9,background:sm.color+"18",color:sm.color,padding:"2px 7px",borderRadius:4,letterSpacing:".03em",border:`1px solid ${sm.color}30`}}>{sm.label}</span>})()}
                               {isCb&&<span style={{fontSize:9,background:"#8b5cf618",color:"#8b5cf6",padding:"2px 7px",borderRadius:4,border:"1px solid #8b5cf630"}}>🔔 {lead.callbackDate}</span>}
                               {/* 📧 Persistent email-history badge — survives status changes
                                   so caller knows "this lead got our email" even after a
