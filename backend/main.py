@@ -166,6 +166,11 @@ NON_ADMIN_FREE_SOURCE_CAP = int(os.getenv("NON_ADMIN_FREE_SOURCE_CAP", "25"))
 # phone-sparse; this converts the wide net into callable leads without letting
 # one pull burn unlimited Apollo credits. Admin-only (it costs ~1 credit each).
 OSM_ENRICH_CAP = int(os.getenv("OSM_ENRICH_CAP", "50"))
+# Wall-clock budgets so a big-state pull (6 Overpass queries + 50 sequential
+# Apollo calls) can't blow the HTTP gateway timeout and hang. Each phase returns
+# whatever it gathered so far — partial coverage beats a dead request.
+OSM_FETCH_BUDGET_SEC  = int(os.getenv("OSM_FETCH_BUDGET_SEC", "35"))
+OSM_ENRICH_BUDGET_SEC = int(os.getenv("OSM_ENRICH_BUDGET_SEC", "40"))
 
 # Google Places pricing (May 2025) — used for usage_events cost tracking
 # AND run-level spend prediction.
@@ -3471,13 +3476,17 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
         return None
 
     seen_ids, elements = set(), []
+    fetch_deadline = time.time() + OSM_FETCH_BUDGET_SEC
     for cat in categories:
         sels = OSM_CATEGORY_SELECTORS.get(cat, [])
         if not sels:
             continue
+        if time.time() > fetch_deadline:
+            print(f"[OSM] fetch budget ({OSM_FETCH_BUDGET_SEC}s) hit — stopping at {cat}, partial result")
+            break
         body = "\n".join(f"  nwr{sel}(area.a);" for sel in sels)
-        ql = (f"[out:json][timeout:120];\n"
-              f'area["ISO3166-2"="{iso}"]->.a;\n(' + body + "\n);\nout center 300;")
+        ql = (f"[out:json][timeout:60];\n"
+              f'area["ISO3166-2"="{iso}"]->.a;\n(' + body + "\n);\nout center 250;")
         els = _overpass(ql)
         if els is None:
             print(f"[OSM] {cat}: all mirrors failed — skipping")
@@ -3615,9 +3624,10 @@ def source_osm(body: FreeSourceRequest, user: str = Depends(verify_token)):
     # only — it spends ~1 Apollo credit per company looked up.
     enriched = 0
     if body.enrich and is_admin(user) and APOLLO_API_KEY and not APOLLO_KILL_SWITCH:
+        enrich_deadline = time.time() + OSM_ENRICH_BUDGET_SEC
         for lead in all_raw:
-            if enriched >= OSM_ENRICH_CAP:
-                break
+            if enriched >= OSM_ENRICH_CAP or time.time() > enrich_deadline:
+                break  # bounded so a big-state pull can't hang the request
             if not is_valid_us_phone(lead.get("phone")):
                 if apollo_enrich_lead_in_place(lead):
                     enriched += 1
