@@ -3621,23 +3621,27 @@ def source_npi(body: FreeSourceRequest, user: str = Depends(verify_token)):
 # the leads are actually callable). Add metros over time; many publish nothing
 # usable (address only), which is why this is curated, not blanket.
 # ════════════════════════════════════════════════════════════════════════════
-PERMIT_SOURCES = [
-    {
-        "name": "Austin, TX", "state": "TX",
-        "url": "https://data.austintexas.gov/resource/3syk-w9eu.json",
-        # Commercial new builds / additions only — skip residential + sign/electrical noise.
-        "where": "permit_class_mapped='Commercial' and work_class in('New','Addition') "
-                 "and permit_type_desc='Building Permit'",
-        "date_field": "issue_date",
-        "company_fields":  ["applicant_org", "contractor_company_name"],
-        "phone_fields":    ["applicant_phone", "contractor_phone"],
-        "name_field":      "applicant_full_name",
-        "addr_field":      "original_address1",
-        "city_field":      "original_city",
-        "state_field":     "original_state",
-        "desc_field":      "description",
-        "workclass_field": "work_class",
-    },
+# Curated Socrata permit datasets — (state, metro, domain, dataset_id). Just an
+# address; a heuristic field-detector maps each dataset's columns, so adding a
+# metro is one line, not a custom schema. Datasets that change/vanish yield 0
+# (engine fails soft). Coverage ≠ every state — many publish no usable permit
+# data; this is the metros that do, expandable on request.
+SOCRATA_PERMIT_SOURCES = [
+    ("TX", "Austin",       "data.austintexas.gov",       "3syk-w9eu"),
+    ("TX", "Dallas",       "www.dallasopendata.com",     "e7gq-4sah"),
+    ("CA", "Los Angeles",  "data.lacity.org",            "pi9x-tg5x"),
+    ("CA", "Roseville",    "data.roseville.ca.us",       "buxi-gsvq"),
+    ("FL", "Gainesville",  "data.cityofgainesville.org", "p798-x3nx"),
+    ("LA", "Baton Rouge",  "data.brla.gov",              "7fq7-8j7r"),
+    ("LA", "New Orleans",  "data.nola.gov",              "nbcf-m6c2"),
+    ("OH", "Cincinnati",   "data.cincinnati-oh.gov",     "uhjb-xac9"),
+    ("IL", "Chicago",      "data.cityofchicago.org",     "ydr8-5enu"),
+    ("CO", "Fort Collins", "opendata.fcgov.com",         "fvgz-viez"),
+    ("AZ", "Mesa",         "citydata.mesaaz.gov",        "dzpk-hxfb"),
+    ("HI", "Honolulu",     "data.honolulu.gov",          "4vab-c87q"),
+    ("WI", "Janesville",   "janesville.data.socrata.com","qskr-bfe6"),
+    ("NY", "New York City","data.cityofnewyork.us",      "ipu4-2q9a"),
+    ("MA", "Cambridge",    "data.cambridgema.gov",       "9qm7-wbdc"),
 ]
 
 def _permit_industry(desc: str) -> str:
@@ -3652,45 +3656,134 @@ def _permit_industry(desc: str) -> str:
             return label
     return "Commercial Construction"
 
+# Keep commercial, drop residential — these run against the description + permit
+# type since most datasets lack a clean class flag.
+_PERMIT_COMMERCIAL_HINTS = ["commercial", "office", "retail", "tenant", "restaurant", "medical",
+    "clinic", "hospital", "school", "university", "warehouse", "industrial", "hotel", "motel",
+    "mixed use", "business", "store", "church", "worship", "institutional", "assembly",
+    "mercantile", "bank", "daycare", "gym", "fitness", "shopping"]
+_PERMIT_RESIDENTIAL_HINTS = ["single family", "single-family", "sfr", " sfd", "1 & 2 family",
+    "one and two family", "dwelling", "residential", "townhome", "townhouse", "duplex", "reroof",
+    "re-roof", "roof replace", "water heater", "solar", "swimming pool", "fence", "deck", "shed",
+    "accessory dwelling", " adu", "mobile home"]
+
+def _permit_is_commercial(klass: str, text: str) -> bool:
+    if "commercial" in (klass or "").lower():
+        return True
+    t = f"{klass} {text}".lower()
+    if any(h in t for h in _PERMIT_COMMERCIAL_HINTS):
+        return True
+    if any(h in t for h in _PERMIT_RESIDENTIAL_HINTS):
+        return False
+    return False  # unknown → drop, to keep the feed free of residential noise
+
+def _pick_field(keys, priorities, exclude=()):
+    """Return ALL original-cased keys matching the priority substrings (none of
+    `exclude`), ordered by priority. Socrata omits null fields per-row, so we
+    sample many rows AND keep every candidate — the row mapper picks the first
+    non-empty (e.g. applicant_phone on one row, contractor_phone on the next)."""
+    low = [(k.lower(), k) for k in keys]
+    out = []
+    for p in priorities:
+        for lk, orig in low:
+            if p in lk and not any(x in lk for x in exclude) and orig not in out:
+                out.append(orig)
+    return out
+
+def _permit_val(row, candidates):
+    """First non-empty value among candidate field names."""
+    for c in candidates:
+        v = row.get(c)
+        if v not in (None, "", "N/A"):
+            return v
+    return ""
+
+def _detect_permit_fields(k: list) -> dict:
+    return {
+        "addr":   _pick_field(k, ["original_address1", "street_address", "streetaddress",
+                  "primary_address", "property_address", "project_address", "site_address", "address"],
+                  exclude=["contact", "contractor", "applicant", "owner", "mail"]),
+        "house":  _pick_field(k, ["street_number", "streetnumber", "house_number"]),
+        "street": _pick_field(k, ["street_name", "streetname"]),
+        "city":   _pick_field(k, ["original_city", "project_city", "site_city", "city"],
+                  exclude=["contact", "contractor", "applicant", "owner", "capacity"]),
+        "state":  _pick_field(k, ["original_state", "project_state", "site_state", "state"],
+                  exclude=["contact", "contractor", "applicant", "owner", "real_estate", "statu"]),
+        "date":   _pick_field(k, ["issue_date", "issued_date", "issueddate", "permit_issue", "issue",
+                  "applieddate", "application_start", "permit_date", "file_date"]),
+        "desc":   _pick_field(k, ["work_description", "description_of_work", "projectdescription",
+                  "b1_work_desc", "scope", "description"],
+                  exclude=["contact", "contractor", "applicant", "owner"]),
+        "ptype":  _pick_field(k, ["permit_type_desc", "permittypemapped", "permit_type", "permittype",
+                  "work_type", "worktype", "subtype", "type"]),
+        "company": _pick_field(k, ["applicant_org", "company_name", "companyname", "business_name",
+                  "contractor_company", "contractor_name", "contractorname", "contractor",
+                  "applicant_name", "applicantname", "owner_name", "ownername", "contact_1_name", "owner"],
+                  exclude=["address", "city", "state", "zip", "phone", "trade", "type"]),
+        "phone":  _pick_field(k, ["applicant_phone", "contractor_phone", "phone"]),
+        "name":   _pick_field(k, ["applicant_full_name", "contractor_full_name", "applicantname",
+                  "contact_1_name"]),
+        "klass":  _pick_field(k, ["permit_class_mapped", "permitclassmapped", "permit_class",
+                  "permitclass", "class"]),
+    }
+
 def fetch_permits(state_abbrev: str, days: int = 30) -> list:
-    """Pull recent commercial new-construction permits for configured metros in
-    a state. Returns raw lead dicts tagged [INTENT:newbuild]. Free, no key."""
-    sources = [s for s in PERMIT_SOURCES if s["state"] == state_abbrev.upper()]
-    if not sources:
-        return []
-    cutoff = (datetime.utcnow() - timedelta(days=max(1, min(days, 120)))).strftime("%Y-%m-%dT00:00:00")
+    """Pull recent commercial permits for every configured metro in a state.
+    Heuristically maps each dataset's schema. Returns raw lead dicts tagged
+    [INTENT:newbuild]. Free, no key. (days kept for signature compat.)"""
+    sources = [s for s in SOCRATA_PERMIT_SOURCES if s[0] == state_abbrev.upper()]
     leads = []
-    for s in sources:
-        where = f"{s['where']} and {s['date_field']} > '{cutoff}'"
-        try:
-            r = req_lib.get(s["url"], params={"$where": where, "$order": f"{s['date_field']} DESC",
-                            "$limit": FREE_SOURCE_MAX_ROWS}, headers={"User-Agent": "LeadFlow/1.0"}, timeout=40)
-            rows = r.json() if r.status_code == 200 else []
-            if r.status_code != 200:
-                print(f"[PERMITS] {s['name']} HTTP {r.status_code}: {str(rows)[:150]}")
+    for st, name, domain, rid in sources:
+        base = f"https://{domain}/resource/{rid}.json"
+        hdr = {"User-Agent": "LeadFlow/1.0 (Vision Cleaning)"}
+        try:  # sample many rows (Socrata drops null fields per-row) → union of keys
+            sr = req_lib.get(base, params={"$limit": 50}, headers=hdr, timeout=25)
+            sample = sr.json() if sr.status_code == 200 else []
+            if not sample:
+                print(f"[PERMITS] {name}: sample HTTP {sr.status_code}")
+                continue
+            union_keys = set()
+            for row in sample:
+                union_keys.update(row.keys())
+            f = _detect_permit_fields(sorted(union_keys))
         except Exception as e:
-            print(f"[PERMITS] {s['name']} failed: {e}")
+            print(f"[PERMITS] {name}: sample failed {e}")
+            continue
+        params = {"$limit": FREE_SOURCE_MAX_ROWS}
+        if f["date"]:
+            params["$order"] = f"{f['date']} DESC"   # newest first
+        try:
+            r = req_lib.get(base, params=params, headers=hdr, timeout=45)
+            if r.status_code != 200 and "$order" in params:  # bad date type → retry unordered
+                r = req_lib.get(base, params={"$limit": FREE_SOURCE_MAX_ROWS}, headers=hdr, timeout=45)
+            rows = r.json() if r.status_code == 200 else []
+        except Exception as e:
+            print(f"[PERMITS] {name}: fetch failed {e}")
             continue
         for row in rows:
-            company = next((row.get(f) for f in s["company_fields"] if row.get(f)), "")
-            phone   = next((row.get(f) for f in s["phone_fields"] if row.get(f)), "")
-            desc    = row.get(s["desc_field"], "") or ""
-            workcls = row.get(s.get("workclass_field",""), "") or ""
-            addr    = row.get(s["addr_field"], "") or ""
-            full    = row.get(s.get("name_field",""), "") or ""
+            desc  = _permit_val(row, f["desc"])
+            ptype = _permit_val(row, f["ptype"])
+            klass = _permit_val(row, f["klass"])
+            if not _permit_is_commercial(klass, f"{desc} {ptype}"):
+                continue
+            company = _permit_val(row, f["company"])
+            addr = _permit_val(row, f["addr"])
+            if not addr and f["house"] and f["street"]:
+                addr = " ".join(x for x in [_permit_val(row, f["house"]), _permit_val(row, f["street"])] if x).strip()
+            full = _permit_val(row, f["name"])
             fn, ln = "", ""
             if full:
-                parts = full.split()
+                parts = str(full).split()
                 fn, ln = parts[0], " ".join(parts[1:]) if len(parts) > 1 else ""
             if not company:
-                company = f"{workcls} commercial build — {addr}".strip(" —") or desc[:60]
+                company = full or (f"New commercial build — {addr}".strip(" —")) or desc[:50]
             leads.append({
-                "company": company, "industry": _permit_industry(desc),
-                "phone": phone, "firstName": fn, "lastName": ln,
-                "address": addr, "city": row.get(s["city_field"], ""),
-                "state": row.get(s["state_field"], state_abbrev.upper()),
-                "notes": f"[INTENT:newbuild] {workcls} commercial permit ({s['name']}): "
-                         f"{desc[:120]} @ {addr}".strip(),
+                "company": company, "industry": _permit_industry(f"{desc} {ptype}"),
+                "phone": _permit_val(row, f["phone"]), "firstName": fn, "lastName": ln,
+                "address": addr, "city": _permit_val(row, f["city"]),
+                "state": _permit_val(row, f["state"]) or state_abbrev.upper(),
+                "notes": f"[INTENT:newbuild] Commercial permit ({name}): "
+                         f"{(desc or ptype)[:120]} @ {addr}".strip(),
             })
     return leads
 
@@ -3701,10 +3794,10 @@ def source_permits(body: FreeSourceRequest, user: str = Depends(verify_token)):
     _free_source_guard(user)
     if not body.state:
         raise HTTPException(status_code=400, detail="Pick a state.")
-    configured = {s["state"] for s in PERMIT_SOURCES}
+    configured = {s[0] for s in SOCRATA_PERMIT_SOURCES}
     if body.state.upper() not in configured:
         return {"found": 0, "saved": 0, "alreadyInDb": 0, "droppedUncallable": 0,
-                "summary": f"No permit feed configured for {body.state} yet. Available: "
+                "summary": f"No permit feed configured for {body.state} yet. Covered states: "
                            f"{', '.join(sorted(configured))}. (Permit portals are per-metro; ask to add yours.)"}
     raw = fetch_permits(body.state, body.limit if (body.limit and body.limit < 121) else 30)
     res = ingest_leads(raw, "Permit (new construction)", user)

@@ -579,7 +579,8 @@ function FreeSourceFinder({onFound}){
             🏗️ <b style={{color:"#dee5ff"}}>Timing intel, not a dial-list.</b> Pulls recent commercial new-construction
             permits — a future cleaning need being born. The reachable contact is the builder/contractor, so use these
             to <b>time outreach</b> and learn what's going up in your territory, not as ready cleaning prospects.
-            Currently seeded for <b>Austin, TX</b> (more metros on request).
+            Covers metros in <b>TX, CA, FL, LA, OH, IL, CO, AZ, HI, WI, NY, MA</b> (callable contacts only where the
+            portal publishes them — strongest in TX). More on request.
           </div>
         )}
 
