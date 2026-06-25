@@ -482,6 +482,7 @@ function FreeSourceFinder({onFound}){
   const [cities,setCities] = useState("")
   const [cats,setCats]     = useState(["Healthcare","Education","Industrial","Entertainment"])
   const [taxonomy,setTax]  = useState("")
+  const [enrich,setEnrich] = useState(false)
   const [loading,setLoad]  = useState(false)
   const [result,setResult] = useState(null)
   const [err,setErr]       = useState("")
@@ -495,7 +496,7 @@ function FreeSourceFinder({onFound}){
     setLoad(true); setResult(null)
     try{
       const path = src==="osm" ? "/api/sources/osm" : "/api/sources/npi"
-      const body = src==="osm" ? {state,cities,categories:cats}
+      const body = src==="osm" ? {state,cities,categories:cats,enrich}
                                : {state,cities,taxonomy,limit:200}
       const res = await api(path,{method:"POST",body:JSON.stringify(body)})
       setResult(res); if(res.saved>0) onFound&&onFound()
@@ -554,6 +555,12 @@ function FreeSourceFinder({onFound}){
                 </button>
               ))}
             </div>
+            {isAdmin()&&(
+              <label style={{display:"flex",alignItems:"center",gap:8,fontSize:11,color:"#a3aac4",cursor:"pointer",marginTop:10}}>
+                <input type="checkbox" checked={enrich} onChange={e=>setEnrich(e.target.checked)} style={{cursor:"pointer"}}/>
+                <span>Find decision-makers via Apollo <span style={{color:"#8b5cf6"}}>(fills phones for OSM's phoneless rows — ~1 credit each, up to 50/pull)</span></span>
+              </label>
+            )}
           </div>
         )}
         {src==="npi"&&(

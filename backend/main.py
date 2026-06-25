@@ -162,6 +162,10 @@ NPI_API_URL = os.getenv("NPI_API_URL", "https://npiregistry.cms.hhs.gov/api/")
 FREE_SOURCE_MAX_ROWS = int(os.getenv("FREE_SOURCE_MAX_ROWS", "200"))
 # Non-admin daily free-source pull cap (free, so looser than the paid caps).
 NON_ADMIN_FREE_SOURCE_CAP = int(os.getenv("NON_ADMIN_FREE_SOURCE_CAP", "25"))
+# Max phoneless OSM leads to Apollo-enrich per run when enrich=true. OSM is
+# phone-sparse; this converts the wide net into callable leads without letting
+# one pull burn unlimited Apollo credits. Admin-only (it costs ~1 credit each).
+OSM_ENRICH_CAP = int(os.getenv("OSM_ENRICH_CAP", "50"))
 
 # Google Places pricing (May 2025) — used for usage_events cost tracking
 # AND run-level spend prediction.
@@ -665,24 +669,35 @@ def clean(v): return str(v).strip() if v else ""
 # how frequently-cleaned, and how outsourcing-prone the facility is. Matched
 # against industry + company name (lowercased). First tier that matches wins.
 CLEANING_FIT_TIERS = [
-    # (points, [keywords]) — high to low
-    (40, ["hospital", "surgery", "surgical", "nursing home", "nursing facility",
-          "assisted living", "senior living", "dialysis", "rehabilitation",
-          "medical center", "health system", "imaging center", "urgent care"]),
-    (36, ["clinic", "medical", "dental", "orthodont", "veterinary", "physical therapy",
-          "health", "healthcare", "pediatric", "dermatology", "outpatient"]),
-    (38, ["manufacturing", "warehouse", "distribution", "factory", "plant",
-          "industrial", "fabrication", "processing", "logistics", "fulfillment"]),
-    (36, ["school", "university", "college", "campus", "academy", "daycare",
-          "preschool", "childcare", "education", "montessori", "charter"]),
-    (34, ["casino", "arena", "stadium", "convention", "event venue", "banquet",
-          "theater", "theatre", "fitness", "gym", "athletic club", "bowling",
-          "hotel", "resort", "conference center"]),
-    (24, ["office", "corporate", "headquarters", "bank", "credit union",
-          "dealership", "property management", "law firm", "accounting",
-          "insurance", "real estate", "church", "worship", "clubhouse"]),
-    (12, ["retail", "store", "shop", "salon", "spa", "restaurant", "cafe",
-          "boutique", "barber"]),
+    # (points, [keywords]) — high to low. Keywords are substrings, matched
+    # against industry + company + title, so they must catch NPI taxonomy
+    # strings ("Family Medicine", "Skilled Nursing Facility, Internal Medicine")
+    # and Apollo/OSM labels alike.
+    (40, ["hospital", "surgery", "surgical", "surgeon", "nursing home", "nursing facility",
+          "skilled nursing", "assisted living", "senior living", "long term care",
+          "dialysis", "rehabilitation", "rehab", "medical center", "health system",
+          "imaging center", "radiology", "urgent care", "emergency", "trauma",
+          "behavioral health", "psychiatric", "hospice", "ambulatory"]),
+    (36, ["clinic", "medical", "medicine", "physician", "practice", "dental", "dentist",
+          "orthodont", "veterinary", "veterinarian", "physical therapy", "therapy",
+          "health", "healthcare", "pediatric", "dermatology", "cardiology", "oncology",
+          "orthopedic", "ophthalmology", "optometr", "chiropract", "pharmacy",
+          "family medicine", "internal medicine", "primary care", "outpatient", "wellness"]),
+    (38, ["manufacturing", "manufacturer", "warehouse", "distribution", "factory", "plant",
+          "industrial", "fabrication", "machining", "processing", "logistics", "freight",
+          "fulfillment", "storage", "cold storage", "assembly", "foundry", "refinery"]),
+    (36, ["school", "university", "college", "campus", "academy", "daycare", "day care",
+          "preschool", "pre-school", "childcare", "child care", "education", "educational",
+          "montessori", "charter", "learning center", "institute", "seminary", "head start"]),
+    (34, ["casino", "arena", "stadium", "convention", "event venue", "events venue", "banquet",
+          "theater", "theatre", "cinema", "fitness", "gym", "athletic", "recreation",
+          "bowling", "hotel", "motel", "resort", "conference center", "nightclub", "country club"]),
+    (24, ["office", "corporate", "headquarters", "bank", "credit union", "financial",
+          "dealership", "property management", "law firm", "attorney", "legal", "accounting",
+          "cpa", "insurance", "real estate", "realty", "church", "worship", "ministry",
+          "clubhouse", "municipal", "city hall", "government", "library"]),
+    (12, ["retail", "store", "shop", "salon", "spa", "restaurant", "cafe", "coffee",
+          "boutique", "barber", "grocery", "market", "bar ", "diner"]),
 ]
 # National chains decide cleaning at HQ — a local rep can't close them. Demote.
 CHAIN_MARKERS = ["mcdonald", "starbucks", "walmart", "target", "cvs", "walgreens",
@@ -3535,6 +3550,7 @@ class FreeSourceRequest(BaseModel):
     categories: Optional[object] = None   # OSM only: list of vertical names
     taxonomy:   Optional[str] = ""        # NPI only: e.g. "Nursing", "Dentist"
     limit:      Optional[int] = 200
+    enrich:     Optional[bool] = False    # OSM only: Apollo-enrich phoneless leads (admin)
 
 def _free_source_guard(user: str):
     """Shared preflight: kill switch + non-admin daily cap. Raises HTTPException."""
@@ -3556,15 +3572,30 @@ def source_osm(body: FreeSourceRequest, user: str = Depends(verify_token)):
     cats = body.categories if isinstance(body.categories, list) and body.categories \
            else list(OSM_CATEGORY_SELECTORS.keys())
     cities = [c.strip() for c in (body.cities or "").split(",") if c.strip()] or [""]
-    agg, all_raw = {"found":0,"saved":0,"alreadyInDb":0,"droppedUncallable":0}, []
+    all_raw = []
     for city in cities:
         all_raw += fetch_osm(body.state, cats, city)
+
+    # OSM is phone-sparse. Optionally Apollo-enrich the phoneless rows (up to a
+    # cap) so the wide net becomes callable instead of getting dropped. Admin
+    # only — it spends ~1 Apollo credit per company looked up.
+    enriched = 0
+    if body.enrich and is_admin(user) and APOLLO_API_KEY and not APOLLO_KILL_SWITCH:
+        for lead in all_raw:
+            if enriched >= OSM_ENRICH_CAP:
+                break
+            if not is_valid_us_phone(lead.get("phone")):
+                if apollo_enrich_lead_in_place(lead):
+                    enriched += 1
+
     res = ingest_leads(all_raw, "OpenStreetMap", user)
-    for k in agg: agg[k] += res[k]
-    audit_log(user, "source_osm", "lead", None, {"state": body.state, "categories": cats, **agg})
-    agg["summary"] = (f"OSM: {agg['found']} found · {agg['alreadyInDb']} already in DB · "
-                      f"{agg['droppedUncallable']} uncallable · {agg['saved']} new saved")
-    return agg
+    res["apolloEnriched"] = enriched
+    audit_log(user, "source_osm", "lead", None,
+              {"state": body.state, "categories": cats, "enriched": enriched, **res})
+    enrich_note = f" · {enriched} Apollo-enriched" if enriched else ""
+    res["summary"] = (f"OSM: {res['found']} found · {res['alreadyInDb']} already in DB · "
+                      f"{res['droppedUncallable']} uncallable{enrich_note} · {res['saved']} new saved")
+    return res
 
 @app.post("/api/sources/npi")
 def source_npi(body: FreeSourceRequest, user: str = Depends(verify_token)):
