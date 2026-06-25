@@ -3894,25 +3894,31 @@ def enrich_lookalike(user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
 
-    applied = 0
+    applied, matched, patch_err = 0, 0, ""
     for lead in candidates:
         if "[INTENT:lookalike]" in (lead.get("notes") or ""):
             continue
         ti = _fit_tier_index(lead)
         if ti not in win_tiers:
             continue
+        matched += 1
         # Vertical match required; same-state is a bonus reason, not a gate.
         why = "matches a vertical you convert"
         if (lead.get("state") or "").upper() in win_states:
             why += " in a state you win in"
         add_intent_marker(lead, "lookalike", why)
         try:
-            req_lib.patch(
+            pr = req_lib.patch(
                 f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead['id']))}",
                 headers={**SB_HEADERS, "Prefer": "return=minimal"},
                 json={"notes": lead["notes"], "score": score_lead(lead)}, timeout=15)
-            applied += 1
+            if pr.status_code in (200, 204):
+                applied += 1
+            elif not patch_err:
+                patch_err = f"HTTP {pr.status_code}: {pr.text[:160]}"
         except Exception as e:
+            if not patch_err:
+                patch_err = str(e)[:160]
             print(f"[LOOKALIKE] patch failed for {lead.get('id')}: {e}")
 
     top_labels = [", ".join(CLEANING_FIT_TIERS[ti][1][:2]) for ti, _ in tier_ct.most_common(3)]
@@ -3920,6 +3926,8 @@ def enrich_lookalike(user: str = Depends(verify_admin)):
               {"wins": len(wins), "applied": applied, "win_states": list(win_states)})
     return {"applied": applied, "wins": len(wins),
             "winning_verticals": top_labels, "winning_states": sorted(win_states),
+            "debug": {"candidates": len(candidates), "matched": matched,
+                      "win_tiers": sorted(win_tiers), "patch_err": patch_err},
             "summary": f"Learned from {len(wins)} wins → boosted {applied} matching leads "
                        f"(verticals like {'; '.join(top_labels)})"}
 
