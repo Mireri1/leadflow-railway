@@ -495,9 +495,12 @@ function FreeSourceFinder({onFound}){
     if(src==="osm" && cats.length===0){ setErr("Pick at least one category."); return }
     setLoad(true); setResult(null)
     try{
-      const path = src==="osm" ? "/api/sources/osm" : "/api/sources/npi"
+      const path = src==="osm" ? "/api/sources/osm"
+                 : src==="npi" ? "/api/sources/npi"
+                 : "/api/sources/permits"
       const body = src==="osm" ? {state,cities,categories:cats,enrich}
-                               : {state,cities,taxonomy,limit:200}
+                 : src==="npi" ? {state,cities,taxonomy,limit:200}
+                 : {state,limit:30}
       const res = await api(path,{method:"POST",body:JSON.stringify(body)})
       setResult(res); if(res.saved>0) onFound&&onFound()
     }catch(ex){ setErr(ex.message||"Pull failed — try again or a different state.") }
@@ -516,7 +519,7 @@ function FreeSourceFinder({onFound}){
 
       {/* Source toggle */}
       <div style={{display:"flex",gap:8,marginBottom:14}}>
-        {[["osm","🗺️ OpenStreetMap"],["npi","🏥 NPI Healthcare"]].map(([v,label])=>(
+        {[["osm","🗺️ OpenStreetMap"],["npi","🏥 NPI Healthcare"],["permits","🏗️ New-Build Permits"]].map(([v,label])=>(
           <button key={v} onClick={()=>setSrc(v)} type="button"
             style={{padding:"6px 14px",borderRadius:8,fontSize:12,fontFamily:"inherit",cursor:"pointer",
               background:src===v?"#69f6b8":"transparent",color:src===v?"#001b12":"#a3aac4",
@@ -570,10 +573,19 @@ function FreeSourceFinder({onFound}){
               placeholder="e.g. Nursing, Dentist, Hospital — blank = all healthcare orgs"/>
           </div>
         )}
+        {src==="permits"&&(
+          <div style={{gridColumn:"1 / -1",fontSize:11,color:"#a3aac4",background:"#0f1930",
+            border:"1px solid #40485d40",borderRadius:8,padding:"10px 12px",lineHeight:1.5}}>
+            🏗️ <b style={{color:"#dee5ff"}}>Timing intel, not a dial-list.</b> Pulls recent commercial new-construction
+            permits — a future cleaning need being born. The reachable contact is the builder/contractor, so use these
+            to <b>time outreach</b> and learn what's going up in your territory, not as ready cleaning prospects.
+            Currently seeded for <b>Austin, TX</b> (more metros on request).
+          </div>
+        )}
 
         <button className="btn btn-p" onClick={pull} disabled={loading}
           style={{gridColumn:"1 / -1",padding:"10px 22px",background:"#69f6b8",color:"#001b12",fontWeight:600}}>
-          {loading?"Pulling…":(src==="osm"?"Pull from OpenStreetMap →":"Pull from NPI Registry →")}
+          {loading?"Pulling…":(src==="osm"?"Pull from OpenStreetMap →":src==="npi"?"Pull from NPI Registry →":"Pull New-Build Permits →")}
         </button>
       </div>
 

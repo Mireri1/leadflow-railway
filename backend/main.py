@@ -3614,6 +3614,106 @@ def source_npi(body: FreeSourceRequest, user: str = Depends(verify_token)):
     return res
 
 # ════════════════════════════════════════════════════════════════════════════
+# PERMIT / NEW-CONSTRUCTION TRIGGER FEED — a commercial build permit is a future
+# cleaning need being born. Open-data permit portals vary per jurisdiction, so
+# this is a pluggable registry: each entry knows its Socrata dataset + field
+# map. Seeded with Austin TX (rich — includes contractor/applicant phones, so
+# the leads are actually callable). Add metros over time; many publish nothing
+# usable (address only), which is why this is curated, not blanket.
+# ════════════════════════════════════════════════════════════════════════════
+PERMIT_SOURCES = [
+    {
+        "name": "Austin, TX", "state": "TX",
+        "url": "https://data.austintexas.gov/resource/3syk-w9eu.json",
+        # Commercial new builds / additions only — skip residential + sign/electrical noise.
+        "where": "permit_class_mapped='Commercial' and work_class in('New','Addition') "
+                 "and permit_type_desc='Building Permit'",
+        "date_field": "issue_date",
+        "company_fields":  ["applicant_org", "contractor_company_name"],
+        "phone_fields":    ["applicant_phone", "contractor_phone"],
+        "name_field":      "applicant_full_name",
+        "addr_field":      "original_address1",
+        "city_field":      "original_city",
+        "state_field":     "original_state",
+        "desc_field":      "description",
+        "workclass_field": "work_class",
+    },
+]
+
+def _permit_industry(desc: str) -> str:
+    d = (desc or "").lower()
+    for label, kws in [("Medical", ["medical", "clinic", "hospital", "dental", "health"]),
+                       ("Office", ["office"]),
+                       ("Education", ["school", "education", "university", "college"]),
+                       ("Industrial", ["warehouse", "industrial", "manufactur", "distribution"]),
+                       ("Hotel", ["hotel", "motel", "hospitality"]),
+                       ("Retail", ["retail", "restaurant", "store", "shopping"])]:
+        if any(k in d for k in kws):
+            return label
+    return "Commercial Construction"
+
+def fetch_permits(state_abbrev: str, days: int = 30) -> list:
+    """Pull recent commercial new-construction permits for configured metros in
+    a state. Returns raw lead dicts tagged [INTENT:newbuild]. Free, no key."""
+    sources = [s for s in PERMIT_SOURCES if s["state"] == state_abbrev.upper()]
+    if not sources:
+        return []
+    cutoff = (datetime.utcnow() - timedelta(days=max(1, min(days, 120)))).strftime("%Y-%m-%dT00:00:00")
+    leads = []
+    for s in sources:
+        where = f"{s['where']} and {s['date_field']} > '{cutoff}'"
+        try:
+            r = req_lib.get(s["url"], params={"$where": where, "$order": f"{s['date_field']} DESC",
+                            "$limit": FREE_SOURCE_MAX_ROWS}, headers={"User-Agent": "LeadFlow/1.0"}, timeout=40)
+            rows = r.json() if r.status_code == 200 else []
+            if r.status_code != 200:
+                print(f"[PERMITS] {s['name']} HTTP {r.status_code}: {str(rows)[:150]}")
+        except Exception as e:
+            print(f"[PERMITS] {s['name']} failed: {e}")
+            continue
+        for row in rows:
+            company = next((row.get(f) for f in s["company_fields"] if row.get(f)), "")
+            phone   = next((row.get(f) for f in s["phone_fields"] if row.get(f)), "")
+            desc    = row.get(s["desc_field"], "") or ""
+            workcls = row.get(s.get("workclass_field",""), "") or ""
+            addr    = row.get(s["addr_field"], "") or ""
+            full    = row.get(s.get("name_field",""), "") or ""
+            fn, ln = "", ""
+            if full:
+                parts = full.split()
+                fn, ln = parts[0], " ".join(parts[1:]) if len(parts) > 1 else ""
+            if not company:
+                company = f"{workcls} commercial build — {addr}".strip(" —") or desc[:60]
+            leads.append({
+                "company": company, "industry": _permit_industry(desc),
+                "phone": phone, "firstName": fn, "lastName": ln,
+                "address": addr, "city": row.get(s["city_field"], ""),
+                "state": row.get(s["state_field"], state_abbrev.upper()),
+                "notes": f"[INTENT:newbuild] {workcls} commercial permit ({s['name']}): "
+                         f"{desc[:120]} @ {addr}".strip(),
+            })
+    return leads
+
+@app.post("/api/sources/permits")
+def source_permits(body: FreeSourceRequest, user: str = Depends(verify_token)):
+    """Pull recent commercial new-construction permits (trigger leads). Free.
+    Coverage is metro-seeded — returns a clear note for unconfigured states."""
+    _free_source_guard(user)
+    if not body.state:
+        raise HTTPException(status_code=400, detail="Pick a state.")
+    configured = {s["state"] for s in PERMIT_SOURCES}
+    if body.state.upper() not in configured:
+        return {"found": 0, "saved": 0, "alreadyInDb": 0, "droppedUncallable": 0,
+                "summary": f"No permit feed configured for {body.state} yet. Available: "
+                           f"{', '.join(sorted(configured))}. (Permit portals are per-metro; ask to add yours.)"}
+    raw = fetch_permits(body.state, body.limit if (body.limit and body.limit < 121) else 30)
+    res = ingest_leads(raw, "Permit (new construction)", user)
+    audit_log(user, "source_permits", "lead", None, {"state": body.state, **res})
+    res["summary"] = (f"Permits: {res['found']} commercial builds found · {res['alreadyInDb']} already in DB · "
+                      f"{res['droppedUncallable']} no contact · {res['saved']} new saved")
+    return res
+
+# ════════════════════════════════════════════════════════════════════════════
 # GOOGLE-REVIEW CLEANLINESS INTENT — the out-of-the-box play. A business with a
 # recent review complaining about dirtiness has an ACUTE need and a built-in
 # pitch. We scan existing leads' Google reviews, stamp [INTENT:cleanliness] +
