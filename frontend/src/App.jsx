@@ -471,6 +471,132 @@ function CityAutocomplete({value, onChange, state, placeholder, style, disabled,
   )
 }
 
+// ─── FreeSourceFinder ────────────────────────────────────────────────────────
+// $0 lead sources: OpenStreetMap (any vertical, nationwide) + NPI registry
+// (healthcare facilities). No per-lead cost, so no spend cap — pull freely.
+const OSM_CATEGORIES = ["Healthcare","Education","Industrial","Entertainment","Offices","Hospitality"]
+
+function FreeSourceFinder({onFound}){
+  const [src,setSrc]       = useState("osm")          // "osm" | "npi"
+  const [state,setState]   = useState("")
+  const [cities,setCities] = useState("")
+  const [cats,setCats]     = useState(["Healthcare","Education","Industrial","Entertainment"])
+  const [taxonomy,setTax]  = useState("")
+  const [loading,setLoad]  = useState(false)
+  const [result,setResult] = useState(null)
+  const [err,setErr]       = useState("")
+
+  function toggleCat(c){ setCats(s=>s.includes(c)?s.filter(x=>x!==c):[...s,c]) }
+
+  async function pull(){
+    setErr("")
+    if(!state){ setErr("Pick a state."); return }
+    if(src==="osm" && cats.length===0){ setErr("Pick at least one category."); return }
+    setLoad(true); setResult(null)
+    try{
+      const path = src==="osm" ? "/api/sources/osm" : "/api/sources/npi"
+      const body = src==="osm" ? {state,cities,categories:cats}
+                               : {state,cities,taxonomy,limit:200}
+      const res = await api(path,{method:"POST",body:JSON.stringify(body)})
+      setResult(res); if(res.saved>0) onFound&&onFound()
+    }catch(ex){ setErr(ex.message||"Pull failed — try again or a different state.") }
+    finally{ setLoad(false) }
+  }
+
+  return(
+    <div className="finder" style={{borderTop:"3px solid #69f6b8"}}>
+      <div className="finder-title">
+        🌐 Free Lead Sources
+        <span style={{color:"#69f6b8",fontSize:9,marginLeft:8,verticalAlign:"middle"}}>$0 · NO LIMIT</span>
+      </div>
+      <div className="finder-sub">
+        OpenStreetMap (every vertical) + the national NPI healthcare registry. No API cost — pull as much as you want.
+      </div>
+
+      {/* Source toggle */}
+      <div style={{display:"flex",gap:8,marginBottom:14}}>
+        {[["osm","🗺️ OpenStreetMap"],["npi","🏥 NPI Healthcare"]].map(([v,label])=>(
+          <button key={v} onClick={()=>setSrc(v)} type="button"
+            style={{padding:"6px 14px",borderRadius:8,fontSize:12,fontFamily:"inherit",cursor:"pointer",
+              background:src===v?"#69f6b8":"transparent",color:src===v?"#001b12":"#a3aac4",
+              border:`1px solid ${src===v?"#69f6b8":"#40485d40"}`,transition:"all .1s"}}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,alignItems:"flex-end"}}>
+        <div className="ff">
+          <label>State (required)</label>
+          <select value={state} onChange={e=>setState(e.target.value)} className="sel"
+            style={{color:state?"#dee5ff":"#a3aac4",border:!state?"1px solid #40485d40":""}}>
+            <option value="">Pick a state</option>
+            {STATES.filter(s=>s).map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div className="ff">
+          <label>Cities (optional, comma-sep)</label>
+          <CityAutocomplete value={cities} onChange={setCities} state={state} multi={true}
+            placeholder={state?"e.g. Atlanta, Savannah — blank = whole state":"Pick a state first"}/>
+        </div>
+
+        {src==="osm"&&(
+          <div className="ff" style={{gridColumn:"1 / -1"}}>
+            <label>Categories ({cats.length} selected)</label>
+            <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:4}}>
+              {OSM_CATEGORIES.map(c=>(
+                <button key={c} type="button" onClick={()=>toggleCat(c)}
+                  style={{padding:"4px 10px",borderRadius:6,fontSize:11,fontFamily:"inherit",cursor:"pointer",
+                    background:cats.includes(c)?"#69f6b8":"transparent",
+                    color:cats.includes(c)?"#001b12":"#a3aac4",
+                    border:`1px solid ${cats.includes(c)?"#69f6b8":"#40485d40"}`}}>
+                  {c}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {src==="npi"&&(
+          <div className="ff" style={{gridColumn:"1 / -1"}}>
+            <label>Facility type (optional)</label>
+            <input className="sel" value={taxonomy} onChange={e=>setTax(e.target.value)}
+              placeholder="e.g. Nursing, Dentist, Hospital — blank = all healthcare orgs"/>
+          </div>
+        )}
+
+        <button className="btn btn-p" onClick={pull} disabled={loading}
+          style={{gridColumn:"1 / -1",padding:"10px 22px",background:"#69f6b8",color:"#001b12",fontWeight:600}}>
+          {loading?"Pulling…":(src==="osm"?"Pull from OpenStreetMap →":"Pull from NPI Registry →")}
+        </button>
+      </div>
+
+      {err&&<div style={{marginTop:14,padding:"10px 14px",background:"#ff6e8418",border:"1px solid #ff6e8440",
+        borderRadius:8,fontSize:12,color:"#ff6e84"}}>{err}</div>}
+      {loading&&<div style={{marginTop:14,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#a3aac4"}}>
+        <div className="pulse" style={{width:6,height:6,borderRadius:"50%",background:"#69f6b8"}}/>
+        {src==="osm"?"Querying OpenStreetMap (can take 20-40s for a whole state)…":"Querying NPI registry…"}
+      </div>}
+      {result&&!loading&&(
+        <div style={{marginTop:14,padding:"10px 14px",
+          background:result.saved>0?"#69f6b815":"#ffe08315",
+          border:`1px solid ${result.saved>0?"#69f6b830":"#ffe08340"}`,
+          borderRadius:8,fontSize:12,color:result.saved>0?"#69f6b8":"#ffe083",lineHeight:1.5}}>
+          {result.saved>0
+            ? <>✓ <b>{result.saved}</b> new lead{result.saved===1?"":"s"} saved</>
+            : <>ⓘ <b>0 new</b> — see breakdown below</>}
+          {result.summary&&<div style={{marginTop:4,fontSize:10,color:"#a3aac4"}}>{result.summary}</div>}
+          {src==="osm"&&result.found>0&&result.saved<result.found*0.3&&(
+            <div style={{marginTop:6,fontSize:10,color:"#a3aac4"}}>
+              OSM is phone-sparse — many results had no phone and were skipped. NPI and the Apollo
+              enrichment fill those gaps; OSM is best for the wide net across industrial/education/venues.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── LeadFinder ──────────────────────────────────────────────────────────────
 
 function LeadFinder({onFound, industries}){
@@ -3012,6 +3138,7 @@ export default function App(){
               {industries.length>0&&(
                 <div style={{marginTop:32}}><LeadFinder onFound={loadLeads} industries={industries}/></div>
               )}
+              <div style={{marginTop:24}}><FreeSourceFinder onFound={loadLeads}/></div>
               <div style={{marginTop:24}}><ApolloFinder onFound={loadLeads} industries={industries}/></div>
             </div>
           )}

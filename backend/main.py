@@ -145,6 +145,24 @@ PLACES_CACHE_TTL_DAYS = int(os.getenv("PLACES_CACHE_TTL_DAYS", "14"))
 # Autocomplete in-memory cache TTL, seconds.
 AUTOCOMPLETE_CACHE_TTL_SECONDS = int(os.getenv("AUTOCOMPLETE_CACHE_TTL_SECONDS", "3600"))
 
+# ── Free lead sources (OpenStreetMap, NPI, USASpending) ─────────────────────
+# These cost $0 — no per-lead spend cap needed, just a kill switch + a sane
+# fetch ceiling so a runaway query can't hammer a public API or flood the DB.
+# One switch halts all free sources; mirrors PLACES_KILL_SWITCH ergonomics.
+FREE_SOURCES_KILL_SWITCH = os.getenv("FREE_SOURCES_KILL_SWITCH", "0") == "1"
+# Overpass mirrors, tried in order — public instances 504 under load, so we
+# fall through to the next. kumi is usually fastest; .de is the canonical one.
+OVERPASS_MIRRORS = [m.strip() for m in os.getenv("OVERPASS_MIRRORS",
+    "https://overpass.kumi.systems/api/interpreter,https://overpass-api.de/api/interpreter").split(",") if m.strip()]
+# Public Overpass blocks requests with no User-Agent (returns 406). Identify us.
+OVERPASS_HEADERS = {"User-Agent": "LeadFlow/1.0 (Vision Cleaning lead sourcing)"}
+# NPPES / NPI registry — free US healthcare-provider directory.
+NPI_API_URL = os.getenv("NPI_API_URL", "https://npiregistry.cms.hhs.gov/api/")
+# Max rows any single free-source pull will save (backstop, not a money cap).
+FREE_SOURCE_MAX_ROWS = int(os.getenv("FREE_SOURCE_MAX_ROWS", "200"))
+# Non-admin daily free-source pull cap (free, so looser than the paid caps).
+NON_ADMIN_FREE_SOURCE_CAP = int(os.getenv("NON_ADMIN_FREE_SOURCE_CAP", "25"))
+
 # Google Places pricing (May 2025) — used for usage_events cost tracking
 # AND run-level spend prediction.
 GOOGLE_COSTS_CENTS = {
@@ -642,14 +660,100 @@ INDUSTRY_MAP = {
 
 def clean(v): return str(v).strip() if v else ""
 
+# ── Lead quality model ───────────────────────────────────────────────────────
+# Cleaning-fit tiers. For a commercial janitorial company, value tracks how big,
+# how frequently-cleaned, and how outsourcing-prone the facility is. Matched
+# against industry + company name (lowercased). First tier that matches wins.
+CLEANING_FIT_TIERS = [
+    # (points, [keywords]) — high to low
+    (40, ["hospital", "surgery", "surgical", "nursing home", "nursing facility",
+          "assisted living", "senior living", "dialysis", "rehabilitation",
+          "medical center", "health system", "imaging center", "urgent care"]),
+    (36, ["clinic", "medical", "dental", "orthodont", "veterinary", "physical therapy",
+          "health", "healthcare", "pediatric", "dermatology", "outpatient"]),
+    (38, ["manufacturing", "warehouse", "distribution", "factory", "plant",
+          "industrial", "fabrication", "processing", "logistics", "fulfillment"]),
+    (36, ["school", "university", "college", "campus", "academy", "daycare",
+          "preschool", "childcare", "education", "montessori", "charter"]),
+    (34, ["casino", "arena", "stadium", "convention", "event venue", "banquet",
+          "theater", "theatre", "fitness", "gym", "athletic club", "bowling",
+          "hotel", "resort", "conference center"]),
+    (24, ["office", "corporate", "headquarters", "bank", "credit union",
+          "dealership", "property management", "law firm", "accounting",
+          "insurance", "real estate", "church", "worship", "clubhouse"]),
+    (12, ["retail", "store", "shop", "salon", "spa", "restaurant", "cafe",
+          "boutique", "barber"]),
+]
+# National chains decide cleaning at HQ — a local rep can't close them. Demote.
+CHAIN_MARKERS = ["mcdonald", "starbucks", "walmart", "target", "cvs", "walgreens",
+                 "subway", "burger king", "wendy", "taco bell", "dunkin", "kfc",
+                 "home depot", "lowe's", "costco", "kroger", "7-eleven", "dollar general"]
+
+# Intent markers a source can stamp into a lead's notes via add_intent_marker().
+# Each maps to a score boost — intent (active need) outranks raw fit.
+INTENT_BOOSTS = {
+    "cleanliness": 34,   # recent reviews complain about dirtiness = urgent pain
+    "rfp":         32,   # active solicitation for janitorial services
+    "contract":    28,   # holds an expiring janitorial contract (recompete soon)
+    "newbuild":    22,   # new construction / just opened = need being born
+    "competitor":  26,   # unhappy with their current cleaner (poach)
+    "lookalike":   12,   # resembles a lead we've already converted
+}
+
+def _fit_points(text: str) -> int:
+    t = (text or "").lower()
+    for pts, kws in CLEANING_FIT_TIERS:
+        if any(k in t for k in kws):
+            return pts
+    return 15  # unknown vertical — neutral
+
+def add_intent_marker(lead: dict, kind: str, label: str):
+    """Stamp a machine-readable intent tag + human label into notes so the
+    score model picks it up and reps see WHY a lead is hot. Idempotent-ish."""
+    tag = f"[INTENT:{kind}]"
+    notes = lead.get("notes") or ""
+    if tag in notes:
+        return
+    lead["notes"] = (f"{tag} {label} | {notes}").strip(" |") if notes else f"{tag} {label}"
+
+def lead_intent_kinds(lead: dict) -> list:
+    notes = (lead.get("notes") or "").lower()
+    return [k for k in INTENT_BOOSTS if f"[intent:{k}]" in notes]
+
 def score_lead(lead):
-    s = 5
-    if lead.get("company","").strip():  s += 8
-    if lead.get("phone","").strip():    s += 15
-    if lead.get("email","").strip():    s += 6
-    if lead.get("website","").strip():  s += 5
-    if lead.get("address","").strip():  s += 3
-    return min(100, max(0, s))
+    """Quality = contactability + cleaning-fit + active intent. 0-100.
+    Replaces the old 'sum of filled fields' score so the dialer surfaces who's
+    actually worth calling, not just who has the most complete record."""
+    score = 0
+
+    # ── Contactability (can a rep actually reach a buyer?) — up to ~33 ──
+    if is_valid_us_phone((lead.get("phone") or "").strip()):
+        score += 18
+    if (lead.get("firstName") or "").strip():        # named decision-maker (Apollo)
+        score += 11
+    em = (lead.get("email") or "").strip()
+    if "@" in em and "." in em.split("@")[-1]:
+        score += 4
+
+    # ── Cleaning-fit (is this the kind of facility we want?) — up to ~40 ──
+    fit_text = f"{lead.get('industry','')} {lead.get('company','')} {lead.get('title','')}"
+    score += _fit_points(fit_text)
+
+    # Size/establishment proxy: review volume parsed from notes ("123 reviews").
+    m = re.search(r"(\d+)\s+reviews", (lead.get("notes") or "").lower())
+    if m:
+        n = int(m.group(1))
+        score += 8 if n >= 200 else 5 if n >= 50 else 2
+
+    # ── Active intent (someone with a need RIGHT NOW) — can dominate ──
+    for kind in lead_intent_kinds(lead):
+        score += INTENT_BOOSTS.get(kind, 0)
+
+    # ── Penalties ──
+    if any(c in (lead.get("company") or "").lower() for c in CHAIN_MARKERS):
+        score -= 25  # HQ-decided, local rep can't close
+
+    return min(100, max(0, score))
 
 US_STATES_FULL = {
     "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
@@ -1034,6 +1138,58 @@ def save_to_supabase(leads):
     except Exception as e:
         print(f"[SUPABASE] Exception: {e}")
         return 0, already_in_db
+
+# ── Unified free-source ingestion ───────────────────────────────────────────
+# Every free source (OpenStreetMap, NPI, USASpending, …) produces partial lead
+# dicts and funnels them through here: stamp defaults → in-batch phone dedup →
+# score → callable filter → cross-run dedup + insert (reusing save_to_supabase).
+# Keeps each fetcher tiny and guarantees they all inherit the same dedup + the
+# phone-unique safety. Returns a breakdown dict shaped like run_scrape's.
+def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: bool = True):
+    now = datetime.utcnow().isoformat()
+    staged, seen_batch_phones = [], set()
+    dropped_uncallable = 0
+    for r in (raw_leads or []):
+        lead = {
+            "company": clean(r.get("company", "")), "industry": r.get("industry", "") or "",
+            "phone": normalize_us_phone(r.get("phone")) or "",
+            "address": clean(r.get("address", "")), "city": clean(r.get("city", "")),
+            "state": normalize_state_abbrev(clean(r.get("state", ""))),
+            "website": clean(r.get("website", "")), "notes": r.get("notes", "") or "",
+            "source": source, "firstName": clean(r.get("firstName", "")),
+            "lastName": clean(r.get("lastName", "")), "title": clean(r.get("title", "")),
+            "email": clean(r.get("email", "")), "assignedTo": "", "callbackDate": "",
+            "status": "new", "createdAt": now, "updatedAt": now, "createdBy": user,
+        }
+        if not lead["company"]:
+            continue
+        # In-batch dedup on real phones (the partial unique index lets multiple
+        # phoneless rows coexist, so only collapse meaningfully-set phones).
+        ph = lead["phone"]
+        if ph:
+            if ph in seen_batch_phones:
+                continue
+            seen_batch_phones.add(ph)
+        lead["score"] = score_lead(lead)
+        # Callable: dialable phone OR a named DM with a deliverable email.
+        if callable_filter:
+            has_phone = is_valid_us_phone(ph)
+            em = lead["email"]
+            has_dm_email = bool(lead["firstName"]) and "@" in em and "." in em.split("@")[-1]
+            if not (has_phone or has_dm_email):
+                dropped_uncallable += 1
+                continue
+        staged.append(lead)
+        if len(staged) >= FREE_SOURCE_MAX_ROWS:
+            break
+    saved, already_in_db = save_to_supabase(staged)
+    if saved:
+        audit_log(user, "ingest_leads", "lead", None,
+                  {"source": source, "saved": saved, "found": len(raw_leads or [])})
+    print(f"[INGEST:{source}] found={len(raw_leads or [])} staged={len(staged)} "
+          f"saved={saved} dupes={already_in_db} dropped={dropped_uncallable}")
+    return {"found": len(raw_leads or []), "saved": saved,
+            "alreadyInDb": already_in_db, "droppedUncallable": dropped_uncallable}
 
 # ── VCC campaign helpers ───────────────────────────────────────────────────
 
@@ -3238,6 +3394,193 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
         "apolloEnriched":    apollo_enriched,
         "droppedUncallable": dropped_uncallable,
     }
+
+# ════════════════════════════════════════════════════════════════════════════
+# FREE LEAD SOURCES — OpenStreetMap (Overpass) + NPI registry. $0, no per-lead
+# cost, funneled through ingest_leads() for dedup + scoring + phone-unique safety.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Cleaning-vertical → Overpass tag selectors. `nwr` = node|way|relation.
+OSM_CATEGORY_SELECTORS = {
+    "Healthcare":    ['["amenity"="hospital"]', '["amenity"="clinic"]', '["amenity"="doctors"]',
+                      '["amenity"="dentist"]', '["amenity"="nursing_home"]', '["healthcare"="centre"]',
+                      '["healthcare"="hospital"]', '["healthcare"="clinic"]'],
+    "Education":     ['["amenity"="school"]', '["amenity"="college"]', '["amenity"="university"]',
+                      '["amenity"="kindergarten"]'],
+    "Industrial":    ['["building"="industrial"]', '["building"="warehouse"]', '["landuse"="industrial"]',
+                      '["man_made"="works"]', '["industrial"]'],
+    "Entertainment": ['["amenity"="theatre"]', '["amenity"="cinema"]', '["amenity"="conference_centre"]',
+                      '["amenity"="events_venue"]', '["leisure"="sports_centre"]', '["leisure"="fitness_centre"]',
+                      '["leisure"="bowling_alley"]'],
+    "Offices":       ['["office"]', '["amenity"="bank"]'],
+    "Hospitality":   ['["tourism"="hotel"]', '["amenity"="events_venue"]', '["leisure"="resort"]'],
+}
+# Map a category to the industry label stored on the lead (drives fit scoring).
+OSM_CATEGORY_INDUSTRY = {
+    "Healthcare": "Healthcare", "Education": "Education", "Industrial": "Industrial",
+    "Entertainment": "Entertainment", "Offices": "Office", "Hospitality": "Hotel",
+}
+
+def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
+    """Query Overpass for businesses in a US state by cleaning-vertical. Free,
+    no key. Returns raw lead dicts (company/phone/address/...) for ingest_leads."""
+    iso = f"US-{state_abbrev.upper()}"
+    # Parse each selector once into (key, value|None) and remember its category.
+    # '["amenity"="hospital"]' -> ("amenity","hospital"); '["office"]' -> ("office",None).
+    def _parse_sel(s):
+        inner = s.strip("[]")
+        if '"="' in inner:
+            k, v = inner.split('"="', 1)
+            return (k.strip('"'), v.strip('"'))
+        return (inner.strip('"'), None)
+    cat_parsed = []  # [(category, key, value|None)] in priority order
+    body_lines = []
+    for cat in categories:
+        for sel in OSM_CATEGORY_SELECTORS.get(cat, []):
+            body_lines.append(f"  nwr{sel}(area.a);")
+            k, v = _parse_sel(sel)
+            cat_parsed.append((cat, k, v))
+    if not body_lines:
+        return []
+    ql = (f"[out:json][timeout:90];\n"
+          f'area["ISO3166-2"="{iso}"]->.a;\n('
+          + "\n".join(body_lines) + "\n);\nout center 400;")
+    elements = None
+    for ep in OVERPASS_MIRRORS:
+        try:
+            # Raw QL body (not form-encoded) + User-Agent — public instances 406
+            # without a UA and prefer the raw body.
+            r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS, timeout=120)
+            if r.status_code == 200:
+                elements = r.json().get("elements", [])
+                break
+            print(f"[OSM] {ep.split('/')[2]} HTTP {r.status_code} — trying next mirror")
+        except Exception as e:
+            print(f"[OSM] {ep.split('/')[2]} failed ({e}) — trying next mirror")
+    if elements is None:
+        print("[OSM] all mirrors failed")
+        return []
+
+    city_l = city.strip().lower()
+    leads = []
+    for el in elements:
+        t = el.get("tags", {})
+        name = t.get("name", "")
+        if not name:
+            continue
+        el_city = t.get("addr:city", "")
+        if city_l and el_city.lower() != city_l:
+            continue
+        # Label by the first selector that actually matches key=value (a school
+        # has amenity=school, which must NOT match the amenity=hospital selector).
+        industry = ""
+        for cat, k, v in cat_parsed:
+            if k in t and (v is None or t.get(k) == v):
+                industry = OSM_CATEGORY_INDUSTRY.get(cat, cat); break
+        street = " ".join(x for x in [t.get("addr:housenumber",""), t.get("addr:street","")] if x).strip()
+        leads.append({
+            "company": name,
+            "industry": industry,
+            "phone": t.get("phone") or t.get("contact:phone") or "",
+            "website": t.get("website") or t.get("contact:website") or "",
+            "address": street,
+            "city": el_city,
+            "state": t.get("addr:state") or state_abbrev.upper(),
+            "notes": "Source: OpenStreetMap",
+        })
+    return leads
+
+def fetch_npi(state_abbrev: str, city: str = "", taxonomy: str = "", limit: int = 200) -> list:
+    """Query the NPPES/NPI registry for healthcare ORGANIZATIONS (facilities).
+    Free public API, no key. Returns raw lead dicts for ingest_leads."""
+    params = {"version": "2.1", "enumeration_type": "NPI-2",
+              "state": state_abbrev.upper(), "limit": min(max(limit, 1), 200)}
+    if city:     params["city"] = city
+    if taxonomy: params["taxonomy_description"] = taxonomy
+    try:
+        r = req_lib.get(NPI_API_URL, params=params, timeout=30)
+        if r.status_code != 200:
+            print(f"[NPI] HTTP {r.status_code}: {r.text[:200]}")
+            return []
+        results = r.json().get("results", []) or []
+    except Exception as e:
+        print(f"[NPI] fetch failed: {e}")
+        return []
+
+    leads = []
+    for res in results:
+        basic = res.get("basic", {})
+        name = basic.get("organization_name") or basic.get("name") or ""
+        if not name:
+            continue
+        # Prefer the LOCATION address (not mailing). NPPES marks it purpose=LOCATION.
+        addrs = res.get("addresses", []) or []
+        loc = next((a for a in addrs if a.get("address_purpose") == "LOCATION"), addrs[0] if addrs else {})
+        taxos = res.get("taxonomies", []) or []
+        primary_taxo = next((x.get("desc","") for x in taxos if x.get("primary")), taxos[0].get("desc","") if taxos else "")
+        leads.append({
+            "company": name,
+            "industry": primary_taxo or "Healthcare",
+            "phone": loc.get("telephone_number") or "",
+            "address": " ".join(x for x in [loc.get("address_1",""), loc.get("address_2","")] if x).strip(),
+            "city": loc.get("city", ""),
+            "state": loc.get("state", state_abbrev.upper()),
+            "notes": f"Source: NPI registry | {primary_taxo}".strip(" |"),
+        })
+    return leads
+
+class FreeSourceRequest(BaseModel):
+    state:      Optional[str] = ""
+    cities:     Optional[str] = ""        # comma-sep; each pulled separately
+    categories: Optional[object] = None   # OSM only: list of vertical names
+    taxonomy:   Optional[str] = ""        # NPI only: e.g. "Nursing", "Dentist"
+    limit:      Optional[int] = 200
+
+def _free_source_guard(user: str):
+    """Shared preflight: kill switch + non-admin daily cap. Raises HTTPException."""
+    if FREE_SOURCES_KILL_SWITCH:
+        raise HTTPException(status_code=503, detail="Free lead sources are disabled (FREE_SOURCES_KILL_SWITCH).")
+    if not is_admin(user):
+        used = events_today(user, "free_source_pull")
+        if used >= NON_ADMIN_FREE_SOURCE_CAP:
+            raise HTTPException(status_code=429,
+                detail=f"Daily free-source limit reached ({used}/{NON_ADMIN_FREE_SOURCE_CAP}). Resets at UTC midnight.")
+    log_usage(user, "free_source_pull", {})
+
+@app.post("/api/sources/osm")
+def source_osm(body: FreeSourceRequest, user: str = Depends(verify_token)):
+    """Pull businesses from OpenStreetMap by US state + cleaning vertical. Free."""
+    _free_source_guard(user)
+    if not body.state:
+        raise HTTPException(status_code=400, detail="Pick a state.")
+    cats = body.categories if isinstance(body.categories, list) and body.categories \
+           else list(OSM_CATEGORY_SELECTORS.keys())
+    cities = [c.strip() for c in (body.cities or "").split(",") if c.strip()] or [""]
+    agg, all_raw = {"found":0,"saved":0,"alreadyInDb":0,"droppedUncallable":0}, []
+    for city in cities:
+        all_raw += fetch_osm(body.state, cats, city)
+    res = ingest_leads(all_raw, "OpenStreetMap", user)
+    for k in agg: agg[k] += res[k]
+    audit_log(user, "source_osm", "lead", None, {"state": body.state, "categories": cats, **agg})
+    agg["summary"] = (f"OSM: {agg['found']} found · {agg['alreadyInDb']} already in DB · "
+                      f"{agg['droppedUncallable']} uncallable · {agg['saved']} new saved")
+    return agg
+
+@app.post("/api/sources/npi")
+def source_npi(body: FreeSourceRequest, user: str = Depends(verify_token)):
+    """Pull healthcare facilities from the NPI registry by state/city. Free."""
+    _free_source_guard(user)
+    if not body.state:
+        raise HTTPException(status_code=400, detail="Pick a state.")
+    cities = [c.strip() for c in (body.cities or "").split(",") if c.strip()] or [""]
+    all_raw = []
+    for city in cities:
+        all_raw += fetch_npi(body.state, city, body.taxonomy or "", body.limit or 200)
+    res = ingest_leads(all_raw, "NPI registry", user)
+    audit_log(user, "source_npi", "lead", None, {"state": body.state, "taxonomy": body.taxonomy, **res})
+    res["summary"] = (f"NPI: {res['found']} found · {res['alreadyInDb']} already in DB · "
+                      f"{res['droppedUncallable']} uncallable · {res['saved']} new saved")
+    return res
 
 @app.get("/api/usage")
 def get_usage(days: int = 7, user: str = Depends(verify_token)):
