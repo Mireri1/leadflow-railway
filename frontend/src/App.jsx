@@ -5241,6 +5241,7 @@ export default function App(){
 
               {/* ── Google Places Usage + Leads Pulled (admin only) ── */}
               {isAdmin()&&<ConversionPanel/>}
+              {isAdmin()&&<CallNotesPanel/>}
               {isAdmin()&&<UsageDashboard/>}
 
               {/* ── Login Activity (admin only) ── */}
@@ -5702,6 +5703,110 @@ function LogCallBtn({onClick}){
 
 // Admin-only: Google Places spend + leads-pulled-per-rep dashboard.
 // Mirrors LoginActivityPanel visual style — collapsible card, dark theme.
+// ─── CallNotesPanel (admin) — daily caller notes + recurring patterns ────────
+function CallNotesPanel(){
+  const [data,setData]=useState(null)
+  const [days,setDays]=useState(7)
+  const [show,setShow]=useState(false)
+  const [loading,setLoading]=useState(false)
+  const [openDay,setOpenDay]=useState(null)
+  function load(d){
+    setLoading(true)
+    api(`/api/analytics/call-notes?days=${d||days}`).then(r=>{setData(r);setLoading(false)}).catch(()=>setLoading(false))
+  }
+  const oc={converted:"#69f6b8",interested:"#69f6b8",interested_no_dm:"#69f6b8",callback:"#8b5cf6",
+    not_interested:"#ff6e84",no_answer:"#a3aac4",voicemail:"#ffe083",answered:"#a3a6ff"}
+  const Bars=({title,rows,total})=>rows&&rows.length>0?(
+    <div style={{marginBottom:10}}>
+      <div style={{fontSize:10,color:"#40485d",textTransform:"uppercase",letterSpacing:".07em",marginBottom:4}}>{title}</div>
+      {rows.map(([k,n],i)=>(
+        <div key={i} style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+          <div style={{width:150,fontSize:11,color:"#c9d2ee",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{k}</div>
+          <div style={{flex:1,height:14,background:"#000011",borderRadius:3,overflow:"hidden"}}>
+            <div style={{width:`${total?Math.round(n/total*100):0}%`,height:"100%",background:"#a3a6ff66"}}/>
+          </div>
+          <div style={{width:30,textAlign:"right",fontSize:11,color:"#a3aac4"}}>{n}</div>
+        </div>
+      ))}
+    </div>
+  ):null
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>{setShow(s=>!s); if(!data) load()}}
+        style={{padding:"16px 24px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,color:"#dee5ff",fontSize:15}}>📝 Daily Call Notes & Patterns</div>
+          <div style={{fontSize:11,color:"#a3aac4",marginTop:2}}>What your caller's hearing each day — and the objections that keep coming up.</div>
+        </div>
+        <span style={{color:"#40485d"}}>{show?"▾":"▸"}</span>
+      </div>
+      {show&&(
+        <div style={{padding:"0 24px 22px"}}>
+          <div style={{display:"flex",gap:6,marginBottom:14}}>
+            {[7,14,30].map(d=>(
+              <button key={d} onClick={()=>{setDays(d);load(d)}}
+                style={{fontSize:11,padding:"5px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                  border:`1px solid ${days===d?"#a3a6ff":"#40485d40"}`,
+                  background:days===d?"#a3a6ff22":"transparent",color:days===d?"#a3a6ff":"#a3aac4"}}>
+                {d} days
+              </button>
+            ))}
+          </div>
+          {loading&&<div style={{color:"#a3aac4",fontSize:12}}>Loading…</div>}
+          {data&&(
+            <>
+              {/* PATTERNS */}
+              <div style={{background:"#060e20",border:"1px solid #a3a6ff25",borderRadius:10,padding:"14px 16px",marginBottom:14}}>
+                <div style={{fontSize:11,color:"#a3a6ff",letterSpacing:".08em",fontWeight:700,marginBottom:10}}>
+                  🔁 RECURRING PATTERNS — {data.totals.calls} calls · {data.totals.notes_written} notes
+                </div>
+                <Bars title="What's coming up in notes" rows={data.patterns.themes} total={data.totals.notes_written}/>
+                <Bars title="Vendor status (the objection)" rows={data.patterns.vendor_status} total={data.totals.calls}/>
+                <Bars title="Timeline" rows={data.patterns.timeline} total={data.totals.calls}/>
+                {data.patterns.themes.length===0&&data.patterns.vendor_status.length===0&&(
+                  <div style={{fontSize:12,color:"#5a6a8a"}}>No notes/qual data in this window yet — patterns appear as your caller logs calls.</div>
+                )}
+              </div>
+              {/* DAILY NOTES */}
+              {(data.daily||[]).map(day=>(
+                <div key={day.date} style={{marginBottom:8,border:"1px solid #40485d20",borderRadius:10,overflow:"hidden"}}>
+                  <div onClick={()=>setOpenDay(o=>o===day.date?null:day.date)}
+                    style={{padding:"10px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",background:"#000011"}}>
+                    <div style={{fontSize:13,color:"#dee5ff",fontWeight:600}}>{day.date}
+                      <span style={{color:"#a3aac4",fontWeight:400,fontSize:12}}> · {day.calls} calls · {day.notes.length} notes</span></div>
+                    <div style={{display:"flex",gap:5}}>
+                      {Object.entries(day.outcomes).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([o,n])=>(
+                        <span key={o} style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:(oc[o]||"#40485d")+"22",color:oc[o]||"#a3aac4"}}>{o.replace(/_/g," ")} {n}</span>
+                      ))}
+                    </div>
+                  </div>
+                  {openDay===day.date&&(
+                    <div style={{padding:"6px 14px 12px",maxHeight:340,overflowY:"auto"}}>
+                      {day.notes.length===0?<div style={{fontSize:11,color:"#5a6a8a",padding:"8px 0"}}>No written notes this day.</div>:
+                        day.notes.map((n,i)=>(
+                          <div key={i} style={{padding:"7px 0",borderTop:i?"1px solid #40485d14":""}}>
+                            <div style={{fontSize:11,color:"#a3aac4",marginBottom:2}}>
+                              <b style={{color:"#dee5ff"}}>{n.company}</b>{n.state?` · ${n.state}`:""}
+                              {n.outcome&&<span style={{color:oc[n.outcome]||"#a3aac4"}}> · {n.outcome.replace(/_/g," ")}</span>}
+                              {n.caller&&<span style={{color:"#5a6a8a"}}> · {n.caller}</span>}
+                            </div>
+                            <div style={{fontSize:12,color:"#c9d2ee",lineHeight:1.45}}>{n.note}</div>
+                            {n.qual?.length>0&&<div style={{fontSize:10,color:"#8b5cf6",marginTop:2}}>{n.qual.join(" · ")}</div>}
+                          </div>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── ConversionPanel (admin) — which sources/intents actually convert ────────
 function ConversionPanel(){
   const [data,setData]=useState(null)

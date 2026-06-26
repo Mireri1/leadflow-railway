@@ -8333,6 +8333,79 @@ def daily_summary():
         print(f"[daily-summary] error: {e}")
         return {"error": str(e)}
 
+# Objection/theme buckets tallied from free-text call notes (no LLM needed).
+CALL_NOTE_THEMES = {
+    "Happy w/ current / in-house": ["happy with", "in-house", "in house", "already have", "have someone",
+                                    "have a company", "under contract", "already using", "got a guy"],
+    "Price / no budget":           ["no budget", "too expensive", "expensive", "price", "pricing", "cost",
+                                    "can't afford", "cant afford", "budget"],
+    "Gatekeeper / wrong person":   ["gatekeeper", "front desk", "wrong person", "not the right", "transferred",
+                                    "wouldn't transfer", "no name"],
+    "Voicemail / no answer":       ["voicemail", "vm", "no answer", "left message", "left a message", "didn't pick"],
+    "Callback / timing":           ["call back", "callback", "follow up", "next month", "next week", "busy",
+                                    "not a good time", "reach out later", "circle back"],
+    "Interested / wants quote":    ["interested", "wants a quote", "quote", "walkthrough", "walk through",
+                                    "send info", "schedule", "set up", "estimate"],
+    "Not interested":              ["not interested", "no thanks", "no need", "all set", "we're good"],
+}
+
+@app.get("/api/analytics/call-notes")
+def call_notes_digest(days: int = 7, user: str = Depends(verify_token)):
+    """Daily digest of the caller's notes + objection/theme patterns over the
+    window — so the admin can read what's being said and spot what's recurring.
+    Admin only. No LLM: patterns come from the qual chips + note keyword tallies."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    days = max(1, min(int(days), 30))
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    calls = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes?select=notes,outcome,calledBy,calledAt,leadId,"
+        f"vendorstatus,budgetfocus,timeline,decisionmaker,qualified"
+        f"&calledAt=gte.{since}T00:00:00&order=calledAt.desc")
+    leadmap = {}
+    for l in _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=id,company,state"):
+        leadmap[l.get("id")] = l
+
+    from collections import defaultdict, Counter
+    days_map = defaultdict(lambda: {"date": "", "calls": 0, "outcomes": Counter(), "notes": []})
+    vendor, focus, timeline, themes = Counter(), Counter(), Counter(), Counter()
+    for c in calls:
+        d = (c.get("calledAt") or "")[:10]
+        if not d:
+            continue
+        day = days_map[d]; day["date"] = d; day["calls"] += 1
+        day["outcomes"][c.get("outcome", "") or "?"] += 1
+        if c.get("vendorstatus"): vendor[c["vendorstatus"]] += 1
+        if c.get("budgetfocus"):  focus[c["budgetfocus"]] += 1
+        if c.get("timeline"):     timeline[c["timeline"]] += 1
+        note = (c.get("notes") or "").strip()
+        if note:
+            nl = note.lower()
+            for theme, kws in CALL_NOTE_THEMES.items():
+                if any(k in nl for k in kws):
+                    themes[theme] += 1
+            if len(day["notes"]) < 120:
+                lead = leadmap.get(c.get("leadId"), {})
+                day["notes"].append({"company": lead.get("company", "—"), "state": lead.get("state", ""),
+                                     "outcome": c.get("outcome", ""), "caller": c.get("calledBy", ""),
+                                     "note": note[:400],
+                                     "qual": [x for x in [c.get("vendorstatus"), c.get("budgetfocus"),
+                                              c.get("timeline"), c.get("qualified")] if x]})
+    daily = sorted(days_map.values(), key=lambda x: x["date"], reverse=True)
+    for x in daily:
+        x["outcomes"] = dict(x["outcomes"])
+    return {
+        "days": days,
+        "daily": daily,
+        "patterns": {
+            "themes":        themes.most_common(),
+            "vendor_status": vendor.most_common(),
+            "focus":         focus.most_common(),
+            "timeline":      timeline.most_common(),
+        },
+        "totals": {"calls": sum(x["calls"] for x in daily), "notes_written": sum(len(x["notes"]) for x in daily)},
+    }
+
 @app.get("/api/analytics/conversions")
 def conversion_analytics(user: str = Depends(verify_token)):
     """Conversion funnel BY SOURCE and BY INTENT — closes the learning loop:
