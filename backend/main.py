@@ -794,6 +794,14 @@ def score_lead(lead):
                 boost = round(boost * mult)
         score += boost
 
+    # CMS Special Focus Facility = actively watched worst-performer (updated
+    # monthly) → freshest, hottest signal. Complaint-triggered = year-round, off
+    # the annual cycle = fresher than a routine survey.
+    if "special focus" in notes_l:
+        score += 12
+    elif "complaint-triggered" in notes_l:
+        score += 5
+
     # ── Penalties ──
     if any(c in (lead.get("company") or "").lower() for c in CHAIN_MARKERS):
         score -= 25  # HQ-decided, local rep can't close
@@ -3940,24 +3948,41 @@ CMS_BASE = "https://data.cms.gov/provider-data/api/1/datastore/query"
 CMS_DEFICIENCIES_ID = "327a1777-6c39-5872-9874-c18728c3c104"
 CMS_PROVIDER_ID     = "c977e9dc-c100-5531-aeb5-80cdff2eacc5"
 
+# Cleanliness/sanitation-relevant deficiency descriptions (beyond the explicit
+# infection-control flag) — keeps the pitch on-message while letting us pull the
+# FRESHEST surveys regardless of how a given citation was coded.
+CMS_CLEAN_KEYWORDS = ["infection", "clean", "sanitat", "sanitary", "environment", "housekeep",
+    "garbage", "pest", "vermin", "soiled", "dirty", "linen", "laundry", "disinfect",
+    "hand hygiene", "odor", "mold", "sewage", "waste", "food storage", "hazardous", "ppe"]
+
 def fetch_cms_nursing(state_abbrev: str) -> list:
-    """All-50-states nursing facilities with infection-control / sanitation
-    deficiencies, newest survey first, deduped to one lead/facility, phone
-    joined from the CMS Provider table. Healthcare = real cleaning budgets."""
+    """All-50-states nursing facilities with recent cleanliness/sanitation
+    deficiencies, FRESHEST survey first, deduped to one lead/facility, phone
+    joined from the CMS Provider table. Boosts Special Focus Facilities (CMS's
+    actively-watched worst performers) + complaint-triggered surveys."""
     st = state_abbrev.upper()
     hdr = {"User-Agent": "LeadFlow/1.0 (Vision Cleaning)"}
-    # 1) Deficiencies flagged for infection control in this state, newest first.
+    # 1) Recent deficiencies in this state, NEWEST first (no infection-only
+    #    server filter — that skewed old; we filter for relevance client-side).
+    #    CMS caps limit at 500, so paginate the newest several pages so we get
+    #    enough unique facilities without reaching back into stale years.
+    defs = []
     try:
-        dj = req_lib.get(f"{CMS_BASE}/{CMS_DEFICIENCIES_ID}", headers=hdr, timeout=45, params={
-            "limit": FREE_SOURCE_MAX_ROWS * 3,
-            "conditions[0][property]": "state", "conditions[0][value]": st, "conditions[0][operator]": "=",
-            "conditions[1][property]": "infection_control_inspection_deficiency",
-            "conditions[1][value]": "Y", "conditions[1][operator]": "=",
-            "sort[0][property]": "survey_date", "sort[0][order]": "desc"})
-        defs = dj.json().get("results", []) if dj.status_code == 200 else []
+        offset = 0
+        while offset < 3000:
+            dj = req_lib.get(f"{CMS_BASE}/{CMS_DEFICIENCIES_ID}", headers=hdr, timeout=45, params={
+                "limit": 500, "offset": offset,
+                "conditions[0][property]": "state", "conditions[0][value]": st, "conditions[0][operator]": "=",
+                "sort[0][property]": "survey_date", "sort[0][order]": "desc"})
+            page = dj.json().get("results", []) if dj.status_code == 200 else []
+            defs.extend(page)
+            if len(page) < 500:
+                break
+            offset += 500
     except Exception as e:
         print(f"[CMS] deficiency fetch failed: {e}")
-        return []
+        if not defs:
+            return []
     # 2) Provider phones/ratings for this state → CCN map. CMS caps limit at
     #    500, so paginate (a big state has ~1200 facilities = ~3 pages).
     prov = {}
@@ -3979,7 +4004,13 @@ def fetch_cms_nursing(state_abbrev: str) -> list:
     leads, seen = [], set()
     for d in defs:
         ccn = d.get("cms_certification_number_ccn")
-        if not ccn or ccn in seen:        # one lead per facility (newest kept)
+        if not ccn or ccn in seen:        # one lead per facility (freshest kept)
+            continue
+        desc = clean(d.get("deficiency_description", ""))
+        desc_l = desc.lower()
+        # Relevance: infection-control flag OR a cleanliness/sanitation keyword.
+        if d.get("infection_control_inspection_deficiency") != "Y" and \
+           not any(k in desc_l for k in CMS_CLEAN_KEYWORDS):
             continue
         seen.add(ccn)
         p = prov.get(ccn, {})
@@ -3992,18 +4023,22 @@ def fetch_cms_nursing(state_abbrev: str) -> list:
             age_days = max(0, (datetime.utcnow() - datetime.strptime(survey, "%Y-%m-%d")).days)
         except Exception:
             pass
-        desc = clean(d.get("deficiency_description", ""))[:150]
         sev = clean(d.get("scope_severity_code", ""))
+        sff = clean(p.get("special_focus_status", ""))        # "SFF" / "SFF Candidate" / ""
+        complaint = d.get("complaint_deficiency") == "Y"
+        tags = []
+        if sff:        tags.append(f"⚠ CMS Special Focus ({sff})")
+        if complaint:  tags.append("complaint-triggered")
+        rating = p.get("overall_rating")
+        if rating:     tags.append(f"{rating}★ overall")
         age_tag = f" [hvage:{age_days}]" if age_days is not None else ""
         leads.append({
             "company": name, "industry": "Nursing Facility",
             "phone": clean(p.get("telephone_number", "")),
             "address": clean(d.get("provider_address") or p.get("provider_address") or ""),
             "city": clean(d.get("citytown") or p.get("citytown") or ""), "state": st,
-            "notes": f"[INTENT:health_violation] CMS infection-control deficiency "
-                     f"(survey {survey}, severity {sev}): {desc}"
-                     f"{(' | ' + str(p.get('overall_rating')) + '★ overall') if p.get('overall_rating') else ''}"
-                     f"{age_tag}".strip(),
+            "notes": f"[INTENT:health_violation] CMS deficiency (survey {survey}, severity {sev}): "
+                     f"{desc[:150]}{(' | ' + ' · '.join(tags)) if tags else ''}{age_tag}".strip(),
         })
         if len(leads) >= FREE_SOURCE_MAX_ROWS:
             break
