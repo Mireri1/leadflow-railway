@@ -8490,6 +8490,8 @@ def hours_worked(start: str = "", end: str = "", user: str = Depends(verify_toke
 
     callers = []
     for name, b in per.items():
+        if is_admin(name):        # payroll is for hourly callers, not admins
+            continue
         days = sorted(b["days"].values(), key=lambda x: x["date"])
         for d in days:
             d["hours"] = round(d["hours"], 2)
