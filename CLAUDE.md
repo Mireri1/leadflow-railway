@@ -142,7 +142,7 @@ ACTIONS TAKEN: [list or "None needed"]
 - `GOOGLE_API_KEY` — Google Places for lead finding
 - `ANTHROPIC_API_KEY` — powers the note assistant + AI insights. If unset, both fall back to a keyword heuristic — never hard-fails.
 - `HAIKU_MODEL` — per-note assistant model (default: claude-haiku-4-5-20251001). High-frequency, simple classification → Haiku.
-- `INSIGHTS_MODEL` — pattern-insights model (default: claude-sonnet-4-6). Low-frequency, multi-note synthesis → Sonnet.
+- `INSIGHTS_MODEL` — pattern-insights / weekly-digest model (default: claude-opus-4-8). Low-frequency, multi-note synthesis → top tier; spend negligible at weekly cadence. Falls back to HAIKU_MODEL if it errors. (max_tokens 4000 — rich JSON was truncating at 1600.)
 - `WEEKLY_DIGEST_ENABLED` — auto weekly AI review to Slack (default: 1)
 - `WEEKLY_DIGEST_DAY` — weekday to send (0=Mon … 6=Sun, default: 0)
 
