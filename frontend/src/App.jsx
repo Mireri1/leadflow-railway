@@ -249,16 +249,14 @@ function buildOpener(lead){
   const greet = lead?.firstName ? `Hi ${lead.firstName} — ` : "Hi — "
   return { opener: greet + opener, reference, hot: ints.length>0 }
 }
-// Once they agree to the walkthrough — quick qualifiers so you don't walk in
-// blind. Each maps to a chip or to notes (size/frequency have no field).
+// Once they agree to the walkthrough — run the qualification section below.
+// Each prompt maps to one of the existing qual chips so it gets captured.
 const QUALIFY_QUESTIONS = [
-  ["Roughly how big is the space — square footage, or floors/units?", "→ notes"],
-  ["Do you have a cleaning crew now, or is it in-house?", "→ Vendor Status"],
-  ["How often does it need cleaning — nightly, daily, a few times a week?", "→ notes"],
-  ["Anyone besides you who'd weigh in on the decision?", "→ Contact Type"],
-  ["When are you hoping to have it handled?", "→ Timeline"],
+  ["Do you have a cleaning company now — and how's that going?", "→ Vendor Status"],
+  ["Is your priority keeping costs down, top quality, or a balance?", "→ Focus"],
+  ["Are you the one who'd sign off, or is someone else involved?", "→ Contact Type"],
+  ["When are you looking to make a change?", "→ Timeline"],
 ]
-const QUALIFY_NOTE_TEMPLATE = "Sq ft / size: \nCurrent cleaning: \nFrequency needed: \nWalkthrough booked: "
 
 async function api(path, opts={}) {
   const token = getToken()
@@ -1775,16 +1773,10 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                   📋 <b style={{color:"#c9d2ee"}}>What they were flagged for</b> (if they ask): {o.reference}
                 </div>
               )}
-              {/* Once they say yes — qualify so you don't walk in blind. */}
+              {/* Once they say yes — run the qualification section below. */}
               <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid #ffffff12"}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-                  <span style={{fontSize:10,letterSpacing:".08em",fontWeight:700,color:"#69f6b8"}}>✅ ONCE THEY SAY YES — ASK</span>
-                  <button type="button"
-                    onClick={()=>setNotes(n=>n&&n.trim()?n:QUALIFY_NOTE_TEMPLATE)}
-                    style={{fontSize:10,padding:"3px 9px",borderRadius:5,border:"1px solid #69f6b840",
-                      background:"#69f6b815",color:"#69f6b8",cursor:"pointer",fontFamily:"inherit"}}>
-                    📋 Add to notes
-                  </button>
+                <div style={{fontSize:10,letterSpacing:".08em",fontWeight:700,color:"#69f6b8",marginBottom:6}}>
+                  ✅ ONCE THEY SAY YES — RUN YOUR QUALIFICATION (capture below)
                 </div>
                 {QUALIFY_QUESTIONS.map(([q,where],i)=>(
                   <div key={i} style={{fontSize:11.5,color:"#c9d2ee",lineHeight:1.5,marginBottom:3}}>
