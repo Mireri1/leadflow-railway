@@ -205,7 +205,12 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 # Turns the caller's freeform note into structured fields so she types one line
 # and the app fills the rest. Degrades to a keyword heuristic if the key is unset
 # or the API hiccups — the endpoint never hard-fails the caller's save.
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Accept the key under whatever name the rest of the Vision stack already uses,
+# so LeadFlow can reuse the exact same Anthropic key with zero new secrets.
+ANTHROPIC_API_KEY = next((os.getenv(k) for k in (
+    "ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_KEY",
+    "LEADFLOW_ANTHROPIC_KEY", "VLM_ANTHROPIC_KEY", "HQ_ANTHROPIC_KEY",
+) if os.getenv(k)), "")
 # Model split by task: Haiku for the high-frequency per-note assistant (simple
 # classification, runs 100+×/day — speed + cost matter); Sonnet for pattern
 # insights (synthesize hundreds of notes a few ×/day — quality matters, volume
