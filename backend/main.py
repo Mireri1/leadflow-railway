@@ -201,6 +201,87 @@ OUTREACH_REPLY_TO = os.getenv("OUTREACH_REPLY_TO", "")
 RESEND_API_KEY    = os.getenv("RESEND_API_KEY", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
+# ── Haiku note intelligence (Anthropic Messages API, no SDK) ────────────────────
+# Turns the caller's freeform note into structured fields so she types one line
+# and the app fills the rest. Degrades to a keyword heuristic if the key is unset
+# or the API hiccups — the endpoint never hard-fails the caller's save.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+HAIKU_MODEL       = os.getenv("HAIKU_MODEL", "claude-haiku-4-5-20251001")
+VALID_NOTE_OUTCOMES = ["no_answer", "voicemail", "not_interested", "callback", "interested", "converted"]
+
+def _heuristic_note_analysis(note: str):
+    """Keyword fallback so sentiment/outcome still populate without the API."""
+    n = (note or "").lower()
+    cold = any(k in n for k in ["not interested", "happy with", "no thanks", "hung up", "remove", "do not", "stop call", "already have", "signed", "rude", "annoyed"])
+    warm = any(k in n for k in ["interested", "wants", "send", "quote", "great", "excited", "loved", "yes ", "sounds good", "set up", "schedule", "meeting", "demo"])
+    if any(k in n for k in ["lvm", "voicemail", "left a message", "mailbox", "vm "]):
+        outcome = "voicemail"
+    elif any(k in n for k in ["not interested", "happy with", "no thanks", "already have", "signed"]):
+        outcome = "not_interested"
+    elif any(k in n for k in ["call back", "callback", "cb ", "follow up", "reach out", "revisit", "check in", "later"]):
+        outcome = "callback"
+    elif any(k in n for k in ["na", "no answer", "not available", "didn't pick", "no one"]):
+        outcome = "no_answer"
+    elif warm:
+        outcome = "interested"
+    else:
+        outcome = ""
+    sentiment = "cold" if cold and not warm else ("warm" if warm and not cold else "neutral")
+    summary = (note or "").strip().replace("\n", " ")
+    if len(summary) > 90:
+        summary = summary[:87] + "…"
+    return {"sentiment": sentiment, "outcome": outcome, "callbackDate": "", "summary": summary, "engine": "heuristic"}
+
+def haiku_analyze_note(note: str, company: str = "", status: str = ""):
+    """Ask Haiku to read one call note and return {sentiment, outcome,
+    callbackDate, summary}. Returns the heuristic if the key/API is unavailable."""
+    note = (note or "").strip()
+    if not note:
+        return {"sentiment": "neutral", "outcome": "", "callbackDate": "", "summary": "", "engine": "empty"}
+    if not ANTHROPIC_API_KEY:
+        return _heuristic_note_analysis(note)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    system = (
+        "You are a sales-call note assistant for a commercial cleaning company. "
+        "Read one cold-call note written by the rep and return STRICT JSON only "
+        "(no prose, no markdown) with keys: sentiment, outcome, callbackDate, summary.\n"
+        f"- sentiment: one of 'warm' (prospect open/positive/interested), 'neutral', 'cold' (rejected/annoyed/no fit).\n"
+        f"- outcome: the single best call outcome, one of {VALID_NOTE_OUTCOMES}, or '' if unclear.\n"
+        f"- callbackDate: if the note implies WHEN to call back, resolve it to an absolute YYYY-MM-DD date relative to today ({today}); else ''. "
+        "E.g. 'next Tuesday', 'in two weeks', 'the fall', 'after the holidays' → a concrete date. Be reasonable; 'the fall' ≈ Sept 15 of the appropriate year.\n"
+        "- summary: a clean one-line summary (max ~90 chars) the rep can read at a glance."
+    )
+    user = f"Company: {company or 'unknown'}\nCurrent status: {status or 'unknown'}\nNote: {note}"
+    try:
+        r = req_lib.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": HAIKU_MODEL, "max_tokens": 300, "system": system,
+                  "messages": [{"role": "user", "content": user}]},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            print(f"[HAIKU] {r.status_code} {r.text[:200]}")
+            return _heuristic_note_analysis(note)
+        text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`").split("\n", 1)[-1] if "\n" in text else text.strip("`")
+        data = json_lib.loads(text[text.find("{"): text.rfind("}") + 1])
+        sentiment = data.get("sentiment", "neutral")
+        if sentiment not in ("warm", "neutral", "cold"):
+            sentiment = "neutral"
+        outcome = data.get("outcome", "") or ""
+        if outcome not in VALID_NOTE_OUTCOMES:
+            outcome = ""
+        cb = (data.get("callbackDate") or "").strip()
+        if cb and not re.match(r"^\d{4}-\d{2}-\d{2}$", cb):
+            cb = ""
+        summary = (data.get("summary") or "").strip()[:120]
+        return {"sentiment": sentiment, "outcome": outcome, "callbackDate": cb, "summary": summary, "engine": "haiku"}
+    except Exception as e:
+        print(f"[HAIKU] analyze failed: {e}")
+        return _heuristic_note_analysis(note)
+
 def send_slack(title, summary, fields=None, actions=None):
     """Fire-and-forget Slack notification."""
     if not SLACK_WEBHOOK_URL:
@@ -5071,6 +5152,20 @@ async def import_leads(request: Request, user: str = Depends(verify_token)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/notes/analyze")
+async def analyze_note(request: Request, user: str = Depends(verify_token)):
+    """Haiku reads one freeform call note and returns {sentiment, outcome,
+    callbackDate, summary} so the caller types one line and the app fills the
+    structured fields. Never hard-fails — falls back to a keyword heuristic."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    note = (body.get("note") or "").strip()
+    if not note:
+        return {"sentiment": "neutral", "outcome": "", "callbackDate": "", "summary": "", "engine": "empty"}
+    return haiku_analyze_note(note, body.get("company") or "", body.get("status") or "")
 
 @app.patch("/api/leads/{lead_id}")
 def update_lead(lead_id: str, data: dict, user: str = Depends(verify_token)):

@@ -221,7 +221,101 @@ function sourceMeta(src){
 // Strip the machine tags from notes → the human detail the caller can cite.
 function cleanNote(notes){
   return (notes||"").replace(/\[INTENT:[a-z_]+\]/gi,"").replace(/\[(hvage|clnage):\d+\]/gi,"")
+    .replace(/\[sent:(warm|neutral|cold)\]/gi,"")
     .replace(/\s*\|\s*/g," · ").replace(/\s+/g," ").trim()
+}
+
+// ── Sentiment (Haiku note assistant) ────────────────────────────────────────
+// Sentiment rides along in the notes string as a [sent:warm|neutral|cold] tag,
+// same tokenized-notes pattern as [INTENT:*] — no schema change needed.
+const SENT_META = {
+  warm:    { dot:"#69f6b8", label:"Warm",    emoji:"🟢", chip:"#69f6b8" },
+  neutral: { dot:"#ffe083", label:"Neutral", emoji:"🟡", chip:"#ffe083" },
+  cold:    { dot:"#ff6e84", label:"Cold",    emoji:"🔴", chip:"#ff6e84" },
+}
+function parseSentiment(notes){
+  const m = (notes||"").match(/\[sent:(warm|neutral|cold)\]/i)
+  return m ? m[1].toLowerCase() : null
+}
+// Embed/replace the sentiment tag on a note string (idempotent — one tag max).
+function embedSentiment(notes, s){
+  const stripped = (notes||"").replace(/\s*\[sent:(warm|neutral|cold)\]/ig,"")
+  if(!s) return stripped
+  return `${stripped} [sent:${s}]`.trim()
+}
+// Small colored dot for lead/call rows. Returns null when no sentiment yet.
+function SentimentDot({notes, size=8}){
+  const s = parseSentiment(notes)
+  if(!s) return null
+  const m = SENT_META[s]||SENT_META.neutral
+  return <span title={`${m.label} lead`} style={{display:"inline-block",width:size,height:size,borderRadius:"50%",
+    background:m.dot,boxShadow:`0 0 6px ${m.dot}80`,flexShrink:0}}/>
+}
+
+// 🎤 Dictate-into-a-field button (Web Speech API). Renders nothing on browsers
+// without speech support, so it never breaks the form. onText(transcript) is
+// called with each final phrase — the parent appends it to the note field.
+function MicButton({onText, title}){
+  const [listening,setListening]=useState(false)
+  const recRef=useRef(null)
+  const SR = typeof window!=="undefined" && (window.SpeechRecognition||window.webkitSpeechRecognition)
+  if(!SR) return null
+  function toggle(){
+    if(listening){ try{recRef.current&&recRef.current.stop()}catch{}; return }
+    const rec=new SR(); rec.lang="en-US"; rec.interimResults=false; rec.continuous=true
+    rec.onresult=e=>{ let t=""; for(let i=e.resultIndex;i<e.results.length;i++){ if(e.results[i].isFinal) t+=e.results[i][0].transcript } if(t.trim()) onText(t.trim()) }
+    rec.onend=()=>setListening(false); rec.onerror=()=>setListening(false)
+    recRef.current=rec; try{rec.start(); setListening(true)}catch{ setListening(false) }
+  }
+  return <button type="button" onClick={toggle} title={title||"Dictate — speak instead of type"}
+    style={{fontSize:12,padding:"5px 10px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap",
+      border:`1px solid ${listening?"#ff6e84":"#40485d40"}`,background:listening?"#ff6e8420":"transparent",
+      color:listening?"#ff6e84":"#a3aac4"}}>{listening?"⏺ Listening…":"🎤 Dictate"}</button>
+}
+
+// ✨ Smart-fill: sends the note to Haiku and surfaces sentiment + suggested
+// outcome + parsed callback date. onApply(result) lets each parent wire the
+// suggestion into its own fields. Self-contained state (no hooks-in-IIFE).
+const SENT_OUTCOME_LABEL = {no_answer:"No answer",voicemail:"Voicemail",not_interested:"Not interested",callback:"Callback",interested:"Interested",converted:"Converted"}
+function NoteAssist({getNote, context, onApply}){
+  const [loading,setLoading]=useState(false)
+  const [res,setRes]=useState(null)
+  const [msg,setMsg]=useState("")
+  async function run(){
+    const note=(getNote()||"").trim()
+    if(!note){ setMsg("Type or dictate a note first"); setRes(null); return }
+    setLoading(true); setMsg("")
+    try{
+      const r=await api("/api/notes/analyze",{method:"POST",body:JSON.stringify({note,company:context?.company||"",status:context?.status||""})})
+      setRes(r)
+    }catch{ setMsg("Couldn't analyze — your note still saves as-is") }
+    finally{ setLoading(false) }
+  }
+  const sm = res ? (SENT_META[res.sentiment]||SENT_META.neutral) : null
+  return (
+    <div style={{marginTop:8}}>
+      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+        <button type="button" onClick={run} disabled={loading}
+          style={{fontSize:12,padding:"5px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+            border:"1px solid #a3a6ff55",background:"#a3a6ff18",color:"#c2c4ff"}}>
+          {loading?"Reading note…":"✨ Smart-fill"}</button>
+        {msg&&<span style={{fontSize:11,color:"#ffb3c0"}}>{msg}</span>}
+      </div>
+      {res&&(
+        <div style={{marginTop:8,padding:"10px 12px",background:"#0f1930",border:`1px solid ${sm.chip}40`,borderRadius:8}}>
+          <div style={{display:"flex",gap:14,alignItems:"center",flexWrap:"wrap",fontSize:12}}>
+            <span style={{color:sm.chip,fontWeight:700}}>{sm.emoji} {sm.label}</span>
+            {res.outcome&&<span style={{color:"#dee5ff"}}>Outcome: <strong>{SENT_OUTCOME_LABEL[res.outcome]||res.outcome}</strong></span>}
+            {res.callbackDate&&<span style={{color:"#ffe083"}}>Call back: <strong>{res.callbackDate}</strong></span>}
+          </div>
+          {res.summary&&<div style={{fontSize:12,color:"#a3aac4",marginTop:6,fontStyle:"italic"}}>"{res.summary}"</div>}
+          <button type="button" onClick={()=>onApply&&onApply(res)}
+            style={{marginTop:8,fontSize:12,padding:"5px 14px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+              border:"1px solid #69f6b855",background:"#69f6b818",color:"#69f6b8"}}>Apply to form ↑</button>
+        </div>
+      )}
+    </div>
+  )
 }
 // Signal-aware cold-call opener. Picks the script by the lead's hottest intent
 // (and facility type), fills in the name/city, ends with the walkthrough ask.
@@ -1535,6 +1629,20 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [scriptId,setScriptId]    = useState("")
   const [showScript,setShowScript]= useState(false)
   const [contractValue,setContractValue] = useState("")
+  const [aiSent,setAiSent]        = useState("")       // Haiku sentiment, embedded on the lead at save
+
+  // Smart-fill: map Haiku's note read onto the outcome chips + callback date.
+  function applyAi(r){
+    if(r.sentiment) setAiSent(r.sentiment)
+    const o=r.outcome
+    if(o==="no_answer"||o==="voicemail"){ setPrimary(o); setSecondary("") }
+    else if(o==="not_interested"||o==="callback"||o==="interested"||o==="converted"){ setPrimary("answered"); setSecondary(o) }
+    if(r.callbackDate){
+      setCbDate(r.callbackDate)
+      if(!o){ setPrimary("answered"); setSecondary("callback") }   // a date but no clear outcome ⇒ callback
+    }
+    setModalError("")
+  }
 
   useEffect(()=>{
     api(`/api/calls/${lead.id}`).then(r=>setCalls(Array.isArray(r)?r:[])).catch(()=>setCalls([]))
@@ -1607,6 +1715,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         followupsequence: followUpSeq||null,
         nextfollowup: nextFollowUp||null,
         followupstep: fuDays ? 0 : null,
+        ...(aiSent ? {notes: embedSentiment(lead.notes, aiSent)} : {}),
         ...(!lead.assignedTo ? {assignedTo: getUser()} : {}),
         updatedAt:new Date().toISOString()
       })})
@@ -1983,9 +2092,13 @@ function CallModal({lead: leadProp,onClose,onSaved}){
           <div style={{background:"#060e20",borderRadius:10,padding:14,marginBottom:16,
             border:"1px solid #40485d20"}}>
             <div className="ff" style={{marginBottom:12}}>
-              <label>Notes</label>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <label style={{margin:0}}>Notes {aiSent&&<SentimentDot notes={`[sent:${aiSent}]`}/>}</label>
+                <MicButton onText={t=>setNotes(n=>(n?n+" ":"")+t)}/>
+              </div>
               <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{resize:"vertical"}}
-                placeholder={secondary==="callback"?"What did they say? When should you call back?":"Any details from the call..."}/>
+                placeholder={secondary==="callback"?"What did they say? When should you call back?":"Dictate or type — then hit Smart-fill…"}/>
+              <NoteAssist getNote={()=>notes} context={{company:lead.company,status:outcome}} onApply={applyAi}/>
             </div>
             <div className="ff" style={{marginBottom:12}}>
               <label>Follow-up Sequence</label>
@@ -2710,6 +2823,36 @@ const SIDEBAR_NAV = [
 ]
 
 // ─── MyWeek — the caller's own call/note workspace (replaces her spreadsheet) ─
+// Lifted to top level (stable identity) so typing in the note doesn't remount
+// the panel and steal focus — and so NoteAssist keeps its result between keys.
+function MyWeekActionPanel({lead, mode, setMode, noteText, setNoteText, fuDate, setFuDate, today, aiSent, applyAi, onSave, onCancel}){
+  return (
+    <div style={{marginTop:8,padding:10,background:"#060e20",border:"1px solid #40485d40",borderRadius:8}}>
+      <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"center"}}>
+        {[["note","📝 Add note"],["followup","🗓 Schedule follow-up"]].map(([m,lbl])=>(
+          <button key={m} onClick={()=>setMode(m)} style={{fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",
+            border:`1px solid ${mode===m?"#a3a6ff":"#40485d40"}`,background:mode===m?"#a3a6ff22":"transparent",color:mode===m?"#a3a6ff":"#a3aac4"}}>{lbl}</button>
+        ))}
+        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:6}}>
+          {aiSent&&<SentimentDot notes={`[sent:${aiSent}]`}/>}
+          <MicButton onText={t=>setNoteText(n=>(n?n+" ":"")+t)}/>
+        </div>
+      </div>
+      {mode==="followup"&&(
+        <input type="date" value={fuDate} onChange={e=>setFuDate(e.target.value)} className="sel" style={{marginBottom:8}}/>
+      )}
+      <textarea value={noteText} onChange={e=>setNoteText(e.target.value)} rows={2}
+        placeholder={mode==="note"?"Dictate or type what happened…":"Note for the follow-up (optional)…"}
+        style={{width:"100%",background:"#0f1930",border:"1px solid #40485d40",borderRadius:7,color:"#dee5ff",padding:"8px 10px",fontSize:13,fontFamily:"inherit"}}/>
+      <NoteAssist getNote={()=>noteText} context={{company:lead.company,status:lead.status}} onApply={applyAi}/>
+      <div style={{display:"flex",gap:8,marginTop:8}}>
+        <button className="btn btn-p" style={{fontSize:12,padding:"6px 14px"}}
+          onClick={()=>mode==="note"?onSave.note(lead):onSave.followup(lead)}>Save</button>
+        <button className="btn btn-g" style={{fontSize:12,padding:"6px 14px"}} onClick={onCancel}>Cancel</button>
+      </div>
+    </div>
+  )
+}
 function MyWeek({user, leads, onCall, onReload, notify}){
   const [weekOffset,setWeekOffset]=useState(0)
   const [calls,setCalls]=useState([])
@@ -2718,8 +2861,13 @@ function MyWeek({user, leads, onCall, onReload, notify}){
   const [mode,setMode]=useState("note")       // "note" | "followup"
   const [noteText,setNoteText]=useState("")
   const [fuDate,setFuDate]=useState("")
+  const [aiSent,setAiSent]=useState("")
   const [importing,setImporting]=useState(false)
   const fileRef=useRef(null)
+  function applyAi(r){
+    if(r.sentiment) setAiSent(r.sentiment)
+    if(r.callbackDate){ setMode("followup"); setFuDate(r.callbackDate) }
+  }
 
   function weekBounds(o){
     const d=new Date(); const dow=(d.getDay()+6)%7
@@ -2742,18 +2890,20 @@ function MyWeek({user, leads, onCall, onReload, notify}){
   const myDue=leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted"&&(!l.assignedTo||l.assignedTo===user))
     .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
 
-  function openAction(leadId,m){ setExpand(expand===leadId?null:leadId); setMode(m); setNoteText(""); setFuDate(today) }
+  function openAction(leadId,m){ setExpand(expand===leadId?null:leadId); setMode(m); setNoteText(""); setFuDate(today); setAiSent("") }
   async function saveNote(lead){
     if(!noteText.trim()) return
     const stamped=`[${today}] ${noteText.trim()}`
-    const newNotes=(lead.notes?lead.notes+"\n":"")+stamped
+    const base=(lead.notes?lead.notes+"\n":"")+stamped
+    const newNotes=aiSent?embedSentiment(base, aiSent):base
     try{ await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({notes:newNotes,updatedAt:new Date().toISOString()})})
       notify&&notify("Note added"); setExpand(null); onReload&&onReload() }catch{ notify&&notify("Error saving note","error") }
   }
   async function saveFollowup(lead){
     if(!fuDate){ notify&&notify("Pick a follow-up date","error"); return }
     const fuNote=noteText.trim()?`[follow-up ${fuDate}] ${noteText.trim()}`:""
-    const newNotes=fuNote?((lead.notes?lead.notes+"\n":"")+fuNote):lead.notes
+    const base=fuNote?((lead.notes?lead.notes+"\n":"")+fuNote):lead.notes
+    const newNotes=aiSent?embedSentiment(base, aiSent):base
     try{ await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({callbackDate:fuDate,status:"callback",notes:newNotes,updatedAt:new Date().toISOString()})})
       notify&&notify("Follow-up scheduled"); setExpand(null); onReload&&onReload() }catch{ notify&&notify("Error scheduling","error") }
   }
@@ -2778,28 +2928,6 @@ function MyWeek({user, leads, onCall, onReload, notify}){
   const byDay={}; calls.forEach(c=>{ const d=(c.calledAt||"").slice(0,10); if(d){(byDay[d]=byDay[d]||[]).push(c)} })
   const dayKeys=Object.keys(byDay).sort().reverse()
   const oc={converted:"#69f6b8",interested:"#69f6b8",interested_no_dm:"#69f6b8",callback:"#8b5cf6",not_interested:"#ff6e84",no_answer:"#a3aac4",voicemail:"#ffe083",answered:"#a3a6ff"}
-  const ActionPanel=({lead})=>(
-    <div style={{marginTop:8,padding:10,background:"#060e20",border:"1px solid #40485d40",borderRadius:8}}>
-      <div style={{display:"flex",gap:6,marginBottom:8}}>
-        {[["note","📝 Add note"],["followup","🗓 Schedule follow-up"]].map(([m,lbl])=>(
-          <button key={m} onClick={()=>setMode(m)} style={{fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",
-            border:`1px solid ${mode===m?"#a3a6ff":"#40485d40"}`,background:mode===m?"#a3a6ff22":"transparent",color:mode===m?"#a3a6ff":"#a3aac4"}}>{lbl}</button>
-        ))}
-      </div>
-      {mode==="followup"&&(
-        <input type="date" value={fuDate} onChange={e=>setFuDate(e.target.value)} className="sel" style={{marginBottom:8}}/>
-      )}
-      <textarea value={noteText} onChange={e=>setNoteText(e.target.value)} rows={2}
-        placeholder={mode==="note"?"What happened / anything to remember…":"Note for the follow-up (optional)…"}
-        style={{width:"100%",background:"#0f1930",border:"1px solid #40485d40",borderRadius:7,color:"#dee5ff",padding:"8px 10px",fontSize:13,fontFamily:"inherit"}}/>
-      <div style={{display:"flex",gap:8,marginTop:8}}>
-        <button className="btn btn-p" style={{fontSize:12,padding:"6px 14px"}}
-          onClick={()=>mode==="note"?saveNote(lead):saveFollowup(lead)}>Save</button>
-        <button className="btn btn-g" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setExpand(null)}>Cancel</button>
-      </div>
-    </div>
-  )
-
   return (
     <div>
       <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between",gap:20,flexWrap:"wrap",marginBottom:24}}>
@@ -2860,11 +2988,12 @@ function MyWeek({user, leads, onCall, onReload, notify}){
                 <div key={c.id} style={{padding:"10px 16px",borderTop:"1px solid #40485d14"}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12}}>
                     <div style={{minWidth:0}}>
-                      <div style={{fontSize:13,color:"#dee5ff",fontWeight:600}}>{co}
-                        <span style={{color:oc[c.outcome]||"#a3aac4",fontSize:11,marginLeft:8}}>{(c.outcome||"").replace(/_/g," ")}</span>
-                        <span style={{color:"#40485d",fontSize:10,marginLeft:8}}>{(c.calledAt||"").slice(11,16)}</span>
+                      <div style={{fontSize:13,color:"#dee5ff",fontWeight:600,display:"flex",alignItems:"center",gap:6}}>
+                        <SentimentDot notes={lead.notes}/>{co}
+                        <span style={{color:oc[c.outcome]||"#a3aac4",fontSize:11,marginLeft:2}}>{(c.outcome||"").replace(/_/g," ")}</span>
+                        <span style={{color:"#40485d",fontSize:10,marginLeft:2}}>{(c.calledAt||"").slice(11,16)}</span>
                       </div>
-                      {c.notes&&<div style={{fontSize:12,color:"#c9d2ee",marginTop:2,lineHeight:1.4}}>{c.notes}</div>}
+                      {c.notes&&<div style={{fontSize:12,color:"#c9d2ee",marginTop:2,lineHeight:1.4}}>{cleanNote(c.notes)}</div>}
                     </div>
                     {lead.id&&(
                       <div style={{display:"flex",gap:5,flexShrink:0}}>
@@ -2874,7 +3003,10 @@ function MyWeek({user, leads, onCall, onReload, notify}){
                       </div>
                     )}
                   </div>
-                  {expand===lead.id&&<ActionPanel lead={lead}/>}
+                  {expand===lead.id&&<MyWeekActionPanel lead={lead} mode={mode} setMode={setMode}
+                    noteText={noteText} setNoteText={setNoteText} fuDate={fuDate} setFuDate={setFuDate}
+                    today={today} aiSent={aiSent} applyAi={applyAi}
+                    onSave={{note:saveNote,followup:saveFollowup}} onCancel={()=>setExpand(null)}/>}
                 </div>
               )
             })}
@@ -3873,9 +4005,11 @@ export default function App(){
                             fontSize:13,fontWeight:700,color:ac,fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-.01em"}}>
                             {getInitials(lead)}</div>
                           <div style={{minWidth:0}}>
-                            <div style={{fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,
-                              overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                              {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
+                            <div style={{display:"flex",alignItems:"center",gap:7,minWidth:0}}>
+                              <SentimentDot notes={lead.notes}/>
+                              <div style={{fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",fontSize:14,
+                                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div></div>
                             {/* Show title only when we have a person (firstName) — for warm leads
                                 where line 1 is already the company, repeating it would look weird. */}
                             {lead.firstName&&lead.title&&(
