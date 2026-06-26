@@ -3442,9 +3442,19 @@ OSM_CATEGORY_INDUSTRY = {
 }
 
 def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
-    """Query Overpass for businesses in a US state by cleaning-vertical. Free,
-    no key. Returns raw lead dicts (company/phone/address/...) for ingest_leads."""
+    """Query Overpass for businesses by cleaning-vertical. Free, no key. When a
+    city is given, scopes to that CITY's boundary (small area = fast, reliable on
+    big states like CA); otherwise the whole state. Returns raw lead dicts."""
     iso = f"US-{state_abbrev.upper()}"
+    city = (city or "").strip()
+    # City-scoped area is tiny → fast, dodges the big-state Overpass timeout.
+    # Escape quotes; admin_level 7|8 covers US municipalities. Name collisions
+    # (a same-named city in another state) are dropped by the state post-filter.
+    if city:
+        c_esc = city.replace('"', '\\"')
+        area_def = f'area["name"="{c_esc}"]["admin_level"~"^(7|8)$"]["boundary"="administrative"]->.a;'
+    else:
+        area_def = f'area["ISO3166-2"="{iso}"]->.a;'
     # Parse each selector once into (key, value|None) and remember its category.
     # '["amenity"="hospital"]' -> ("amenity","hospital"); '["office"]' -> ("office",None).
     def _parse_sel(s):
@@ -3488,8 +3498,7 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
             print(f"[OSM] fetch budget ({OSM_FETCH_BUDGET_SEC}s) hit — stopping at {cat}, partial result")
             break
         body = "\n".join(f"  nwr{sel}(area.a);" for sel in sels)
-        ql = (f"[out:json][timeout:40];\n"
-              f'area["ISO3166-2"="{iso}"]->.a;\n(' + body + "\n);\nout center 250;")
+        ql = (f"[out:json][timeout:40];\n" + area_def + "\n(" + body + "\n);\nout center 250;")
         els = _overpass(ql)
         if els is None:
             print(f"[OSM] {cat}: all mirrors failed — skipping")
@@ -3500,7 +3509,7 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
                 seen_ids.add(key)
                 elements.append(el)
 
-    city_l = city.strip().lower()
+    st_up = state_abbrev.upper()
     leads = []
     for el in elements:
         t = el.get("tags", {})
@@ -3508,8 +3517,13 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
         if not name:
             continue
         el_city = t.get("addr:city", "")
-        if city_l and el_city.lower() != city_l:
-            continue
+        # City-scoped query already limits to the city's boundary, so we DON'T
+        # drop rows missing addr:city. Guard only against a same-named city in
+        # another state: if addr:state is present and wrong, skip.
+        if city:
+            est = (t.get("addr:state", "") or "").upper()
+            if est and est not in (st_up, US_STATES_FULL.get(st_up, "").upper()):
+                continue
         # Label by the first selector that actually matches key=value (a school
         # has amenity=school, which must NOT match the amenity=hospital selector).
         industry = ""
