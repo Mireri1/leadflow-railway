@@ -230,7 +230,7 @@ function buildOpener(lead){
   const ind = (lead?.industry||"").toLowerCase()
   const city = lead?.city || "your area"
   const ask = "Can we set up 15 minutes for us to stop by, walk the facility, and provide you a quote?"
-  const askSpace = "Can we set up 15 minutes to stop by, walk the space, and get you a quote?"
+  const askSpace = "Can we set up 15 minutes for us to stop by, walk the space, and provide you a quote?"
   let opener=null, reference=null
   if(ints.includes("health_violation")){
     reference = cleanNote(lead.notes)
@@ -239,12 +239,12 @@ function buildOpener(lead){
       : `You got cited for infection control on your last inspection — and that's the one thing we specialize in fixing. ${ask}`
   } else if(ints.includes("cleanliness")){
     reference = cleanNote(lead.notes)
-    opener = `Your recent reviews are calling out the restrooms — and cleaning up exactly that is what we specialize in. ${askSpace}`
+    opener = `You've got some bad reviews calling out cleanliness — and that's the one thing we specialize in fixing. ${askSpace}`
   } else if(ints.includes("newbuild")){
     reference = cleanNote(lead.notes)
-    opener = `Saw you've got a new commercial space going up — getting it move-in clean and kept up is what we specialize in. Can we set up a time to stop by and get you a quote before you open?`
+    opener = `You've got a new space opening up — and getting it move-in clean and keeping it that way is the one thing we specialize in. ${askSpace}`
   } else {
-    opener = `We specialize in commercial cleaning for places like yours here in ${city}. ${askSpace}`
+    opener = `Commercial cleaning for places like yours here in ${city} is the one thing we specialize in. ${askSpace}`
   }
   const greet = lead?.firstName ? `Hi ${lead.firstName} — ` : "Hi — "
   return { opener: greet + opener, reference, hot: ints.length>0 }
