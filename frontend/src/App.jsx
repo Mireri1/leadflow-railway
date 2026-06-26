@@ -3105,6 +3105,8 @@ function AppointmentsBoard(){
                     ))}
                     <button onClick={()=>{setNoteFor(noteFor===a.leadId?null:a.leadId);setNoteText("")}}
                       style={{fontSize:11,padding:"6px 10px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",border:"1px solid #40485d40",background:"transparent",color:"#a3aac4"}}>📝 Note</button>
+                    <button title="Remove" onClick={async()=>{ if(window.confirm(`Remove the appointment for ${a.company||"this lead"}?`)){ try{ await api(`/api/appointments/${a.leadId}`,{method:"DELETE"}) }catch{}; load() } }}
+                      style={{fontSize:11,padding:"6px 9px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",border:"1px solid #ff6e8430",background:"transparent",color:"#ff6e84"}}>✕</button>
                   </div>
                 </div>
                 {noteFor===a.leadId&&(

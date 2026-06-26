@@ -5322,6 +5322,17 @@ async def transition_appointment(lead_id: str, request: Request, user: str = Dep
         _notify_angelo(appt)
     return appt
 
+@app.delete("/api/appointments/{lead_id}")
+def delete_appointment(lead_id: str, user: str = Depends(verify_token)):
+    """Remove an appointment entirely (admin) — for mistaken bookings."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        r = req_lib.delete(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.appt_{lead_id}", headers=SB_HEADERS, timeout=10)
+        return {"deleted": r.status_code in (200, 204)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.patch("/api/leads/{lead_id}")
 def update_lead(lead_id: str, data: dict, user: str = Depends(verify_token)):
     try:
