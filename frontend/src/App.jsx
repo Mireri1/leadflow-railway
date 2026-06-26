@@ -246,7 +246,9 @@ function buildOpener(lead){
   } else {
     opener = `Commercial cleaning for places like yours here in ${city} is the one thing we specialize in. ${askSpace}`
   }
-  const greet = lead?.firstName ? `Hi ${lead.firstName} — ` : "Hi — "
+  const greet = lead?.firstName
+    ? `Hi ${lead.firstName} — I won't take up much of your time. `
+    : "Hi — I won't take up much of your time. "
   return { opener: greet + opener, reference, hot: ints.length>0 }
 }
 // Once they agree to the walkthrough — run the qualification section below.
