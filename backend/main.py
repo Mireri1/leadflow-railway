@@ -3930,6 +3930,10 @@ def google_place_reviews(place_id: str):
         r = req_lib.get(
             "https://maps.googleapis.com/maps/api/place/details/json",
             params={"place_id": place_id, "fields": "reviews,rating,user_ratings_total",
+                    # Google caps this at 5 reviews; ask for the NEWEST 5 (not the
+                    # default "most relevant", which skews positive) so we're far
+                    # likelier to catch a recent cleanliness complaint.
+                    "reviews_sort": "newest",
                     "key": GOOGLE_KEY}, timeout=12)
         res = r.json().get("result", {})
         return res.get("reviews", []) or [], res.get("rating"), res.get("user_ratings_total")
