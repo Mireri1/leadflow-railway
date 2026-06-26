@@ -218,6 +218,38 @@ function sourceMeta(src){
   return SOURCE_META[key] || { label: src||"—", color: "#5a6a8a" }
 }
 
+// Strip the machine tags from notes → the human detail the caller can cite.
+function cleanNote(notes){
+  return (notes||"").replace(/\[INTENT:[a-z_]+\]/gi,"").replace(/\[(hvage|clnage):\d+\]/gi,"")
+    .replace(/\s*\|\s*/g," · ").replace(/\s+/g," ").trim()
+}
+// Signal-aware cold-call opener. Picks the script by the lead's hottest intent
+// (and facility type), fills in the name/city, ends with the walkthrough ask.
+function buildOpener(lead){
+  const ints = parseIntents(lead?.notes)
+  const ind = (lead?.industry||"").toLowerCase()
+  const city = lead?.city || "your area"
+  const ask = "Can we set up 15 minutes for us to stop by, walk the facility, and provide you a quote?"
+  const askSpace = "Can we set up 15 minutes to stop by, walk the space, and get you a quote?"
+  let opener=null, reference=null
+  if(ints.includes("health_violation")){
+    reference = cleanNote(lead.notes)
+    opener = ind.includes("hospital")
+      ? `Your infection rates are running worse than the national benchmark — and that's the one thing we specialize in fixing. ${ask}`
+      : `You got cited for infection control on your last inspection — and that's the one thing we specialize in fixing. ${ask}`
+  } else if(ints.includes("cleanliness")){
+    reference = cleanNote(lead.notes)
+    opener = `Your recent reviews are calling out the restrooms — and cleaning up exactly that is what we specialize in. ${askSpace}`
+  } else if(ints.includes("newbuild")){
+    reference = cleanNote(lead.notes)
+    opener = `Saw you've got a new commercial space going up — getting it move-in clean and kept up is what we specialize in. Can we set up a time to stop by and get you a quote before you open?`
+  } else {
+    opener = `We specialize in commercial cleaning for places like yours here in ${city}. ${askSpace}`
+  }
+  const greet = lead?.firstName ? `Hi ${lead.firstName} — ` : "Hi — "
+  return { opener: greet + opener, reference, hot: ints.length>0 }
+}
+
 async function api(path, opts={}) {
   const token = getToken()
   const res = await fetch(`${API_BASE}${path}`, {
@@ -1714,6 +1746,28 @@ function CallModal({lead: leadProp,onClose,onSaved}){
           borderRadius:8,fontSize:13,color:"#ff6e84",display:"flex",alignItems:"center",gap:8}}>
           <span>⚠</span>{modalError}
         </div>}
+
+        {/* Signal-aware opener — the first line that earns the next 20 seconds. */}
+        {(()=>{
+          const o = buildOpener(lead)
+          return (
+            <div style={{marginBottom:16,background:o.hot?"#ff4d6d10":"#69f6b810",
+              border:`1px solid ${o.hot?"#ff4d6d40":"#69f6b830"}`,borderRadius:10,padding:14}}>
+              <div style={{fontSize:10,letterSpacing:".1em",fontWeight:700,marginBottom:8,
+                color:o.hot?"#ff8da3":"#69f6b8"}}>
+                {o.hot?"🎯 SUGGESTED OPENER — LEAD WITH THIS":"💬 SUGGESTED OPENER"}
+              </div>
+              <div style={{fontSize:15,color:"#dee5ff",lineHeight:1.55,fontWeight:500}}>
+                {o.opener}
+              </div>
+              {o.reference&&(
+                <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid #ffffff12",fontSize:11,color:"#a3aac4",lineHeight:1.5}}>
+                  📋 <b style={{color:"#c9d2ee"}}>What they were flagged for</b> (if they ask): {o.reference}
+                </div>
+              )}
+            </div>
+          )
+        })()}
 
         {scripts.length>0&&(
           <div style={{marginBottom:16,background:"#060e20",border:"1px solid #a3a6ff25",borderRadius:10,padding:14}}>
