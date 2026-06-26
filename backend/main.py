@@ -5015,11 +5015,20 @@ def create_lead(lead: dict, user: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/leads/import")
-def import_leads(leads: list, user: str = Depends(verify_token)):
-    """CSV import. Canonicalizes phones and dedups against existing DB phones
-    BEFORE insert — same cross-run guard `save_to_supabase` uses for scrape
-    output. Stops a re-imported CSV from doubling up the leads table."""
+async def import_leads(request: Request, user: str = Depends(verify_token)):
+    """CSV / prospect-sheet import. Canonicalizes phones and dedups against
+    existing DB phones BEFORE insert — same cross-run guard `save_to_supabase`
+    uses for scrape output. Stops a re-imported sheet from doubling up leads.
+
+    Reads the JSON body directly so a bare array (`[...]`, what the frontend
+    sends) and a wrapped object (`{"leads": [...]}`) both work. A plain
+    `leads: list` signature made FastAPI expect multipart/form-data, which
+    silently broke every JSON import."""
     try:
+        body = await request.json()
+        leads = body.get("leads") if isinstance(body, dict) else body
+        if not isinstance(leads, list):
+            raise HTTPException(status_code=400, detail="expected a JSON array of leads")
         for lead in leads:
             np = normalize_us_phone(lead.get("phone"))
             if np:
@@ -5058,6 +5067,8 @@ def import_leads(leads: list, user: str = Depends(verify_token)):
         count = len(saved) if isinstance(saved, list) else 0
         audit_log(user, "import_leads", "lead", None, {"count": count, "skipped": skipped, "source": "csv"})
         return {"count": count, "skipped": skipped}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
