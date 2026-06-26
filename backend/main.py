@@ -786,8 +786,11 @@ def score_lead(lead):
             am = re.search(r"\[hvage:(\d+)\]", notes_l)
             if am:
                 d = int(am.group(1))
-                mult = 1.5 if d <= 14 else 1.3 if d <= 30 else 1.0 if d <= 90 \
-                       else 0.6 if d <= 180 else 0.35
+                # Gentle decay — CMS nursing-home surveys run ~annually, so a
+                # 1-2yr-old infection-control deficiency is still a live signal
+                # (and the facility's top-tier cleaning fit carries it anyway).
+                mult = 1.5 if d <= 30 else 1.35 if d <= 90 else 1.1 if d <= 365 \
+                       else 0.85 if d <= 730 else 0.6
                 boost = round(boost * mult)
         score += boost
 
@@ -3633,6 +3636,7 @@ class FreeSourceRequest(BaseModel):
     taxonomy:   Optional[str] = ""        # NPI only: e.g. "Nursing", "Dentist"
     limit:      Optional[int] = 200
     enrich:     Optional[bool] = False    # OSM only: Apollo-enrich phoneless leads (admin)
+    restaurants: Optional[bool] = False   # health only: ALSO pull restaurant inspections (low-budget)
 
 def _free_source_guard(user: str):
     """Shared preflight: kill switch + non-admin daily cap. Raises HTTPException."""
@@ -3928,6 +3932,83 @@ def google_place_phone(name: str, city: str, state: str) -> str:
     except Exception:
         return ""
 
+# CMS (Medicare) nursing-home data — nationwide (all 50 states), free, no key,
+# and the Provider table includes phone numbers. Health Deficiencies has 418k
+# infection-control / sanitation citations; we surface the facilities flagged
+# for infection control (the cleaning-relevant ones) and join their phone.
+CMS_BASE = "https://data.cms.gov/provider-data/api/1/datastore/query"
+CMS_DEFICIENCIES_ID = "327a1777-6c39-5872-9874-c18728c3c104"
+CMS_PROVIDER_ID     = "c977e9dc-c100-5531-aeb5-80cdff2eacc5"
+
+def fetch_cms_nursing(state_abbrev: str) -> list:
+    """All-50-states nursing facilities with infection-control / sanitation
+    deficiencies, newest survey first, deduped to one lead/facility, phone
+    joined from the CMS Provider table. Healthcare = real cleaning budgets."""
+    st = state_abbrev.upper()
+    hdr = {"User-Agent": "LeadFlow/1.0 (Vision Cleaning)"}
+    # 1) Deficiencies flagged for infection control in this state, newest first.
+    try:
+        dj = req_lib.get(f"{CMS_BASE}/{CMS_DEFICIENCIES_ID}", headers=hdr, timeout=45, params={
+            "limit": FREE_SOURCE_MAX_ROWS * 3,
+            "conditions[0][property]": "state", "conditions[0][value]": st, "conditions[0][operator]": "=",
+            "conditions[1][property]": "infection_control_inspection_deficiency",
+            "conditions[1][value]": "Y", "conditions[1][operator]": "=",
+            "sort[0][property]": "survey_date", "sort[0][order]": "desc"})
+        defs = dj.json().get("results", []) if dj.status_code == 200 else []
+    except Exception as e:
+        print(f"[CMS] deficiency fetch failed: {e}")
+        return []
+    # 2) Provider phones/ratings for this state → CCN map. CMS caps limit at
+    #    500, so paginate (a big state has ~1200 facilities = ~3 pages).
+    prov = {}
+    try:
+        offset = 0
+        while offset < 4000:
+            pj = req_lib.get(f"{CMS_BASE}/{CMS_PROVIDER_ID}", headers=hdr, timeout=45, params={
+                "limit": 500, "offset": offset,
+                "conditions[0][property]": "state", "conditions[0][value]": st, "conditions[0][operator]": "="})
+            page = pj.json().get("results", []) if pj.status_code == 200 else []
+            for p in page:
+                prov[p.get("cms_certification_number_ccn")] = p
+            if len(page) < 500:
+                break
+            offset += 500
+    except Exception as e:
+        print(f"[CMS] provider fetch failed: {e}")
+
+    leads, seen = [], set()
+    for d in defs:
+        ccn = d.get("cms_certification_number_ccn")
+        if not ccn or ccn in seen:        # one lead per facility (newest kept)
+            continue
+        seen.add(ccn)
+        p = prov.get(ccn, {})
+        name = clean(d.get("provider_name") or p.get("provider_name") or "")
+        if not name:
+            continue
+        survey = str(d.get("survey_date", ""))[:10]
+        age_days = None
+        try:
+            age_days = max(0, (datetime.utcnow() - datetime.strptime(survey, "%Y-%m-%d")).days)
+        except Exception:
+            pass
+        desc = clean(d.get("deficiency_description", ""))[:150]
+        sev = clean(d.get("scope_severity_code", ""))
+        age_tag = f" [hvage:{age_days}]" if age_days is not None else ""
+        leads.append({
+            "company": name, "industry": "Nursing Facility",
+            "phone": clean(p.get("telephone_number", "")),
+            "address": clean(d.get("provider_address") or p.get("provider_address") or ""),
+            "city": clean(d.get("citytown") or p.get("citytown") or ""), "state": st,
+            "notes": f"[INTENT:health_violation] CMS infection-control deficiency "
+                     f"(survey {survey}, severity {sev}): {desc}"
+                     f"{(' | ' + str(p.get('overall_rating')) + '★ overall') if p.get('overall_rating') else ''}"
+                     f"{age_tag}".strip(),
+        })
+        if len(leads) >= FREE_SOURCE_MAX_ROWS:
+            break
+    return leads
+
 def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
     """Pull recent FAILED health inspections for configured metros in a state.
     Dedups multi-violation rows to one lead per facility, tagged
@@ -3981,40 +4062,44 @@ def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
 
 @app.post("/api/sources/health")
 def source_health(body: FreeSourceRequest, user: str = Depends(verify_token)):
-    """Pull recently-FAILED health inspections (urgent, call-today leads). Free.
-    Phone-enriches via Google Places (food-service facilities list a public
-    number) so the caller can dial immediately, then ingests as hot leads."""
+    """Failed health inspections (urgent, call-today leads). PRIMARY source is
+    CMS nursing-home infection-control deficiencies — nationwide (all 50 states),
+    healthcare facilities with real cleaning budgets, phones included. Restaurant
+    inspections (city-run, low-budget) are opt-in via restaurants=true."""
     _free_source_guard(user)
     if not body.state:
         raise HTTPException(status_code=400, detail="Pick a state.")
-    configured = {s["state"] for s in HEALTH_INSPECTION_SOURCES}
-    if body.state.upper() not in configured:
-        return {"found": 0, "saved": 0, "alreadyInDb": 0, "droppedUncallable": 0,
-                "summary": f"No health-inspection feed for {body.state} yet. Covered: "
-                           f"{', '.join(sorted(configured))}. (County/city-run; ask to add yours.)"}
-    raw = fetch_health_inspections(body.state, body.limit if (body.limit and body.limit < 181) else 90)
 
-    # Fill phones via Google Places so these are dialable today. Cost-capped +
-    # kill-switch aware; skips silently if Places is off.
-    phoned = 0
-    on, _src = is_kill_switch_on()
-    if GOOGLE_KEY and not on:
-        deadline = time.time() + OSM_ENRICH_BUDGET_SEC
-        for lead in raw:
-            if phoned >= OSM_ENRICH_CAP or time.time() > deadline:
-                break
-            ph = google_place_phone(lead["company"], lead.get("city", ""), lead.get("state", ""))
-            if ph:
-                lead["phone"] = ph
-                phoned += 1
-                log_usage(user, "google_find_place", {"company": lead["company"]})
-                log_usage(user, "google_details", {"company": lead["company"]})
+    # PRIMARY: CMS nursing facilities, all 50 states. Phones come from CMS.
+    raw = fetch_cms_nursing(body.state)
+    cms_n = len(raw)
+
+    # OPT-IN: restaurant inspections (3 metros) — Google-phone-matched. Off by
+    # default because restaurants rarely have a cleaning budget.
+    restaurant_n = 0
+    if body.restaurants:
+        rest = fetch_health_inspections(body.state, body.limit if (body.limit and body.limit < 181) else 90)
+        restaurant_n = len(rest)
+        on, _src = is_kill_switch_on()
+        if GOOGLE_KEY and not on and rest:
+            deadline = time.time() + OSM_ENRICH_BUDGET_SEC
+            phoned = 0
+            for lead in rest:
+                if phoned >= OSM_ENRICH_CAP or time.time() > deadline:
+                    break
+                ph = google_place_phone(lead["company"], lead.get("city", ""), lead.get("state", ""))
+                if ph:
+                    lead["phone"] = ph; phoned += 1
+                    log_usage(user, "google_find_place", {"company": lead["company"]})
+                    log_usage(user, "google_details", {"company": lead["company"]})
+        raw = raw + rest
 
     res = ingest_leads(raw, "Health Inspection", user)
-    res["phoned"] = phoned
-    audit_log(user, "source_health", "lead", None, {"state": body.state, "phoned": phoned, **res})
-    res["summary"] = (f"Health inspections: {res['found']} recent FAILURES found · {phoned} phone-matched · "
-                      f"{res['alreadyInDb']} already in DB · {res['droppedUncallable']} no contact · "
+    audit_log(user, "source_health", "lead", None,
+              {"state": body.state, "cms_nursing": cms_n, "restaurants": restaurant_n, **res})
+    res["summary"] = (f"Health: {cms_n} nursing facilities w/ infection-control deficiencies"
+                      f"{f' + {restaurant_n} restaurant failures' if body.restaurants else ''} · "
+                      f"{res['alreadyInDb']} already in DB · {res['droppedUncallable']} no phone · "
                       f"{res['saved']} new urgent leads saved")
     return res
 

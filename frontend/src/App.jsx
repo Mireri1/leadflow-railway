@@ -516,6 +516,7 @@ function FreeSourceFinder({onFound}){
   const [cats,setCats]     = useState(["Healthcare","Education","Industrial","Entertainment"])
   const [taxonomy,setTax]  = useState("")
   const [enrich,setEnrich] = useState(false)
+  const [restaurants,setRestaurants] = useState(false)
   const [loading,setLoad]  = useState(false)
   const [result,setResult] = useState(null)
   const [err,setErr]       = useState("")
@@ -535,7 +536,7 @@ function FreeSourceFinder({onFound}){
       const body = src==="osm" ? {state,cities,categories:cats,enrich}
                  : src==="npi" ? {state,cities,taxonomy,limit:200}
                  : src==="permits" ? {state,limit:30}
-                 : {state,limit:90}
+                 : {state,limit:90,restaurants}
       const res = await api(path,{method:"POST",body:JSON.stringify(body)})
       setResult(res); if(res.saved>0) onFound&&onFound()
     }catch(ex){ setErr(ex.message||"Pull failed — try again or a different state.") }
@@ -621,10 +622,14 @@ function FreeSourceFinder({onFound}){
         {src==="health"&&(
           <div style={{gridColumn:"1 / -1",fontSize:11,color:"#a3aac4",background:"#1a0f15",
             border:"1px solid #ff4d6d40",borderRadius:8,padding:"10px 12px",lineHeight:1.5}}>
-            🚨 <b style={{color:"#ff8da3"}}>Most urgent source — call today, don't email.</b> Pulls facilities that
-            recently <b>FAILED a government health inspection</b> (dirty surfaces, vermin, poor housekeeping). The
-            violation is the pitch and there's a re-inspection clock ticking. Auto phone-matched via Google so they're
-            dialable. Freshest failures score highest. Covers <b>Chicago (IL), New York City (NY), Austin (TX)</b> — more metros on request.
+            🚨 <b style={{color:"#ff8da3"}}>Highest-value source — nursing facilities, all 50 states.</b> Pulls
+            <b> nursing homes with documented infection-control / sanitation deficiencies</b> from CMS (Medicare) —
+            healthcare facilities with real cleaning budgets and regulatory pressure. <b>Phone numbers included</b> (no
+            lookup needed), so every lead is dialable. The deficiency is the pitch. Pick any state.
+            <label style={{display:"flex",alignItems:"center",gap:8,marginTop:8,cursor:"pointer",color:"#a3aac4"}}>
+              <input type="checkbox" checked={restaurants} onChange={e=>setRestaurants(e.target.checked)} style={{cursor:"pointer"}}/>
+              <span>Also include failed <b>restaurant</b> inspections <span style={{color:"#5a6a8a"}}>(IL/NY/TX metros — low budget, off by default)</span></span>
+            </label>
           </div>
         )}
 
