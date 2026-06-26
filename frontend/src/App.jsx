@@ -5165,6 +5165,7 @@ export default function App(){
               </div>
 
               {/* ── Google Places Usage + Leads Pulled (admin only) ── */}
+              {isAdmin()&&<ConversionPanel/>}
               {isAdmin()&&<UsageDashboard/>}
 
               {/* ── Login Activity (admin only) ── */}
@@ -5626,6 +5627,77 @@ function LogCallBtn({onClick}){
 
 // Admin-only: Google Places spend + leads-pulled-per-rep dashboard.
 // Mirrors LoginActivityPanel visual style — collapsible card, dark theme.
+// ─── ConversionPanel (admin) — which sources/intents actually convert ────────
+function ConversionPanel(){
+  const [data,setData]=useState(null)
+  const [show,setShow]=useState(false)
+  const [loading,setLoading]=useState(false)
+  function load(){
+    setLoading(true)
+    api("/api/analytics/conversions").then(d=>{setData(d);setLoading(false)}).catch(()=>setLoading(false))
+  }
+  const intentLabel=(k)=> (INTENT_META[k]?.label) || k
+  const srcLabel=(n)=> (SOURCE_META[(n||"").toLowerCase()]?.label) || n
+  const rateColor=(r)=> r>=15?"#69f6b8":r>=5?"#ffe083":"#a3aac4"
+
+  const Table=({title,rows,labeller})=>(
+    <div style={{marginTop:14}}>
+      <div style={{fontSize:11,color:"#a3aac4",textTransform:"uppercase",letterSpacing:".08em",marginBottom:6}}>{title}</div>
+      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1.2fr",fontSize:10,color:"#40485d",
+        textTransform:"uppercase",letterSpacing:".06em",padding:"0 10px 4px"}}>
+        <div>Segment</div><div style={{textAlign:"right"}}>Leads</div><div style={{textAlign:"right"}}>Called</div>
+        <div style={{textAlign:"right"}}>Interested</div><div style={{textAlign:"right"}}>Won</div><div style={{textAlign:"right"}}>Conv. rate</div>
+      </div>
+      {rows.filter(r=>r.leads>0).map((r,i)=>(
+        <div key={i} style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1.2fr",fontSize:12,
+          padding:"7px 10px",borderTop:"1px solid #40485d18",alignItems:"center",
+          background:r.converted>0?"#69f6b80a":"transparent"}}>
+          <div style={{color:"#dee5ff",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{labeller(r.name)}</div>
+          <div style={{textAlign:"right",color:"#a3aac4"}}>{r.leads}</div>
+          <div style={{textAlign:"right",color:"#a3aac4"}}>{r.called}<span style={{color:"#40485d",fontSize:10}}> · {r.contact_rate}%</span></div>
+          <div style={{textAlign:"right",color:"#a3aac4"}}>{r.interested}</div>
+          <div style={{textAlign:"right",color:r.converted>0?"#69f6b8":"#40485d",fontWeight:700}}>{r.converted}</div>
+          <div style={{textAlign:"right",color:rateColor(r.conv_rate),fontWeight:700}}>{r.called>0?`${r.conv_rate}%`:"—"}</div>
+        </div>
+      ))}
+    </div>
+  )
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>{setShow(s=>!s); if(!data) load()}}
+        style={{padding:"16px 24px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,color:"#dee5ff",fontSize:15}}>📊 Conversion by Source & Intent</div>
+          <div style={{fontSize:11,color:"#a3aac4",marginTop:2}}>Which sources & hot-intent signals actually close — so you double down on what works.</div>
+        </div>
+        <span style={{color:"#40485d"}}>{show?"▾":"▸"}</span>
+      </div>
+      {show&&(
+        <div style={{padding:"0 24px 22px"}}>
+          {loading&&<div style={{color:"#a3aac4",fontSize:12,padding:"10px 0"}}>Crunching…</div>}
+          {data&&(
+            <>
+              <div style={{fontSize:11,color:"#5a6a8a",fontStyle:"italic",marginBottom:6}}>{data.note}</div>
+              {data.overall&&(
+                <div style={{display:"flex",gap:18,padding:"10px 12px",background:"#000011",borderRadius:8,fontSize:12,color:"#a3aac4"}}>
+                  <span>Total: <b style={{color:"#dee5ff"}}>{data.overall.leads}</b></span>
+                  <span>Called: <b style={{color:"#dee5ff"}}>{data.overall.called}</b></span>
+                  <span>Won: <b style={{color:"#69f6b8"}}>{data.overall.converted}</b></span>
+                  <span>Overall conv: <b style={{color:"#69f6b8"}}>{data.overall.conv_rate}%</b> of called</span>
+                </div>
+              )}
+              <Table title="By source" rows={data.by_source||[]} labeller={srcLabel}/>
+              {(data.by_intent||[]).some(r=>r.leads>0)&&<Table title="By hot-intent signal" rows={data.by_intent||[]} labeller={intentLabel}/>}
+              <button onClick={load} className="btn btn-g" style={{fontSize:11,padding:"6px 14px",marginTop:12}}>↻ Refresh</button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function UsageDashboard(){
   const [data,setData]=useState(null)
   const [days,setDays]=useState(7)

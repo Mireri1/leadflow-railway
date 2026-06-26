@@ -8333,6 +8333,45 @@ def daily_summary():
         print(f"[daily-summary] error: {e}")
         return {"error": str(e)}
 
+@app.get("/api/analytics/conversions")
+def conversion_analytics(user: str = Depends(verify_token)):
+    """Conversion funnel BY SOURCE and BY INTENT — closes the learning loop:
+    which lead sources / hot-intent signals actually convert, so you double down
+    on what works (and feed the lookalike model). conv_rate = converted / called,
+    so uncalled fresh leads don't dilute it. Admin only."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    rows = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/leads?select=source,status,total_calls,notes")
+    from collections import defaultdict
+    def bucket():
+        return {"leads": 0, "called": 0, "interested": 0, "converted": 0}
+    by_source, by_intent, overall = defaultdict(bucket), defaultdict(bucket), bucket()
+    for l in rows:
+        src = (l.get("source") or "—").strip() or "—"
+        called = (l.get("total_calls") or 0) > 0
+        st = l.get("status")
+        conv = st == "converted"
+        inter = st in ("interested", "interested_no_dm")
+        targets = [by_source[src], overall] + [by_intent[k] for k in lead_intent_kinds(l)]
+        for d in targets:
+            d["leads"] += 1
+            d["called"] += 1 if called else 0
+            d["interested"] += 1 if inter else 0
+            d["converted"] += 1 if conv else 0
+    def fmt(name, d):
+        return {"name": name, **d,
+                "conv_rate": round(d["converted"] / d["called"] * 100, 1) if d["called"] else 0.0,
+                "contact_rate": round(d["called"] / d["leads"] * 100, 1) if d["leads"] else 0.0}
+    return {
+        "by_source": sorted((fmt(k, v) for k, v in by_source.items()),
+                            key=lambda x: (-x["converted"], -x["called"], -x["leads"])),
+        "by_intent": sorted((fmt(k, v) for k, v in by_intent.items()),
+                            key=lambda x: (-x["converted"], -x["called"])),
+        "overall": fmt("All leads", overall),
+        "note": "conv_rate = converted ÷ called. New sources read ~0 until the caller works them.",
+    }
+
 @app.get("/api/leaderboard")
 def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
     try:
