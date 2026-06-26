@@ -3984,19 +3984,25 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
     # Vertical filter (case-insensitive substring match against lead.industry).
     want_inds = [str(x).strip().lower() for x in body.industries] if isinstance(body.industries, list) \
                 else [s.strip().lower() for s in str(body.industries or "").split(",") if s.strip()]
-    # Pull candidate leads: have a company, not already cleanliness-tagged. Fetch
-    # a wider net when filtering by vertical so we still find scan_n matches.
-    flt = "&state=eq." + url_quote(body.state) if body.state else ""
-    # When filtering by vertical, cast a wide net (the target leads may be older
-    # than the most recent pulls); otherwise just the freshest scan_n*3.
-    fetch_n = 3000 if want_inds else scan_n * 3
+    # Build the query via params so PostgREST encodes correctly. Crucially, the
+    # vertical filter is SERVER-SIDE (or= of ilike patterns) — PostgREST caps a
+    # response near 1000 rows, so a client-side filter over "newest 1000" would
+    # miss older target leads (e.g. gyms pulled before today's healthcare sweep).
+    params = {
+        "select": "id,company,city,state,notes,score,phone,firstName,email,industry,title",
+        "company": "not.is.null",
+        "order": "createdAt.desc",
+        "limit": str(scan_n * (40 if want_inds else 3)),
+    }
+    if body.state:
+        params["state"] = f"eq.{body.state}"
+    if want_inds:
+        params["or"] = "(" + ",".join(f"industry.ilike.*{w}*" for w in want_inds) + ")"
     try:
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads"
-            f"?select=id,company,city,state,notes,score,phone,firstName,email,industry,title"
-            f"&company=not.is.null{flt}&order=createdAt.desc&limit={min(fetch_n, 3000)}",
-            headers=SB_HEADERS, timeout=25)
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads", params=params, headers=SB_HEADERS, timeout=25)
         candidates = r.json() if r.status_code == 200 else []
+        if r.status_code != 200:
+            print(f"[REVIEWS] candidate fetch {r.status_code}: {r.text[:160]}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
 
