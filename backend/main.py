@@ -5203,7 +5203,7 @@ ANGELO_SLACK_WEBHOOK_URL = os.getenv("ANGELO_SLACK_WEBHOOK_URL", "")
 
 def _settings_get_json(key):
     try:
-        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{key}&select=value", headers=SB_HEADERS, timeout=10)
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{key}&select=value", headers=SB_ADMIN_HEADERS, timeout=10)
         rows = r.json() if r.status_code == 200 else []
         return json_lib.loads(rows[0]["value"]) if rows and rows[0].get("value") else None
     except Exception as e:
@@ -5213,7 +5213,7 @@ def _settings_get_json(key):
 def _settings_set_json(key, obj):
     try:
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-                         headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                         headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
                          json={"key": key, "value": json_lib.dumps(obj)}, timeout=10)
         return r.status_code in (200, 201, 204)
     except Exception as e:
@@ -5281,7 +5281,7 @@ def list_appointments(user: str = Depends(verify_token)):
         raise HTTPException(status_code=403, detail="Admin only")
     out = []
     try:
-        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=like.appt_*&select=value", headers=SB_HEADERS, timeout=15)
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=like.appt_*&select=value", headers=SB_ADMIN_HEADERS, timeout=15)
         for row in (r.json() if r.status_code == 200 else []):
             try:
                 out.append(json_lib.loads(row.get("value") or "{}"))
@@ -5328,7 +5328,7 @@ def delete_appointment(lead_id: str, user: str = Depends(verify_token)):
     if not is_admin(user):
         raise HTTPException(status_code=403, detail="Admin only")
     try:
-        r = req_lib.delete(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.appt_{lead_id}", headers=SB_HEADERS, timeout=10)
+        r = req_lib.delete(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.appt_{lead_id}", headers=SB_ADMIN_HEADERS, timeout=10)
         return {"deleted": r.status_code in (200, 204)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -8674,7 +8674,7 @@ def _weekly_digest_due() -> bool:
         if now.weekday() < WEEKLY_DIGEST_DAY:
             return False
         r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_weekly_digest&select=value",
-                        headers=SB_HEADERS, timeout=10)
+                        headers=SB_ADMIN_HEADERS, timeout=10)
         if r.status_code != 200:
             return False
         rows = r.json()
@@ -8692,7 +8692,7 @@ def _weekly_digest_due() -> bool:
 def _record_weekly_digest_run():
     try:
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-                         headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                         headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
                          json={"key": "last_weekly_digest", "value": datetime.utcnow().isoformat() + "Z"}, timeout=10)
         if r.status_code not in (200, 201, 204):
             print(f"[WEEKLY-DIGEST] cooldown upsert HTTP {r.status_code}: {r.text[:200]}")
@@ -9426,7 +9426,7 @@ def macro_analytics(user: str = Depends(verify_token)):
     history = []
     try:
         r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=like.macro_snapshot_*&select=key,value",
-                        headers=SB_HEADERS, timeout=15)
+                        headers=SB_ADMIN_HEADERS, timeout=15)
         for row in (r.json() if r.status_code == 200 else []):
             try:
                 history.append({"month": row["key"].replace("macro_snapshot_", ""),
@@ -9446,7 +9446,7 @@ def run_macro_snapshot_if_due():
         ym = datetime.utcnow().strftime("%Y-%m")
         key = f"macro_snapshot_{ym}"
         chk = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{key}&select=key",
-                          headers=SB_HEADERS, timeout=10)
+                          headers=SB_ADMIN_HEADERS, timeout=10)
         if chk.status_code == 200 and chk.json():
             return  # already captured this month
         snap = get_macro_snapshot(force=True)
@@ -9454,7 +9454,7 @@ def run_macro_snapshot_if_due():
         if not values:
             return
         req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-                     headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                     headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
                      json={"key": key, "value": json_lib.dumps(values)}, timeout=10)
         print(f"[MACRO] snapshot banked for {ym}: {values}")
     except Exception as e:

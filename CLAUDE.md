@@ -145,6 +145,12 @@ ACTIONS TAKEN: [list or "None needed"]
 - `INSIGHTS_MODEL` — pattern-insights / weekly-digest model (default: claude-opus-4-8). Low-frequency, multi-note synthesis → top tier; spend negligible at weekly cadence. Falls back to HAIKU_MODEL if it errors. (max_tokens 4000 — rich JSON was truncating at 1600.)
 - `WEEKLY_DIGEST_ENABLED` — auto weekly AI review to Slack (default: 1)
 - `WEEKLY_DIGEST_DAY` — weekday to send (0=Mon … 6=Sun, default: 0)
+- `ANGELO_SLACK_WEBHOOK_URL` — Slack webhook for the appointment→Angelo hiring handoff (falls back to SLACK_WEBHOOK_URL if unset)
+
+## Appointments (sales → fulfillment loop)
+- LeadFlow is the system of record. Stored as JSON in `app_settings` (`appt_<leadId>`) — no DDL. Stages: pending → approved → confirmed → won/lost.
+- `POST /api/appointments/{lead_id}` (any caller — books a walkthrough, starts 'pending'), `GET /api/appointments` (admin board), `POST /api/appointments/{lead_id}/transition` (admin — 'approved' fires the Angelo Slack handoff), `DELETE /api/appointments/{lead_id}` (admin — cancel).
+- Caller captures it in the CallModal when marking Interested/Converted (date + area). Admin works it on the **Appointments** board (admin-only nav). Calendar / Twilio SMS to subs / Notion sub-matching are the planned next layers that hang off this.
 
 ## Note Intelligence (Haiku)
 - `POST /api/notes/analyze` `{note, company?, status?}` → `{sentiment: warm|neutral|cold, outcome, callbackDate (ISO, parsed from plain English), summary, engine}`.
