@@ -8662,13 +8662,23 @@ def build_weekly_digest():
                                         "top_industry": (top_ind[0]["industry"] if top_ind else None)}}
 
 @app.get("/api/weekly-summary")
-def weekly_summary():
-    """Send the weekly AI review to Slack. Auto-fired weekly by the bg loop;
-    also hittable manually (e.g. to preview)."""
+def weekly_summary(preview: int = 0):
+    """Send the weekly AI review to Slack. Auto-fired weekly by the bg loop; also
+    hittable manually. ?preview=1 renders the block text WITHOUT posting to Slack."""
     try:
         payload = build_weekly_digest()
         if not payload:
             return {"sent": False, "reason": "SLACK_WEBHOOK_URL not configured"}
+        if preview:
+            texts = []
+            for b in payload["blocks"]:
+                if b.get("type") == "header":
+                    texts.append("# " + b["text"]["text"])
+                elif b.get("type") == "section":
+                    texts.append(b["text"]["text"])
+                elif b.get("type") == "context":
+                    texts.append(b["elements"][0]["text"])
+            return {"preview": True, "blocks_text": texts, **payload["stats"]}
         r = req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": payload["blocks"]}, timeout=10)
         ok = r.status_code in (200, 204)
         return {"sent": ok, **payload["stats"]}
