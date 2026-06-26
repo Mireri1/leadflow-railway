@@ -6189,7 +6189,7 @@ function NoteInsightsPanel(){
                 <div>
                   <div style={{fontSize:14,color:"#dee5ff",fontWeight:600,lineHeight:1.5}}>{data.headline||"No clear patterns yet."}</div>
                   <div style={{fontSize:10,color:"#5a6a8a",marginTop:6}}>
-                    {data.sample||0} notes analyzed · {data.engine==="haiku"?"Haiku":data.engine==="heuristic"?"keyword fallback (add ANTHROPIC_API_KEY)":"—"}
+                    {data.sample||0} notes analyzed · {data.engine==="ai"?"Sonnet":data.engine==="heuristic"?"keyword fallback (add ANTHROPIC_API_KEY)":"—"}
                     {data.cached?" · cached":""}
                   </div>
                 </div>

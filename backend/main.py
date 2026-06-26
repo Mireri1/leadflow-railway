@@ -206,7 +206,12 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 # and the app fills the rest. Degrades to a keyword heuristic if the key is unset
 # or the API hiccups — the endpoint never hard-fails the caller's save.
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Model split by task: Haiku for the high-frequency per-note assistant (simple
+# classification, runs 100+×/day — speed + cost matter); Sonnet for pattern
+# insights (synthesize hundreds of notes a few ×/day — quality matters, volume
+# is tiny). Both overridable via env.
 HAIKU_MODEL       = os.getenv("HAIKU_MODEL", "claude-haiku-4-5-20251001")
+INSIGHTS_MODEL    = os.getenv("INSIGHTS_MODEL", "claude-sonnet-4-6")
 VALID_NOTE_OUTCOMES = ["no_answer", "voicemail", "not_interested", "callback", "interested", "converted"]
 
 def _heuristic_note_analysis(note: str):
@@ -8482,7 +8487,7 @@ def daily_summary():
 
         # 🧠 AI pattern read of the last 7 days of notes (one cheap Haiku call/day).
         try:
-            ins = haiku_note_insights(_gather_note_records(7), 7)
+            ins = generate_note_insights(_gather_note_records(7), 7)
             if ins.get("headline") and ins.get("engine") != "empty":
                 obj = "\n".join(f"  • {o.get('theme')}" + (f" — _{o.get('counter')}_" if o.get("counter") else "")
                                 for o in ins.get("objections", [])[:3])
@@ -8781,7 +8786,10 @@ def _insight_heuristic(records):
             "timing": [], "segments": [], "opportunities": [], "watchouts": [],
             "engine": "heuristic", "sample": len(records)}
 
-def haiku_note_insights(records, days):
+def generate_note_insights(records, days):
+    """Synthesize patterns across many notes. Uses Sonnet (INSIGHTS_MODEL) — the
+    quality of the clustering/rebuttals is worth the bigger model here, and this
+    runs only a few times a day (cached + one digest call)."""
     if not records:
         return {"headline": "No notes in this window yet.", "objections": [], "timing": [],
                 "segments": [], "opportunities": [], "watchouts": [], "engine": "empty", "sample": 0}
@@ -8793,7 +8801,7 @@ def haiku_note_insights(records, days):
                                        r.get("source"), r.get("label")] if x])
         q = (" qual:" + ",".join(r["qual"])) if r.get("qual") else ""
         lines.append(f"- [{meta}]{q} {r.get('note')}")
-    corpus = "\n".join(lines)[:14000]
+    corpus = "\n".join(lines)[:18000]
     system = (
         "You are a sales analyst for a commercial cleaning company that cold-calls B2B prospects "
         f"(healthcare, schools, offices, industrial). Read this batch of call + lead notes from the last {days} days "
@@ -8810,9 +8818,9 @@ def haiku_note_insights(records, days):
         r = req_lib.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": HAIKU_MODEL, "max_tokens": 1300, "system": system,
+            json={"model": INSIGHTS_MODEL, "max_tokens": 1600, "system": system,
                   "messages": [{"role": "user", "content": f"Notes ({len(records)} records):\n{corpus}"}]},
-            timeout=30,
+            timeout=45,
         )
         if r.status_code != 200:
             print(f"[INSIGHTS] {r.status_code} {r.text[:200]}")
@@ -8825,7 +8833,7 @@ def haiku_note_insights(records, days):
             if not isinstance(data.get(k), list):
                 data[k] = []
         data["headline"] = data.get("headline", "") or ""
-        data["engine"] = "haiku"; data["sample"] = len(records)
+        data["engine"] = "ai"; data["sample"] = len(records)
         return data
     except Exception as e:
         print(f"[INSIGHTS] failed: {e}")
@@ -8842,7 +8850,7 @@ def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_to
     cached = _INSIGHT_CACHE.get(ck)
     if cached and not refresh and (time.time() - cached["ts"]) < 1800:
         return {**cached["data"], "cached": True}
-    data = haiku_note_insights(_gather_note_records(days), days)
+    data = generate_note_insights(_gather_note_records(days), days)
     _INSIGHT_CACHE[ck] = {"ts": time.time(), "data": data}
     return {**data, "cached": False}
 
