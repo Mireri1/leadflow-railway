@@ -7132,12 +7132,16 @@ def apollo_backfill(body: dict, user: str = Depends(verify_admin)):
         raise HTTPException(status_code=503, detail="Apollo kill switch is on (APOLLO_KILL_SWITCH=1)")
 
     limit = max(1, min(int(body.get("limit", 25)), 200))
+    # Optional: restrict to one source (e.g. "Health Inspection") so a backfill
+    # can target the high-value health leads + use the right DM titles for them.
+    src = (body.get("source") or "").strip()
+    src_filter = f"&source=eq.{url_quote(src)}" if src else ""
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads"
-            f"?firstName=eq.&assignedTo=eq.&status=eq.new"
-            f"&select=id,company,firstName,lastName,title,email,phone,notes,score"
-            f"&limit={limit}",
+            f"?firstName=eq.&assignedTo=eq.&status=eq.new{src_filter}"
+            f"&select=id,company,firstName,lastName,title,email,phone,notes,score,source"
+            f"&order=score.desc&limit={limit}",
             headers=SB_HEADERS, timeout=30,
         )
         rows = r.json() if r.status_code == 200 else []
@@ -7149,7 +7153,9 @@ def apollo_backfill(body: dict, user: str = Depends(verify_admin)):
     enriched = 0
     updated_ids = []
     for lead in rows:
-        if not apollo_enrich_lead_in_place(lead):
+        # Healthcare facilities need EVS/admin titles, not Owner/CEO.
+        titles = APOLLO_HEALTHCARE_TITLES if lead.get("source") == "Health Inspection" else None
+        if not apollo_enrich_lead_in_place(lead, titles=titles):
             continue
         update_payload = {
             "firstName": lead.get("firstName", ""),
