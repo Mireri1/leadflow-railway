@@ -6181,24 +6181,33 @@ function ReceptivityPanel(){
       {show&&(
         <div style={{padding:"0 24px 22px"}}>
           {/* Macro backdrop */}
-          {macro&&!macro.error&&(
-            <div style={{background:"#060e20",border:"1px solid #40485d30",borderRadius:10,padding:"12px 14px",marginBottom:16}}>
-              <div style={{fontSize:10,color:"#8893b0",letterSpacing:".08em",fontWeight:700,marginBottom:8}}>🌐 MACRO BACKDROP (FRED)</div>
-              <div style={{display:"flex",gap:18,flexWrap:"wrap"}}>
-                {(macro.series||[]).map(s=>(
-                  <div key={s.id} title={s.note} style={{minWidth:120,cursor:"help"}}>
-                    <div style={{fontSize:11,color:"#a3aac4"}}>{s.label}</div>
-                    <div style={{fontSize:16,color:"#dee5ff",fontWeight:700}}>
-                      {s.value!=null?s.value.toLocaleString():"—"}<span style={{fontSize:11,color:"#5a6a8a"}}>{s.unit}</span>
-                      {s.change!=null&&<span style={{fontSize:11,marginLeft:6,color:s.change>0?"#69f6b8":s.change<0?"#ff6e84":"#a3aac4"}}>
-                        {s.change>0?"▲":s.change<0?"▼":"→"}{Math.abs(s.change)}</span>}
-                    </div>
-                    <div style={{fontSize:9,color:"#5a6a8a"}}>{s.date||""}</div>
+          {macro&&!macro.error&&(()=>{
+            const dirColor={tailwind:"#69f6b8",headwind:"#ff6e84",neutral:"#a3aac4"}
+            const dirLabel={tailwind:"TAILWIND",headwind:"HEADWIND",neutral:"NEUTRAL"}
+            const a=macro.analysis||{}
+            return (
+            <div style={{background:"#060e20",border:"1px solid #40485d30",borderRadius:10,padding:"14px 16px",marginBottom:16}}>
+              <div style={{fontSize:10,color:"#8893b0",letterSpacing:".08em",fontWeight:700,marginBottom:8}}>🌐 MACRO READ — WHAT THE ECONOMY MEANS FOR DEMAND</div>
+              {a.headline&&<div style={{fontSize:13,color:"#dee5ff",fontWeight:600,lineHeight:1.5,marginBottom:10}}>{a.headline}</div>}
+              {(a.reads||[]).map((r,i)=>(
+                <div key={i} style={{display:"flex",gap:9,alignItems:"flex-start",padding:"6px 0",borderTop:i?"1px solid #40485d14":""}}>
+                  <span style={{fontSize:8,fontWeight:700,letterSpacing:".04em",padding:"2px 6px",borderRadius:4,whiteSpace:"nowrap",marginTop:1,
+                    background:(dirColor[r.direction]||"#a3aac4")+"22",color:dirColor[r.direction]||"#a3aac4"}}>{dirLabel[r.direction]||""}</span>
+                  <div>
+                    <div style={{fontSize:12,color:"#dee5ff",fontWeight:600}}>{r.signal}</div>
+                    <div style={{fontSize:12,color:"#a3aac4",lineHeight:1.45}}>{r.impact}</div>
                   </div>
+                </div>
+              ))}
+              {/* compact raw figures for reference */}
+              <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid #40485d20",fontSize:10,color:"#5a6a8a",display:"flex",gap:14,flexWrap:"wrap"}}>
+                {(macro.series||[]).map(s=>(
+                  <span key={s.id} title={s.note} style={{cursor:"help"}}>{s.label}: <b style={{color:"#8893b0"}}>{s.value!=null?s.value.toLocaleString():"—"}{s.unit}</b>
+                    {s.change!=null&&<span style={{color:s.change>0?"#69f6b8":s.change<0?"#ff6e84":"#5a6a8a"}}> {s.change>0?"▲":s.change<0?"▼":"→"}{Math.abs(s.change)}</span>}</span>
                 ))}
               </div>
             </div>
-          )}
+          )})()}
           <div style={{display:"flex",gap:6,marginBottom:14}}>
             {[90,180,365].map(d=>(
               <button key={d} onClick={()=>{setDays(d);load(d)}}
@@ -6211,8 +6220,10 @@ function ReceptivityPanel(){
           {data&&data.error&&<div style={{color:"#ffb3c0",fontSize:12}}>Couldn't load receptivity — try again.</div>}
           {data&&!data.error&&(
             <>
-              <div style={{fontSize:11,color:"#5a6a8a",marginBottom:14}}>
-                Index = blend of contact-rate + engagement-rate (0–100), so a slow week still scores.
+              <div style={{fontSize:11,color:"#5a6a8a",marginBottom:14,lineHeight:1.6}}>
+                <b style={{color:"#69f6b8"}}>Index</b> = warmth score 0–100 (contact-rate + engagement-rate blended) — compare rows to each other, higher = warmer.
+                &nbsp;<b style={{color:"#a3aac4"}}>n</b> = how many calls it's based on (the trust meter; under 15 gets a ⚠).
+                &nbsp;<b>contact</b> = reached a human · <b>engaged</b> = interested/callback/converted.<br/>
                 Overall: <b style={{color:idxColor(data.overall.index)}}>{data.overall.index}</b> · {data.overall.n} calls · contact {data.overall.contact_rate}% · engaged {data.overall.engagement_rate}%
               </div>
               <div style={{marginBottom:18}}>

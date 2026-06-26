@@ -9187,10 +9187,74 @@ def get_macro_snapshot(force=False):
     _MACRO_CACHE.update(ts=time.time(), data=data)
     return data
 
+def analyze_macro(series):
+    """Translate the raw FRED readings into a plain-English read of what they
+    mean for cleaning demand BY SECTOR — not just a list of numbers. Directional
+    rules (level + change); works with no LLM/key."""
+    by = {s["id"]: s for s in (series or [])}
+    reads, tail, head = [], 0, 0
+    def add(signal, impact, direction):
+        nonlocal tail, head
+        reads.append({"signal": signal, "impact": impact, "direction": direction})
+        if direction == "tailwind": tail += 1
+        elif direction == "headwind": head += 1
+
+    un = by.get("UNRATE", {}); sent = by.get("UMCSENT", {})
+    ff = by.get("FEDFUNDS", {}); t10 = by.get("DGS10", {}); pay = by.get("PAYEMS", {})
+
+    if un.get("value") is not None:
+        v = un["value"]
+        if v <= 4.5:
+            add(f"Unemployment {v}% — tight labor",
+                "Facilities can't hire or keep in-house janitorial staff, so they're more open to outsourcing. Tailwind for healthcare, industrial, and offices — your core verticals.", "tailwind")
+        elif v >= 6:
+            add(f"Unemployment {v}% — slack labor",
+                "Easier for prospects to staff cleaning internally — expect more 'we handle it in-house'. Lead with cost savings, not convenience.", "headwind")
+        else:
+            add(f"Unemployment {v}%", "Labor market neutral — no strong push toward or away from outsourcing.", "neutral")
+
+    if sent.get("value") is not None:
+        v = sent["value"]; ch = sent.get("change") or 0
+        if v < 70 or ch <= -2:
+            arrow = " ▼" if ch < 0 else ""
+            add(f"Consumer sentiment {v}{arrow} — weak/falling",
+                "Retail, hospitality, fitness and entertainment cut discretionary spend first — expect more 'no budget' objections and a dip in conversions in those sectors. Shift effort to non-discretionary verticals (healthcare, schools, industrial).", "headwind")
+        elif v > 85:
+            add(f"Consumer sentiment {v} — strong",
+                "Discretionary sectors (retail, hospitality) have room to spend — worth leaning into.", "tailwind")
+
+    ffv, t10v = ff.get("value"), t10.get("value")
+    rate_ch = t10.get("change") if t10.get("change") is not None else (ff.get("change") or 0)
+    if (ffv or 0) >= 4.5 or (t10v or 0) >= 4.5:
+        add(f"Rates elevated (fed funds {ffv}%, 10-yr {t10v}%)",
+            "High borrowing costs slow construction and new builds — expect fewer new-build-permit leads and more cost-cutting from commercial real estate clients.", "headwind")
+    elif rate_ch < -0.1:
+        add(f"Rates easing (10-yr {t10v}%)",
+            "Falling borrowing costs support construction over the coming months — watch for new-build-permit leads to pick back up.", "tailwind")
+
+    if pay.get("change") is not None:
+        ch = pay["change"]
+        if ch > 0:
+            add(f"Payrolls +{ch}k — hiring growing",
+                "More facilities opening and staffed up — a mild broad tailwind for cleaning demand.", "tailwind")
+        elif ch < 0:
+            add(f"Payrolls {ch}k — contracting",
+                "Facilities downsizing or closing — softer demand and higher churn risk; protect existing accounts.", "headwind")
+
+    if not reads:
+        headline = "Macro data unavailable right now."
+    elif head == 0 and tail > 0:
+        headline = "Supportive backdrop for outsourced cleaning — tight labor and growth favor your core verticals; push volume now."
+    elif tail == 0 and head > 0:
+        headline = "Softening backdrop — the consumer side is cooling, so expect discretionary sectors (retail, hospitality, fitness) to convert worse. Lean on non-discretionary verticals."
+    else:
+        headline = "Mixed backdrop — tailwinds for non-discretionary verticals (healthcare, schools, industrial), but headwinds where spend is discretionary, so watch for softer conversions in retail and hospitality."
+    return {"headline": headline, "reads": reads}
+
 @app.get("/api/analytics/macro")
 def macro_analytics(user: str = Depends(verify_token)):
-    """Current macro backdrop (FRED) + the monthly snapshot history we've banked
-    in app_settings (macro_snapshot_YYYY-MM). Admin only."""
+    """Current macro backdrop (FRED) + a plain-English sector analysis + the
+    monthly snapshot history banked in app_settings. Admin only."""
     if not is_admin(user):
         raise HTTPException(status_code=403, detail="Admin only")
     snap = get_macro_snapshot()
@@ -9207,7 +9271,7 @@ def macro_analytics(user: str = Depends(verify_token)):
         history.sort(key=lambda x: x["month"])
     except Exception as e:
         print(f"[MACRO] history fetch failed: {e}")
-    return {**snap, "history": history}
+    return {**snap, "analysis": analyze_macro(snap.get("series", [])), "history": history}
 
 def run_macro_snapshot_if_due():
     """Bank one macro snapshot per calendar month into app_settings so a paired
