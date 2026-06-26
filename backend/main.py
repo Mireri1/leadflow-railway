@@ -8401,13 +8401,16 @@ CALL_NOTE_THEMES = {
 }
 
 def _parse_iso(s):
-    """Parse a stored ISO timestamp ('2026-06-25T14:30:00.000' / with Z) → datetime."""
+    """Parse a stored ISO timestamp → NAIVE UTC datetime. PostgREST returns
+    timestamptz with a +00:00 offset, so we strip tzinfo to stay comparable with
+    datetime.utcnow() (mixing aware+naive raises)."""
     if not s:
         return None
     s = str(s).strip().replace("Z", "")
     for fmt in (None, "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
         try:
-            return datetime.fromisoformat(s) if fmt is None else datetime.strptime(s, fmt)
+            dt = datetime.fromisoformat(s) if fmt is None else datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
         except Exception:
             continue
     return None
