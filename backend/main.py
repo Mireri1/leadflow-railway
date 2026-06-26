@@ -4044,6 +4044,113 @@ def fetch_cms_nursing(state_abbrev: str) -> list:
             break
     return leads
 
+# Other CMS facility types. CMS only publishes structured DEFICIENCIES for
+# nursing homes; for hospitals the equivalent "sanitation problem" signal is a
+# worse-than-national Healthcare-Associated-Infection (HAI) rate, and for
+# dialysis it's a low CMS star rating. Framework so more types drop in cleanly.
+CMS_HOSPITAL_GENERAL_ID = "b0a92ff7-a457-54f9-b247-20022db14590"
+CMS_HAI_ID              = "76ff056f-2b95-5594-ab53-c9b5a1e4db43"
+CMS_DIALYSIS_ID         = "bd6d011d-7e7e-5964-be9a-a0bbf4010e6c"
+
+def _cms_paginate(did, params, cap=4000):
+    """Page through a CMS datastore query (500-row cap) up to `cap` rows."""
+    hdr = {"User-Agent": "LeadFlow/1.0 (Vision Cleaning)"}
+    out, offset = [], 0
+    while offset < cap:
+        try:
+            r = req_lib.get(f"{CMS_BASE}/{did}", headers=hdr, timeout=45,
+                            params={**params, "limit": 500, "offset": offset})
+            page = r.json().get("results", []) if r.status_code == 200 else []
+        except Exception as e:
+            print(f"[CMS] paginate {did[:8]} failed: {e}"); break
+        out.extend(page)
+        if len(page) < 500:
+            break
+        offset += 500
+    return out
+
+def fetch_cms_hospitals(state_abbrev: str) -> list:
+    """Hospitals with a WORSE-than-national infection (HAI) rate — the hospital
+    equivalent of a sanitation problem. Phone/address from Hospital General
+    Information. All 50 states."""
+    st = state_abbrev.upper()
+    hai = _cms_paginate(CMS_HAI_ID, {
+        "conditions[0][property]": "state", "conditions[0][value]": st, "conditions[0][operator]": "=",
+        "conditions[1][property]": "compared_to_national",
+        "conditions[1][value]": "Worse than the National Benchmark", "conditions[1][operator]": "="})
+    worst = {}
+    for r in hai:
+        fid = r.get("facility_id")
+        if not fid:
+            continue
+        w = worst.setdefault(fid, {"name": r.get("facility_name", ""), "measures": []})
+        m = clean(r.get("measure_name", "")).replace(" (ICU + select Wards)", "")
+        if m and m not in w["measures"] and len(w["measures"]) < 3:
+            w["measures"].append(m)
+    if not worst:
+        return []
+    # Phone/address/rating by facility_id.
+    gmap = {}
+    for g in _cms_paginate(CMS_HOSPITAL_GENERAL_ID, {
+            "conditions[0][property]": "state", "conditions[0][value]": st, "conditions[0][operator]": "="}):
+        gmap[g.get("facility_id")] = g
+    leads = []
+    for fid, w in worst.items():
+        g = gmap.get(fid, {})
+        name = clean(w["name"] or g.get("facility_name", ""))
+        if not name:
+            continue
+        measures = ", ".join(w["measures"]) or "infection rates"
+        leads.append({
+            "company": name, "industry": "Hospital",
+            "phone": clean(g.get("telephone_number", "")),
+            "address": clean(g.get("address", "")), "city": clean(g.get("citytown", "")), "state": st,
+            "notes": f"[INTENT:health_violation] CMS: worse-than-national infection rate ({measures})"
+                     f"{(' | ' + str(g.get('hospital_overall_rating')) + '★ overall') if g.get('hospital_overall_rating') else ''}".strip(),
+        })
+        if len(leads) >= FREE_SOURCE_MAX_ROWS:
+            break
+    return leads
+
+def fetch_cms_dialysis(state_abbrev: str) -> list:
+    """Dialysis centers (infection-critical, real cleaning need). CMS listing has
+    name/address/phone + a 5-star rating; we surface the BELOW-AVERAGE (1-2★)
+    ones as the 'needs help' signal."""
+    st = state_abbrev.upper()
+    rows = _cms_paginate(CMS_DIALYSIS_ID, {
+        "conditions[0][property]": "state", "conditions[0][value]": st, "conditions[0][operator]": "="})
+    leads = []
+    for r in rows:
+        star_raw = clean(r.get("five_star", ""))
+        try:
+            star = float(star_raw)
+        except ValueError:
+            continue
+        if star > 2:                      # only the below-average (1-2★) ones signal a need
+            continue
+        name = clean(r.get("facility_name", ""))
+        if not name:
+            continue
+        addr = " ".join(clean(r.get(p, "")) for p in ["address_line_1", "address_line_2"]).strip()
+        leads.append({
+            "company": name, "industry": "Dialysis Center",
+            "phone": clean(r.get("telephone_number", "")),
+            "address": addr, "city": clean(r.get("citytown", "")), "state": st,
+            "notes": f"[INTENT:health_violation] CMS {int(star)}★ dialysis facility (below average) — "
+                     f"infection control is critical here",
+        })
+        if len(leads) >= FREE_SOURCE_MAX_ROWS:
+            break
+    return leads
+
+# Registry — add a facility type by dropping in (label, fetcher). The endpoint
+# pulls every type for a state. Nursing homes carry the deepest signal.
+CMS_HEALTHCARE_FETCHERS = [
+    ("nursing",  fetch_cms_nursing),
+    ("hospital", fetch_cms_hospitals),
+    ("dialysis", fetch_cms_dialysis),
+]
+
 def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
     """Pull recent FAILED health inspections for configured metros in a state.
     Dedups multi-violation rows to one lead per facility, tagged
@@ -4105,8 +4212,16 @@ def source_health(body: FreeSourceRequest, user: str = Depends(verify_token)):
     if not body.state:
         raise HTTPException(status_code=400, detail="Pick a state.")
 
-    # PRIMARY: CMS nursing facilities, all 50 states. Phones come from CMS.
-    raw = fetch_cms_nursing(body.state)
+    # PRIMARY: CMS healthcare facilities (nursing homes + hospitals + dialysis),
+    # all 50 states, phones included. Each type carries its own sanitation signal.
+    raw, by_type = [], {}
+    for label, fetcher in CMS_HEALTHCARE_FETCHERS:
+        try:
+            part = fetcher(body.state)
+        except Exception as e:
+            print(f"[CMS] {label} fetch error: {e}"); part = []
+        by_type[label] = len(part)
+        raw += part
     cms_n = len(raw)
 
     # OPT-IN: restaurant inspections (3 metros) — Google-phone-matched. Off by
@@ -4131,9 +4246,10 @@ def source_health(body: FreeSourceRequest, user: str = Depends(verify_token)):
 
     res = ingest_leads(raw, "Health Inspection", user)
     audit_log(user, "source_health", "lead", None,
-              {"state": body.state, "cms_nursing": cms_n, "restaurants": restaurant_n, **res})
-    res["summary"] = (f"Health: {cms_n} nursing facilities w/ infection-control deficiencies"
-                      f"{f' + {restaurant_n} restaurant failures' if body.restaurants else ''} · "
+              {"state": body.state, "by_type": by_type, "restaurants": restaurant_n, **res})
+    breakdown = ", ".join(f"{n} {lbl}" for lbl, n in by_type.items() if n)
+    res["summary"] = (f"Health: {cms_n} healthcare facilities ({breakdown})"
+                      f"{f' + {restaurant_n} restaurants' if body.restaurants else ''} · "
                       f"{res['alreadyInDb']} already in DB · {res['droppedUncallable']} no phone · "
                       f"{res['saved']} new urgent leads saved")
     return res

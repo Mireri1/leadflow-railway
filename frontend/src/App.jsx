@@ -622,11 +622,11 @@ function FreeSourceFinder({onFound}){
         {src==="health"&&(
           <div style={{gridColumn:"1 / -1",fontSize:11,color:"#a3aac4",background:"#1a0f15",
             border:"1px solid #ff4d6d40",borderRadius:8,padding:"10px 12px",lineHeight:1.5}}>
-            🚨 <b style={{color:"#ff8da3"}}>Highest-value source — nursing facilities, all 50 states.</b> Pulls
-            <b> nursing homes with recent sanitation / infection-control deficiencies</b> from CMS (Medicare) — real
-            cleaning budgets + regulatory pressure. Sorted <b>freshest-first</b> (newest surveys ~2 months old);
-            <b>Special Focus Facilities</b> (CMS's actively-watched worst performers) and complaint-triggered surveys
-            score highest. <b>Phones included</b> — every lead dialable. The deficiency is the pitch. Pick any state.
+            🚨 <b style={{color:"#ff8da3"}}>Highest-value source — healthcare facilities, all 50 states.</b> Pulls
+            from CMS (Medicare): <b>nursing homes</b> (recent sanitation deficiencies, freshest-first, Special-Focus
+            facilities boosted), <b>hospitals</b> (worse-than-national infection rates), and <b>dialysis centers</b>
+            (below-average, infection-critical). Real cleaning budgets + regulatory pressure; the violation is the pitch.
+            <b>Phones included</b> — every lead dialable. Pick any state.
             <label style={{display:"flex",alignItems:"center",gap:8,marginTop:8,cursor:"pointer",color:"#a3aac4"}}>
               <input type="checkbox" checked={restaurants} onChange={e=>setRestaurants(e.target.checked)} style={{cursor:"pointer"}}/>
               <span>Also include failed <b>restaurant</b> inspections <span style={{color:"#5a6a8a"}}>(IL/NY/TX metros — low budget, off by default)</span></span>
