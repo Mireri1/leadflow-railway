@@ -766,8 +766,20 @@ def score_lead(lead):
         score += 8 if n >= 200 else 5 if n >= 50 else 2
 
     # ── Active intent (someone with a need RIGHT NOW) — can dominate ──
+    notes_l = (lead.get("notes") or "").lower()
     for kind in lead_intent_kinds(lead):
-        score += INTENT_BOOSTS.get(kind, 0)
+        boost = INTENT_BOOSTS.get(kind, 0)
+        # Cleanliness complaints decay with age — a review from last week is a
+        # red-hot lead; one from 2 years ago is stale. The [clnage:<days>] token
+        # is stamped by the review scanner. No token (older runs) → neutral.
+        if kind == "cleanliness":
+            am = re.search(r"\[clnage:(\d+)\]", notes_l)
+            if am:
+                d = int(am.group(1))
+                mult = 1.45 if d <= 14 else 1.25 if d <= 30 else 1.0 if d <= 90 \
+                       else 0.7 if d <= 365 else 0.45
+                boost = round(boost * mult)
+        score += boost
 
     # ── Penalties ──
     if any(c in (lead.get("company") or "").lower() for c in CHAIN_MARKERS):
@@ -3909,18 +3921,30 @@ def google_place_reviews(place_id: str):
         return [], None, None
 
 def scan_cleanliness(reviews: list):
-    """Return (hit, quotable_snippet) if any recent-ish review complains about
-    cleanliness. Weight toward lower-rated reviews — a 5-star 'spotless!' that
-    contains 'dusty' shouldn't trigger."""
+    """Find the MOST RECENT low-rated review complaining about cleanliness. A
+    fresh complaint = an urgent, acute need, so recency matters as much as the
+    hit itself. Returns (hit, snippet, age_days, relative_desc).
+    age_days is None when Google doesn't give a timestamp."""
+    matches = []
     for rev in reviews:
         text = (rev.get("text") or "").lower()
         rating = rev.get("rating", 5)
         if rating and rating <= 3 and any(term in text for term in CLEANLINESS_COMPLAINT_TERMS):
-            snippet = (rev.get("text") or "").strip().replace("\n", " ")
-            if len(snippet) > 140:
-                snippet = snippet[:137] + "…"
-            return True, f'"{snippet}" ({rating}★)'
-    return False, ""
+            matches.append(rev)
+    if not matches:
+        return False, "", None, ""
+    # Newest first — Google gives `time` (unix seconds) + relative_time_description.
+    matches.sort(key=lambda r: r.get("time", 0), reverse=True)
+    best = matches[0]
+    snippet = (best.get("text") or "").strip().replace("\n", " ")
+    if len(snippet) > 140:
+        snippet = snippet[:137] + "…"
+    age_days = None
+    if best.get("time"):
+        age_days = max(0, int((time.time() - best["time"]) / 86400))
+    rel = best.get("relative_time_description", "")
+    label = f' ({rel})' if rel else ""
+    return True, f'"{snippet}" ({best.get("rating", "?")}★{label})', age_days, rel
 
 class ReviewScanRequest(BaseModel):
     state:  Optional[str] = ""
@@ -3967,10 +3991,12 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
             continue
         log_usage(user, "google_details", {"place_id": pid})
         reviews, rating, _ = google_place_reviews(pid)
-        hit, snippet = scan_cleanliness(reviews)
+        hit, snippet, age_days, rel = scan_cleanliness(reviews)
         if not hit:
             continue
-        add_intent_marker(lead, "cleanliness", f"Recent review complaint: {snippet}")
+        # Stamp a parseable age token so score_lead can decay older complaints.
+        age_tag = f" [clnage:{age_days}]" if age_days is not None else ""
+        add_intent_marker(lead, "cleanliness", f"Review complaint: {snippet}{age_tag}")
         new_score = score_lead(lead)
         try:
             req_lib.patch(
@@ -3980,19 +4006,22 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
             flagged += 1
             if len(samples) < 8:
                 samples.append({"company": lead.get("company"), "city": city,
-                                "score": new_score, "snippet": snippet})
+                                "score": new_score, "snippet": snippet,
+                                "posted": rel or "?", "age_days": age_days})
         except Exception as e:
             print(f"[REVIEWS] patch failed for {lead.get('id')}: {e}")
 
+    # Freshest complaint first — that's the order a caller should work them.
+    samples.sort(key=lambda s: (s.get("age_days") if s.get("age_days") is not None else 99999))
     audit_log(user, "enrich_reviews", "lead", None,
               {"scanned": scanned, "flagged": flagged, "state": body.state})
     if flagged:
         send_slack("🔥 Cleanliness-complaint leads found",
-                   f"*{user}* scanned {scanned} leads → *{flagged}* have recent Google reviews "
-                   f"complaining about cleanliness. They're now top-scored in the dialer.",
-                   fields=[{"label": s["company"], "value": s["snippet"]} for s in samples[:5]])
+                   f"*{user}* scanned {scanned} leads → *{flagged}* have Google reviews complaining "
+                   f"about cleanliness. Freshest complaints are now top-scored in the dialer.",
+                   fields=[{"label": f"{s['company']} · {s['posted']}", "value": s["snippet"]} for s in samples[:5]])
     return {"scanned": scanned, "flagged": flagged,
-            "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (now hot)",
+            "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (freshest = hottest)",
             "samples": samples}
 
 # ════════════════════════════════════════════════════════════════════════════

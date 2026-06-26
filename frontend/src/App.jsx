@@ -709,7 +709,7 @@ function IntentToolsPanel({onChange}){
             {rRes.samples&&rRes.samples.length>0&&(
               <div style={{marginTop:6,fontSize:11,color:"#dee5ff",lineHeight:1.6}}>
                 {rRes.samples.slice(0,5).map((s,i)=>(
-                  <div key={i}>🔥 <b>{s.company}</b> ({s.city}) → score {s.score} · <span style={{color:"#a3aac4"}}>{s.snippet}</span></div>
+                  <div key={i}>🔥 <b>{s.company}</b> ({s.city}) → score {s.score}{s.posted&&s.posted!=="?"?<span style={{color:"#ff6e84"}}> · 🕒 {s.posted}</span>:""} · <span style={{color:"#a3aac4"}}>{s.snippet}</span></div>
                 ))}
               </div>
             )}
