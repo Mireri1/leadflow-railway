@@ -5193,6 +5193,135 @@ async def analyze_note(request: Request, user: str = Depends(verify_token)):
         return {"sentiment": "neutral", "outcome": "", "callbackDate": "", "summary": "", "engine": "empty"}
     return haiku_analyze_note(note, body.get("company") or "", body.get("status") or "")
 
+# ── Appointments (sales → fulfillment loop) ─────────────────────────────────
+# LeadFlow is the system of record: a caller books a walkthrough → the admin
+# approves it (→ Angelo + downstream hiring) → it routes back here so decisions
+# and follow-ups are tracked to close the loop. Stored as JSON in app_settings
+# (appt_<leadId>) — no schema/DDL change. Calendar/Twilio/Notion hang off this.
+APPT_STAGES = ["pending", "approved", "confirmed", "won", "lost"]
+ANGELO_SLACK_WEBHOOK_URL = os.getenv("ANGELO_SLACK_WEBHOOK_URL", "")
+
+def _settings_get_json(key):
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{key}&select=value", headers=SB_HEADERS, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        return json_lib.loads(rows[0]["value"]) if rows and rows[0].get("value") else None
+    except Exception as e:
+        print(f"[APPT] settings_get {key} failed: {e}")
+        return None
+
+def _settings_set_json(key, obj):
+    try:
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                         headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                         json={"key": key, "value": json_lib.dumps(obj)}, timeout=10)
+        return r.status_code in (200, 201, 204)
+    except Exception as e:
+        print(f"[APPT] settings_set {key} failed: {e}")
+        return False
+
+def _notify_angelo(appt):
+    """Post an approved appointment to Angelo's Slack (own webhook if set, else
+    the main one) — everything he needs to kick off hiring."""
+    hook = ANGELO_SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL
+    if not hook:
+        return
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    fields = [f"*Company:* {appt.get('company','—')}", f"*When:* {appt.get('date','—')}",
+              f"*Area:* {appt.get('area','—')}", f"*Booked by:* {appt.get('createdBy','—')}"]
+    if appt.get("phone"): fields.append(f"*Phone:* {appt['phone']}")
+    if appt.get("notes"): fields.append(f"*Notes:* {appt['notes']}")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "✅ Approved appointment — start hiring", "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(fields)}},
+        {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Open in LeadFlow", "emoji": True}, "url": app_url, "style": "primary"}]},
+    ]
+    try:
+        req_lib.post(hook, json={"blocks": blocks}, timeout=10)
+    except Exception as e:
+        print(f"[APPT] angelo notify failed: {e}")
+
+@app.post("/api/appointments/{lead_id}")
+async def upsert_appointment(lead_id: str, request: Request, user: str = Depends(verify_token)):
+    """Book/update a walkthrough appointment (any caller). New ones start at
+    'pending' for admin approval. Mirrors the date onto the lead's callback."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    now = datetime.utcnow().isoformat() + "Z"
+    key = f"appt_{lead_id}"
+    appt = _settings_get_json(key) or {"leadId": lead_id, "stage": "pending",
+                                       "createdBy": user, "createdAt": now, "history": []}
+    try:
+        lr = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=company,phone,city,state", headers=SB_HEADERS, timeout=10)
+        lead = (lr.json() or [{}])[0] if lr.status_code == 200 else {}
+    except Exception:
+        lead = {}
+    appt["company"] = lead.get("company") or appt.get("company") or ""
+    appt["phone"] = lead.get("phone") or appt.get("phone") or ""
+    if body.get("date"): appt["date"] = body["date"]
+    appt["area"] = body.get("area") or appt.get("area") or " ".join(x for x in [lead.get("city"), lead.get("state")] if x)
+    if body.get("notes"): appt["notes"] = body["notes"]
+    appt["updatedAt"] = now
+    _settings_set_json(key, appt)
+    if appt.get("date"):
+        try:
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
+                          headers=SB_HEADERS, json={"callbackDate": appt["date"][:10], "updatedAt": now}, timeout=10)
+        except Exception:
+            pass
+    return appt
+
+@app.get("/api/appointments")
+def list_appointments(user: str = Depends(verify_token)):
+    """All appointments for the admin board (pending → approved → confirmed →
+    won/lost). Admin only."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    out = []
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=like.appt_*&select=value", headers=SB_HEADERS, timeout=15)
+        for row in (r.json() if r.status_code == 200 else []):
+            try:
+                out.append(json_lib.loads(row.get("value") or "{}"))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[APPT] list failed: {e}")
+    out.sort(key=lambda a: a.get("date", "") or "9999")
+    return {"appointments": out, "stages": APPT_STAGES}
+
+@app.post("/api/appointments/{lead_id}/transition")
+async def transition_appointment(lead_id: str, request: Request, user: str = Depends(verify_token)):
+    """Move an appointment to a new stage (admin). 'approved' fires the Angelo
+    handoff; 'won'/'lost' close the loop."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    stage = body.get("stage")
+    if stage not in APPT_STAGES:
+        raise HTTPException(status_code=400, detail=f"stage must be one of {APPT_STAGES}")
+    key = f"appt_{lead_id}"
+    appt = _settings_get_json(key)
+    if not appt:
+        raise HTTPException(status_code=404, detail="appointment not found")
+    now = datetime.utcnow().isoformat() + "Z"
+    appt["stage"] = stage
+    if body.get("subAssigned") is not None: appt["subAssigned"] = body["subAssigned"]
+    if body.get("decision") is not None: appt["decision"] = body["decision"]
+    if body.get("note"):
+        appt["notes"] = ((appt.get("notes", "") + "\n") if appt.get("notes") else "") + f"[{now[:10]}] {body['note']}"
+    appt.setdefault("history", []).append({"stage": stage, "at": now, "by": user})
+    appt["updatedAt"] = now
+    _settings_set_json(key, appt)
+    if stage == "approved":
+        _notify_angelo(appt)
+    return appt
+
 @app.patch("/api/leads/{lead_id}")
 def update_lead(lead_id: str, data: dict, user: str = Depends(verify_token)):
     try:

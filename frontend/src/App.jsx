@@ -1630,6 +1630,8 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [showScript,setShowScript]= useState(false)
   const [contractValue,setContractValue] = useState("")
   const [aiSent,setAiSent]        = useState("")       // Haiku sentiment, embedded on the lead at save
+  const [apptDate,setApptDate]    = useState("")       // walkthrough appointment (optional)
+  const [apptArea,setApptArea]    = useState("")
 
   // Smart-fill: map Haiku's note read onto the outcome chips + callback date.
   function applyAi(r){
@@ -1719,6 +1721,10 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         ...(!lead.assignedTo ? {assignedTo: getUser()} : {}),
         updatedAt:new Date().toISOString()
       })})
+      // Booked a walkthrough → create the appointment (pending admin approval)
+      if(apptDate){
+        try{ await api(`/api/appointments/${lead.id}`,{method:"POST",body:JSON.stringify({date:apptDate,area:apptArea,notes:cleanNote(notes)})}) }catch{}
+      }
       onSaved(); onClose()
     }catch(ex){setModalError("Couldn't save — check your internet and try again.")}
     finally{setSave(false)}
@@ -2100,6 +2106,16 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                 placeholder={secondary==="callback"?"What did they say? When should you call back?":"Dictate or type — then hit Smart-fill…"}/>
               <NoteAssist getNote={()=>notes} context={{company:lead.company,status:outcome}} onApply={applyAi}/>
             </div>
+            {(secondary==="interested"||secondary==="converted")&&(
+              <div style={{marginBottom:12,padding:"12px 14px",background:"#69f6b80d",border:"1px solid #69f6b833",borderRadius:9}}>
+                <div style={{fontSize:12,fontWeight:700,color:"#69f6b8",marginBottom:8}}>📅 Booked a walkthrough? (sends to admin for approval)</div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                  <input type="date" value={apptDate} onChange={e=>setApptDate(e.target.value)} className="sel" style={{flex:"1 1 150px"}}/>
+                  <input value={apptArea} onChange={e=>setApptArea(e.target.value)} placeholder={`Area (e.g. ${lead.city||"city"}, ${lead.state||"ST"})`}
+                    style={{flex:"2 1 200px",background:"#060e20",border:"1px solid #40485d40",borderRadius:7,color:"#dee5ff",padding:"8px 10px",fontSize:13,fontFamily:"inherit"}}/>
+                </div>
+              </div>
+            )}
             <div className="ff" style={{marginBottom:12}}>
               <label>Follow-up Sequence</label>
               <select value={followUpSeq} onChange={e=>setFuSeq(e.target.value)}>
@@ -2816,6 +2832,7 @@ const SIDEBAR_NAV = [
   { key:"warm",      label:"Warm Leads",      Icon:IconChart },
   { key:"dialer",    label:"Dialer",          Icon:IconPhone },
   { key:"followups", label:"Follow-Ups",      Icon:IconCalendarFar },
+  { key:"appointments", label:"Appointments",  Icon:IconCalendarFar, admin:true },
   { key:"qualified", label:"Qualified",        Icon:IconClipCheck },
   { key:"campaigns", label:"Email Campaigns",  Icon:IconMail },
   { key:"analytics", label:"Analytics",       Icon:IconChart },
@@ -3010,6 +3027,95 @@ function MyWeek({user, leads, onCall, onReload, notify}){
                 </div>
               )
             })}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ─── AppointmentsBoard (admin) — the sales→fulfillment loop, system of record ─
+const APPT_STAGE_META = {
+  pending:   { label:"⏳ Pending approval",          color:"#ffe083" },
+  approved:  { label:"✅ Approved — sent to Angelo",  color:"#a3a6ff" },
+  confirmed: { label:"📅 Confirmed",                  color:"#69b4f6" },
+  won:       { label:"🏆 Won",                        color:"#69f6b8" },
+  lost:      { label:"❌ Lost",                       color:"#ff6e84" },
+}
+const APPT_STAGES = ["pending","approved","confirmed","won","lost"]
+function AppointmentsBoard(){
+  const [appts,setAppts]=useState([])
+  const [loading,setLoading]=useState(true)
+  const [busy,setBusy]=useState("")
+  const [noteFor,setNoteFor]=useState(null)
+  const [noteText,setNoteText]=useState("")
+  function load(){ setLoading(true); api("/api/appointments").then(r=>setAppts(r.appointments||[])).catch(()=>setAppts([])).finally(()=>setLoading(false)) }
+  useEffect(()=>{ load() },[]) // eslint-disable-line
+  async function transition(a,stage,extra){
+    setBusy(a.leadId+stage)
+    try{ await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage,...(extra||{})})}); load() }
+    catch{} finally{ setBusy("") }
+  }
+  async function addNote(a){
+    if(!noteText.trim()){ setNoteFor(null); return }
+    try{ await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage:a.stage,note:noteText.trim()})}) }catch{}
+    setNoteFor(null); setNoteText(""); load()
+  }
+  const nextActions=a=>{
+    if(a.stage==="pending")   return [["approved","✅ Approve & send to Angelo"]]
+    if(a.stage==="approved")  return [["confirmed","📅 Mark confirmed"]]
+    if(a.stage==="confirmed") return [["won","🏆 Won"],["lost","❌ Lost"]]
+    return []
+  }
+  const byStage={}; APPT_STAGES.forEach(s=>byStage[s]=[]); appts.forEach(a=>{(byStage[a.stage]||byStage.pending).push(a)})
+  return (
+    <div>
+      <div style={{marginBottom:20}}>
+        <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,color:"#dee5ff",letterSpacing:"-.02em"}}>Appointments</h1>
+        <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Walkthroughs your callers booked — approve, hand off to Angelo for hiring, then track the decision to close the loop.</p>
+      </div>
+      {loading&&<div style={{color:"#a3aac4",fontSize:13,padding:"20px 0"}}>Loading appointments…</div>}
+      {!loading&&appts.length===0&&(
+        <div style={{color:"#5a6a8a",fontSize:14,padding:"30px 0",textAlign:"center"}}>No appointments yet — they show up here the moment a caller books a walkthrough.</div>
+      )}
+      {APPT_STAGES.map(s=> byStage[s].length>0&&(
+        <div key={s} style={{marginBottom:22}}>
+          <div style={{fontSize:13,fontWeight:700,color:APPT_STAGE_META[s].color,marginBottom:10}}>
+            {APPT_STAGE_META[s].label} <span style={{color:"#5a6a8a",fontWeight:400}}>· {byStage[s].length}</span>
+          </div>
+          <div style={{display:"grid",gap:10}}>
+            {byStage[s].map(a=>(
+              <div key={a.leadId} style={{background:"#0f1930",border:`1px solid ${APPT_STAGE_META[s].color}30`,borderRadius:12,padding:"14px 16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap"}}>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontSize:15,color:"#dee5ff",fontWeight:700}}>{a.company||"(lead)"}</div>
+                    <div style={{fontSize:12,color:"#a3aac4",marginTop:2}}>
+                      📅 <b style={{color:"#dee5ff"}}>{a.date||"—"}</b>{a.area?` · 📍 ${a.area}`:""}{a.phone?` · ${a.phone}`:""}
+                    </div>
+                    <div style={{fontSize:11,color:"#5a6a8a",marginTop:2}}>booked by {a.createdBy||"—"}{a.subAssigned?` · sub: ${a.subAssigned}`:""}</div>
+                    {a.notes&&<div style={{fontSize:12,color:"#c9d2ee",marginTop:6,whiteSpace:"pre-line",lineHeight:1.45}}>{a.notes}</div>}
+                  </div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}>
+                    {nextActions(a).map(([stage,label])=>(
+                      <button key={stage} disabled={busy===a.leadId+stage} onClick={()=>transition(a,stage)}
+                        style={{fontSize:11,padding:"6px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                          border:`1px solid ${APPT_STAGE_META[stage]?.color||"#a3a6ff"}66`,
+                          background:(APPT_STAGE_META[stage]?.color||"#a3a6ff")+"18",color:APPT_STAGE_META[stage]?.color||"#a3a6ff"}}>
+                        {busy===a.leadId+stage?"…":label}</button>
+                    ))}
+                    <button onClick={()=>{setNoteFor(noteFor===a.leadId?null:a.leadId);setNoteText("")}}
+                      style={{fontSize:11,padding:"6px 10px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",border:"1px solid #40485d40",background:"transparent",color:"#a3aac4"}}>📝 Note</button>
+                  </div>
+                </div>
+                {noteFor===a.leadId&&(
+                  <div style={{marginTop:10,display:"flex",gap:8}}>
+                    <input value={noteText} onChange={e=>setNoteText(e.target.value)} placeholder="Decision, sub status, follow-up…" autoFocus
+                      style={{flex:1,background:"#060e20",border:"1px solid #40485d40",borderRadius:7,color:"#dee5ff",padding:"7px 10px",fontSize:12,fontFamily:"inherit"}}/>
+                    <button className="btn btn-p" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>addNote(a)}>Save</button>
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
         </div>
       ))}
@@ -3560,7 +3666,7 @@ export default function App(){
         display:"flex",flexDirection:"column",overflowY:"auto"}}>
 
         <nav style={{flex:1,padding:"8px 0",display:"flex",flexDirection:"column",gap:2}}>
-          {SIDEBAR_NAV.map(({key,label,Icon})=>{
+          {SIDEBAR_NAV.filter(n=>!n.admin||isAdmin()).map(({key,label,Icon})=>{
             const active=activeNav===key
             return(
               <a key={key} href="#" onClick={e=>{e.preventDefault();setNav(key)}}
@@ -4961,6 +5067,8 @@ export default function App(){
           {activeNav==="myweek"&&(
             <MyWeek user={user} leads={leads} onCall={setCallModal} onReload={loadLeads} notify={notify}/>
           )}
+
+          {activeNav==="appointments"&&isAdmin()&&<AppointmentsBoard/>}
 
           {/* ── FOLLOW-UPS (overdue + today + week + month + later + future) ── */}
           {activeNav==="followups"&&(()=>{
