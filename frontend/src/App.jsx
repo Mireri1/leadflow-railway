@@ -290,6 +290,44 @@ function parseCSV(text) {
   }).filter(l=>l.company||l.phone||l.firstName)
 }
 
+// Robust "one row per prospect" importer for the caller's spreadsheet — maps her
+// column headers (case/space-insensitive, common aliases) to lead fields and
+// folds any unmapped columns into notes so nothing from her sheet is lost.
+const PROSPECT_ALIASES = {
+  company:["company","companyname","business","businessname","name","account","organization","org","prospect","facility","client"],
+  phone:["phone","phonenumber","number","tel","telephone","contactnumber","cell","mobile","ph"],
+  notes:["notes","note","comments","comment","details","remarks","statusnote","description","log"],
+  firstName:["firstname","first","contactfirst","contact"],
+  lastName:["lastname","last","contactlast"],
+  email:["email","emailaddress","e-mail"],
+  city:["city","town"], state:["state","st"], address:["address","street","streetaddress","location"],
+  title:["title","role","position"], industry:["industry","vertical","type","category"],
+  website:["website","url","site","web"],
+}
+function parseProspectCSV(text){
+  const lines=text.replace(/\r/g,"").trim().split("\n")
+  if(lines.length<2) return []
+  const splitLine=(line)=>{const v=[];let cur="",q=false;for(const ch of line){if(ch==='"'){q=!q;continue}if(ch===','&&!q){v.push(cur);cur="";continue}cur+=ch}v.push(cur);return v.map(x=>x.trim())}
+  const rawHeaders=splitLine(lines[0])
+  const norm=rawHeaders.map(h=>h.toLowerCase().replace(/[^a-z0-9]/g,""))
+  const colMap={}
+  norm.forEach((h,i)=>{ for(const f in PROSPECT_ALIASES){ if(PROSPECT_ALIASES[f].includes(h)){ colMap[i]=f; break } } })
+  if(!Object.values(colMap).includes("company")){       // no company col → use first unmapped column
+    const free=norm.findIndex((h,i)=>!colMap[i]); if(free>=0) colMap[free]="company"
+  }
+  const out=[]
+  for(let r=1;r<lines.length;r++){
+    if(!lines[r].trim()) continue
+    const vals=splitLine(lines[r])
+    const lead={...emptyForm, source:"Imported", status:"new"}
+    vals.forEach((v,i)=>{ const f=colMap[i]; if(f&&v) lead[f]=lead[f]?lead[f]:v })
+    const extra=vals.map((v,i)=>(!colMap[i]&&v)?`${rawHeaders[i]||("col"+i)}: ${v}`:"").filter(Boolean)
+    if(extra.length) lead.notes=(lead.notes?lead.notes+" | ":"")+extra.join(" | ")
+    if(lead.company||lead.phone) out.push(lead)
+  }
+  return out
+}
+
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap');
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -2659,6 +2697,7 @@ function IconBtn({onClick,children,title,hoverColor="#dee5ff",baseColor="#a3aac4
 
 const SIDEBAR_NAV = [
   { key:"dashboard", label:"Dashboard",       Icon:IconDashboard },
+  { key:"myweek",    label:"My Week",         Icon:IconClipCheck },
   { key:"leads",     label:"Leads",           Icon:IconPeople },
   { key:"lookup",    label:"Phone Lookup",    Icon:IconSearch },
   { key:"warm",      label:"Warm Leads",      Icon:IconChart },
@@ -2669,6 +2708,182 @@ const SIDEBAR_NAV = [
   { key:"analytics", label:"Analytics",       Icon:IconChart },
   { key:"history",   label:"History",         Icon:IconHistory },
 ]
+
+// ─── MyWeek — the caller's own call/note workspace (replaces her spreadsheet) ─
+function MyWeek({user, leads, onCall, onReload, notify}){
+  const [weekOffset,setWeekOffset]=useState(0)
+  const [calls,setCalls]=useState([])
+  const [loading,setLoading]=useState(false)
+  const [expand,setExpand]=useState(null)     // leadId whose action panel is open
+  const [mode,setMode]=useState("note")       // "note" | "followup"
+  const [noteText,setNoteText]=useState("")
+  const [fuDate,setFuDate]=useState("")
+  const [importing,setImporting]=useState(false)
+  const fileRef=useRef(null)
+
+  function weekBounds(o){
+    const d=new Date(); const dow=(d.getDay()+6)%7
+    const mon=new Date(d); mon.setDate(d.getDate()-dow+o*7); mon.setHours(0,0,0,0)
+    const sun=new Date(mon); sun.setDate(mon.getDate()+6)
+    const f=x=>x.toISOString().slice(0,10); return {start:f(mon),end:f(sun)}
+  }
+  const bounds=weekBounds(weekOffset)
+  const leadmap={}; leads.forEach(l=>{leadmap[l.id]=l})
+  const today=new Date().toISOString().slice(0,10)
+
+  async function load(o){
+    setLoading(true); const b=weekBounds(o)
+    try{ const r=await api(`/api/calls/history?caller=${encodeURIComponent(user)}&date_from=${b.start}&date_to=${b.end}`); setCalls(r.calls||[]) }
+    catch{ setCalls([]) } finally{ setLoading(false) }
+  }
+  useEffect(()=>{ load(weekOffset) },[]) // eslint-disable-line
+
+  // Her due/overdue follow-ups (the worklist) for the top strip.
+  const myDue=leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted"&&(!l.assignedTo||l.assignedTo===user))
+    .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
+
+  function openAction(leadId,m){ setExpand(expand===leadId?null:leadId); setMode(m); setNoteText(""); setFuDate(today) }
+  async function saveNote(lead){
+    if(!noteText.trim()) return
+    const stamped=`[${today}] ${noteText.trim()}`
+    const newNotes=(lead.notes?lead.notes+"\n":"")+stamped
+    try{ await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({notes:newNotes,updatedAt:new Date().toISOString()})})
+      notify&&notify("Note added"); setExpand(null); onReload&&onReload() }catch{ notify&&notify("Error saving note","error") }
+  }
+  async function saveFollowup(lead){
+    if(!fuDate){ notify&&notify("Pick a follow-up date","error"); return }
+    const fuNote=noteText.trim()?`[follow-up ${fuDate}] ${noteText.trim()}`:""
+    const newNotes=fuNote?((lead.notes?lead.notes+"\n":"")+fuNote):lead.notes
+    try{ await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({callbackDate:fuDate,status:"callback",notes:newNotes,updatedAt:new Date().toISOString()})})
+      notify&&notify("Follow-up scheduled"); setExpand(null); onReload&&onReload() }catch{ notify&&notify("Error scheduling","error") }
+  }
+  function handleImport(e){
+    const file=e.target.files&&e.target.files[0]; if(!file) return
+    setImporting(true)
+    const reader=new FileReader()
+    reader.onload=async ev=>{
+      try{
+        const rows=parseProspectCSV(ev.target.result)
+        if(!rows.length){ notify&&notify("No rows found — is it a CSV with a header row?","error"); setImporting(false); return }
+        if(!window.confirm(`Import ${rows.length} prospects from this file? Their notes come with them.`)){ setImporting(false); return }
+        const r=await api("/api/leads/import",{method:"POST",body:JSON.stringify(rows)})
+        notify&&notify(`Imported ${r.count!=null?r.count:rows.length} prospects${r.skipped?` (${r.skipped} dupes skipped)`:""}`)
+        onReload&&onReload()
+      }catch(ex){ notify&&notify("Import failed — try exporting the sheet tab as .csv","error") }
+      finally{ setImporting(false); if(fileRef.current) fileRef.current.value="" }
+    }
+    reader.readAsText(file)
+  }
+
+  const byDay={}; calls.forEach(c=>{ const d=(c.calledAt||"").slice(0,10); if(d){(byDay[d]=byDay[d]||[]).push(c)} })
+  const dayKeys=Object.keys(byDay).sort().reverse()
+  const oc={converted:"#69f6b8",interested:"#69f6b8",interested_no_dm:"#69f6b8",callback:"#8b5cf6",not_interested:"#ff6e84",no_answer:"#a3aac4",voicemail:"#ffe083",answered:"#a3a6ff"}
+  const ActionPanel=({lead})=>(
+    <div style={{marginTop:8,padding:10,background:"#060e20",border:"1px solid #40485d40",borderRadius:8}}>
+      <div style={{display:"flex",gap:6,marginBottom:8}}>
+        {[["note","📝 Add note"],["followup","🗓 Schedule follow-up"]].map(([m,lbl])=>(
+          <button key={m} onClick={()=>setMode(m)} style={{fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",
+            border:`1px solid ${mode===m?"#a3a6ff":"#40485d40"}`,background:mode===m?"#a3a6ff22":"transparent",color:mode===m?"#a3a6ff":"#a3aac4"}}>{lbl}</button>
+        ))}
+      </div>
+      {mode==="followup"&&(
+        <input type="date" value={fuDate} onChange={e=>setFuDate(e.target.value)} className="sel" style={{marginBottom:8}}/>
+      )}
+      <textarea value={noteText} onChange={e=>setNoteText(e.target.value)} rows={2}
+        placeholder={mode==="note"?"What happened / anything to remember…":"Note for the follow-up (optional)…"}
+        style={{width:"100%",background:"#0f1930",border:"1px solid #40485d40",borderRadius:7,color:"#dee5ff",padding:"8px 10px",fontSize:13,fontFamily:"inherit"}}/>
+      <div style={{display:"flex",gap:8,marginTop:8}}>
+        <button className="btn btn-p" style={{fontSize:12,padding:"6px 14px"}}
+          onClick={()=>mode==="note"?saveNote(lead):saveFollowup(lead)}>Save</button>
+        <button className="btn btn-g" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setExpand(null)}>Cancel</button>
+      </div>
+    </div>
+  )
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between",gap:20,flexWrap:"wrap",marginBottom:24}}>
+        <div>
+          <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,color:"#dee5ff",letterSpacing:"-.02em"}}>My Week</h1>
+          <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>Your calls, notes, and follow-ups — all here, no spreadsheet.</p>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={handleImport}/>
+          <button className="btn btn-g" style={{fontSize:13,padding:"9px 16px"}} disabled={importing}
+            onClick={()=>fileRef.current&&fileRef.current.click()}>{importing?"Importing…":"⬆ Import my prospects (CSV)"}</button>
+        </div>
+      </div>
+
+      {/* Due / overdue follow-ups */}
+      {myDue.length>0&&(
+        <div style={{background:"#0f1930",border:"1px solid #ff6e8430",borderRadius:14,padding:"16px 20px",marginBottom:20}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#ffb3c0",marginBottom:10}}>🔔 Follow-ups due now ({myDue.length})</div>
+          {myDue.slice(0,12).map(l=>(
+            <div key={l.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderTop:"1px solid #40485d18"}}>
+              <div style={{minWidth:0}}>
+                <span style={{color:"#dee5ff",fontWeight:600,fontSize:13}}>{l.company||l.firstName}</span>
+                <span style={{color:l.callbackDate<today?"#ff6e84":"#ffe083",fontSize:11,marginLeft:8}}>
+                  {l.callbackDate<today?`${l.callbackDate} · overdue`:"today"}</span>
+              </div>
+              <button className="btn btn-p" style={{fontSize:11,padding:"5px 12px"}} onClick={()=>onCall&&onCall(l)}>Call</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Week navigator */}
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+        <button onClick={()=>{const o=weekOffset-1;setWeekOffset(o);load(o)}} className="btn btn-g" style={{fontSize:12,padding:"6px 12px"}}>◀ Prev week</button>
+        <div style={{fontSize:13,color:"#dee5ff",fontWeight:600,minWidth:200,textAlign:"center"}}>
+          {weekOffset===0?"This week":weekOffset===-1?"Last week":`${-weekOffset} weeks ago`}
+          <div style={{fontSize:10,color:"#5a6a8a"}}>{bounds.start} → {bounds.end} · {calls.length} calls</div>
+        </div>
+        <button onClick={()=>{const o=Math.min(0,weekOffset+1);setWeekOffset(o);load(o)}} disabled={weekOffset>=0}
+          className="btn btn-g" style={{fontSize:12,padding:"6px 12px",opacity:weekOffset>=0?.4:1}}>Next week ▶</button>
+      </div>
+
+      {loading&&<div style={{color:"#a3aac4",fontSize:13,padding:"20px 0"}}>Loading your week…</div>}
+      {!loading&&calls.length===0&&(
+        <div style={{color:"#5a6a8a",fontSize:14,padding:"30px 0",textAlign:"center"}}>No calls logged this week yet — they'll show up here as you dial.</div>
+      )}
+      {dayKeys.map(day=>(
+        <div key={day} style={{marginBottom:16}}>
+          <div style={{fontSize:12,color:"#a3aac4",fontWeight:700,marginBottom:6}}>
+            {new Date(day+"T12:00:00").toLocaleDateString(undefined,{weekday:"long",month:"short",day:"numeric"})}
+            <span style={{color:"#40485d",fontWeight:400}}> · {byDay[day].length} calls</span>
+          </div>
+          <div style={{background:"#0f1930",borderRadius:12,overflow:"hidden"}}>
+            {byDay[day].map(c=>{
+              const lead=leadmap[c.leadId]||{}
+              const co=lead.company||lead.firstName||"(lead removed)"
+              return (
+                <div key={c.id} style={{padding:"10px 16px",borderTop:"1px solid #40485d14"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12}}>
+                    <div style={{minWidth:0}}>
+                      <div style={{fontSize:13,color:"#dee5ff",fontWeight:600}}>{co}
+                        <span style={{color:oc[c.outcome]||"#a3aac4",fontSize:11,marginLeft:8}}>{(c.outcome||"").replace(/_/g," ")}</span>
+                        <span style={{color:"#40485d",fontSize:10,marginLeft:8}}>{(c.calledAt||"").slice(11,16)}</span>
+                      </div>
+                      {c.notes&&<div style={{fontSize:12,color:"#c9d2ee",marginTop:2,lineHeight:1.4}}>{c.notes}</div>}
+                    </div>
+                    {lead.id&&(
+                      <div style={{display:"flex",gap:5,flexShrink:0}}>
+                        <button onClick={()=>openAction(lead.id,"note")} title="Add a note" style={{fontSize:11,padding:"4px 9px",borderRadius:6,border:"1px solid #40485d40",background:"transparent",color:"#a3aac4",cursor:"pointer"}}>📝</button>
+                        <button onClick={()=>openAction(lead.id,"followup")} title="Schedule follow-up" style={{fontSize:11,padding:"4px 9px",borderRadius:6,border:"1px solid #40485d40",background:"transparent",color:"#a3aac4",cursor:"pointer"}}>🗓</button>
+                        <button onClick={()=>onCall&&onCall(lead)} title="Call again" style={{fontSize:11,padding:"4px 9px",borderRadius:6,border:"1px solid #69f6b840",background:"#69f6b815",color:"#69f6b8",cursor:"pointer"}}>📞</button>
+                      </div>
+                    )}
+                  </div>
+                  {expand===lead.id&&<ActionPanel lead={lead}/>}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 export default function App(){
   const [user,setUser]             = useState(()=>isLoggedIn()?localStorage.getItem("lf_user"):null)
@@ -4606,6 +4821,11 @@ export default function App(){
                 </div>
               )}
             </div>
+          )}
+
+          {/* ── MY WEEK — caller's call/note workspace ── */}
+          {activeNav==="myweek"&&(
+            <MyWeek user={user} leads={leads} onCall={setCallModal} onReload={loadLeads} notify={notify}/>
           )}
 
           {/* ── FOLLOW-UPS (overdue + today + week + month + later + future) ── */}
