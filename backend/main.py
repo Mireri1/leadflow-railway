@@ -8561,6 +8561,33 @@ def _bullets(items, fmt, cap=5):
     out = [fmt(x) for x in (items or [])[:cap]]
     return "\n".join(b for b in out if b)
 
+def _macro_receptivity_context(recept_days=90):
+    """Shared macro + receptivity context for the insight prompt AND the digest
+    sections. Returns {context (str for the AI), top_ind, warm_dow, macro_line}."""
+    out = {"context": "", "top_ind": [], "warm_dow": [], "macro_line": ""}
+    try:
+        recept = compute_receptivity(recept_days)
+        macro = get_macro_snapshot()
+    except Exception as e:
+        print(f"[CTX] macro/receptivity failed: {e}")
+        return out
+    top_ind = [i for i in recept.get("by_industry", []) if i["n"] >= recept.get("min_slice", 15)][:6]
+    warm_dow = sorted([d for d in recept.get("by_dow", []) if d.get("n")], key=lambda x: -x["index"])[:2]
+    macro_line = ", ".join(
+        f"{s['label']} {s['value']}{s['unit']}" + (f" ({'+' if (s.get('change') or 0) > 0 else ''}{s['change']})" if s.get("change") is not None else "")
+        for s in macro.get("series", []) if s.get("value") is not None)
+    parts = []
+    if macro_line:
+        parts.append("Macro (FRED): " + macro_line)
+    if top_ind:
+        parts.append("Receptivity leaders (trailing 90d, 0-100 index): " +
+                     ", ".join(f"{i['industry']} {i['index']} (n={i['n']})" for i in top_ind))
+    if warm_dow:
+        parts.append("Warmest days: " + ", ".join(f"{d['label']} ({d['index']})" for d in warm_dow))
+    out.update(context=("MACRO/RECEPTIVITY CONTEXT:\n" + "\n".join(parts)) if parts else "",
+               top_ind=top_ind, warm_dow=warm_dow, macro_line=macro_line)
+    return out
+
 def build_weekly_digest():
     """Assemble the weekly metrics + Sonnet insights and return the Slack blocks
     (or None if there's nothing/Slack isn't configured)."""
@@ -8581,7 +8608,12 @@ def build_weekly_digest():
         callers[c.get("calledBy", "Unknown")] = callers.get(c.get("calledBy", "Unknown"), 0) + 1
     top_callers = "\n".join(f"  {n}: *{v}*" for n, v in sorted(callers.items(), key=lambda x: -x[1])[:5]) or "  —"
 
-    ins = generate_note_insights(_gather_note_records(7), 7)
+    # Trailing-90d receptivity (stable industry rankings) + live macro backdrop —
+    # fed to the AI as context AND shown in the digest.
+    cx = _macro_receptivity_context(90)
+    top_ind, warm_dow, macro_line = cx["top_ind"], cx["warm_dow"], cx["macro_line"]
+
+    ins = generate_note_insights(_gather_note_records(7), 7, context=cx["context"])
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
     label = wk_start.strftime("%b %-d") + " – " + now.strftime("%b %-d")
 
@@ -8595,6 +8627,8 @@ def build_weekly_digest():
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*💡 {ins.get('headline') or 'No clear patterns this week.'}*"}},
     ]
+    if ins.get("outlook"):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🔮 Outlook*\n{ins['outlook']}"[:2900]}})
     obj = _bullets(ins.get("objections"), lambda o: f"• *{o.get('theme')}*" +
                    (f" ({o.get('count')}×)" if o.get("count") else "") +
                    (f"\n   → _{o.get('counter')}_" if o.get("counter") else ""))
@@ -8612,13 +8646,20 @@ def build_weekly_digest():
     watch = _bullets(ins.get("watchouts"), lambda w: f"• {w}")
     if watch:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*⚠️ Watch-outs*\n{watch}"[:2900]}})
-    if ins.get("engine") == "heuristic":
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
-            "text": "_Keyword fallback — add ANTHROPIC_API_KEY in Railway for full Sonnet analysis._"}]})
+    # 📈 Receptivity leaders (trailing 90d) + warmest day
+    if top_ind:
+        recept_txt = "\n".join(f"• *{i['industry']}* — {i['index']} _(n={i['n']})_" for i in top_ind[:5])
+        if warm_dow:
+            recept_txt += "\n_Warmest day:_ " + ", ".join(f"{d['label']} ({d['index']})" for d in warm_dow)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*📈 Most receptive verticals (trailing 90d)*\n{recept_txt}"[:2900]}})
+    # 🌐 Macro backdrop
+    if macro_line:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"🌐 *Macro:* {macro_line}"[:2900]}]})
     blocks.append({"type": "actions", "elements": [{"type": "button",
         "text": {"type": "plain_text", "text": "Open LeadFlow", "emoji": True}, "url": app_url, "style": "primary"}]})
     return {"blocks": blocks, "stats": {"calls": total, "conversions": conv, "interest_rate": wk_rate,
-                                        "notes": ins.get("sample", 0), "engine": ins.get("engine")}}
+                                        "notes": ins.get("sample", 0), "engine": ins.get("engine"),
+                                        "top_industry": (top_ind[0]["industry"] if top_ind else None)}}
 
 @app.get("/api/weekly-summary")
 def weekly_summary():
@@ -8915,18 +8956,19 @@ def _insight_heuristic(records):
         for theme, kws in CALL_NOTE_THEMES.items():
             if any(k in nl for k in kws):
                 t[theme] += 1
-    return {"headline": "Keyword patterns only — add ANTHROPIC_API_KEY in Railway for full AI analysis.",
+    return {"headline": "Top recurring themes this week (keyword read).",
             "objections": [{"theme": k, "count": v, "example": "", "counter": ""} for k, v in t.most_common(6)],
-            "timing": [], "segments": [], "opportunities": [], "watchouts": [],
+            "timing": [], "segments": [], "opportunities": [], "watchouts": [], "outlook": "",
             "engine": "heuristic", "sample": len(records)}
 
-def generate_note_insights(records, days):
+def generate_note_insights(records, days, context=""):
     """Synthesize patterns across many notes. Uses Sonnet (INSIGHTS_MODEL) — the
     quality of the clustering/rebuttals is worth the bigger model here, and this
-    runs only a few times a day (cached + one digest call)."""
+    runs only a few times a day (cached + one digest call). An optional `context`
+    block (macro + receptivity numbers) lets it tie patterns to the backdrop."""
     if not records:
         return {"headline": "No notes in this window yet.", "objections": [], "timing": [],
-                "segments": [], "opportunities": [], "watchouts": [], "engine": "empty", "sample": 0}
+                "segments": [], "opportunities": [], "watchouts": [], "outlook": "", "engine": "empty", "sample": 0}
     if not ANTHROPIC_API_KEY:
         return _insight_heuristic(records)
     lines = []
@@ -8939,21 +8981,25 @@ def generate_note_insights(records, days):
     system = (
         "You are a sales analyst for a commercial cleaning company that cold-calls B2B prospects "
         f"(healthcare, schools, offices, industrial). Read this batch of call + lead notes from the last {days} days "
-        "and surface ACTIONABLE PATTERNS. Return STRICT JSON only (no markdown) with keys:\n"
+        "and surface ACTIONABLE PATTERNS. You may also be given a MACRO/RECEPTIVITY context block — when present, use "
+        "the receptivity numbers to ground your segment reads and the macro figures (labor, rates, consumer sentiment) "
+        "for the outlook. Return STRICT JSON only (no markdown) with keys:\n"
         "- headline: one sentence, the single most important takeaway.\n"
         "- objections: array (max 6) of {theme, count (approx int), example (a short real quote from the notes), counter (a one-line rebuttal the rep could say)}.\n"
         "- timing: array (max 6) of strings — recurring 'call back when' signals (seasons, semesters, contract-end, budget cycles).\n"
-        "- segments: array (max 6) of {segment (a vertical/state/source), read ('warm'|'cold'|'mixed'), note}.\n"
+        "- segments: array (max 6) of {segment (a vertical/state/source), read ('warm'|'cold'|'mixed'), note} — lean on the receptivity numbers when given.\n"
         "- opportunities: array (max 6) of {company, why} — specific named leads clearly worth a re-touch and when.\n"
         "- watchouts: array (max 6) of strings — risks, data-quality problems, or rep behaviors that are costing deals.\n"
+        "- outlook: 1-2 sentences — a forward read for the coming weeks tying the macro backdrop to which verticals to lean into vs ease off. Only if a macro context block is provided; otherwise ''.\n"
         "Be concrete and quote the notes. If the data is thin, return fewer items rather than inventing them."
     )
+    user_content = (f"{context}\n\n" if context else "") + f"Notes ({len(records)} records):\n{corpus}"
     try:
         r = req_lib.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={"model": INSIGHTS_MODEL, "max_tokens": 1600, "system": system,
-                  "messages": [{"role": "user", "content": f"Notes ({len(records)} records):\n{corpus}"}]},
+                  "messages": [{"role": "user", "content": user_content}]},
             timeout=45,
         )
         if r.status_code != 200:
@@ -8967,6 +9013,7 @@ def generate_note_insights(records, days):
             if not isinstance(data.get(k), list):
                 data[k] = []
         data["headline"] = data.get("headline", "") or ""
+        data["outlook"] = data.get("outlook", "") or ""
         data["engine"] = "ai"; data["sample"] = len(records)
         return data
     except Exception as e:
@@ -8984,7 +9031,7 @@ def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_to
     cached = _INSIGHT_CACHE.get(ck)
     if cached and not refresh and (time.time() - cached["ts"]) < 1800:
         return {**cached["data"], "cached": True}
-    data = generate_note_insights(_gather_note_records(days), days)
+    data = generate_note_insights(_gather_note_records(days), days, context=_macro_receptivity_context(90)["context"])
     _INSIGHT_CACHE[ck] = {"ts": time.time(), "data": data}
     return {**data, "cached": False}
 
@@ -9012,13 +9059,11 @@ def _agg_recept(calls):
             "engagement_rate": round(engaged / n * 100, 1),
             "index": round((0.35 * contact / n + 0.65 * engaged / n) * 100, 1)}
 
-@app.get("/api/analytics/receptivity")
-def receptivity_analytics(days: int = 180, user: str = Depends(verify_token)):
+def compute_receptivity(days=180):
     """Composite receptivity by INDUSTRY and by TIME (day-of-week, hour, month),
     plus the industry×month cross-tab — the 'which vertical is warm when' view.
-    Admin only. Phase-1 of the macro program; Phase-2 macro lives at /macro."""
-    if not is_admin(user):
-        raise HTTPException(status_code=403, detail="Admin only")
+    Phase-1 of the macro program; Phase-2 macro lives at /macro. Reusable by the
+    weekly digest (not just the HTTP endpoint)."""
     days = max(7, min(int(days or 180), 730))
     since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     calls = _paginated_get(
@@ -9071,6 +9116,12 @@ def receptivity_analytics(days: int = 180, user: str = Depends(verify_token)):
             "overall": _agg_recept(rows),
             "by_industry": by_industry, "by_dow": by_dow, "by_hour": by_hour,
             "by_month": by_month, "by_industry_month": by_industry_month}
+
+@app.get("/api/analytics/receptivity")
+def receptivity_analytics(days: int = 180, user: str = Depends(verify_token)):
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    return compute_receptivity(days)
 
 # ── Macro snapshot (FRED, no API key — public CSV export) ────────────────────
 # Phase-2: capture the macro backdrop alongside our receptivity time-series so

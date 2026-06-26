@@ -6305,6 +6305,14 @@ function NoteInsightsPanel(){
                 </div>
               </div>
 
+              {data.outlook&&(
+                <div style={{display:"flex",gap:10,alignItems:"flex-start",background:"#69f6b80d",border:"1px solid #69f6b833",
+                  borderRadius:10,padding:"12px 14px",marginBottom:14}}>
+                  <span style={{fontSize:18,lineHeight:1}}>🔮</span>
+                  <div style={{fontSize:13,color:"#c9f7e2",lineHeight:1.55}}><b style={{color:"#69f6b8"}}>Outlook · </b>{data.outlook}</div>
+                </div>
+              )}
+
               {data.objections?.length>0&&(
                 <Section icon="🛑" title="Objections + how to counter them">
                   {data.objections.map((o,i)=>(
