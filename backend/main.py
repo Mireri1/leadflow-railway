@@ -8400,6 +8400,103 @@ CALL_NOTE_THEMES = {
     "Not interested":              ["not interested", "no thanks", "no need", "all set", "we're good"],
 }
 
+def _parse_iso(s):
+    """Parse a stored ISO timestamp ('2026-06-25T14:30:00.000' / with Z) → datetime."""
+    if not s:
+        return None
+    s = str(s).strip().replace("Z", "")
+    for fmt in (None, "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.fromisoformat(s) if fmt is None else datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+# A session longer than this = a forgotten logout, not a 16-hour shift. Capped.
+MAX_SESSION_HOURS = float(os.getenv("MAX_SESSION_HOURS", "12"))
+
+@app.get("/api/analytics/hours")
+def hours_worked(start: str = "", end: str = "", user: str = Depends(verify_token)):
+    """Consolidated hours-worked per caller for payroll. Built from user_sessions
+    (sign-in → sign-out); a missing sign-out (left-open tab) is capped at the
+    caller's LAST CALL that session, then at MAX_SESSION_HOURS — so you don't pay
+    for an idle overnight tab. Defaults to the current week (Mon → now). Admin."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    now = datetime.utcnow()
+    start_dt = _parse_iso(start + "T00:00:00") if start else (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = _parse_iso(end + "T23:59:59") if end else now
+    s_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    sessions = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/user_sessions?select=username,signed_in,signed_out"
+        f"&signed_in=gte.{s_iso}&order=signed_in.asc")
+    calls = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes?select=calledBy,calledAt,duration"
+        f"&calledAt=gte.{s_iso}")
+
+    from collections import defaultdict
+    calls_by = defaultdict(list)          # caller → [(dt, duration)]
+    for c in calls:
+        dt = _parse_iso(c.get("calledAt"))
+        if dt:
+            calls_by[c.get("calledBy") or "Unknown"].append((dt, c.get("duration") or 0))
+    for k in calls_by:
+        calls_by[k].sort()
+
+    per = defaultdict(lambda: {"name": "", "total_hours": 0.0, "days": {}})
+    for s in sessions:
+        name = s.get("username") or ""
+        si = _parse_iso(s.get("signed_in"))
+        if not name or not si or si < start_dt or si > end_dt:
+            continue
+        so = _parse_iso(s.get("signed_out"))
+        capped = False
+        if not so:
+            # No sign-out → end at the last call after sign-in (+5m), else minimal.
+            after = [dt for dt, _ in calls_by.get(name, []) if dt >= si]
+            so = (max(after) + timedelta(minutes=5)) if after else (si + timedelta(minutes=15))
+            capped = True
+        hrs = (so - si).total_seconds() / 3600
+        if hrs > MAX_SESSION_HOURS:
+            hrs, capped = MAX_SESSION_HOURS, True
+        hrs = max(0.0, hrs)
+        d_key = si.strftime("%Y-%m-%d")
+        bucket = per[name]
+        bucket["name"] = name
+        day = bucket["days"].setdefault(d_key, {"date": d_key, "hours": 0.0, "sessions": 0,
+                                                "first_in": None, "last_out": None, "capped": False})
+        day["hours"] += hrs
+        day["sessions"] += 1
+        day["first_in"] = si.strftime("%H:%M") if not day["first_in"] else min(day["first_in"], si.strftime("%H:%M"))
+        day["last_out"] = max(day["last_out"] or "", so.strftime("%H:%M"))
+        day["capped"] = day["capped"] or capped
+        bucket["total_hours"] += hrs
+
+    # Attach per-day call counts + talk time.
+    for name, (lst) in calls_by.items():
+        if name not in per:
+            continue
+        for dt, dur in lst:
+            dk = dt.strftime("%Y-%m-%d")
+            if dk in per[name]["days"]:
+                per[name]["days"][dk].setdefault("calls", 0)
+                per[name]["days"][dk]["calls"] += 1
+                per[name]["days"][dk].setdefault("talk_min", 0)
+                per[name]["days"][dk]["talk_min"] += round((dur or 0) / 60)
+
+    callers = []
+    for name, b in per.items():
+        days = sorted(b["days"].values(), key=lambda x: x["date"])
+        for d in days:
+            d["hours"] = round(d["hours"], 2)
+            d.setdefault("calls", 0); d.setdefault("talk_min", 0)
+        callers.append({"name": name, "total_hours": round(b["total_hours"], 2),
+                        "total_calls": sum(d["calls"] for d in days), "days": days})
+    callers.sort(key=lambda x: -x["total_hours"])
+    return {"start": start_dt.strftime("%Y-%m-%d"), "end": end_dt.strftime("%Y-%m-%d"),
+            "callers": callers, "max_session_hours": MAX_SESSION_HOURS}
+
 @app.get("/api/analytics/call-notes")
 def call_notes_digest(days: int = 7, user: str = Depends(verify_token)):
     """Daily digest of the caller's notes + objection/theme patterns over the

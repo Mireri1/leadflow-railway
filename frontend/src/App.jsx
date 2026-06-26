@@ -5240,6 +5240,7 @@ export default function App(){
               </div>
 
               {/* ── Google Places Usage + Leads Pulled (admin only) ── */}
+              {isAdmin()&&<HoursPanel/>}
               {isAdmin()&&<ConversionPanel/>}
               {isAdmin()&&<CallNotesPanel/>}
               {isAdmin()&&<UsageDashboard/>}
@@ -5703,6 +5704,85 @@ function LogCallBtn({onClick}){
 
 // Admin-only: Google Places spend + leads-pulled-per-rep dashboard.
 // Mirrors LoginActivityPanel visual style — collapsible card, dark theme.
+// ─── HoursPanel (admin) — consolidated hours worked per caller for payroll ───
+function HoursPanel(){
+  const [data,setData]=useState(null)
+  const [show,setShow]=useState(false)
+  const [loading,setLoading]=useState(false)
+  const [weekOffset,setWeekOffset]=useState(0)  // 0 = this week, -1 = last week
+  // Monday of the week `offset` weeks back, and the following Sunday.
+  function weekBounds(offset){
+    const d=new Date(); const day=(d.getDay()+6)%7 // 0=Mon
+    const mon=new Date(d); mon.setDate(d.getDate()-day+offset*7); mon.setHours(0,0,0,0)
+    const sun=new Date(mon); sun.setDate(mon.getDate()+6)
+    const fmt=(x)=>x.toISOString().slice(0,10)
+    return {start:fmt(mon),end:fmt(sun),label:`${fmt(mon)} → ${fmt(sun)}`}
+  }
+  function load(offset){
+    setLoading(true)
+    const {start,end}=weekBounds(offset)
+    api(`/api/analytics/hours?start=${start}&end=${end}`).then(r=>{setData(r);setLoading(false)}).catch(()=>setLoading(false))
+  }
+  const DOW=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+  const dow=(iso)=>DOW[(new Date(iso+"T12:00:00").getDay()+6)%7]
+  const bounds=weekBounds(weekOffset)
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>{setShow(s=>!s); if(!data) load(weekOffset)}}
+        style={{padding:"16px 24px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,color:"#dee5ff",fontSize:15}}>⏱️ Hours Worked (Payroll)</div>
+          <div style={{fontSize:11,color:"#a3aac4",marginTop:2}}>Weekly hours per caller, from sign-in/out — capped at last call when a logout is missed.</div>
+        </div>
+        <span style={{color:"#40485d"}}>{show?"▾":"▸"}</span>
+      </div>
+      {show&&(
+        <div style={{padding:"0 24px 22px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+            <button onClick={()=>{const o=weekOffset-1;setWeekOffset(o);load(o)}}
+              style={{fontSize:12,padding:"5px 12px",borderRadius:7,border:"1px solid #40485d40",background:"transparent",color:"#a3aac4",cursor:"pointer",fontFamily:"inherit"}}>◀ Prev</button>
+            <div style={{fontSize:13,color:"#dee5ff",fontWeight:600,minWidth:200,textAlign:"center"}}>
+              {weekOffset===0?"This week":weekOffset===-1?"Last week":`${-weekOffset} weeks ago`}
+              <div style={{fontSize:10,color:"#5a6a8a"}}>{bounds.label}</div>
+            </div>
+            <button onClick={()=>{const o=Math.min(0,weekOffset+1);setWeekOffset(o);load(o)}} disabled={weekOffset>=0}
+              style={{fontSize:12,padding:"5px 12px",borderRadius:7,border:"1px solid #40485d40",background:"transparent",
+                color:weekOffset>=0?"#40485d":"#a3aac4",cursor:weekOffset>=0?"default":"pointer",fontFamily:"inherit"}}>Next ▶</button>
+          </div>
+          {loading&&<div style={{color:"#a3aac4",fontSize:12}}>Loading…</div>}
+          {data&&(data.callers||[]).length===0&&!loading&&(
+            <div style={{color:"#5a6a8a",fontSize:13,padding:"10px 0"}}>No sessions logged this week.</div>
+          )}
+          {data&&(data.callers||[]).map(c=>(
+            <div key={c.name} style={{marginBottom:14,border:"1px solid #40485d25",borderRadius:12,overflow:"hidden"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px",background:"#000011"}}>
+                <div style={{fontSize:14,color:"#dee5ff",fontWeight:700}}>{c.name}
+                  <span style={{color:"#5a6a8a",fontWeight:400,fontSize:12}}> · {c.total_calls} calls</span></div>
+                <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:22,fontWeight:700,color:"#69f6b8"}}>{c.total_hours} <span style={{fontSize:12,color:"#a3aac4"}}>hrs</span></div>
+              </div>
+              <div style={{padding:"4px 16px 10px"}}>
+                {c.days.map(d=>(
+                  <div key={d.date} style={{display:"grid",gridTemplateColumns:"1.4fr 1fr 1.4fr 1fr",gap:8,
+                    fontSize:12,padding:"6px 0",borderTop:"1px solid #40485d14",alignItems:"center"}}>
+                    <div style={{color:"#dee5ff"}}>{dow(d.date)} <span style={{color:"#5a6a8a"}}>{d.date.slice(5)}</span></div>
+                    <div style={{color:"#69f6b8",fontWeight:600}}>{d.hours} hrs {d.capped&&<span title="A sign-out was missing; capped at last call." style={{color:"#ffe083",cursor:"help"}}>⚠</span>}</div>
+                    <div style={{color:"#a3aac4"}}>{d.first_in}–{d.last_out}</div>
+                    <div style={{color:"#a3aac4",textAlign:"right"}}>{d.calls} calls</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+          {data&&(data.callers||[]).length>0&&(
+            <div style={{fontSize:10,color:"#5a6a8a",fontStyle:"italic"}}>⚠ = sign-out missing, capped at the last call (or {data.max_session_hours}h max) so you don't pay for an idle tab.</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── CallNotesPanel (admin) — daily caller notes + recurring patterns ────────
 function CallNotesPanel(){
   const [data,setData]=useState(null)
