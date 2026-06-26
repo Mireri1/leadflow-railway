@@ -9004,31 +9004,38 @@ def generate_note_insights(records, days, context=""):
         "Be concrete and quote the notes. If the data is thin, return fewer items rather than inventing them."
     )
     user_content = (f"{context}\n\n" if context else "") + f"Notes ({len(records)} records):\n{corpus}"
-    try:
-        r = req_lib.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": INSIGHTS_MODEL, "max_tokens": 1600, "system": system,
-                  "messages": [{"role": "user", "content": user_content}]},
-            timeout=45,
-        )
-        if r.status_code != 200:
-            print(f"[INSIGHTS] {r.status_code} {r.text[:200]}")
-            return _insight_heuristic(records)
-        text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
-        if text.startswith("```"):
-            text = text.strip("`").split("\n", 1)[-1] if "\n" in text else text.strip("`")
-        data = json_lib.loads(text[text.find("{"): text.rfind("}") + 1])
-        for k in ["objections", "timing", "segments", "opportunities", "watchouts"]:
-            if not isinstance(data.get(k), list):
-                data[k] = []
-        data["headline"] = data.get("headline", "") or ""
-        data["outlook"] = data.get("outlook", "") or ""
-        data["engine"] = "ai"; data["sample"] = len(records)
-        return data
-    except Exception as e:
-        print(f"[INSIGHTS] failed: {e}")
-        return _insight_heuristic(records)
+    # Try Sonnet (INSIGHTS_MODEL) first; if that model errors (bad id / no access
+    # / rate limit), fall back to Haiku so insights are still AI — not keyword.
+    last_err = ""
+    for model in [INSIGHTS_MODEL, HAIKU_MODEL]:
+        try:
+            r = req_lib.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": model, "max_tokens": 1600, "system": system,
+                      "messages": [{"role": "user", "content": user_content}]},
+                timeout=45,
+            )
+            if r.status_code != 200:
+                last_err = f"{model} → {r.status_code}: {r.text[:160]}"
+                print(f"[INSIGHTS] {last_err}")
+                continue
+            text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+            if text.startswith("```"):
+                text = text.strip("`").split("\n", 1)[-1] if "\n" in text else text.strip("`")
+            data = json_lib.loads(text[text.find("{"): text.rfind("}") + 1])
+            for k in ["objections", "timing", "segments", "opportunities", "watchouts"]:
+                if not isinstance(data.get(k), list):
+                    data[k] = []
+            data["headline"] = data.get("headline", "") or ""
+            data["outlook"] = data.get("outlook", "") or ""
+            data["engine"] = "ai"; data["model"] = model; data["sample"] = len(records)
+            return data
+        except Exception as e:
+            last_err = f"{model} → {e}"
+            print(f"[INSIGHTS] failed: {last_err}")
+            continue
+    return {**_insight_heuristic(records), "api_error": last_err}
 
 @app.get("/api/analytics/note-insights")
 def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_token)):
