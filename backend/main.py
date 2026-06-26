@@ -2100,6 +2100,12 @@ def _bg_maintenance_loop():
             run_once_called_recycle_if_due()
         except Exception as e:
             print(f"[ONCE-RECYCLE] loop exception: {e}")
+        # Weekly AI review digest — fires once per ISO week on/after the target
+        # weekday (default Monday). Internal gate, no-ops the rest of the week.
+        try:
+            run_weekly_digest_if_due()
+        except Exception as e:
+            print(f"[WEEKLY-DIGEST] loop exception: {e}")
         time.sleep(IMAP_POLL_INTERVAL_MINUTES * 60)
 
 # ── Apollo dedupe — shared detection + self-healing weekly sweep ─────────
@@ -8484,22 +8490,8 @@ def daily_summary():
             {"label": "Today's objections / themes", "value": themes_txt},
             {"label": "📈 This week vs last (trend)", "value": trend_txt},
         ]
-
-        # 🧠 AI pattern read of the last 7 days of notes (one cheap Haiku call/day).
-        try:
-            ins = generate_note_insights(_gather_note_records(7), 7)
-            if ins.get("headline") and ins.get("engine") != "empty":
-                obj = "\n".join(f"  • {o.get('theme')}" + (f" — _{o.get('counter')}_" if o.get("counter") else "")
-                                for o in ins.get("objections", [])[:3])
-                timing = ins.get("timing", [])[:2]
-                ins_txt = ins["headline"]
-                if obj:
-                    ins_txt += "\n*Top objections + counters:*\n" + obj
-                if timing:
-                    ins_txt += "\n*Timing:* " + "; ".join(timing)
-                fields.append({"label": "🧠 This week's patterns (AI)", "value": ins_txt[:1400]})
-        except Exception as e:
-            print(f"[daily-summary] insight block failed: {e}")
+        # Deep AI pattern analysis now lives in the dedicated weekly review
+        # (run_weekly_digest_if_due) — the daily stays lean + keyword-cheap.
 
         send_slack(
             "📊 LeadFlow Daily Summary",
@@ -8514,6 +8506,137 @@ def daily_summary():
     except Exception as e:
         print(f"[daily-summary] error: {e}")
         return {"error": str(e)}
+
+# ── Weekly AI review digest (Sonnet) ────────────────────────────────────────
+# A deeper "what last week taught us" Slack post: full pattern analysis +
+# week-over-week metrics. Fires once per ISO week on/after WEEKLY_DIGEST_DAY
+# (0=Mon) from the bg loop; also hittable manually at GET /api/weekly-summary.
+WEEKLY_DIGEST_ENABLED = os.getenv("WEEKLY_DIGEST_ENABLED", "1") == "1"
+WEEKLY_DIGEST_DAY     = int(os.getenv("WEEKLY_DIGEST_DAY", "0"))   # Monday
+
+def _weekly_digest_due() -> bool:
+    """True once per ISO week, on/after the target weekday. Fail closed."""
+    try:
+        now = datetime.utcnow()
+        if now.weekday() < WEEKLY_DIGEST_DAY:
+            return False
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_weekly_digest&select=value",
+                        headers=SB_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return False
+        rows = r.json()
+        if not rows:
+            return True
+        try:
+            last_dt = datetime.fromisoformat((rows[0].get("value") or "").replace("Z", ""))
+        except Exception:
+            return True
+        return last_dt.isocalendar()[:2] != now.isocalendar()[:2]   # different ISO (year, week)
+    except Exception as e:
+        print(f"[WEEKLY-DIGEST] cooldown check failed: {e}")
+        return False
+
+def _record_weekly_digest_run():
+    try:
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                         headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                         json={"key": "last_weekly_digest", "value": datetime.utcnow().isoformat() + "Z"}, timeout=10)
+        if r.status_code not in (200, 201, 204):
+            print(f"[WEEKLY-DIGEST] cooldown upsert HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[WEEKLY-DIGEST] failed to record last-run: {e}")
+
+def _bullets(items, fmt, cap=5):
+    out = [fmt(x) for x in (items or [])[:cap]]
+    return "\n".join(b for b in out if b)
+
+def build_weekly_digest():
+    """Assemble the weekly metrics + Sonnet insights and return the Slack blocks
+    (or None if there's nothing/Slack isn't configured)."""
+    if not SLACK_WEBHOOK_URL:
+        return None
+    now = datetime.utcnow()
+    wk_start = (now - timedelta(days=7))
+    prior_start = (now - timedelta(days=14))
+    wk_iso, prior_iso = wk_start.strftime("%Y-%m-%dT00:00:00"), prior_start.strftime("%Y-%m-%dT00:00:00")
+    wk = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,notes,calledAt&calledAt=gte.{wk_iso}")
+    prior = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledAt"
+                           f"&calledAt=gte.{prior_iso}&calledAt=lt.{wk_iso}")
+    total, prior_n = len(wk), len(prior)
+    conv = sum(1 for c in wk if c.get("outcome") == "converted")
+    wk_rate, prior_rate = _interest_rate(wk), _interest_rate(prior)
+    callers = {}
+    for c in wk:
+        callers[c.get("calledBy", "Unknown")] = callers.get(c.get("calledBy", "Unknown"), 0) + 1
+    top_callers = "\n".join(f"  {n}: *{v}*" for n, v in sorted(callers.items(), key=lambda x: -x[1])[:5]) or "  —"
+
+    ins = generate_note_insights(_gather_note_records(7), 7)
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    label = wk_start.strftime("%b %-d") + " – " + now.strftime("%b %-d")
+
+    metrics = (f"*Calls:* {total} {_trend_arrow(total, prior_n)} _(prev {prior_n})_\n"
+               f"*Interest rate:* {wk_rate}% {_trend_arrow(wk_rate, prior_rate)} _(prev {prior_rate}%)_\n"
+               f"*Conversions:* {conv}\n*By caller:*\n{top_callers}")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "🧠 LeadFlow Weekly Review", "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Week of {label}* · {ins.get('sample', 0)} notes analyzed"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": metrics}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*💡 {ins.get('headline') or 'No clear patterns this week.'}*"}},
+    ]
+    obj = _bullets(ins.get("objections"), lambda o: f"• *{o.get('theme')}*" +
+                   (f" ({o.get('count')}×)" if o.get("count") else "") +
+                   (f"\n   → _{o.get('counter')}_" if o.get("counter") else ""))
+    if obj:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🛑 Objections & counters*\n{obj}"[:2900]}})
+    timing = _bullets(ins.get("timing"), lambda t: f"• {t}")
+    if timing:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🗓 When to call back*\n{timing}"[:2900]}})
+    segs = _bullets(ins.get("segments"), lambda s: f"• *{s.get('segment')}* — {s.get('read','')}: {s.get('note','')}")
+    if segs:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*🎯 Warm vs cold segments*\n{segs}"[:2900]}})
+    opps = _bullets(ins.get("opportunities"), lambda o: f"• *{o.get('company')}* — {o.get('why','')}")
+    if opps:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*⭐ Worth a re-touch*\n{opps}"[:2900]}})
+    watch = _bullets(ins.get("watchouts"), lambda w: f"• {w}")
+    if watch:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*⚠️ Watch-outs*\n{watch}"[:2900]}})
+    if ins.get("engine") == "heuristic":
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+            "text": "_Keyword fallback — add ANTHROPIC_API_KEY in Railway for full Sonnet analysis._"}]})
+    blocks.append({"type": "actions", "elements": [{"type": "button",
+        "text": {"type": "plain_text", "text": "Open LeadFlow", "emoji": True}, "url": app_url, "style": "primary"}]})
+    return {"blocks": blocks, "stats": {"calls": total, "conversions": conv, "interest_rate": wk_rate,
+                                        "notes": ins.get("sample", 0), "engine": ins.get("engine")}}
+
+@app.get("/api/weekly-summary")
+def weekly_summary():
+    """Send the weekly AI review to Slack. Auto-fired weekly by the bg loop;
+    also hittable manually (e.g. to preview)."""
+    try:
+        payload = build_weekly_digest()
+        if not payload:
+            return {"sent": False, "reason": "SLACK_WEBHOOK_URL not configured"}
+        r = req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": payload["blocks"]}, timeout=10)
+        ok = r.status_code in (200, 204)
+        return {"sent": ok, **payload["stats"]}
+    except Exception as e:
+        print(f"[weekly-summary] error: {e}")
+        return {"error": str(e)}
+
+def run_weekly_digest_if_due():
+    if not WEEKLY_DIGEST_ENABLED or not SLACK_WEBHOOK_URL:
+        return
+    if not _weekly_digest_due():
+        return
+    try:
+        payload = build_weekly_digest()
+        if payload:
+            req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": payload["blocks"]}, timeout=10)
+            print(f"[WEEKLY-DIGEST] sent — {payload['stats']}")
+        _record_weekly_digest_run()   # record even if empty, so we don't retry all week
+    except Exception as e:
+        print(f"[WEEKLY-DIGEST] send failed: {e}")
 
 # Objection/theme buckets tallied from free-text call notes (no LLM needed).
 CALL_NOTE_THEMES = {

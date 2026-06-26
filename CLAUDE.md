@@ -143,9 +143,12 @@ ACTIONS TAKEN: [list or "None needed"]
 - `ANTHROPIC_API_KEY` — powers the note assistant + AI insights. If unset, both fall back to a keyword heuristic — never hard-fails.
 - `HAIKU_MODEL` — per-note assistant model (default: claude-haiku-4-5-20251001). High-frequency, simple classification → Haiku.
 - `INSIGHTS_MODEL` — pattern-insights model (default: claude-sonnet-4-6). Low-frequency, multi-note synthesis → Sonnet.
+- `WEEKLY_DIGEST_ENABLED` — auto weekly AI review to Slack (default: 1)
+- `WEEKLY_DIGEST_DAY` — weekday to send (0=Mon … 6=Sun, default: 0)
 
 ## Note Intelligence (Haiku)
 - `POST /api/notes/analyze` `{note, company?, status?}` → `{sentiment: warm|neutral|cold, outcome, callbackDate (ISO, parsed from plain English), summary, engine}`.
 - Sentiment is persisted in the lead's `notes` as a `[sent:warm|neutral|cold]` tag (same tokenized-notes pattern as `[INTENT:*]` — no schema change). `cleanNote()` strips it; `parseSentiment()` reads it; `<SentimentDot/>` renders the colored dot.
 - Caller UI: CallModal + My Week have 🎤 Dictate (Web Speech API) and ✨ Smart-fill (applies suggested outcome + callback date in one tap).
-- `POST /api/analytics/note-insights?days=N` (admin) → Sonnet reads recent notes (call_outcomes + leads incl. imported lists/My Week) → `{headline, objections[], timing[], segments[], opportunities[], watchouts[], engine, sample, cached}`. 30-min cache; `refresh=1` bypasses. `generate_note_insights()` + `_gather_note_records()`. Also a 7-day block in the daily digest.
+- `POST /api/analytics/note-insights?days=N` (admin) → Sonnet reads recent notes (call_outcomes + leads incl. imported lists/My Week) → `{headline, objections[], timing[], segments[], opportunities[], watchouts[], engine, sample, cached}`. 30-min cache; `refresh=1` bypasses. `generate_note_insights()` + `_gather_note_records()`.
+- Weekly Slack review: `GET /api/weekly-summary` posts the full Sonnet analysis + week-over-week metrics. Auto-fires once per ISO week (on/after `WEEKLY_DIGEST_DAY`) from `_bg_maintenance_loop` via `run_weekly_digest_if_due()` (cooldown row `last_weekly_digest`). The daily digest stays lean (keyword themes + trend only).
