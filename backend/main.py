@@ -712,6 +712,7 @@ CHAIN_MARKERS = ["mcdonald", "starbucks", "walmart", "target", "cvs", "walgreens
 # Intent markers a source can stamp into a lead's notes via add_intent_marker().
 # Each maps to a score boost — intent (active need) outranks raw fit.
 INTENT_BOOSTS = {
+    "health_violation": 42,  # FAILED a govt health inspection = authoritative, urgent, call-now
     "cleanliness": 34,   # recent reviews complain about dirtiness = urgent pain
     "rfp":         32,   # active solicitation for janitorial services
     "contract":    28,   # holds an expiring janitorial contract (recompete soon)
@@ -778,6 +779,15 @@ def score_lead(lead):
                 d = int(am.group(1))
                 mult = 1.45 if d <= 14 else 1.25 if d <= 30 else 1.0 if d <= 90 \
                        else 0.7 if d <= 365 else 0.45
+                boost = round(boost * mult)
+        # Failed inspection: a re-inspection clock is ticking, so freshness is
+        # everything — a last-week failure is a call-today lead.
+        if kind == "health_violation":
+            am = re.search(r"\[hvage:(\d+)\]", notes_l)
+            if am:
+                d = int(am.group(1))
+                mult = 1.5 if d <= 14 else 1.3 if d <= 30 else 1.0 if d <= 90 \
+                       else 0.6 if d <= 180 else 0.35
                 boost = round(boost * mult)
         score += boost
 
@@ -3877,6 +3887,135 @@ def source_permits(body: FreeSourceRequest, user: str = Depends(verify_token)):
     audit_log(user, "source_permits", "lead", None, {"state": body.state, **res})
     res["summary"] = (f"Permits: {res['found']} commercial builds found · {res['alreadyInDb']} already in DB · "
                       f"{res['droppedUncallable']} no contact · {res['saved']} new saved")
+    return res
+
+# ════════════════════════════════════════════════════════════════════════════
+# HEALTH-INSPECTION FEED — a FAILED government health inspection is the most
+# urgent cleaning signal there is: an inspector documented the sanitation
+# problem, there's a re-inspection clock ticking, and the violation text is the
+# pitch. These are "call today" leads. Per-metro (county/city) open data on
+# Socrata; explicit per-source field map since grading systems vary wildly.
+# ════════════════════════════════════════════════════════════════════════════
+HEALTH_INSPECTION_SOURCES = [
+    {"state": "IL", "metro": "Chicago", "domain": "data.cityofchicago.org", "id": "4ijn-s7e5",
+     "name": "dba_name", "addr": "address", "city": "city", "date": "inspection_date",
+     "viol": "violations", "result": "results", "ftype": "facility_type",
+     "where": "results='Fail'"},
+    {"state": "NY", "metro": "New York City", "domain": "data.cityofnewyork.us", "id": "43nn-pn8j",
+     "name": "dba", "addr_parts": ["building", "street"], "city": "boro", "date": "inspection_date",
+     "viol": "violation_description", "result": "grade", "ftype": "cuisine_description",
+     "where": "grade in('B','C')"},
+    # (King County/WA dropped — its open data lags ~7 months, too stale for an
+    #  "urgent" signal. Add metros only where inspections post within weeks.)
+    {"state": "TX", "metro": "Austin", "domain": "data.austintexas.gov", "id": "ecmv-9xxi",
+     "name": "restaurant_name", "addr": "address", "city_const": "Austin", "date": "inspection_date",
+     "viol": "process_description", "result": "score", "ftype": None,
+     "where": "score < 70"},  # Austin posts 0-100; <70 = serious problems
+]
+
+def google_place_phone(name: str, city: str, state: str) -> str:
+    """Look up a business's public phone via Google Places (Find Place →
+    Details). Best phone source for food-service facilities (restaurants list a
+    public number; Apollo targets office DMs, not diners). ~$0.035/lead."""
+    pid = google_find_place_id(name, city, state)
+    if not pid:
+        return ""
+    try:
+        det = req_lib.get("https://maps.googleapis.com/maps/api/place/details/json",
+                          params={"place_id": pid, "fields": "formatted_phone_number", "key": GOOGLE_KEY},
+                          timeout=10).json().get("result", {})
+        return clean(det.get("formatted_phone_number", ""))
+    except Exception:
+        return ""
+
+def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
+    """Pull recent FAILED health inspections for configured metros in a state.
+    Dedups multi-violation rows to one lead per facility, tagged
+    [INTENT:health_violation] with the violation as the pitch. Free, no key."""
+    sources = [s for s in HEALTH_INSPECTION_SOURCES if s["state"] == state_abbrev.upper()]
+    cutoff = (datetime.utcnow() - timedelta(days=max(1, min(days, 180)))).strftime("%Y-%m-%dT00:00:00")
+    leads, seen = [], set()
+    for s in sources:
+        where = f"{s['where']} and {s['date']} > '{cutoff}'"
+        try:
+            r = req_lib.get(f"https://{s['domain']}/resource/{s['id']}.json",
+                            params={"$where": where, "$order": f"{s['date']} DESC",
+                                    "$limit": FREE_SOURCE_MAX_ROWS * 2},
+                            headers={"User-Agent": "LeadFlow/1.0 (Vision Cleaning)"}, timeout=45)
+            rows = r.json() if r.status_code == 200 else []
+            if r.status_code != 200:
+                print(f"[HEALTH] {s['metro']} HTTP {r.status_code}: {str(rows)[:150]}")
+        except Exception as e:
+            print(f"[HEALTH] {s['metro']} failed: {e}")
+            continue
+        for row in rows:
+            name = clean(row.get(s["name"], ""))
+            if not name:
+                continue
+            addr = clean(row.get(s["addr"], "")) if s.get("addr") else \
+                   " ".join(clean(row.get(p, "")) for p in s.get("addr_parts", [])).strip()
+            key = (name.lower(), addr.lower())
+            if key in seen:           # one lead per facility (rows repeat per violation)
+                continue
+            seen.add(key)
+            date = str(row.get(s["date"], ""))[:10]
+            age_days = None
+            try:
+                age_days = max(0, (datetime.utcnow() - datetime.strptime(date, "%Y-%m-%d")).days)
+            except Exception:
+                pass
+            viol = clean(row.get(s["viol"], ""))[:160]
+            result = clean(row.get(s["result"], ""))
+            ftype = clean(row.get(s["ftype"], "")) if s.get("ftype") else ""
+            age_tag = f" [hvage:{age_days}]" if age_days is not None else ""
+            lead_city = clean(row.get(s["city"], "")) if s.get("city") else s.get("city_const", "")
+            leads.append({
+                "company": name, "industry": ftype or "Food Service", "phone": "",
+                "address": addr, "city": lead_city, "state": state_abbrev.upper(),
+                "notes": f"[INTENT:health_violation] Failed health inspection ({s['metro']}, {date}) — "
+                         f"{result}: {viol}{age_tag}".strip(),
+            })
+            if len(leads) >= FREE_SOURCE_MAX_ROWS:
+                break
+    return leads
+
+@app.post("/api/sources/health")
+def source_health(body: FreeSourceRequest, user: str = Depends(verify_token)):
+    """Pull recently-FAILED health inspections (urgent, call-today leads). Free.
+    Phone-enriches via Google Places (food-service facilities list a public
+    number) so the caller can dial immediately, then ingests as hot leads."""
+    _free_source_guard(user)
+    if not body.state:
+        raise HTTPException(status_code=400, detail="Pick a state.")
+    configured = {s["state"] for s in HEALTH_INSPECTION_SOURCES}
+    if body.state.upper() not in configured:
+        return {"found": 0, "saved": 0, "alreadyInDb": 0, "droppedUncallable": 0,
+                "summary": f"No health-inspection feed for {body.state} yet. Covered: "
+                           f"{', '.join(sorted(configured))}. (County/city-run; ask to add yours.)"}
+    raw = fetch_health_inspections(body.state, body.limit if (body.limit and body.limit < 181) else 90)
+
+    # Fill phones via Google Places so these are dialable today. Cost-capped +
+    # kill-switch aware; skips silently if Places is off.
+    phoned = 0
+    on, _src = is_kill_switch_on()
+    if GOOGLE_KEY and not on:
+        deadline = time.time() + OSM_ENRICH_BUDGET_SEC
+        for lead in raw:
+            if phoned >= OSM_ENRICH_CAP or time.time() > deadline:
+                break
+            ph = google_place_phone(lead["company"], lead.get("city", ""), lead.get("state", ""))
+            if ph:
+                lead["phone"] = ph
+                phoned += 1
+                log_usage(user, "google_find_place", {"company": lead["company"]})
+                log_usage(user, "google_details", {"company": lead["company"]})
+
+    res = ingest_leads(raw, "Health Inspection", user)
+    res["phoned"] = phoned
+    audit_log(user, "source_health", "lead", None, {"state": body.state, "phoned": phoned, **res})
+    res["summary"] = (f"Health inspections: {res['found']} recent FAILURES found · {phoned} phone-matched · "
+                      f"{res['alreadyInDb']} already in DB · {res['droppedUncallable']} no contact · "
+                      f"{res['saved']} new urgent leads saved")
     return res
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -190,6 +190,7 @@ function isAdmin()  { return getRole() === "admin" }
 // sourcing/enrichment endpoints. These drive the hot-lead badges + the Intent
 // filter so a caller instantly sees WHY a lead matters.
 const INTENT_META = {
+  health_violation: { label: "🚨 Failed health inspection", color: "#ff4d6d", pitch: "Official failed inspection — call today, re-inspection clock is ticking." },
   cleanliness: { label: "🔥 Cleanliness complaint", color: "#ff6e84", pitch: "Their reviews mention dirtiness — lead with that." },
   rfp:         { label: "📋 Active RFP",            color: "#ffb347", pitch: "Actively soliciting janitorial bids." },
   contract:    { label: "⏳ Contract expiring",     color: "#ffb347", pitch: "Time the recompete." },
@@ -203,6 +204,7 @@ const SOURCE_META = {
   "npi registry":              { label: "NPI Healthcare", color: "#69f6b8" },
   "openstreetmap":             { label: "OpenStreetMap",  color: "#69f6b8" },
   "permit (new construction)": { label: "Permit",         color: "#69b4f6" },
+  "health inspection":         { label: "Health Inspection", color: "#ff4d6d" },
   "google places":             { label: "Google Places",  color: "#a3a6ff" },
 }
 function parseIntents(notes){
@@ -528,10 +530,12 @@ function FreeSourceFinder({onFound}){
     try{
       const path = src==="osm" ? "/api/sources/osm"
                  : src==="npi" ? "/api/sources/npi"
-                 : "/api/sources/permits"
+                 : src==="permits" ? "/api/sources/permits"
+                 : "/api/sources/health"
       const body = src==="osm" ? {state,cities,categories:cats,enrich}
                  : src==="npi" ? {state,cities,taxonomy,limit:200}
-                 : {state,limit:30}
+                 : src==="permits" ? {state,limit:30}
+                 : {state,limit:90}
       const res = await api(path,{method:"POST",body:JSON.stringify(body)})
       setResult(res); if(res.saved>0) onFound&&onFound()
     }catch(ex){ setErr(ex.message||"Pull failed — try again or a different state.") }
@@ -550,7 +554,7 @@ function FreeSourceFinder({onFound}){
 
       {/* Source toggle */}
       <div style={{display:"flex",gap:8,marginBottom:14}}>
-        {[["osm","🗺️ OpenStreetMap"],["npi","🏥 NPI Healthcare"],["permits","🏗️ New-Build Permits"]].map(([v,label])=>(
+        {[["osm","🗺️ OpenStreetMap"],["npi","🏥 NPI Healthcare"],["permits","🏗️ New-Build Permits"],["health","🚨 Health Inspections"]].map(([v,label])=>(
           <button key={v} onClick={()=>setSrc(v)} type="button"
             style={{padding:"6px 14px",borderRadius:8,fontSize:12,fontFamily:"inherit",cursor:"pointer",
               background:src===v?"#69f6b8":"transparent",color:src===v?"#001b12":"#a3aac4",
@@ -614,10 +618,20 @@ function FreeSourceFinder({onFound}){
             portal publishes them — strongest in TX). More on request.
           </div>
         )}
+        {src==="health"&&(
+          <div style={{gridColumn:"1 / -1",fontSize:11,color:"#a3aac4",background:"#1a0f15",
+            border:"1px solid #ff4d6d40",borderRadius:8,padding:"10px 12px",lineHeight:1.5}}>
+            🚨 <b style={{color:"#ff8da3"}}>Most urgent source — call today, don't email.</b> Pulls facilities that
+            recently <b>FAILED a government health inspection</b> (dirty surfaces, vermin, poor housekeeping). The
+            violation is the pitch and there's a re-inspection clock ticking. Auto phone-matched via Google so they're
+            dialable. Freshest failures score highest. Covers <b>Chicago (IL), New York City (NY), Austin (TX)</b> — more metros on request.
+          </div>
+        )}
 
         <button className="btn btn-p" onClick={pull} disabled={loading}
-          style={{gridColumn:"1 / -1",padding:"10px 22px",background:"#69f6b8",color:"#001b12",fontWeight:600}}>
-          {loading?"Pulling…":(src==="osm"?"Pull from OpenStreetMap →":src==="npi"?"Pull from NPI Registry →":"Pull New-Build Permits →")}
+          style={{gridColumn:"1 / -1",padding:"10px 22px",
+            background:src==="health"?"#ff4d6d":"#69f6b8",color:src==="health"?"#fff":"#001b12",fontWeight:600}}>
+          {loading?"Pulling…":(src==="osm"?"Pull from OpenStreetMap →":src==="npi"?"Pull from NPI Registry →":src==="permits"?"Pull New-Build Permits →":"Pull Failed Inspections →")}
         </button>
       </div>
 
@@ -3365,6 +3379,7 @@ export default function App(){
                     <option value="apollo">📞 Apollo DM</option>
                     <option value="google places">📍 Google Places</option>
                     <option value="permit (new construction)">🏗️ Permit</option>
+                    <option value="health inspection">🚨 Health Inspection</option>
                   </select>
                   <select className="sel" value={fIntent} onChange={e=>setFIntent(e.target.value)}
                     title="Hot-intent signal — why this lead matters right now"
