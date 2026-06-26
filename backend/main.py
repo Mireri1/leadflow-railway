@@ -8265,17 +8265,55 @@ def get_stats(user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def _theme_tally(calls):
+    """Count CALL_NOTE_THEMES across a list of calls (by their notes)."""
+    from collections import Counter
+    t = Counter()
+    for c in (calls or []):
+        nl = (c.get("notes") or "").lower()
+        if not nl:
+            continue
+        for theme, kws in CALL_NOTE_THEMES.items():
+            if any(k in nl for k in kws):
+                t[theme] += 1
+    return t
+
+def _interest_rate(calls):
+    """% of calls that reached interest (interested/converted/callback)."""
+    calls = calls or []
+    if not calls:
+        return 0.0
+    inter = sum(1 for c in calls if c.get("outcome") in
+                ("interested", "interested_no_dm", "converted", "callback"))
+    return round(inter / len(calls) * 100, 1)
+
+def _trend_arrow(now, prev):
+    if prev == 0:
+        return "🆕" if now else "→"
+    d = now - prev
+    return "↑" if d > 0 else "↓" if d < 0 else "→"
+
 @app.get("/api/daily-summary")
 def daily_summary():
-    """Send end-of-day summary to Slack. Triggered by Railway cron or manually."""
+    """Send end-of-day summary to Slack. Triggered by Railway cron or manually.
+    Includes objection patterns + week-over-week trend (the seasonality base)."""
     try:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        now = datetime.utcnow()
+        today = now.strftime("%Y-%m-%d")
+        wk_start = (now - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00")
+        prior_start = (now - timedelta(days=14)).strftime("%Y-%m-%dT00:00:00")
 
-        # Calls today
+        # Calls today (with notes for theme tally)
         r_calls = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{today}T00:00:00",
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,notes,vendorstatus&calledAt=gte.{today}T00:00:00",
             headers=SB_HEADERS, timeout=30)
         calls = r_calls.json() if r_calls.status_code == 200 else []
+
+        # This week + prior week (for week-over-week trend → seasonality over time)
+        wk = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,notes,calledAt&calledAt=gte.{wk_start}")
+        prior = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,notes,calledAt"
+            f"&calledAt=gte.{prior_start}&calledAt=lt.{wk_start}")
 
         # Leads created today
         r_leads = req_lib.get(
@@ -8310,6 +8348,17 @@ def daily_summary():
 
         interested = len([c for c in (calls if isinstance(calls, list) else []) if c.get("outcome") in ("interested", "converted", "callback")])
 
+        # ── Patterns + week-over-week trend (the seasonality base) ──
+        themes_today = _theme_tally(calls).most_common(3)
+        themes_txt = "\n".join(f"  • {t}: *{n}*" for t, n in themes_today) or "  No notes logged"
+        wk_n, prior_n = len(wk), len(prior)
+        wk_rate, prior_rate = _interest_rate(wk), _interest_rate(prior)
+        wk_themes = _theme_tally(wk).most_common(1)
+        top_obj = f"{wk_themes[0][0]} ({wk_themes[0][1]})" if wk_themes else "—"
+        trend_txt = (f"  Calls: *{wk_n}* {_trend_arrow(wk_n, prior_n)} (prev {prior_n})\n"
+                     f"  Interest rate: *{wk_rate}%* {_trend_arrow(wk_rate, prior_rate)} (prev {prior_rate}%)\n"
+                     f"  Top objection: {top_obj}")
+
         app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
 
         send_slack(
@@ -8322,6 +8371,8 @@ def daily_summary():
                 {"label": "Emails Sent", "value": f":email: *{total_emails}*"},
                 {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
                 {"label": "Top Callers", "value": lb_text},
+                {"label": "Today's objections / themes", "value": themes_txt},
+                {"label": "📈 This week vs last (trend)", "value": trend_txt},
             ],
             actions=[
                 {"label": "Open LeadFlow", "url": app_url, "style": "primary"},
