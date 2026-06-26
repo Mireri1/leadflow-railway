@@ -8469,19 +8469,37 @@ def daily_summary():
 
         app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
 
+        fields = [
+            {"label": "Calls Made", "value": f":telephone_receiver: *{total_calls}*"},
+            {"label": "Interested/Callback", "value": f":fire: *{interested}*"},
+            {"label": "Leads Scraped", "value": f":busts_in_silhouette: *{total_leads}*"},
+            {"label": "Emails Sent", "value": f":email: *{total_emails}*"},
+            {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
+            {"label": "Top Callers", "value": lb_text},
+            {"label": "Today's objections / themes", "value": themes_txt},
+            {"label": "📈 This week vs last (trend)", "value": trend_txt},
+        ]
+
+        # 🧠 AI pattern read of the last 7 days of notes (one cheap Haiku call/day).
+        try:
+            ins = haiku_note_insights(_gather_note_records(7), 7)
+            if ins.get("headline") and ins.get("engine") != "empty":
+                obj = "\n".join(f"  • {o.get('theme')}" + (f" — _{o.get('counter')}_" if o.get("counter") else "")
+                                for o in ins.get("objections", [])[:3])
+                timing = ins.get("timing", [])[:2]
+                ins_txt = ins["headline"]
+                if obj:
+                    ins_txt += "\n*Top objections + counters:*\n" + obj
+                if timing:
+                    ins_txt += "\n*Timing:* " + "; ".join(timing)
+                fields.append({"label": "🧠 This week's patterns (AI)", "value": ins_txt[:1400]})
+        except Exception as e:
+            print(f"[daily-summary] insight block failed: {e}")
+
         send_slack(
             "📊 LeadFlow Daily Summary",
             f"Here's what your team did today ({today}):",
-            fields=[
-                {"label": "Calls Made", "value": f":telephone_receiver: *{total_calls}*"},
-                {"label": "Interested/Callback", "value": f":fire: *{interested}*"},
-                {"label": "Leads Scraped", "value": f":busts_in_silhouette: *{total_leads}*"},
-                {"label": "Emails Sent", "value": f":email: *{total_emails}*"},
-                {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
-                {"label": "Top Callers", "value": lb_text},
-                {"label": "Today's objections / themes", "value": themes_txt},
-                {"label": "📈 This week vs last (trend)", "value": trend_txt},
-            ],
+            fields=fields,
             actions=[
                 {"label": "Open LeadFlow", "url": app_url, "style": "primary"},
             ],
@@ -8675,6 +8693,158 @@ def call_notes_digest(days: int = 7, user: str = Depends(verify_token)):
         },
         "totals": {"calls": sum(x["calls"] for x in daily), "notes_written": sum(len(x["notes"]) for x in daily)},
     }
+
+# ── Haiku note-pattern learning ─────────────────────────────────────────────
+# Reads the actual free-text notes (her dialing notes in call_outcomes AND the
+# lead-level notes — the imported lists + her My Week entries) and asks Haiku to
+# surface ACTIONABLE patterns the fixed keyword tally can't: recurring objections
+# with rebuttals, "call back when" timing signals, which segments run warm/cold,
+# specific re-touch opportunities, and watch-outs. Cached so panel reloads don't
+# re-spend on the LLM.
+_INSIGHT_CACHE = {}
+
+def _clean_note_text(s):
+    """Strip machine tags + date/follow-up stamps → just the human sentence."""
+    s = s or ""
+    s = re.sub(r"\[INTENT:[a-z_]+\]", "", s, flags=re.I)
+    s = re.sub(r"\[(hvage|clnage):\d+\]", "", s, flags=re.I)
+    s = re.sub(r"\[sent:(warm|neutral|cold)\]", "", s, flags=re.I)
+    s = re.sub(r"\[(follow-up\s+)?\d{4}-\d{2}-\d{2}\]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _gather_note_records(days=7, cap=220):
+    """Pull substantive notes from call_outcomes (dialing) + leads (imported
+    lists + My Week notes) in the window, deduped + cleaned, newest first."""
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    records, seen = [], set()
+    # 1) Dialing notes
+    calls = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes?select=notes,outcome,calledAt,leadId,"
+        f"vendorstatus,budgetfocus,timeline,qualified&calledAt=gte.{since}T00:00:00&order=calledAt.desc")
+    lead_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
+    leadmap = {}
+    for i in range(0, len(lead_ids), 100):
+        chunk = ",".join(f'"{x}"' for x in lead_ids[i:i+100])
+        try:
+            r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?select=id,company,state,industry,source&id=in.({chunk})",
+                            headers=SB_HEADERS, timeout=20)
+            for l in (r.json() if r.status_code == 200 else []):
+                leadmap[l.get("id")] = l
+        except Exception as e:
+            print(f"[INSIGHTS] lead chunk failed: {e}")
+    for c in calls:
+        note = _clean_note_text(c.get("notes"))
+        if len(note) < 4:
+            continue
+        lead = leadmap.get(c.get("leadId"), {})
+        key = ((lead.get("company") or "—"), note[:48])
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({"company": lead.get("company", "—"), "state": lead.get("state", ""),
+                        "industry": lead.get("industry", ""), "source": lead.get("source", ""),
+                        "label": c.get("outcome", ""), "date": (c.get("calledAt") or "")[:10],
+                        "qual": [x for x in [c.get("vendorstatus"), c.get("budgetfocus"),
+                                 c.get("timeline"), c.get("qualified")] if x],
+                        "note": note[:300]})
+    # 2) Lead-level notes touched in the window (imported lists + My Week).
+    leads2 = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/leads?select=company,state,industry,source,status,notes,updatedAt,createdAt"
+        f"&or=(updatedAt.gte.{since}T00:00:00,createdAt.gte.{since}T00:00:00)&order=updatedAt.desc")
+    for l in leads2:
+        note = _clean_note_text(l.get("notes"))
+        if len(note) < 6:
+            continue
+        note = note[-300:]   # lead notes append newest at the end — keep the recent tail
+        key = ((l.get("company") or "—"), note[:48])
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({"company": l.get("company", "—"), "state": l.get("state", ""),
+                        "industry": l.get("industry", ""), "source": l.get("source", ""),
+                        "label": l.get("status", ""), "date": (l.get("updatedAt") or l.get("createdAt") or "")[:10],
+                        "qual": [], "note": note})
+    records.sort(key=lambda x: x.get("date", ""), reverse=True)
+    return records[:cap]
+
+def _insight_heuristic(records):
+    """No-key fallback — keyword theme tally wrapped in the insight shape."""
+    from collections import Counter
+    t = Counter()
+    for r in records:
+        nl = (r.get("note") or "").lower()
+        for theme, kws in CALL_NOTE_THEMES.items():
+            if any(k in nl for k in kws):
+                t[theme] += 1
+    return {"headline": "Keyword patterns only — add ANTHROPIC_API_KEY in Railway for full AI analysis.",
+            "objections": [{"theme": k, "count": v, "example": "", "counter": ""} for k, v in t.most_common(6)],
+            "timing": [], "segments": [], "opportunities": [], "watchouts": [],
+            "engine": "heuristic", "sample": len(records)}
+
+def haiku_note_insights(records, days):
+    if not records:
+        return {"headline": "No notes in this window yet.", "objections": [], "timing": [],
+                "segments": [], "opportunities": [], "watchouts": [], "engine": "empty", "sample": 0}
+    if not ANTHROPIC_API_KEY:
+        return _insight_heuristic(records)
+    lines = []
+    for r in records:
+        meta = " / ".join([x for x in [r.get("company"), r.get("state"), r.get("industry"),
+                                       r.get("source"), r.get("label")] if x])
+        q = (" qual:" + ",".join(r["qual"])) if r.get("qual") else ""
+        lines.append(f"- [{meta}]{q} {r.get('note')}")
+    corpus = "\n".join(lines)[:14000]
+    system = (
+        "You are a sales analyst for a commercial cleaning company that cold-calls B2B prospects "
+        f"(healthcare, schools, offices, industrial). Read this batch of call + lead notes from the last {days} days "
+        "and surface ACTIONABLE PATTERNS. Return STRICT JSON only (no markdown) with keys:\n"
+        "- headline: one sentence, the single most important takeaway.\n"
+        "- objections: array (max 6) of {theme, count (approx int), example (a short real quote from the notes), counter (a one-line rebuttal the rep could say)}.\n"
+        "- timing: array (max 6) of strings — recurring 'call back when' signals (seasons, semesters, contract-end, budget cycles).\n"
+        "- segments: array (max 6) of {segment (a vertical/state/source), read ('warm'|'cold'|'mixed'), note}.\n"
+        "- opportunities: array (max 6) of {company, why} — specific named leads clearly worth a re-touch and when.\n"
+        "- watchouts: array (max 6) of strings — risks, data-quality problems, or rep behaviors that are costing deals.\n"
+        "Be concrete and quote the notes. If the data is thin, return fewer items rather than inventing them."
+    )
+    try:
+        r = req_lib.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": HAIKU_MODEL, "max_tokens": 1300, "system": system,
+                  "messages": [{"role": "user", "content": f"Notes ({len(records)} records):\n{corpus}"}]},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"[INSIGHTS] {r.status_code} {r.text[:200]}")
+            return _insight_heuristic(records)
+        text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`").split("\n", 1)[-1] if "\n" in text else text.strip("`")
+        data = json_lib.loads(text[text.find("{"): text.rfind("}") + 1])
+        for k in ["objections", "timing", "segments", "opportunities", "watchouts"]:
+            if not isinstance(data.get(k), list):
+                data[k] = []
+        data["headline"] = data.get("headline", "") or ""
+        data["engine"] = "haiku"; data["sample"] = len(records)
+        return data
+    except Exception as e:
+        print(f"[INSIGHTS] failed: {e}")
+        return _insight_heuristic(records)
+
+@app.get("/api/analytics/note-insights")
+def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_token)):
+    """Haiku reads the recent notes (dialing + the imported lists + My Week) and
+    returns actionable patterns. Cached 30 min per window so reloads don't re-spend."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    days = max(1, min(int(days or 7), 30))
+    ck = f"d{days}"
+    cached = _INSIGHT_CACHE.get(ck)
+    if cached and not refresh and (time.time() - cached["ts"]) < 1800:
+        return {**cached["data"], "cached": True}
+    data = haiku_note_insights(_gather_note_records(days), days)
+    _INSIGHT_CACHE[ck] = {"ts": time.time(), "data": data}
+    return {**data, "cached": False}
 
 @app.get("/api/analytics/conversions")
 def conversion_analytics(user: str = Depends(verify_token)):

@@ -5594,6 +5594,7 @@ export default function App(){
               </div>
 
               {/* ── Google Places Usage + Leads Pulled (admin only) ── */}
+              {isAdmin()&&<NoteInsightsPanel/>}
               {isAdmin()&&<HoursPanel/>}
               {isAdmin()&&<ConversionPanel/>}
               {isAdmin()&&<CallNotesPanel/>}
@@ -6130,6 +6131,119 @@ function HoursPanel(){
           ))}
           {data&&(data.callers||[]).length>0&&(
             <div style={{fontSize:10,color:"#5a6a8a",fontStyle:"italic"}}>⚠ = sign-out missing, capped at the last call (or {data.max_session_hours}h max) so you don't pay for an idle tab.</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── NoteInsightsPanel (admin) — Haiku reads the notes & finds patterns ──────
+function NoteInsightsPanel(){
+  const [data,setData]=useState(null)
+  const [days,setDays]=useState(7)
+  const [show,setShow]=useState(false)
+  const [loading,setLoading]=useState(false)
+  function load(d,refresh){
+    setLoading(true)
+    api(`/api/analytics/note-insights?days=${d||days}${refresh?"&refresh=1":""}`)
+      .then(r=>{setData(r);setLoading(false)}).catch(()=>{setData({error:true});setLoading(false)})
+  }
+  const readColor={warm:"#69f6b8",cold:"#ff6e84",mixed:"#ffe083"}
+  const Section=({icon,title,children})=>(
+    <div style={{marginBottom:14}}>
+      <div style={{fontSize:11,color:"#a3a6ff",letterSpacing:".07em",fontWeight:700,marginBottom:8}}>{icon} {title}</div>
+      {children}
+    </div>
+  )
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24,border:"1px solid #a3a6ff20"}}>
+      <div onClick={()=>{setShow(s=>!s); if(!data) load()}}
+        style={{padding:"16px 24px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,color:"#dee5ff",fontSize:15}}>🧠 AI Pattern Insights</div>
+          <div style={{fontSize:11,color:"#a3aac4",marginTop:2}}>Haiku reads every call note + the imported lists and tells you what's actually happening.</div>
+        </div>
+        <span style={{color:"#40485d"}}>{show?"▾":"▸"}</span>
+      </div>
+      {show&&(
+        <div style={{padding:"0 24px 22px"}}>
+          <div style={{display:"flex",gap:6,marginBottom:14,alignItems:"center",flexWrap:"wrap"}}>
+            {[7,14,30].map(d=>(
+              <button key={d} onClick={()=>{setDays(d);load(d)}}
+                style={{fontSize:11,padding:"5px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                  border:`1px solid ${days===d?"#a3a6ff":"#40485d40"}`,
+                  background:days===d?"#a3a6ff22":"transparent",color:days===d?"#a3a6ff":"#a3aac4"}}>{d} days</button>
+            ))}
+            <button onClick={()=>load(days,1)} disabled={loading}
+              style={{marginLeft:"auto",fontSize:11,padding:"5px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                border:"1px solid #69f6b855",background:"#69f6b815",color:"#69f6b8"}}>↻ Re-analyze</button>
+          </div>
+          {loading&&<div style={{color:"#a3aac4",fontSize:12}}>Reading the notes…</div>}
+          {data&&data.error&&<div style={{color:"#ffb3c0",fontSize:12}}>Couldn't load insights — try again.</div>}
+          {data&&!data.error&&(
+            <>
+              <div style={{display:"flex",gap:10,alignItems:"flex-start",background:"#060e20",border:"1px solid #a3a6ff30",
+                borderRadius:10,padding:"14px 16px",marginBottom:14}}>
+                <span style={{fontSize:20,lineHeight:1}}>💡</span>
+                <div>
+                  <div style={{fontSize:14,color:"#dee5ff",fontWeight:600,lineHeight:1.5}}>{data.headline||"No clear patterns yet."}</div>
+                  <div style={{fontSize:10,color:"#5a6a8a",marginTop:6}}>
+                    {data.sample||0} notes analyzed · {data.engine==="haiku"?"Haiku":data.engine==="heuristic"?"keyword fallback (add ANTHROPIC_API_KEY)":"—"}
+                    {data.cached?" · cached":""}
+                  </div>
+                </div>
+              </div>
+
+              {data.objections?.length>0&&(
+                <Section icon="🛑" title="Objections + how to counter them">
+                  {data.objections.map((o,i)=>(
+                    <div key={i} style={{padding:"8px 0",borderTop:i?"1px solid #40485d18":""}}>
+                      <div style={{fontSize:13,color:"#dee5ff",fontWeight:600}}>{o.theme}
+                        {o.count?<span style={{color:"#a3aac4",fontWeight:400,fontSize:11}}> · {o.count}×</span>:null}</div>
+                      {o.example&&<div style={{fontSize:11,color:"#8893b0",fontStyle:"italic",marginTop:2}}>"{o.example}"</div>}
+                      {o.counter&&<div style={{fontSize:12,color:"#69f6b8",marginTop:3}}>→ {o.counter}</div>}
+                    </div>
+                  ))}
+                </Section>
+              )}
+
+              {data.timing?.length>0&&(
+                <Section icon="🗓" title="When to call back (timing signals)">
+                  {data.timing.map((t,i)=><div key={i} style={{fontSize:12,color:"#c9d2ee",padding:"3px 0"}}>• {t}</div>)}
+                </Section>
+              )}
+
+              {data.segments?.length>0&&(
+                <Section icon="🎯" title="Which segments run warm vs cold">
+                  {data.segments.map((s,i)=>(
+                    <div key={i} style={{display:"flex",gap:8,alignItems:"baseline",padding:"3px 0"}}>
+                      <span style={{fontSize:9,fontWeight:700,padding:"1px 7px",borderRadius:4,
+                        background:(readColor[s.read]||"#a3aac4")+"22",color:readColor[s.read]||"#a3aac4",textTransform:"uppercase"}}>{s.read||"—"}</span>
+                      <span style={{fontSize:12,color:"#dee5ff",fontWeight:600}}>{s.segment}</span>
+                      {s.note&&<span style={{fontSize:11,color:"#a3aac4"}}>— {s.note}</span>}
+                    </div>
+                  ))}
+                </Section>
+              )}
+
+              {data.opportunities?.length>0&&(
+                <Section icon="⭐" title="Worth a re-touch">
+                  {data.opportunities.map((o,i)=>(
+                    <div key={i} style={{padding:"3px 0"}}>
+                      <span style={{fontSize:12,color:"#69f6b8",fontWeight:600}}>{o.company}</span>
+                      {o.why&&<span style={{fontSize:12,color:"#c9d2ee"}}> — {o.why}</span>}
+                    </div>
+                  ))}
+                </Section>
+              )}
+
+              {data.watchouts?.length>0&&(
+                <Section icon="⚠️" title="Watch-outs">
+                  {data.watchouts.map((w,i)=><div key={i} style={{fontSize:12,color:"#ffd9a0",padding:"3px 0"}}>• {w}</div>)}
+                </Section>
+              )}
+            </>
           )}
         </div>
       )}
