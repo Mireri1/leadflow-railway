@@ -9052,9 +9052,11 @@ def receptivity_analytics(days: int = 180, user: str = Depends(verify_token)):
             g[keyfn(r)].append(r)
         return {k: _agg_recept(v) for k, v in g.items() if len(v) >= min_n}
 
+    # Rank significant slices (n≥min) by index first, thin/noisy slices after —
+    # so a n=2 fluke can't top the chart. UI still flags the thin ones.
     by_industry = sorted(
         [{"industry": k, **v} for k, v in group(lambda r: r["industry"]).items()],
-        key=lambda x: -x["index"])
+        key=lambda x: (x["n"] >= RECEPTIVITY_MIN_SLICE, x["index"]), reverse=True)
     by_dow = [{"dow": d, "label": _DOW[d], **(group(lambda r: r["dow"]).get(d) or {"n": 0, "index": 0, "contact_rate": 0, "engagement_rate": 0})} for d in range(7)]
     by_hour = sorted([{"hour": k, **v} for k, v in group(lambda r: r["hour"]).items()], key=lambda x: x["hour"])
     by_month = [{"month": m, "label": _MONTHS[m], **(group(lambda r: r["month"]).get(m) or {"n": 0, "index": 0, "contact_rate": 0, "engagement_rate": 0})} for m in range(1, 13)]
