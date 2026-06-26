@@ -212,8 +212,10 @@ VALID_NOTE_OUTCOMES = ["no_answer", "voicemail", "not_interested", "callback", "
 def _heuristic_note_analysis(note: str):
     """Keyword fallback so sentiment/outcome still populate without the API."""
     n = (note or "").lower()
-    cold = any(k in n for k in ["not interested", "happy with", "no thanks", "hung up", "remove", "do not", "stop call", "already have", "signed", "rude", "annoyed"])
-    warm = any(k in n for k in ["interested", "wants", "send", "quote", "great", "excited", "loved", "yes ", "sounds good", "set up", "schedule", "meeting", "demo"])
+    neg_interest = any(k in n for k in ["not interested", "no interest", "isn't interested", "isnt interested", "aren't interested", "arent interested"])
+    cold = neg_interest or any(k in n for k in ["happy with", "no thanks", "hung up", "remove", "do not", "stop call", "already have", "signed", "rude", "annoyed"])
+    # "interested" is a substring of "not interested" — only count it as warm when it isn't negated.
+    warm = (not neg_interest) and any(k in n for k in ["interested", "wants", "send", "quote", "great", "excited", "loved", "yes ", "sounds good", "set up", "schedule", "meeting", "demo"])
     if any(k in n for k in ["lvm", "voicemail", "left a message", "mailbox", "vm "]):
         outcome = "voicemail"
     elif any(k in n for k in ["not interested", "happy with", "no thanks", "already have", "signed"]):
