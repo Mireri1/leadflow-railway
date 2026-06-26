@@ -8362,9 +8362,18 @@ def call_notes_digest(days: int = 7, user: str = Depends(verify_token)):
         f"{SUPABASE_URL}/rest/v1/call_outcomes?select=notes,outcome,calledBy,calledAt,leadId,"
         f"vendorstatus,budgetfocus,timeline,decisionmaker,qualified"
         f"&calledAt=gte.{since}T00:00:00&order=calledAt.desc")
+    # Only resolve the leads actually referenced (not all ~9k) — chunked in.()
+    lead_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
     leadmap = {}
-    for l in _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=id,company,state"):
-        leadmap[l.get("id")] = l
+    for i in range(0, len(lead_ids), 100):
+        chunk = ",".join(f'"{x}"' for x in lead_ids[i:i+100])
+        try:
+            r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?select=id,company,state&id=in.({chunk})",
+                            headers=SB_HEADERS, timeout=20)
+            for l in (r.json() if r.status_code == 200 else []):
+                leadmap[l.get("id")] = l
+        except Exception as e:
+            print(f"[CALL-NOTES] lead chunk failed: {e}")
 
     from collections import defaultdict, Counter
     days_map = defaultdict(lambda: {"date": "", "calls": 0, "outcomes": Counter(), "notes": []})
