@@ -517,6 +517,7 @@ function FreeSourceFinder({onFound}){
   const [taxonomy,setTax]  = useState("")
   const [enrich,setEnrich] = useState(false)
   const [restaurants,setRestaurants] = useState(false)
+  const [dmEnrich,setDmEnrich] = useState(true)   // health: find decision-makers via Apollo
   const [loading,setLoad]  = useState(false)
   const [result,setResult] = useState(null)
   const [err,setErr]       = useState("")
@@ -536,7 +537,7 @@ function FreeSourceFinder({onFound}){
       const body = src==="osm" ? {state,cities,categories:cats,enrich}
                  : src==="npi" ? {state,cities,taxonomy,limit:200}
                  : src==="permits" ? {state,limit:30}
-                 : {state,limit:90,restaurants}
+                 : {state,limit:90,restaurants,enrich:dmEnrich}
       const res = await api(path,{method:"POST",body:JSON.stringify(body)})
       setResult(res); if(res.saved>0) onFound&&onFound()
     }catch(ex){ setErr(ex.message||"Pull failed — try again or a different state.") }
@@ -627,7 +628,13 @@ function FreeSourceFinder({onFound}){
             facilities boosted), <b>hospitals</b> (worse-than-national infection rates), and <b>dialysis centers</b>
             (below-average, infection-critical). Real cleaning budgets + regulatory pressure; the violation is the pitch.
             <b>Phones included</b> — every lead dialable. Pick any state.
-            <label style={{display:"flex",alignItems:"center",gap:8,marginTop:8,cursor:"pointer",color:"#a3aac4"}}>
+            {isAdmin()&&(
+              <label style={{display:"flex",alignItems:"center",gap:8,marginTop:8,cursor:"pointer",color:"#a3aac4"}}>
+                <input type="checkbox" checked={dmEnrich} onChange={e=>setDmEnrich(e.target.checked)} style={{cursor:"pointer"}}/>
+                <span>🎯 Find the <b>decision-maker</b> via Apollo <span style={{color:"#8b5cf6"}}>(EVS / facilities / administrator — the CMS phone is the main line. ~1 credit each, top leads first)</span></span>
+              </label>
+            )}
+            <label style={{display:"flex",alignItems:"center",gap:8,marginTop:6,cursor:"pointer",color:"#a3aac4"}}>
               <input type="checkbox" checked={restaurants} onChange={e=>setRestaurants(e.target.checked)} style={{cursor:"pointer"}}/>
               <span>Also include failed <b>restaurant</b> inspections <span style={{color:"#5a6a8a"}}>(IL/NY/TX metros — low budget, off by default)</span></span>
             </label>

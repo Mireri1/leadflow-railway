@@ -90,6 +90,12 @@ APOLLO_KILL_SWITCH = os.getenv("APOLLO_KILL_SWITCH", "0") == "1"
 # Titles tried (in priority order) when auto-enriching a scraped company.
 APOLLO_ENRICH_TITLES = [t.strip() for t in os.getenv("APOLLO_ENRICH_TITLES",
     "Facility Manager,Director of Operations,Operations Manager,Property Manager,General Manager,Owner,Principal").split(",") if t.strip()]
+# At a nursing home / hospital / dialysis center, the cleaning buyer is the EVS /
+# facilities / admin chief — NOT an Owner/CEO. Used to enrich health-source leads.
+APOLLO_HEALTHCARE_TITLES = [t.strip() for t in os.getenv("APOLLO_HEALTHCARE_TITLES",
+    "Administrator,Executive Director,Director of Environmental Services,Environmental Services Director,"
+    "Director of Facilities,Facilities Director,Director of Plant Operations,Director of Operations,"
+    "Director of Nursing").split(",") if t.strip()]
 # How long to remember "we already searched Apollo for this company" so we don't
 # re-spend credits on the same company. In-memory only — restarts wipe it,
 # which is fine; the worst case is paying for a few duplicate lookups.
@@ -2916,10 +2922,11 @@ def apollo_find_dm_at_company(company_name: str, titles=None):
         print(f"[APOLLO-ENRICH] exception for '{company_name}': {e}")
         return None
 
-def apollo_enrich_lead_in_place(lead: dict) -> bool:
+def apollo_enrich_lead_in_place(lead: dict, titles=None) -> bool:
     """Mutate `lead` to merge Apollo DM info on top of whatever Google Places
     found. Returns True if real enrichment happened (i.e. we got a person).
-    Cache-aware: a previously-MISSed company in the cache window is skipped."""
+    Cache-aware: a previously-MISSed company in the cache window is skipped.
+    `titles` overrides the DM titles searched (e.g. healthcare facility roles)."""
     if not lead.get("company"):
         return False
     if lead.get("firstName"):  # Already has a DM — don't re-spend credits
@@ -2929,7 +2936,7 @@ def apollo_enrich_lead_in_place(lead: dict) -> bool:
     if cache_state == "HIT":
         person = cached  # may be None — that's a cached miss, still skip
     else:
-        person = apollo_find_dm_at_company(lead["company"])
+        person = apollo_find_dm_at_company(lead["company"], titles=titles)
         # Unlock email + last name via /match before caching (~1 extra credit).
         # Without this the cached person has only first_name and is unusable.
         if person:
@@ -4224,6 +4231,20 @@ def source_health(body: FreeSourceRequest, user: str = Depends(verify_token)):
         raw += part
     cms_n = len(raw)
 
+    # Apollo-enrich the HIGHEST-VALUE facilities with the actual cleaning buyer
+    # (EVS / facilities / administrator) — the CMS phone is the main line, not
+    # the decision-maker. Enrich top-scored first (the ones called first), capped
+    # + time-budgeted. On by default for health (enrich!=false); admin only.
+    dm_enriched = 0
+    if body.enrich is not False and is_admin(user) and APOLLO_API_KEY and not APOLLO_KILL_SWITCH and raw:
+        raw.sort(key=lambda l: score_lead(l), reverse=True)   # call-order first
+        deadline = time.time() + OSM_ENRICH_BUDGET_SEC
+        for lead in raw:
+            if dm_enriched >= OSM_ENRICH_CAP or time.time() > deadline:
+                break
+            if apollo_enrich_lead_in_place(lead, titles=APOLLO_HEALTHCARE_TITLES):
+                dm_enriched += 1
+
     # OPT-IN: restaurant inspections (3 metros) — Google-phone-matched. Off by
     # default because restaurants rarely have a cleaning budget.
     restaurant_n = 0
@@ -4245,13 +4266,15 @@ def source_health(body: FreeSourceRequest, user: str = Depends(verify_token)):
         raw = raw + rest
 
     res = ingest_leads(raw, "Health Inspection", user)
+    res["dmEnriched"] = dm_enriched
     audit_log(user, "source_health", "lead", None,
-              {"state": body.state, "by_type": by_type, "restaurants": restaurant_n, **res})
+              {"state": body.state, "by_type": by_type, "restaurants": restaurant_n,
+               "dm_enriched": dm_enriched, **res})
     breakdown = ", ".join(f"{n} {lbl}" for lbl, n in by_type.items() if n)
     res["summary"] = (f"Health: {cms_n} healthcare facilities ({breakdown})"
                       f"{f' + {restaurant_n} restaurants' if body.restaurants else ''} · "
-                      f"{res['alreadyInDb']} already in DB · {res['droppedUncallable']} no phone · "
-                      f"{res['saved']} new urgent leads saved")
+                      f"{dm_enriched} decision-makers found (Apollo) · "
+                      f"{res['alreadyInDb']} already in DB · {res['saved']} new urgent leads saved")
     return res
 
 # ════════════════════════════════════════════════════════════════════════════
