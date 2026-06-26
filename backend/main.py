@@ -2111,6 +2111,12 @@ def _bg_maintenance_loop():
             run_weekly_digest_if_due()
         except Exception as e:
             print(f"[WEEKLY-DIGEST] loop exception: {e}")
+        # Monthly macro snapshot — banks one FRED reading per calendar month so a
+        # paired macro × receptivity history builds up. No-op once banked.
+        try:
+            run_macro_snapshot_if_due()
+        except Exception as e:
+            print(f"[MACRO] loop exception: {e}")
         time.sleep(IMAP_POLL_INTERVAL_MINUTES * 60)
 
 # ── Apollo dedupe — shared detection + self-healing weekly sweep ─────────
@@ -8981,6 +8987,186 @@ def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_to
     data = generate_note_insights(_gather_note_records(days), days)
     _INSIGHT_CACHE[ck] = {"ts": time.time(), "data": data}
     return {**data, "cached": False}
+
+# ── Receptivity Index (industry × time) ─────────────────────────────────────
+# Conversions are too rare (≈0.2%) to slice by industry×month and stay
+# significant. So receptivity is a COMPOSITE of dense per-call signals:
+#   contact   = we reached a human (not just VM/no-answer)
+#   engaged   = interested / callback / converted (a real positive)
+# Index = 100 * (0.35*contact_rate + 0.65*engagement_rate). Hundreds of points
+# a day instead of one win per 500 calls → readable in weeks, not years.
+CONTACT_OUTCOMES = {"answered", "interested", "interested_no_dm", "not_interested", "callback", "converted"}
+ENGAGED_OUTCOMES = {"interested", "interested_no_dm", "callback", "converted"}
+_DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+RECEPTIVITY_MIN_SLICE = int(os.getenv("RECEPTIVITY_MIN_SLICE", "15"))   # below this = low confidence
+
+def _agg_recept(calls):
+    n = len(calls)
+    if not n:
+        return {"n": 0, "contact_rate": 0, "engagement_rate": 0, "index": 0}
+    contact = sum(1 for c in calls if c.get("outcome") in CONTACT_OUTCOMES)
+    engaged = sum(1 for c in calls if c.get("outcome") in ENGAGED_OUTCOMES)
+    return {"n": n,
+            "contact_rate": round(contact / n * 100, 1),
+            "engagement_rate": round(engaged / n * 100, 1),
+            "index": round((0.35 * contact / n + 0.65 * engaged / n) * 100, 1)}
+
+@app.get("/api/analytics/receptivity")
+def receptivity_analytics(days: int = 180, user: str = Depends(verify_token)):
+    """Composite receptivity by INDUSTRY and by TIME (day-of-week, hour, month),
+    plus the industry×month cross-tab — the 'which vertical is warm when' view.
+    Admin only. Phase-1 of the macro program; Phase-2 macro lives at /macro."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    days = max(7, min(int(days or 180), 730))
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    calls = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledAt,leadId&calledAt=gte.{since}T00:00:00")
+    # Resolve industry from the referenced leads only (chunked id=in.()).
+    lead_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
+    ind_map = {}
+    for i in range(0, len(lead_ids), 100):
+        chunk = ",".join(f'"{x}"' for x in lead_ids[i:i+100])
+        try:
+            r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?select=id,industry&id=in.({chunk})",
+                            headers=SB_HEADERS, timeout=20)
+            for l in (r.json() if r.status_code == 200 else []):
+                ind_map[l.get("id")] = (l.get("industry") or "Unknown").strip() or "Unknown"
+        except Exception as e:
+            print(f"[RECEPT] lead chunk failed: {e}")
+    tz_off = int(os.getenv("RECEPTIVITY_TZ_OFFSET_HOURS", "-4"))   # caller works ET
+    rows = []
+    for c in calls:
+        dt = _parse_iso(c.get("calledAt"))
+        if not dt:
+            continue
+        local = dt + timedelta(hours=tz_off)
+        rows.append({"outcome": c.get("outcome"), "industry": ind_map.get(c.get("leadId"), "Unknown"),
+                     "dow": local.weekday(), "hour": local.hour, "month": local.month})
+
+    from collections import defaultdict
+    def group(keyfn, min_n=1):
+        g = defaultdict(list)
+        for r in rows:
+            g[keyfn(r)].append(r)
+        return {k: _agg_recept(v) for k, v in g.items() if len(v) >= min_n}
+
+    by_industry = sorted(
+        [{"industry": k, **v} for k, v in group(lambda r: r["industry"]).items()],
+        key=lambda x: -x["index"])
+    by_dow = [{"dow": d, "label": _DOW[d], **(group(lambda r: r["dow"]).get(d) or {"n": 0, "index": 0, "contact_rate": 0, "engagement_rate": 0})} for d in range(7)]
+    by_hour = sorted([{"hour": k, **v} for k, v in group(lambda r: r["hour"]).items()], key=lambda x: x["hour"])
+    by_month = [{"month": m, "label": _MONTHS[m], **(group(lambda r: r["month"]).get(m) or {"n": 0, "index": 0, "contact_rate": 0, "engagement_rate": 0})} for m in range(1, 13)]
+    # Industry × month cross-tab — the seasonality core. Only slices with enough
+    # volume to mean something; flagged so the UI can show confidence.
+    cross = group(lambda r: (r["industry"], r["month"]), min_n=RECEPTIVITY_MIN_SLICE)
+    by_industry_month = sorted(
+        [{"industry": k[0], "month": k[1], "label": _MONTHS[k[1]], **v} for k, v in cross.items()],
+        key=lambda x: -x["index"])
+
+    return {"window_days": days, "tz_offset_hours": tz_off, "min_slice": RECEPTIVITY_MIN_SLICE,
+            "overall": _agg_recept(rows),
+            "by_industry": by_industry, "by_dow": by_dow, "by_hour": by_hour,
+            "by_month": by_month, "by_industry_month": by_industry_month}
+
+# ── Macro snapshot (FRED, no API key — public CSV export) ────────────────────
+# Phase-2: capture the macro backdrop alongside our receptivity time-series so
+# the history accumulates now. Correlation comes later; today it's context.
+MACRO_SERIES = [
+    ("UNRATE",   "Unemployment rate",   "%",  "lower = tight labor → facilities outsource cleaning (tailwind)"),
+    ("FEDFUNDS", "Fed funds rate",       "%",  "higher = construction/new-builds slow → permit leads dry up"),
+    ("DGS10",    "10-yr Treasury",       "%",  "borrowing cost proxy — tracks capex appetite"),
+    ("PAYEMS",   "Nonfarm payrolls",     "k",  "rising = more facilities staffed/open"),
+    ("UMCSENT",  "Consumer sentiment",   "",   "low = retail/hospitality cut discretionary spend (headwind)"),
+]
+_MACRO_CACHE = {"ts": 0, "data": None}
+
+def _fetch_fred_latest(series_id):
+    """Latest (date, value) from FRED's public CSV export. No key required."""
+    try:
+        r = req_lib.get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}", timeout=15)
+        if r.status_code != 200:
+            return None
+        rows = [ln for ln in r.text.strip().splitlines() if ln and "," in ln]
+        # last two valid (non-".") observations → latest + prior for the delta
+        vals = []
+        for ln in reversed(rows):
+            d, _, v = ln.partition(",")
+            v = v.strip()
+            if v and v != "." and d[:1].isdigit():
+                try:
+                    vals.append((d.strip(), float(v)))
+                except ValueError:
+                    pass
+            if len(vals) == 2:
+                break
+        if not vals:
+            return None
+        latest = vals[0]; prev = vals[1] if len(vals) > 1 else None
+        return {"date": latest[0], "value": latest[1],
+                "prev": prev[1] if prev else None,
+                "change": round(latest[1] - prev[1], 2) if prev else None}
+    except Exception as e:
+        print(f"[MACRO] {series_id} fetch failed: {e}")
+        return None
+
+def get_macro_snapshot(force=False):
+    """Current macro reading for all series. Cached 6h (FRED updates monthly)."""
+    if not force and _MACRO_CACHE["data"] and (time.time() - _MACRO_CACHE["ts"]) < 6 * 3600:
+        return _MACRO_CACHE["data"]
+    out = []
+    for sid, label, unit, note in MACRO_SERIES:
+        obs = _fetch_fred_latest(sid)
+        out.append({"id": sid, "label": label, "unit": unit, "note": note,
+                    **(obs or {"date": None, "value": None, "prev": None, "change": None})})
+    data = {"series": out, "captured_at": datetime.utcnow().isoformat() + "Z"}
+    _MACRO_CACHE.update(ts=time.time(), data=data)
+    return data
+
+@app.get("/api/analytics/macro")
+def macro_analytics(user: str = Depends(verify_token)):
+    """Current macro backdrop (FRED) + the monthly snapshot history we've banked
+    in app_settings (macro_snapshot_YYYY-MM). Admin only."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    snap = get_macro_snapshot()
+    history = []
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=like.macro_snapshot_*&select=key,value",
+                        headers=SB_HEADERS, timeout=15)
+        for row in (r.json() if r.status_code == 200 else []):
+            try:
+                history.append({"month": row["key"].replace("macro_snapshot_", ""),
+                                "values": json_lib.loads(row.get("value") or "{}")})
+            except Exception:
+                pass
+        history.sort(key=lambda x: x["month"])
+    except Exception as e:
+        print(f"[MACRO] history fetch failed: {e}")
+    return {**snap, "history": history}
+
+def run_macro_snapshot_if_due():
+    """Bank one macro snapshot per calendar month into app_settings so a paired
+    macro × receptivity history accumulates for Phase-3 correlation. No-op once
+    this month's row exists."""
+    try:
+        ym = datetime.utcnow().strftime("%Y-%m")
+        key = f"macro_snapshot_{ym}"
+        chk = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{key}&select=key",
+                          headers=SB_HEADERS, timeout=10)
+        if chk.status_code == 200 and chk.json():
+            return  # already captured this month
+        snap = get_macro_snapshot(force=True)
+        values = {s["id"]: s["value"] for s in snap["series"] if s.get("value") is not None}
+        if not values:
+            return
+        req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                     headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                     json={"key": key, "value": json_lib.dumps(values)}, timeout=10)
+        print(f"[MACRO] snapshot banked for {ym}: {values}")
+    except Exception as e:
+        print(f"[MACRO] snapshot failed: {e}")
 
 @app.get("/api/analytics/conversions")
 def conversion_analytics(user: str = Depends(verify_token)):

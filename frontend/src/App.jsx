@@ -5594,6 +5594,7 @@ export default function App(){
               </div>
 
               {/* ── Google Places Usage + Leads Pulled (admin only) ── */}
+              {isAdmin()&&<ReceptivityPanel/>}
               {isAdmin()&&<NoteInsightsPanel/>}
               {isAdmin()&&<HoursPanel/>}
               {isAdmin()&&<ConversionPanel/>}
@@ -6131,6 +6132,115 @@ function HoursPanel(){
           ))}
           {data&&(data.callers||[]).length>0&&(
             <div style={{fontSize:10,color:"#5a6a8a",fontStyle:"italic"}}>⚠ = sign-out missing, capped at the last call (or {data.max_session_hours}h max) so you don't pay for an idle tab.</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── ReceptivityPanel (admin) — which industry is warm, when + macro backdrop ─
+function ReceptivityPanel(){
+  const [data,setData]=useState(null)
+  const [macro,setMacro]=useState(null)
+  const [days,setDays]=useState(180)
+  const [show,setShow]=useState(false)
+  const [loading,setLoading]=useState(false)
+  function load(d){
+    setLoading(true)
+    Promise.all([
+      api(`/api/analytics/receptivity?days=${d||days}`).then(setData).catch(()=>setData({error:true})),
+      macro?Promise.resolve():api(`/api/analytics/macro`).then(setMacro).catch(()=>setMacro({error:true})),
+    ]).finally(()=>setLoading(false))
+  }
+  const idxColor=v=>v>=25?"#69f6b8":v>=12?"#ffe083":"#ff6e84"
+  const Bars=({rows,labelKey,max})=>{
+    const mx=max||Math.max(1,...rows.map(r=>r.index))
+    return rows.map((r,i)=>(
+      <div key={i} style={{display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
+        <div style={{width:150,fontSize:12,color:"#c9d2ee",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+          {r[labelKey]}{r.n<15&&<span title="low sample — read with caution" style={{color:"#5a6a8a"}}> ⚠</span>}</div>
+        <div style={{flex:1,height:16,background:"#000011",borderRadius:3,overflow:"hidden",position:"relative"}}>
+          <div style={{width:`${Math.round(r.index/mx*100)}%`,height:"100%",background:idxColor(r.index)+"cc"}}/>
+        </div>
+        <div style={{width:42,textAlign:"right",fontSize:12,color:idxColor(r.index),fontWeight:700}}>{r.index}</div>
+        <div style={{width:54,textAlign:"right",fontSize:10,color:"#5a6a8a"}}>n={r.n}</div>
+      </div>
+    ))
+  }
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24,border:"1px solid #69f6b820"}}>
+      <div onClick={()=>{setShow(s=>!s); if(!data) load()}}
+        style={{padding:"16px 24px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,color:"#dee5ff",fontSize:15}}>📈 Receptivity Index — industry × time</div>
+          <div style={{fontSize:11,color:"#a3aac4",marginTop:2}}>Which verticals respond best, when they're warmest, against the macro backdrop.</div>
+        </div>
+        <span style={{color:"#40485d"}}>{show?"▾":"▸"}</span>
+      </div>
+      {show&&(
+        <div style={{padding:"0 24px 22px"}}>
+          {/* Macro backdrop */}
+          {macro&&!macro.error&&(
+            <div style={{background:"#060e20",border:"1px solid #40485d30",borderRadius:10,padding:"12px 14px",marginBottom:16}}>
+              <div style={{fontSize:10,color:"#8893b0",letterSpacing:".08em",fontWeight:700,marginBottom:8}}>🌐 MACRO BACKDROP (FRED)</div>
+              <div style={{display:"flex",gap:18,flexWrap:"wrap"}}>
+                {(macro.series||[]).map(s=>(
+                  <div key={s.id} title={s.note} style={{minWidth:120,cursor:"help"}}>
+                    <div style={{fontSize:11,color:"#a3aac4"}}>{s.label}</div>
+                    <div style={{fontSize:16,color:"#dee5ff",fontWeight:700}}>
+                      {s.value!=null?s.value.toLocaleString():"—"}<span style={{fontSize:11,color:"#5a6a8a"}}>{s.unit}</span>
+                      {s.change!=null&&<span style={{fontSize:11,marginLeft:6,color:s.change>0?"#69f6b8":s.change<0?"#ff6e84":"#a3aac4"}}>
+                        {s.change>0?"▲":s.change<0?"▼":"→"}{Math.abs(s.change)}</span>}
+                    </div>
+                    <div style={{fontSize:9,color:"#5a6a8a"}}>{s.date||""}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div style={{display:"flex",gap:6,marginBottom:14}}>
+            {[90,180,365].map(d=>(
+              <button key={d} onClick={()=>{setDays(d);load(d)}}
+                style={{fontSize:11,padding:"5px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                  border:`1px solid ${days===d?"#69f6b8":"#40485d40"}`,
+                  background:days===d?"#69f6b822":"transparent",color:days===d?"#69f6b8":"#a3aac4"}}>{d}d</button>
+            ))}
+          </div>
+          {loading&&<div style={{color:"#a3aac4",fontSize:12}}>Crunching the numbers…</div>}
+          {data&&data.error&&<div style={{color:"#ffb3c0",fontSize:12}}>Couldn't load receptivity — try again.</div>}
+          {data&&!data.error&&(
+            <>
+              <div style={{fontSize:11,color:"#5a6a8a",marginBottom:14}}>
+                Index = blend of contact-rate + engagement-rate (0–100), so a slow week still scores.
+                Overall: <b style={{color:idxColor(data.overall.index)}}>{data.overall.index}</b> · {data.overall.n} calls · contact {data.overall.contact_rate}% · engaged {data.overall.engagement_rate}%
+              </div>
+              <div style={{marginBottom:18}}>
+                <div style={{fontSize:11,color:"#69f6b8",letterSpacing:".07em",fontWeight:700,marginBottom:8}}>🏭 BY INDUSTRY</div>
+                {data.by_industry.length?<Bars rows={data.by_industry} labelKey="industry"/>:<div style={{fontSize:12,color:"#5a6a8a"}}>No data yet.</div>}
+              </div>
+              <div style={{marginBottom:18}}>
+                <div style={{fontSize:11,color:"#69f6b8",letterSpacing:".07em",fontWeight:700,marginBottom:8}}>📅 BY DAY OF WEEK</div>
+                <Bars rows={data.by_dow.filter(r=>r.n>0)} labelKey="label"/>
+              </div>
+              <div style={{marginBottom:18}}>
+                <div style={{fontSize:11,color:"#69f6b8",letterSpacing:".07em",fontWeight:700,marginBottom:8}}>
+                  🗓 BY MONTH <span style={{color:"#5a6a8a",fontWeight:400}}>(seasonality — fills in as the year accumulates)</span></div>
+                <Bars rows={data.by_month.filter(r=>r.n>0)} labelKey="label"/>
+              </div>
+              {data.by_industry_month?.length>0&&(
+                <div>
+                  <div style={{fontSize:11,color:"#69f6b8",letterSpacing:".07em",fontWeight:700,marginBottom:8}}>
+                    🎯 WARMEST INDUSTRY × MONTH <span style={{color:"#5a6a8a",fontWeight:400}}>(n≥{data.min_slice})</span></div>
+                  {data.by_industry_month.slice(0,12).map((r,i)=>(
+                    <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderTop:i?"1px solid #40485d14":"",fontSize:12}}>
+                      <span style={{color:"#dee5ff"}}>{r.industry} · {r.label}</span>
+                      <span><b style={{color:idxColor(r.index)}}>{r.index}</b> <span style={{color:"#5a6a8a",fontSize:10}}>n={r.n}</span></span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
