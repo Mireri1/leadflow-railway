@@ -3987,7 +3987,9 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
     # Pull candidate leads: have a company, not already cleanliness-tagged. Fetch
     # a wider net when filtering by vertical so we still find scan_n matches.
     flt = "&state=eq." + url_quote(body.state) if body.state else ""
-    fetch_n = scan_n * (10 if want_inds else 3)
+    # When filtering by vertical, cast a wide net (the target leads may be older
+    # than the most recent pulls); otherwise just the freshest scan_n*3.
+    fetch_n = 3000 if want_inds else scan_n * 3
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads"
