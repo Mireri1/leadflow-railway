@@ -216,7 +216,9 @@ ANTHROPIC_API_KEY = next((os.getenv(k) for k in (
 # insights (synthesize hundreds of notes a few ×/day — quality matters, volume
 # is tiny). Both overridable via env.
 HAIKU_MODEL       = os.getenv("HAIKU_MODEL", "claude-haiku-4-5-20251001")
-INSIGHTS_MODEL    = os.getenv("INSIGHTS_MODEL", "claude-sonnet-4-6")
+# Weekly/low-frequency synthesis → top tier (Opus). Spend is negligible at once-
+# a-week cadence and the quality is worth it. Falls back to Haiku if unavailable.
+INSIGHTS_MODEL    = os.getenv("INSIGHTS_MODEL", "claude-opus-4-8")
 VALID_NOTE_OUTCOMES = ["no_answer", "voicemail", "not_interested", "callback", "interested", "converted"]
 
 def _heuristic_note_analysis(note: str):
@@ -9012,9 +9014,9 @@ def generate_note_insights(records, days, context=""):
             r = req_lib.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": model, "max_tokens": 1600, "system": system,
+                json={"model": model, "max_tokens": 4000, "system": system,
                       "messages": [{"role": "user", "content": user_content}]},
-                timeout=45,
+                timeout=60,
             )
             if r.status_code != 200:
                 last_err = f"{model} → {r.status_code}: {r.text[:160]}"
@@ -9049,7 +9051,8 @@ def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_to
     if cached and not refresh and (time.time() - cached["ts"]) < 1800:
         return {**cached["data"], "cached": True}
     data = generate_note_insights(_gather_note_records(days), days, context=_macro_receptivity_context(90)["context"])
-    _INSIGHT_CACHE[ck] = {"ts": time.time(), "data": data}
+    if data.get("engine") == "ai":          # don't cache a transient error/heuristic for 30 min
+        _INSIGHT_CACHE[ck] = {"ts": time.time(), "data": data}
     return {**data, "cached": False}
 
 # ── Receptivity Index (industry × time) ─────────────────────────────────────
