@@ -3925,21 +3925,36 @@ def google_find_place_id(name: str, city: str, state: str) -> str:
         return ""
 
 def google_place_reviews(place_id: str):
-    """Fetch up to ~5 reviews + rating for a place (Details Atmosphere data)."""
-    try:
-        r = req_lib.get(
-            "https://maps.googleapis.com/maps/api/place/details/json",
-            params={"place_id": place_id, "fields": "reviews,rating,user_ratings_total",
-                    # Google caps this at 5 reviews; ask for the NEWEST 5 (not the
-                    # default "most relevant", which skews positive) so we're far
-                    # likelier to catch a recent cleanliness complaint.
-                    "reviews_sort": "newest",
-                    "key": GOOGLE_KEY}, timeout=12)
-        res = r.json().get("result", {})
-        return res.get("reviews", []) or [], res.get("rating"), res.get("user_ratings_total")
-    except Exception as e:
-        print(f"[REVIEWS] details failed: {e}")
-        return [], None, None
+    """Fetch reviews + rating for a place. Google caps Details at 5 reviews per
+    call and has no 'lowest rating' sort, so we STACK the two available sorts —
+    `newest` (recent complaints) + `most_relevant` (which surfaces the high-
+    engagement, often-negative reviews) — and union them. Up to ~10 distinct
+    reviews instead of 5, then the rating<=3 filter picks the lowest among them.
+    Costs 2 Details calls per business (~$0.034)."""
+    def _details(sort):
+        params = {"place_id": place_id, "fields": "reviews,rating,user_ratings_total",
+                  "key": GOOGLE_KEY}
+        if sort:
+            params["reviews_sort"] = sort
+        try:
+            res = req_lib.get("https://maps.googleapis.com/maps/api/place/details/json",
+                              params=params, timeout=12).json().get("result", {})
+            return res.get("reviews", []) or [], res.get("rating"), res.get("user_ratings_total")
+        except Exception as e:
+            print(f"[REVIEWS] details({sort}) failed: {e}")
+            return [], None, None
+
+    newest, rating, total = _details("newest")
+    relevant, r2, t2 = _details("most_relevant")
+    rating = rating or r2
+    total = total or t2
+    merged, seen = [], set()
+    for rev in (newest + relevant):
+        key = (rev.get("author_name", ""), rev.get("time", 0))
+        if key not in seen:
+            seen.add(key)
+            merged.append(rev)
+    return merged, rating, total
 
 def scan_cleanliness(reviews: list):
     """Find the MOST RECENT low-rated review complaining about cleanliness. A
