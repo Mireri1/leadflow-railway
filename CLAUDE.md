@@ -140,3 +140,10 @@ ACTIONS TAKEN: [list or "None needed"]
 - `DAILY_CALL_QUOTA` — default quota if not in app_settings (default: 60)
 - `SUPABASE_URL`, `SUPABASE_KEY`
 - `GOOGLE_API_KEY` — Google Places for lead finding
+- `ANTHROPIC_API_KEY` — Haiku note assistant (`/api/notes/analyze`). If unset, the endpoint falls back to a keyword heuristic — it never hard-fails.
+- `HAIKU_MODEL` — override the note-assistant model (default: claude-haiku-4-5-20251001)
+
+## Note Intelligence (Haiku)
+- `POST /api/notes/analyze` `{note, company?, status?}` → `{sentiment: warm|neutral|cold, outcome, callbackDate (ISO, parsed from plain English), summary, engine}`.
+- Sentiment is persisted in the lead's `notes` as a `[sent:warm|neutral|cold]` tag (same tokenized-notes pattern as `[INTENT:*]` — no schema change). `cleanNote()` strips it; `parseSentiment()` reads it; `<SentimentDot/>` renders the colored dot.
+- Caller UI: CallModal + My Week have 🎤 Dictate (Web Speech API) and ✨ Smart-fill (applies suggested outcome + callback date in one tap).
