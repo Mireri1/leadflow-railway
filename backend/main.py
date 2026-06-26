@@ -3885,13 +3885,30 @@ def source_permits(body: FreeSourceRequest, user: str = Depends(verify_token)):
 # pitch. We scan existing leads' Google reviews, stamp [INTENT:cleanliness] +
 # a quotable snippet, and re-score so they rocket up the dialer.
 # ════════════════════════════════════════════════════════════════════════════
-CLEANLINESS_COMPLAINT_TERMS = [
-    "dirty", "filthy", "unclean", "not clean", "wasn't clean", "disgusting",
-    "gross", "unsanitary", "grimy", "grime", "dusty", "mold", "mildew",
-    "stained", "sticky floor", "smelled", "smelly", "foul smell", "bad smell",
-    "dirty bathroom", "dirty restroom", "bathroom was", "restroom was",
-    "toilets were", "trash everywhere", "needs cleaning", "never cleaned",
+# STRONG terms fire on their own — high-confidence facility-cleanliness signals.
+CLEANLINESS_STRONG_TERMS = [
+    "filthy", "unsanitary", "disgusting", "mold", "mildew", "cockroach", "roaches",
+    "rodent", "mice", "feces", "urine", "vomit", "biohazard", "grimy", "grime",
+    "dirty bathroom", "dirty restroom", "dirty toilet", "filthy bathroom",
+    "bathroom was disgusting", "restroom was disgusting", "needs a deep clean",
+    "never cleaned", "needs cleaning", "trash everywhere", "covered in dust",
 ]
+# CONTEXT terms (dirty/smell/etc.) only count when a FACILITY word is nearby —
+# kills false positives like a scrap yard making "clean metal dirty".
+CLEANLINESS_CONTEXT_TERMS = ["dirty", "unclean", "not clean", "wasn't clean",
+    "stained", "sticky", "dusty", "smelled", "smelly", "foul smell", "bad smell", "gross"]
+CLEANLINESS_FACILITY_WORDS = ["bathroom", "restroom", "toilet", "floor", "floors",
+    "table", "tables", "seat", "chair", "room", "rooms", "kitchen", "counter",
+    "locker", "shower", "gym", "lobby", "entrance", "carpet", "wall", "window",
+    "facility", "place was", "store was", "everything was"]
+
+def _is_cleanliness_complaint(text_lower: str) -> bool:
+    if any(t in text_lower for t in CLEANLINESS_STRONG_TERMS):
+        return True
+    if any(t in text_lower for t in CLEANLINESS_CONTEXT_TERMS) and \
+       any(f in text_lower for f in CLEANLINESS_FACILITY_WORDS):
+        return True
+    return False
 
 def google_find_place_id(name: str, city: str, state: str) -> str:
     """Resolve a business to a Google place_id via Find Place From Text."""
@@ -3929,7 +3946,7 @@ def scan_cleanliness(reviews: list):
     for rev in reviews:
         text = (rev.get("text") or "").lower()
         rating = rev.get("rating", 5)
-        if rating and rating <= 3 and any(term in text for term in CLEANLINESS_COMPLAINT_TERMS):
+        if rating and rating <= 3 and _is_cleanliness_complaint(text):
             matches.append(rev)
     if not matches:
         return False, "", None, ""
@@ -3947,9 +3964,10 @@ def scan_cleanliness(reviews: list):
     return True, f'"{snippet}" ({best.get("rating", "?")}★{label})', age_days, rel
 
 class ReviewScanRequest(BaseModel):
-    state:  Optional[str] = ""
-    cities: Optional[str] = ""
-    limit:  Optional[int] = 25   # max leads to scan this run (Google calls cost)
+    state:      Optional[str] = ""
+    cities:     Optional[str] = ""
+    industries: Optional[object] = None  # restrict to these verticals (e.g. gyms/venues)
+    limit:      Optional[int] = 25        # max leads to scan this run (Google calls cost)
 
 @app.post("/api/enrich/reviews")
 def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
@@ -3963,14 +3981,19 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
         raise HTTPException(status_code=400, detail="GOOGLE_API_KEY not configured.")
     scan_n = min(max(int(body.limit or 25), 1), 100)
 
-    # Pull candidate leads: have a company + city, not already cleanliness-tagged.
+    # Vertical filter (case-insensitive substring match against lead.industry).
+    want_inds = [str(x).strip().lower() for x in body.industries] if isinstance(body.industries, list) \
+                else [s.strip().lower() for s in str(body.industries or "").split(",") if s.strip()]
+    # Pull candidate leads: have a company, not already cleanliness-tagged. Fetch
+    # a wider net when filtering by vertical so we still find scan_n matches.
     flt = "&state=eq." + url_quote(body.state) if body.state else ""
+    fetch_n = scan_n * (10 if want_inds else 3)
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads"
             f"?select=id,company,city,state,notes,score,phone,firstName,email,industry,title"
-            f"&company=not.is.null{flt}&order=createdAt.desc&limit={scan_n * 3}",
-            headers=SB_HEADERS, timeout=20)
+            f"&company=not.is.null{flt}&order=createdAt.desc&limit={min(fetch_n, 3000)}",
+            headers=SB_HEADERS, timeout=25)
         candidates = r.json() if r.status_code == 200 else []
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
@@ -3981,6 +4004,10 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
             break
         if "[INTENT:cleanliness]" in (lead.get("notes") or ""):
             continue
+        if want_inds:
+            ind = (lead.get("industry") or "").lower()
+            if not any(w in ind for w in want_inds):
+                continue
         city = lead.get("city") or ""
         if body.cities and city.lower() not in {c.strip().lower() for c in body.cities.split(",")}:
             continue
