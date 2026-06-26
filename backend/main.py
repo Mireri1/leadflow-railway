@@ -9155,6 +9155,20 @@ MACRO_SERIES = [
 ]
 _MACRO_CACHE = {"ts": 0, "data": None}
 
+def _macro_level(sid, v):
+    """Plain-English qualifier so a bare index value reads in context."""
+    if v is None:
+        return ""
+    if sid == "UNRATE":
+        return "very low" if v < 3.8 else "low — tight labor" if v < 4.5 else "moderate" if v < 5.5 else "elevated"
+    if sid == "UMCSENT":
+        return "very weak" if v < 55 else "weak" if v < 70 else "below average" if v < 85 else "healthy" if v <= 100 else "strong"
+    if sid == "FEDFUNDS":
+        return "low" if v < 2 else "moderate" if v < 4 else "elevated" if v < 5 else "high"
+    if sid == "DGS10":
+        return "low" if v < 2.5 else "moderate" if v < 4 else "elevated" if v < 5 else "high"
+    return ""   # PAYEMS is a level in thousands — the ▲/▼ change carries the meaning
+
 def _fetch_fred_latest(series_id):
     """Latest (date, value) from FRED's public CSV export. No key required."""
     try:
@@ -9191,8 +9205,9 @@ def get_macro_snapshot(force=False):
     out = []
     for sid, label, unit, note in MACRO_SERIES:
         obs = _fetch_fred_latest(sid)
+        obs = obs or {"date": None, "value": None, "prev": None, "change": None}
         out.append({"id": sid, "label": label, "unit": unit, "note": note,
-                    **(obs or {"date": None, "value": None, "prev": None, "change": None})})
+                    "level": _macro_level(sid, obs.get("value")), **obs})
     data = {"series": out, "captured_at": datetime.utcnow().isoformat() + "Z"}
     _MACRO_CACHE.update(ts=time.time(), data=data)
     return data

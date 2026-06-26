@@ -6164,7 +6164,7 @@ function ReceptivityPanel(){
           <div style={{width:`${Math.round(r.index/mx*100)}%`,height:"100%",background:idxColor(r.index)+"cc"}}/>
         </div>
         <div style={{width:42,textAlign:"right",fontSize:12,color:idxColor(r.index),fontWeight:700}}>{r.index}</div>
-        <div style={{width:54,textAlign:"right",fontSize:10,color:"#5a6a8a"}}>n={r.n}</div>
+        <div style={{width:64,textAlign:"right",fontSize:10,color:"#5a6a8a"}}>{r.n.toLocaleString()} calls</div>
       </div>
     ))
   }
@@ -6202,7 +6202,7 @@ function ReceptivityPanel(){
               {/* compact raw figures for reference */}
               <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid #40485d20",fontSize:10,color:"#5a6a8a",display:"flex",gap:14,flexWrap:"wrap"}}>
                 {(macro.series||[]).map(s=>(
-                  <span key={s.id} title={s.note} style={{cursor:"help"}}>{s.label}: <b style={{color:"#8893b0"}}>{s.value!=null?s.value.toLocaleString():"—"}{s.unit}</b>
+                  <span key={s.id} title={s.note} style={{cursor:"help"}}>{s.label}: <b style={{color:"#8893b0"}}>{s.value!=null?s.value.toLocaleString():"—"}{s.unit}</b>{s.level?` (${s.level})`:""}
                     {s.change!=null&&<span style={{color:s.change>0?"#69f6b8":s.change<0?"#ff6e84":"#5a6a8a"}}> {s.change>0?"▲":s.change<0?"▼":"→"}{Math.abs(s.change)}</span>}</span>
                 ))}
               </div>
@@ -6222,7 +6222,7 @@ function ReceptivityPanel(){
             <>
               <div style={{fontSize:11,color:"#5a6a8a",marginBottom:14,lineHeight:1.6}}>
                 <b style={{color:"#69f6b8"}}>Index</b> = warmth score 0–100 (contact-rate + engagement-rate blended) — compare rows to each other, higher = warmer.
-                &nbsp;<b style={{color:"#a3aac4"}}>n</b> = how many calls it's based on (the trust meter; under 15 gets a ⚠).
+                &nbsp;The <b style={{color:"#a3aac4"}}>call count</b> next to each row is your trust meter — under 15 calls gets a ⚠.
                 &nbsp;<b>contact</b> = reached a human · <b>engaged</b> = interested/callback/converted.<br/>
                 Overall: <b style={{color:idxColor(data.overall.index)}}>{data.overall.index}</b> · {data.overall.n} calls · contact {data.overall.contact_rate}% · engaged {data.overall.engagement_rate}%
               </div>
@@ -6246,7 +6246,7 @@ function ReceptivityPanel(){
                   {data.by_industry_month.slice(0,12).map((r,i)=>(
                     <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderTop:i?"1px solid #40485d14":"",fontSize:12}}>
                       <span style={{color:"#dee5ff"}}>{r.industry} · {r.label}</span>
-                      <span><b style={{color:idxColor(r.index)}}>{r.index}</b> <span style={{color:"#5a6a8a",fontSize:10}}>n={r.n}</span></span>
+                      <span><b style={{color:idxColor(r.index)}}>{r.index}</b> <span style={{color:"#5a6a8a",fontSize:10}}>{r.n.toLocaleString()} calls</span></span>
                     </div>
                   ))}
                 </div>
