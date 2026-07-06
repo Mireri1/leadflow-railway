@@ -146,6 +146,13 @@ ACTIONS TAKEN: [list or "None needed"]
 - `WEEKLY_DIGEST_ENABLED` — auto weekly AI review to Slack (default: 1)
 - `WEEKLY_DIGEST_DAY` — weekday to send (0=Mon … 6=Sun, default: 0)
 - `ANGELO_SLACK_WEBHOOK_URL` — Slack webhook for the appointment→Angelo hiring handoff (falls back to SLACK_WEBHOOK_URL if unset)
+- `DAILY_DIGEST_ENABLED` / `DAILY_DIGEST_HOUR_UTC` — daily digest self-schedules from the bg loop, once per UTC day on/after the hour (default 1 ≈ 9pm ET). No Railway cron needed.
+- `CRON_SECRET` — optional; lets an external cron hit /api/daily-summary or /api/weekly-summary via ?secret= (they otherwise require an admin token)
+
+## QoL features (2026-06)
+- Caller: ⚡ one-tap "No answer" (lead rows + dialer), 📞 "Who's next?" header button (due callbacks → warm → fresh), year-typo date guard (`confirmFarDate`), end-of-shift recap on sign-out, mid-shift due-callback nudge (max 1/2h).
+- Admin: 🕐 Clock in/out header button + `POST /api/auth/clock-in|clock-out` (user_sessions); weekly digest includes hours/caller via shared `_compute_hours()`.
+- Slack appointment approve: new pending appointment pings Slack with a one-click approve link → `GET /appt-approve?t=<signed JWT>` renders a confirm page, `POST /appt-approve` approves + fires the Angelo handoff. GET is side-effect-free so Slack link-prefetch can't auto-approve.
 
 ## Appointments (sales → fulfillment loop)
 - LeadFlow is the system of record. Stored as JSON in `app_settings` (`appt_<leadId>`) — no DDL. Stages: pending → approved → confirmed → won/lost.
