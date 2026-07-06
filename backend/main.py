@@ -605,7 +605,7 @@ def is_kill_switch_on():
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.places_kill_switch&select=value",
-            headers=SB_HEADERS, timeout=3,
+            headers=SB_ADMIN_HEADERS, timeout=3,
         )
         rows = r.json() if r.status_code == 200 else []
         val = (rows[0]["value"] if isinstance(rows, list) and rows else "0")
@@ -2397,7 +2397,7 @@ def _dedupe_sweep_due() -> bool:
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_dedupe_sweep&select=value",
-            headers=SB_HEADERS, timeout=10,
+            headers=SB_ADMIN_HEADERS, timeout=10,
         )
         if r.status_code != 200:
             return False
@@ -2428,7 +2428,7 @@ def _hot_digest_due() -> bool:
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_hot_digest&select=value",
-            headers=SB_HEADERS, timeout=10,
+            headers=SB_ADMIN_HEADERS, timeout=10,
         )
         if r.status_code != 200: return False
         rows = r.json()
@@ -2553,7 +2553,7 @@ def _once_called_recycle_due() -> bool:
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_once_called_recycle&select=value",
-            headers=SB_HEADERS, timeout=10,
+            headers=SB_ADMIN_HEADERS, timeout=10,
         )
         if r.status_code != 200: return False
         rows = r.json()
@@ -2864,7 +2864,7 @@ def _check_apollo_budget_alert():
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{state_key}&select=value",
-            headers=SB_HEADERS, timeout=5,
+            headers=SB_ADMIN_HEADERS, timeout=5,
         )
         rows = r.json() if r.status_code == 200 else []
         cur = json_lib.loads(rows[0]["value"]) if rows and rows[0].get("value") else {}
@@ -5541,7 +5541,7 @@ def get_quota(user: str = Depends(verify_token)):
         # Check for per-user quota first, then fall back to team default
         r_user = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.quota_{user.lower()}&select=value",
-            headers=SB_HEADERS, timeout=10)
+            headers=SB_ADMIN_HEADERS, timeout=10)
         user_rows = r_user.json() if r_user.status_code == 200 else []
 
         if isinstance(user_rows, list) and user_rows:
@@ -5549,7 +5549,7 @@ def get_quota(user: str = Depends(verify_token)):
         else:
             r_default = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.daily_quota&select=value",
-                headers=SB_HEADERS, timeout=10)
+                headers=SB_ADMIN_HEADERS, timeout=10)
             default_rows = r_default.json() if r_default.status_code == 200 else []
             quota = int(default_rows[0]["value"]) if isinstance(default_rows, list) and default_rows else DEFAULT_QUOTA
 
@@ -5596,11 +5596,11 @@ def get_all_quotas(user: str = Depends(verify_admin)):
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=like.quota_*&select=key,value",
-            headers=SB_HEADERS, timeout=10)
+            headers=SB_ADMIN_HEADERS, timeout=10)
         per_user = r.json() if r.status_code == 200 else []
         r2 = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.daily_quota&select=value",
-            headers=SB_HEADERS, timeout=10)
+            headers=SB_ADMIN_HEADERS, timeout=10)
         default_rows = r2.json() if r2.status_code == 200 else []
         team_default = int(default_rows[0]["value"]) if isinstance(default_rows, list) and default_rows else DEFAULT_QUOTA
         quotas = {}
@@ -6395,7 +6395,7 @@ def guidance_switch(body: dict, user: str = Depends(verify_token)):
     try:
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{ck}&select=value",
-            headers=SB_HEADERS, timeout=10,
+            headers=SB_ADMIN_HEADERS, timeout=10,
         )
         rows = r.json() if r.status_code == 200 else []
         if rows:
