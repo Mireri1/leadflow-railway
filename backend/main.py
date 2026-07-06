@@ -371,6 +371,15 @@ def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = D
     except (jwt.exceptions.InvalidTokenError, KeyError, Exception):
         raise HTTPException(status_code=401, detail="Invalid token")
 
+def verify_cron_or_admin(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """For cron-triggered endpoints (daily/weekly digest): allow an admin JWT,
+    the pipeline key, or ?secret=<CRON_SECRET>. These were previously
+    unauthenticated — anyone could read team stats and spam Slack/burn Opus."""
+    cron_secret = os.getenv("CRON_SECRET", "")
+    if cron_secret and request.query_params.get("secret") == cron_secret:
+        return "cron"
+    return verify_admin(request, credentials)
+
 def verify_admin(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
     # Static-key callers are treated as admin — the key only ships to trusted
     # backend services (MCPs, internal pipelines), never to end-user UIs.
@@ -423,7 +432,10 @@ def login(req: LoginRequest):
         raise HTTPException(status_code=403, detail="Access revoked. Contact your manager.")
     is_admin = name_lower in ADMIN_USERS
     if is_admin:
-        if req.password not in (ADMIN_PASSWORD, TEAM_PASSWORD):
+        # Admin accounts require the ADMIN password specifically. Accepting the
+        # shared TEAM_PASSWORD here let any rep mint an admin token by logging
+        # in with an admin username.
+        if req.password != ADMIN_PASSWORD:
             log_login(req.username, "failed", detail="wrong password (admin)")
             raise HTTPException(status_code=401, detail="Invalid password")
         role = "admin"
@@ -4731,15 +4743,11 @@ def get_usage(days: int = 7, user: str = Depends(verify_token)):
         leads_by_rep_today  = {}  # {username: int}
         leads_by_rep_window = {}  # {username: int}
         try:
-            leads_url = (
+            # paginated — limit=10000 was silently capped at 1000 rows
+            lead_rows = _paginated_get(
                 f"{SUPABASE_URL}/rest/v1/leads"
-                f"?select=createdBy,createdAt"
-                f"&createdAt=gte.{since}"
-                f"&limit=10000"
-            )
-            lr = req_lib.get(leads_url, headers=SB_HEADERS, timeout=15)
-            if lr.status_code == 200:
-                lead_rows = lr.json() if isinstance(lr.json(), list) else []
+                f"?select=createdBy,createdAt&createdAt=gte.{since}")
+            if True:
                 for lrow in lead_rows:
                     rep = lrow.get("createdBy") or "unknown"
                     leads_by_rep_window[rep] = leads_by_rep_window.get(rep, 0) + 1
@@ -4998,7 +5006,11 @@ def list_leads(status: str = "", search: str = "", sort: str = "smart",
         # phase 2 looks at call_outcomes and pulls in any leadIds whose
         # calls match — handles "find the lead my ex-rep worked" and
         # "find the lead with that note in call history".
-        s = search.replace(" ", "%20")
+        # PostgREST-syntax chars (& , ( ) " etc.) in the term used to malform the
+        # or=() filter → 400 → silent zero results for names like "Johnson & Sons".
+        # Replace them with the ilike %-wildcard (broader match, never breaks),
+        # then URL-encode ('%' → '%25' comes back as the wildcard server-side).
+        s = url_quote(re.sub(r'[&,()"\'\\%#?]', "%", search), safe="")
         leads_or = (
             f"company.ilike.%25{s}%25,"
             f"firstName.ilike.%25{s}%25,"
@@ -5370,7 +5382,11 @@ def delete_lead(lead_id: str, user: str = Depends(verify_token)):
 def log_call(call: dict, user: str = Depends(verify_token)):
     try:
         lead_id = call.get("leadId")
-        caller  = call.get("calledBy") or user
+        # Anti-gaming checks key off the AUTHENTICATED user, not a client-supplied
+        # name — call.get("calledBy") let a rep dodge cooldown/cadence flags by
+        # sending a fabricated name. (PIPELINE principal may log for others.)
+        caller   = user if user != PIPELINE_PRINCIPAL else (call.get("calledBy") or user)
+        caller_q = url_quote(str(caller), safe="")   # for PostgREST query filters only
         outcome = (call.get("outcome") or "").strip().lower()
         # Pop the email-followup flag — Supabase's call_outcomes table doesn't
         # have a column for it; we use the local var only for the trigger logic.
@@ -5387,7 +5403,7 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         if lead_id:
             five_min_ago = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
             dup_r = req_lib.get(
-                f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=eq.{lead_id}&calledBy=eq.{caller}"
+                f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=eq.{url_quote(str(lead_id), safe='')}&calledBy=eq.{caller_q}"
                 f"&calledAt=gte.{five_min_ago}&select=id",
                 headers=SB_HEADERS, timeout=10)
             dups = dup_r.json() if dup_r.status_code == 200 else []
@@ -5397,7 +5413,7 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         # Anti-gaming: cadence — more than 5 calls in last 5 minutes
         five_min_ago = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
         cad_r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?calledBy=eq.{caller}"
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?calledBy=eq.{caller_q}"
             f"&calledAt=gte.{five_min_ago}&select=id",
             headers={**SB_HEADERS, "Prefer": ""}, timeout=10)
         recent = cad_r.json() if cad_r.status_code == 200 else []
@@ -5410,6 +5426,11 @@ def log_call(call: dict, user: str = Depends(verify_token)):
 
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_outcomes",
                         headers=SB_HEADERS, json=call, timeout=30)
+        # A PostgREST 400 (e.g. unexpected column) used to return the error
+        # body with HTTP 200 and still bump the lead — the call was silently
+        # lost while the UI thought it saved.
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=f"Call insert failed: {r.text[:200]}")
         if lead_id:
             lr = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=*",
@@ -5594,15 +5615,15 @@ def get_all_quotas(user: str = Depends(verify_admin)):
 @app.get("/api/calls/qualified")
 def get_qualified_calls(user: str = Depends(verify_token)):
     try:
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes"
-            f"?select=*"
-            f"&order=calledAt.desc&limit=500",
-            headers=SB_HEADERS, timeout=30)
-        all_calls = r.json() if r.status_code == 200 else []
-        if not isinstance(all_calls, list):
-            return []
+        # Filter server-side + paginate: the old limit=500 recent-calls scan
+        # silently dropped qualified calls older than ~1 week at 100 dials/day.
         qual_fields = ["budgetfocus", "vendorstatus", "decisionmaker", "timeline", "qualified"]
+        or_filter = ",".join(f"{f}.not.is.null" for f in qual_fields)
+        all_calls = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=*"
+            f"&or=({or_filter})&order=calledAt.desc")
+        # Belt-and-braces: PostgREST not.is.null passes empty strings; keep rows
+        # with at least one truthy qual value (matches old behavior).
         qualified = [c for c in all_calls if any(c.get(f) for f in qual_fields)]
         # Batch-fetch all lead data in one request instead of N+1
         lead_ids = list(set(c.get("leadId") for c in qualified if c.get("leadId")))
@@ -6177,7 +6198,7 @@ def insights_best_call_time(industry: str = "", days: int = 60,
     lead_filter = ""
     if industry:
         rl = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?select=id&industry=eq.{url_quote(industry)}&limit=10000",
+            f"{SUPABASE_URL}/rest/v1/leads?select=id&industry=eq.{url_quote(industry)}&limit=1000",
             headers=SB_HEADERS, timeout=30,
         )
         ids = [str(x.get("id")) for x in (rl.json() if rl.status_code == 200 else []) if x.get("id")]
@@ -6430,14 +6451,10 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
     """Unassign leads that haven't been touched in 7+ days"""
     try:
         cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
-        r = req_lib.get(
+        stale = _paginated_get(
             f"{SUPABASE_URL}/rest/v1/leads?select=id,assignedTo,updatedAt,status"
             f"&assignedTo=neq.&status=not.in.(converted,interested)"
-            f"&updatedAt=lt.{cutoff}",
-            headers=SB_HEADERS, timeout=30)
-        stale = r.json() if r.status_code == 200 else []
-        if not isinstance(stale, list):
-            return {"recycled": 0}
+            f"&updatedAt=lt.{cutoff}")
         recycled_ids = [{"id": l["id"], "was_assigned_to": l.get("assignedTo")} for l in stale if l.get("assignedTo")]
         stale_ids = [item["id"] for item in recycled_ids]
         recycled = 0
@@ -7835,16 +7852,11 @@ def emailed_flags(days: int = 90, user: str = Depends(verify_token)):
     days = max(1, min(int(days), 365))
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
     try:
-        r = req_lib.get(
+        rows = _paginated_get(
             f"{SUPABASE_URL}/rest/v1/audit_log"
             f"?action=eq.campaign_sent&created_at=gte.{since}"
-            f"&select=resource_id,created_at"
-            f"&order=created_at.desc&limit=10000",
-            headers=SB_ADMIN_HEADERS, timeout=15,
-        )
-        rows = r.json() if r.status_code == 200 else []
-        if not isinstance(rows, list):
-            rows = []
+            f"&select=resource_id,created_at&order=created_at.desc",
+            headers=SB_ADMIN_HEADERS)
     except Exception as e:
         print(f"[EMAILED-FLAGS] query failed: {e}")
         return {"flags": {}, "window_days": days}
@@ -7908,14 +7920,13 @@ def campaigns_eligible(window_days: int = 7, user: str = Depends(verify_admin)):
     # eligibility check stays a single batch.
     sup_cutoff = (datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)).isoformat()
     try:
-        sr = req_lib.get(
+        # paginated — a truncated suppression list re-emails contacted leads
+        rows = _paginated_get(
             f"{SUPABASE_URL}/rest/v1/audit_log"
             f"?action=eq.campaign_sent&created_at=gte.{sup_cutoff}"
-            f"&select=resource_id&limit=10000",
-            headers=SB_ADMIN_HEADERS, timeout=10,
-        )
-        rows = sr.json() if sr.status_code == 200 else []
-        suppressed = {str(r_.get("resource_id")) for r_ in (rows if isinstance(rows, list) else []) if r_.get("resource_id")}
+            f"&select=resource_id",
+            headers=SB_ADMIN_HEADERS)
+        suppressed = {str(r_.get("resource_id")) for r_ in rows if r_.get("resource_id")}
     except Exception as e:
         print(f"[ELIGIBLE] suppression query failed: {e}")
         suppressed = set()
@@ -8464,16 +8475,10 @@ def get_flagged_calls(user: str = Depends(verify_admin)):
 def get_reps(user: str = Depends(verify_admin)):
     """Get all reps with their lead counts and last activity"""
     try:
-        # All assigned leads
-        r1 = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo",
-            headers=SB_HEADERS, timeout=30)
-        leads = r1.json() if r1.status_code == 200 else []
-        # All calls for last activity
-        r2 = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=calledBy,calledAt&order=calledAt.desc",
-            headers=SB_HEADERS, timeout=30)
-        calls = r2.json() if r2.status_code == 200 else []
+        # All assigned leads / calls — paginated: plain GETs cap at 1000 rows,
+        # which undercounted leads and dropped reps from Team Management.
+        leads = _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo")
+        calls = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=calledBy,calledAt&order=calledAt.desc")
 
         reps = {}
         for l in (leads if isinstance(leads, list) else []):
@@ -8535,7 +8540,7 @@ def get_stats(user: str = Depends(verify_token)):
             "newToday": len([l for l in sl if (l.get("createdAt","")).startswith(today)]),
             "interested": len([l for l in sl if l.get("status")=="interested"]),
             "converted": converted,
-            "callbacksDue": len([l for l in sl if l.get("callbackDate","")<=today and l.get("callbackDate") and l.get("status")!="converted"]),
+            "callbacksDue": len([l for l in sl if (l.get("callbackDate") or "")<=today and l.get("callbackDate") and l.get("status")!="converted"]),
             "callsToday": len(sc),
             "conversionRate": f"{(converted/total*100):.1f}" if total else "0.0",
             "contactRate": f"{(len([c for c in sc if c.get('outcome') in ('answered','interested','interested_no_dm','converted','callback','not_interested')])/len(sc)*100):.1f}" if sc else "0.0",
@@ -8572,9 +8577,9 @@ def _trend_arrow(now, prev):
     return "↑" if d > 0 else "↓" if d < 0 else "→"
 
 @app.get("/api/daily-summary")
-def daily_summary():
-    """Send end-of-day summary to Slack. Triggered by Railway cron or manually.
-    Includes objection patterns + week-over-week trend (the seasonality base)."""
+def daily_summary(user: str = Depends(verify_cron_or_admin)):
+    """Send end-of-day summary to Slack. Triggered by Railway cron (?secret=
+    CRON_SECRET) or an admin. Includes objection patterns + week-over-week trend."""
     try:
         now = datetime.utcnow()
         today = now.strftime("%Y-%m-%d")
@@ -8810,9 +8815,9 @@ def build_weekly_digest():
                                         "top_industry": (top_ind[0]["industry"] if top_ind else None)}}
 
 @app.get("/api/weekly-summary")
-def weekly_summary(preview: int = 0):
+def weekly_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
     """Send the weekly AI review to Slack. Auto-fired weekly by the bg loop; also
-    hittable manually. ?preview=1 renders the block text WITHOUT posting to Slack."""
+    hittable by an admin (or cron secret). ?preview=1 renders without posting."""
     try:
         payload = build_weekly_digest()
         if not payload:
@@ -8840,11 +8845,14 @@ def run_weekly_digest_if_due():
     if not _weekly_digest_due():
         return
     try:
+        # Record the cooldown BEFORE the multi-second AI build — during a rolling
+        # deploy both containers' bg threads could pass the due-check and
+        # double-post if we recorded afterwards.
+        _record_weekly_digest_run()
         payload = build_weekly_digest()
         if payload:
             req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": payload["blocks"]}, timeout=10)
             print(f"[WEEKLY-DIGEST] sent — {payload['stats']}")
-        _record_weekly_digest_run()   # record even if empty, so we don't retry all week
     except Exception as e:
         print(f"[WEEKLY-DIGEST] send failed: {e}")
 
@@ -9609,9 +9617,13 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             u["leads_populated"] = u.get("leads_populated", 0)
             result.append(u)
 
-        # Flag suspicious stats
+        # Flag suspicious stats — ADMIN-VISIBLE ONLY. Returning them to caller
+        # tokens told reps exactly which thresholds trip detection.
+        show_flags = is_admin(user)
         for u in result:
             u["flags"] = []
+            if not show_flags:
+                continue
             conv = float(u["conv_rate"]) if u["total_calls"] >= 10 else 0
             contact = float(u["contact_rate"]) if u["total_calls"] >= 10 else 0
             if conv > 50: u["flags"].append("high_conv_rate")

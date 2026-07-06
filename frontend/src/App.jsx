@@ -385,7 +385,9 @@ async function api(path, opts={}) {
       ...(opts.headers||{})
     }
   })
-  if (res.status===401) { localStorage.clear(); window.location.reload(); return }
+  // On 401: reload is async, so returning undefined let in-flight callers deref
+  // the result and throw. A never-resolving promise parks them until reload.
+  if (res.status===401) { localStorage.clear(); window.location.reload(); return new Promise(()=>{}) }
   const body = await res.json()
   if (!res.ok) throw new Error(body.detail || JSON.stringify(body))
   return body
@@ -525,7 +527,7 @@ function ScoreRing({score=0}){
 // window and the caller hasn't dismissed that state's banner today.
 function BestRegionBanner({region, dismissed, onSwitch, onDismiss, switching}){
   if(!region || !region.state) return null
-  const today = new Date().toISOString().slice(0,10)
+  const today = localDate()
   if(dismissed && dismissed[region.state] === today) return null
   const hr = region.current_local_hour
   const hrLabel = hr==null ? "" :
@@ -1576,10 +1578,18 @@ const FOLLOW_UP_DAYS = {
   "180d-365d":  [180, 365],
 }
 
+// Local-timezone YYYY-MM-DD. toISOString() is UTC — after ~8pm ET it flips to
+// tomorrow, which shifted "today" for callbacks, My Week, and History filters
+// exactly during the caller's evening shift.
+function localDate(d){
+  d = d || new Date()
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,"0"), day=String(d.getDate()).padStart(2,"0")
+  return `${y}-${m}-${day}`
+}
 function addDays(days){
   const d = new Date()
   d.setDate(d.getDate() + days)
-  return d.toISOString().split("T")[0]
+  return localDate(d)
 }
 
 // ─── QualChip ────────────────────────────────────────────────────────────────
@@ -1634,6 +1644,10 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [timerStart]              = useState(()=>Date.now())
   const [timerNow,setTimerNow]    = useState(Date.now())
   const [timerRunning,setTimerRunning] = useState(true)
+  // Guards retry-after-partial-failure: if POST /api/calls succeeded but the
+  // lead PATCH failed, a retry must NOT insert a second call_outcomes row
+  // (which also tripped the anti-gaming duplicate-cooldown flag on the rep).
+  const callPostedRef = useRef(false)
   useEffect(()=>{
     if(!timerRunning) return
     const iv=setInterval(()=>setTimerNow(Date.now()),1000)
@@ -1723,7 +1737,10 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         converted: outcome === "converted",
         send_email_followup: emailEligible && sendEmailFollowup,
       }
-      await api("/api/calls",{method:"POST",body:JSON.stringify(callPayload)})
+      if(!callPostedRef.current){
+        await api("/api/calls",{method:"POST",body:JSON.stringify(callPayload)})
+        callPostedRef.current = true
+      }
       if(scriptId) {
         api(`/api/scripts/${scriptId}/use`,{method:"POST",body:JSON.stringify({})}).catch(()=>{})
       }
@@ -2927,11 +2944,11 @@ function MyWeek({user, leads, onCall, onReload, notify}){
     const d=new Date(); const dow=(d.getDay()+6)%7
     const mon=new Date(d); mon.setDate(d.getDate()-dow+o*7); mon.setHours(0,0,0,0)
     const sun=new Date(mon); sun.setDate(mon.getDate()+6)
-    const f=x=>x.toISOString().slice(0,10); return {start:f(mon),end:f(sun)}
+    const f=x=>localDate(x); return {start:f(mon),end:f(sun)}
   }
   const bounds=weekBounds(weekOffset)
   const leadmap={}; leads.forEach(l=>{leadmap[l.id]=l})
-  const today=new Date().toISOString().slice(0,10)
+  const today=localDate()
 
   async function load(o){
     setLoading(true); const b=weekBounds(o)
@@ -3165,6 +3182,10 @@ function AppointmentsBoard(){
 export default function App(){
   const [user,setUser]             = useState(()=>isLoggedIn()?localStorage.getItem("lf_user"):null)
   const [leads,setLeads]           = useState([])
+  // Unfiltered copy for the notification bell + My Week — deriving those from
+  // the filter-scoped list silently shrank follow-up counts whenever a search
+  // or status filter was active.
+  const [allLeads,setAllLeads]     = useState([])
   // Persistent "this lead was emailed" map. Survives status changes so the
   // badge stays even after a reply flips the lead back to 'interested'.
   // Shape: { [lead_id]: {last_emailed_at, email_count} }
@@ -3266,7 +3287,7 @@ export default function App(){
   },[user])
 
   function dismissBestRegion(state){
-    const today = new Date().toISOString().slice(0,10)
+    const today = localDate()
     const next = {...bestRegionDismissed, [state]: today}
     setBestRegionDismissed(next)
     try { localStorage.setItem("lf_region_dismissed", JSON.stringify(next)) }
@@ -3366,6 +3387,12 @@ export default function App(){
       params.set("sort", sortBy)
       const leadsData = await api(`/api/leads?${params}`)
       setLeads(Array.isArray(leadsData)?leadsData:[])
+      const unfiltered = fStatus==="all" && !search && !cbOnly
+      if(unfiltered){ setAllLeads(Array.isArray(leadsData)?leadsData:[]) }
+      else{
+        // background refresh of the unfiltered set so bell/My Week stay complete
+        api(`/api/leads?sort=${sortBy}`).then(d=>{ if(Array.isArray(d)) setAllLeads(d) }).catch(()=>{})
+      }
       try{ const s=await api("/api/stats"); if(s) setStats(s) }catch{}
       try{ const q=await api("/api/quota"); if(q) setQuota(q) }catch{}
       // Persistent email-history map for the 📧 badges.
@@ -3488,13 +3515,12 @@ export default function App(){
   if(!user) return <Login onLogin={u=>setUser(u)}/>
 
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
-  const localDate=d=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");return`${y}-${m}-${day}`}
   const today=localDate(new Date())
   const tomorrow=(()=>{const d=new Date();d.setDate(d.getDate()+1);return localDate(d)})()
   const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return localDate(d)})()
 
   // Notification items
-  const notifItems=leads.filter(l=>l.callbackDate&&l.status!=="converted").map(l=>{
+  const notifItems=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.status!=="converted").map(l=>{
     const d=l.callbackDate
     if(d<today) return{...l,urgency:"overdue",label:"Overdue",color:"#ff6e84"}
     if(d===today) return{...l,urgency:"today",label:"Due today",color:"#ffe083"}
@@ -3506,12 +3532,16 @@ export default function App(){
     return(order[a.urgency]||4)-(order[b.urgency]||4)
   })
 
-  // Browser notification on load if overdue
+  // Browser notification on load if overdue — at most once per calendar day.
+  // Keying the effect on leads.length re-fired it on every search keystroke /
+  // filter change / post-mutation refresh → OS notification spam all day.
+  const notifiedOnRef = useRef("")
   useEffect(()=>{
-    if(!leads.length) return
+    if(!leads.length || notifiedOnRef.current===today) return
     const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
     if(overdue.length>0&&"Notification" in window){
       if(Notification.permission==="granted"){
+        notifiedOnRef.current=today
         new Notification(`LeadFlow: ${overdue.length} overdue follow-up${overdue.length>1?"s":""}`,{
           body:overdue.slice(0,3).map(l=>l.company||l.firstName).join(", "),icon:"/favicon.ico"})
       }else if(Notification.permission!=="denied"){
@@ -4814,8 +4844,11 @@ export default function App(){
                         <button className="btn btn-g"
                           style={{width:"100%",padding:"11px",fontSize:13,marginBottom:10}}
                           onClick={async()=>{
-                            await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({assignedTo:user,updatedAt:new Date().toISOString()})})
-                            setLeads(p=>p.map(l=>l.id===lead.id?{...l,assignedTo:user}:l))
+                            try{
+                              await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({assignedTo:user,updatedAt:new Date().toISOString()})})
+                              setLeads(p=>p.map(l=>l.id===lead.id?{...l,assignedTo:user}:l))
+                              notify("Lead claimed")
+                            }catch{ notify("Couldn't claim — try again","error") }
                           }}>
                           🔒 Claim Lead
                         </button>
@@ -4834,7 +4867,8 @@ export default function App(){
                       </button>
                     </div>
                     {/* Trigger lazy script + best-time load for this industry */}
-                    {lead.industry && (ensureScript(lead.industry), ensureBestTime(lead.industry), null)}
+                    {/* deferred: setState during render violates render purity */}
+                    {lead.industry && (queueMicrotask(()=>{ensureScript(lead.industry);ensureBestTime(lead.industry)}), null)}
                     {/* Best-call-time hint — green if the local hour matches
                         the historical sweet spot, dim grey otherwise. Only
                         shows when there's enough signal (≥5 calls). */}
@@ -5105,7 +5139,7 @@ export default function App(){
 
           {/* ── MY WEEK — caller's call/note workspace ── */}
           {activeNav==="myweek"&&(
-            <MyWeek user={user} leads={leads} onCall={setCallModal} onReload={loadLeads} notify={notify}/>
+            <MyWeek user={user} leads={allLeads.length?allLeads:leads} onCall={setCallModal} onReload={loadLeads} notify={notify}/>
           )}
 
           {activeNav==="appointments"&&isAdmin()&&<AppointmentsBoard/>}
@@ -5141,7 +5175,9 @@ export default function App(){
             ]
 
             function relativeTime(dateStr){
-              const days=Math.round((new Date(dateStr)-new Date())/(1000*60*60*24))
+              // parse date-only strings as LOCAL noon — new Date("YYYY-MM-DD") is UTC
+              // midnight, which made due-today rows read "1d overdue" in ET
+              const days=Math.round((new Date(dateStr+"T12:00:00")-new Date())/(1000*60*60*24))
               if(days<0) return Math.abs(days)+"d overdue"
               if(days===0) return "today"
               if(days===1) return "tomorrow"
@@ -5242,10 +5278,12 @@ export default function App(){
                                       addDays(7)
                                     )
                                     if(d&&d.match(/^\d{4}-\d{2}-\d{2}$/)){
-                                      await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
-                                        callbackDate:d,status:"callback",updatedAt:new Date().toISOString()})})
-                                      setLeads(p=>p.map(l=>l.id===lead.id?{...l,callbackDate:d,status:"callback"}:l))
-                                      notify("Follow-up moved to "+d)
+                                      try{
+                                        await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
+                                          callbackDate:d,status:"callback",updatedAt:new Date().toISOString()})})
+                                        setLeads(p=>p.map(l=>l.id===lead.id?{...l,callbackDate:d,status:"callback"}:l))
+                                        notify("Follow-up moved to "+d)
+                                      }catch{ notify("Couldn't reschedule — try again","error") }
                                     }
                                   }}>
                                   Reschedule
@@ -5485,10 +5523,10 @@ export default function App(){
                                         .catch(()=>notify("Failed to load","error"))
                                         .finally(()=>setCallerDetailLoading(false))
                                     }}>Load</button>
-                                  {[{label:"Today",d:new Date().toISOString().slice(0,10),d2:""},
-                                    {label:"Yesterday",d:new Date(Date.now()-864e5).toISOString().slice(0,10),d2:""},
-                                    {label:"Last 7d",d:new Date(Date.now()-7*864e5).toISOString().slice(0,10),d2:new Date().toISOString().slice(0,10)},
-                                    {label:"Last 30d",d:new Date(Date.now()-30*864e5).toISOString().slice(0,10),d2:new Date().toISOString().slice(0,10)},
+                                  {[{label:"Today",d:localDate(),d2:""},
+                                    {label:"Yesterday",d:localDate(new Date(Date.now()-864e5)),d2:""},
+                                    {label:"Last 7d",d:localDate(new Date(Date.now()-7*864e5)),d2:localDate()},
+                                    {label:"Last 30d",d:localDate(new Date(Date.now()-30*864e5)),d2:localDate()},
                                   ].map(p=>(
                                     <button key={p.label} className="btn btn-g" style={{fontSize:10,padding:"4px 10px"}}
                                       onClick={e=>{
@@ -6219,7 +6257,7 @@ function HoursPanel(){
     const d=new Date(); const day=(d.getDay()+6)%7 // 0=Mon
     const mon=new Date(d); mon.setDate(d.getDate()-day+offset*7); mon.setHours(0,0,0,0)
     const sun=new Date(mon); sun.setDate(mon.getDate()+6)
-    const fmt=(x)=>x.toISOString().slice(0,10)
+    const fmt=(x)=>localDate(x)
     return {start:fmt(mon),end:fmt(sun),label:`${fmt(mon)} → ${fmt(sun)}`}
   }
   function load(offset){
