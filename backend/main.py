@@ -2100,11 +2100,13 @@ def _bg_maintenance_loop():
         # Apollo (name+company) and phone-based sweeps share the same cooldown
         # row, so they run together; the cooldown is updated once at the end.
         try:
-            run_phone_dedupe_sweep_if_due()
-        except Exception as e:
-            print(f"[PHONE-DEDUPE] loop exception: {e}")
-        try:
-            run_dedupe_sweep_if_due()
+            if _dedupe_sweep_due():
+                _record_dedupe_sweep_run()   # record first (rolling-deploy dedupe)
+                try:
+                    run_phone_dedupe_sweep_if_due(skip_due_check=True)
+                except Exception as e:
+                    print(f"[PHONE-DEDUPE] loop exception: {e}")
+                run_dedupe_sweep_if_due(skip_due_check=True)
         except Exception as e:
             print(f"[DEDUPE-SWEEP] loop exception: {e}")
         # Daily-cadence hot-lead-at-risk digest. Internal cooldown so this is
@@ -2306,13 +2308,13 @@ def _reparent_call_outcomes(keep_to_extras: dict) -> int:
 # Hard cap per sweep so a runaway can't wipe the table. Configurable.
 PHONE_DEDUPE_MAX_PER_RUN = int(os.getenv("PHONE_DEDUPE_MAX_PER_RUN", "300"))
 
-def run_phone_dedupe_sweep_if_due():
-    """Weekly self-healing phone dedupe. Same cooldown row as Apollo dedupe
-    (`last_dedupe_sweep`) so the two stay in lock-step — one fetch, two
-    sweeps per cycle. Skips silently if not due."""
-    # Re-uses the Apollo cooldown row so the two sweeps share a tick.
-    # If Apollo just ran, this is the same cycle and we run too.
-    if not _dedupe_sweep_due():
+def run_phone_dedupe_sweep_if_due(skip_due_check=False):
+    """Weekly self-healing phone dedupe. Shares the `last_dedupe_sweep`
+    cooldown row with the Apollo sweep — the bg loop checks due ONCE, records,
+    then runs both with skip_due_check=True. (Now that cooldown writes actually
+    persist, per-function record-at-end would starve whichever sweep ran
+    second in the same tick.)"""
+    if not skip_due_check and not _dedupe_sweep_due():
         return
     print("[PHONE-DEDUPE] starting weekly phone-dedup sweep")
     leads = _fetch_all_leads_for_dedupe()
@@ -2383,11 +2385,6 @@ def run_phone_dedupe_sweep_if_due():
             summary += f" — {len(borderline)} group(s) need review (engaged duplicates preserved)"
         send_slack(":broom: Weekly phone-dedupe sweep", summary, fields=fields)
 
-    # Defense-in-depth: record cooldown here too. The Apollo sweep also
-    # records at its end, but if Apollo errors out, phone sweep alone has
-    # already paid for the dedupe + Slack noise — don't let it re-fire next
-    # tick. Shared cooldown row.
-    _record_dedupe_sweep_run()
     print(f"[PHONE-DEDUPE] done — deleted={deleted} reparented={reparented} borderline={len(borderline)}")
 
 def _dedupe_sweep_due() -> bool:
@@ -2471,6 +2468,9 @@ def run_hot_lead_digest_if_due():
         return
     if not _hot_digest_due():
         return
+    # Record BEFORE the work — same rolling-deploy double-post fix as the
+    # weekly digest: two containers' bg threads can both pass the due-check.
+    _record_hot_digest_run()
     cutoff_dt   = datetime.utcnow() - timedelta(days=HOT_LEAD_STALE_DAYS)
     cutoff_iso  = cutoff_dt.isoformat()
     today_str   = datetime.utcnow().strftime("%Y-%m-%d")
@@ -2499,9 +2499,7 @@ def run_hot_lead_digest_if_due():
         return
 
     if not stale and not overdue_cb:
-        # Nothing to say. Still record so we don't re-check every 10 min.
-        _record_hot_digest_run()
-        return
+        return  # nothing to say — cooldown already recorded above
 
     fields = []
     if stale:
@@ -2531,7 +2529,6 @@ def run_hot_lead_digest_if_due():
         f"{len(stale)} engaged lead(s) gone quiet + {len(overdue_cb)} overdue callback(s)",
         fields=fields,
     )
-    _record_hot_digest_run()
     print(f"[HOT-DIGEST] posted: {len(stale)} stale + {len(overdue_cb)} overdue")
 
 # ── Nightly once-called recycle ──────────────────────────────────────────────
@@ -2588,6 +2585,7 @@ def run_once_called_recycle_if_due():
         return
     if not _once_called_recycle_due():
         return
+    _record_once_called_recycle_run()   # record before work (rolling-deploy dedupe)
     cutoff_iso = (datetime.utcnow() - timedelta(hours=ONCE_CALLED_RECYCLE_GRACE_HOURS)).isoformat()
     try:
         # status=no_answer (covers voicemail too — both map to no_answer),
@@ -2607,8 +2605,7 @@ def run_once_called_recycle_if_due():
                      "was_assigned_to": l.get("assignedTo")} for l in leads if l.get("id")]
         ids = [item["id"] for item in recycled]
         if not ids:
-            _record_once_called_recycle_run()
-            return
+            return  # cooldown already recorded above
         # Bulk unassign in chunks (keep the in.() URL well under limits).
         now_iso = datetime.utcnow().isoformat()
         done = 0
@@ -2638,7 +2635,6 @@ def run_once_called_recycle_if_due():
                 )
             except Exception as e:
                 print(f"[ONCE-RECYCLE] slack failed: {e}")
-        _record_once_called_recycle_run()
     except Exception as e:
         print(f"[ONCE-RECYCLE] run failed: {e}")
 
@@ -2663,9 +2659,10 @@ def _record_dedupe_sweep_run():
     except Exception as e:
         print(f"[DEDUPE-SWEEP] failed to record last-run: {e}")
 
-def run_dedupe_sweep_if_due():
-    """Weekly self-healing dedupe. Skips silently if not due."""
-    if not _dedupe_sweep_due():
+def run_dedupe_sweep_if_due(skip_due_check=False):
+    """Weekly self-healing dedupe. Skips silently if not due. See the phone
+    sweep's docstring for the shared-cooldown contract."""
+    if not skip_due_check and not _dedupe_sweep_due():
         return
     print("[DEDUPE-SWEEP] starting weekly sweep")
     leads = _fetch_all_leads_for_dedupe()
@@ -2719,7 +2716,6 @@ def run_dedupe_sweep_if_due():
             summary += f" — {len(borderline)} group(s) need review (call history at risk)"
         send_slack(":broom: Weekly Apollo dedupe sweep", summary, fields=fields)
 
-    _record_dedupe_sweep_run()
     print(f"[DEDUPE-SWEEP] done — deleted={deleted} borderline={len(borderline)}")
 
 # Start the background thread once at module load. Runs regardless of IMAP

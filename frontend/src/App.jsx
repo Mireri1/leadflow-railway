@@ -3244,6 +3244,7 @@ export default function App(){
   const [quota,setQuota]            = useState({quota:60,my_calls_today:0})
   const [leaderboard,setLeaderboard] = useState([])
   const [lbLoading,setLbLoading]   = useState(false)
+  const [reps,setReps]             = useState([])   // Team Management roster
   const [lbRange,setLbRange]       = useState("today")
   const [qualifiedCalls,setQualifiedCalls] = useState([])
   const [qualLoading,setQualLoading] = useState(false)
@@ -5816,18 +5817,10 @@ export default function App(){
                   </div>
                   <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
                     onClick={()=>{
-                      api("/api/reps").then(r=>{
-                        if(Array.isArray(r)) setLeaderboard(prev=>{
-                          // Store reps data in a temp state via leaderboard refresh
-                          window.__lf_reps=r; return prev
-                        })
-                        // Force re-render
-                        setLbLoading(l=>!l); setTimeout(()=>setLbLoading(l=>!l),50)
-                      }).catch(()=>{})
+                      api("/api/reps").then(r=>{ if(Array.isArray(r)) setReps(r) }).catch(()=>{})
                     }}>Load Reps</button>
                 </div>
                 {(()=>{
-                  const reps=window.__lf_reps||[]
                   if(!reps.length) return(
                     <div style={{padding:32,textAlign:"center",color:"#40485d",fontSize:13}}>
                       Click "Load Reps" to see team status
@@ -5883,7 +5876,7 @@ export default function App(){
                                       body:JSON.stringify({from:rep.name,to:to.trim()})})
                                     notify(`${r.reassigned} lead${r.reassigned!==1?"s":""} moved to ${to.trim()||"pool"}`)
                                     // Refresh reps
-                                    api("/api/reps").then(r=>{if(Array.isArray(r))window.__lf_reps=r;setLbLoading(l=>!l);setTimeout(()=>setLbLoading(l=>!l),50)}).catch(()=>{})
+                                    api("/api/reps").then(r=>{if(Array.isArray(r))setReps(r)}).catch(()=>{})
                                     setTimeout(loadLeads,500)
                                   }catch(e){notify("Error: "+e.message,"error")}
                                 }}>
@@ -5897,7 +5890,7 @@ export default function App(){
                                       const r=await api("/api/leads/reassign",{method:"POST",
                                         body:JSON.stringify({from:rep.name,to:""})})
                                       notify(`${r.reassigned} lead${r.reassigned!==1?"s":""} returned to pool`)
-                                      api("/api/reps").then(r=>{if(Array.isArray(r))window.__lf_reps=r;setLbLoading(l=>!l);setTimeout(()=>setLbLoading(l=>!l),50)}).catch(()=>{})
+                                      api("/api/reps").then(r=>{if(Array.isArray(r))setReps(r)}).catch(()=>{})
                                       setTimeout(loadLeads,500)
                                     }catch(e){notify("Error: "+e.message,"error")}
                                   }}>
@@ -5914,7 +5907,7 @@ export default function App(){
                                       await api("/api/leads/reassign",{method:"POST",body:JSON.stringify({from:rep.name,to:""})})
                                     }
                                     notify(`${rep.name} blocked and ${rep.leads} lead${rep.leads!==1?"s":""} released`)
-                                    api("/api/reps").then(r=>{if(Array.isArray(r))window.__lf_reps=r;setLbLoading(l=>!l);setTimeout(()=>setLbLoading(l=>!l),50)}).catch(()=>{})
+                                    api("/api/reps").then(r=>{if(Array.isArray(r))setReps(r)}).catch(()=>{})
                                     setTimeout(loadLeads,500)
                                   }catch(e){notify("Error: "+e.message,"error")}
                                 }}>
