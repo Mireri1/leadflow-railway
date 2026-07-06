@@ -4146,13 +4146,14 @@ def fetch_cms_nursing(state_abbrev: str) -> list:
         rating = p.get("overall_rating")
         if rating:     tags.append(f"{rating}★ overall")
         age_tag = f" [hvage:{age_days}]" if age_days is not None else ""
+        insp_tag = f" [inspected:{survey}]" if re.match(r"\d{4}-\d{2}-\d{2}", survey) else ""
         leads.append({
             "company": name, "industry": "Nursing Facility",
             "phone": clean(p.get("telephone_number", "")),
             "address": clean(d.get("provider_address") or p.get("provider_address") or ""),
             "city": clean(d.get("citytown") or p.get("citytown") or ""), "state": st,
             "notes": f"[INTENT:health_violation] CMS deficiency (survey {survey}, severity {sev}): "
-                     f"{desc[:150]}{(' | ' + ' · '.join(tags)) if tags else ''}{age_tag}".strip(),
+                     f"{desc[:150]}{(' | ' + ' · '.join(tags)) if tags else ''}{age_tag}{insp_tag}".strip(),
         })
         if len(leads) >= FREE_SOURCE_MAX_ROWS:
             break
@@ -4305,12 +4306,13 @@ def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
             result = clean(row.get(s["result"], ""))
             ftype = clean(row.get(s["ftype"], "")) if s.get("ftype") else ""
             age_tag = f" [hvage:{age_days}]" if age_days is not None else ""
+            insp_tag = f" [inspected:{date}]" if re.match(r"\d{4}-\d{2}-\d{2}", date) else ""
             lead_city = clean(row.get(s["city"], "")) if s.get("city") else s.get("city_const", "")
             leads.append({
                 "company": name, "industry": ftype or "Food Service", "phone": "",
                 "address": addr, "city": lead_city, "state": state_abbrev.upper(),
                 "notes": f"[INTENT:health_violation] Failed health inspection ({s['metro']}, {date}) — "
-                         f"{result}: {viol}{age_tag}".strip(),
+                         f"{result}: {viol}{age_tag}{insp_tag}".strip(),
             })
             if len(leads) >= FREE_SOURCE_MAX_ROWS:
                 break
@@ -9040,6 +9042,7 @@ def _clean_note_text(s):
     s = s or ""
     s = re.sub(r"\[INTENT:[a-z_]+\]", "", s, flags=re.I)
     s = re.sub(r"\[(hvage|clnage):\d+\]", "", s, flags=re.I)
+    s = re.sub(r"\[inspected:[\d-]+\]", "", s, flags=re.I)
     s = re.sub(r"\[sent:(warm|neutral|cold)\]", "", s, flags=re.I)
     s = re.sub(r"\[(follow-up\s+)?\d{4}-\d{2}-\d{2}\]", "", s)
     return re.sub(r"\s+", " ", s).strip()

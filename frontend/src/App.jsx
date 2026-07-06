@@ -221,8 +221,29 @@ function sourceMeta(src){
 // Strip the machine tags from notes → the human detail the caller can cite.
 function cleanNote(notes){
   return (notes||"").replace(/\[INTENT:[a-z_]+\]/gi,"").replace(/\[(hvage|clnage):\d+\]/gi,"")
+    .replace(/\[inspected:[\d-]+\]/gi,"")
     .replace(/\[sent:(warm|neutral|cold)\]/gi,"")
     .replace(/\s*\|\s*/g," · ").replace(/\s+/g," ").trim()
+}
+// Last reported health-inspection date for a lead — from the [inspected:DATE]
+// token, or parsed from the note text for leads scraped before the token.
+function parseInspection(notes){
+  const s = notes||""
+  let m = s.match(/\[inspected:(\d{4}-\d{2}-\d{2})\]/i)
+  if(m) return m[1]
+  if(/\[INTENT:health_violation\]/i.test(s)){
+    m = s.match(/survey\s+(\d{4}-\d{2}-\d{2})/i) || s.match(/(\d{4}-\d{2}-\d{2})/)
+    if(m) return m[1]
+  }
+  return null
+}
+function fmtInspection(date){
+  if(!date) return null
+  const d = new Date(date+"T12:00:00")
+  if(isNaN(d.getTime())) return {label:date, ago:"", days:null}
+  const days = Math.floor((Date.now()-d.getTime())/86400000)
+  const ago = days<0?"" : days<31?`${days}d ago` : days<365?`${Math.round(days/30)} mo ago` : `${(days/365).toFixed(1)} yr ago`
+  return {label:d.toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric"}), ago, days}
 }
 
 // ── Sentiment (Haiku note assistant) ────────────────────────────────────────
@@ -1909,6 +1930,22 @@ function CallModal({lead: leadProp,onClose,onSaved}){
           borderRadius:8,fontSize:13,color:"#ff6e84",display:"flex",alignItems:"center",gap:8}}>
           <span>⚠</span>{modalError}
         </div>}
+
+        {/* Last reported inspection — so the caller can answer "when was ours?" */}
+        {(()=>{
+          const insp = fmtInspection(parseInspection(lead.notes))
+          if(!insp) return null
+          return (
+            <div style={{marginBottom:12,background:"#ff4d6d12",border:"1px solid #ff4d6d40",borderRadius:10,padding:"11px 14px",display:"flex",alignItems:"center",gap:11}}>
+              <span style={{fontSize:20}}>🚨</span>
+              <div>
+                <div style={{fontSize:10,letterSpacing:".08em",fontWeight:700,color:"#ff8da3"}}>LAST REPORTED INSPECTION</div>
+                <div style={{fontSize:16,color:"#dee5ff",fontWeight:700}}>{insp.label}
+                  {insp.ago&&<span style={{fontSize:12,color:"#a3aac4",fontWeight:400}}> · {insp.ago}</span>}</div>
+              </div>
+            </div>
+          )
+        })()}
 
         {/* Signal-aware opener — the first line that earns the next 20 seconds. */}
         {(()=>{
@@ -4135,6 +4172,7 @@ export default function App(){
                                   background:m.color+"22",color:m.color,padding:"2px 7px",borderRadius:4,
                                   border:`1px solid ${m.color}55`,cursor:"help"}}>{m.label}</span>
                               })}
+                              {(()=>{const i=fmtInspection(parseInspection(lead.notes));return i?<span title={`Last reported inspection ${i.label}${i.ago?" · "+i.ago:""}`} style={{fontSize:9,fontWeight:700,background:"#ff4d6d18",color:"#ff8da3",padding:"2px 7px",borderRadius:4,border:"1px solid #ff4d6d40",cursor:"help"}}>🚨 {i.label}{i.ago?` · ${i.ago}`:""}</span>:null})()}
                               {isNewToday&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4,border:"1px solid #69f6b830",fontWeight:700}}>NEW TODAY</span>}
                               {takenBy&&<span style={{fontSize:9,background:"#ff6e8420",color:"#ff6e84",padding:"2px 7px",borderRadius:4,border:"1px solid #ff6e8430"}}>🔒 {takenBy}</span>}
                               {!takenBy&&lead.assignedTo&&<span style={{fontSize:9,background:"#69f6b818",color:"#69f6b8",padding:"2px 7px",borderRadius:4}}>✓ mine</span>}
