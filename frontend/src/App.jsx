@@ -1591,6 +1591,15 @@ function addDays(days){
   d.setDate(d.getDate() + days)
   return localDate(d)
 }
+// Year-typo guard: cristine once booked an appointment for 2027 instead of
+// 2026. Soft-confirm any date >6 months out (or in the past).
+function confirmFarDate(dateStr,label){
+  if(!dateStr) return true
+  const days=Math.round((new Date(dateStr+"T12:00:00")-new Date())/86400000)
+  if(days>185) return window.confirm(`⚠️ ${label||"That date"} (${dateStr}) is about ${Math.round(days/30)} months away — is the YEAR right?`)
+  if(days<-1)  return window.confirm(`⚠️ ${label||"That date"} (${dateStr}) is in the past — continue anyway?`)
+  return true
+}
 
 // ─── QualChip ────────────────────────────────────────────────────────────────
 
@@ -1713,6 +1722,8 @@ function CallModal({lead: leadProp,onClose,onSaved}){
     if(primary==="answered"&&!secondary){ setModalError("Select the call result."); return }
     if(needsQual&&!hasQualData){ setModalError("Fill out at least one qualification field below."); return }
     if(secondary==="callback"&&!cbDate){ setModalError("Please select a callback date."); return }
+    if(secondary==="callback"&&!confirmFarDate(cbDate,"Callback")) return
+    if(apptDate&&!confirmFarDate(apptDate,"Walkthrough date")) return
 
     setSave(true)
     try{
@@ -2972,6 +2983,7 @@ function MyWeek({user, leads, onCall, onReload, notify}){
   }
   async function saveFollowup(lead){
     if(!fuDate){ notify&&notify("Pick a follow-up date","error"); return }
+    if(!confirmFarDate(fuDate,"Follow-up")) return
     const fuNote=noteText.trim()?`[follow-up ${fuDate}] ${noteText.trim()}`:""
     const base=fuNote?((lead.notes?lead.notes+"\n":"")+fuNote):lead.notes
     const newNotes=aiSent?embedSentiment(base, aiSent):base
@@ -3347,8 +3359,91 @@ export default function App(){
 
   function notify(msg,type="success"){ setToast({msg,type}); setTimeout(()=>setToast(null),3200) }
 
+  // ⚡ One-tap outcome logging — most of a 100-dial day is no-answers; this
+  // skips the modal entirely (POST call + status patch in one tap).
+  const [quickLogging,setQuickLogging]=useState(null)
+  async function quickLog(lead, outcome="no_answer"){
+    if(quickLogging) return
+    setQuickLogging(lead.id)
+    try{
+      await api("/api/calls",{method:"POST",body:JSON.stringify({
+        leadId:lead.id, outcome, notes:"", duration:0,
+        calledBy:getUser(), calledAt:new Date().toISOString(), converted:false})})
+      await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
+        status:"no_answer",
+        ...(!lead.assignedTo?{assignedTo:getUser()}:{}),
+        updatedAt:new Date().toISOString()})})
+      notify(`⚡ No answer — ${lead.company||lead.firstName||"lead"}`)
+      loadLeads()
+    }catch{ notify("Couldn't log — try again","error") }
+    finally{ setQuickLogging(null) }
+  }
+
+  // 📞 "Who's next?" — the single best next dial: due callbacks → warm → fresh.
+  function pickNextLead(){
+    const pool=(allLeads.length?allLeads:leads)
+    const t=localDate()
+    const mine=l=>!l.assignedTo||l.assignedTo===user
+    const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l))
+      .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
+    if(due.length) return due[0]
+    const warm=pool.filter(l=>parseSentiment(l.notes)==="warm"&&mine(l)&&!["converted","not_interested"].includes(l.status))
+      .sort((a,b)=>(b.score||0)-(a.score||0))
+    if(warm.length) return warm[0]
+    const fresh=pool.filter(l=>mine(l)&&l.phone&&(!l.status||["new","no_answer"].includes(l.status)))
+      .sort((a,b)=>(b.score||0)-(a.score||0))
+    return fresh[0]||null
+  }
+
+  // 🕐 Explicit clock in/out for payroll (sessions also open on login).
+  const [clockedIn,setClockedIn]=useState(()=>!!localStorage.getItem("lf_session_id"))
+  async function toggleClock(){
+    try{
+      if(clockedIn){
+        const sid=localStorage.getItem("lf_session_id")
+        if(sid) await api("/api/auth/clock-out",{method:"POST",body:JSON.stringify({session_id:sid})})
+        localStorage.removeItem("lf_session_id"); setClockedIn(false); notify("🕐 Clocked out — hours saved")
+      }else{
+        const r=await api("/api/auth/clock-in",{method:"POST",body:"{}"})
+        if(r&&r.session_id){ localStorage.setItem("lf_session_id",String(r.session_id)); setClockedIn(true); notify("🕐 Clocked in") }
+        else notify("Couldn't clock in","error")
+      }
+    }catch{ notify("Clock action failed — try again","error") }
+  }
+
+  // 🔔 Mid-shift nudge: due-today callbacks not yet called today (max 1/2h).
+  const cbNudgeRef=useRef(0)
+  useEffect(()=>{
+    if(!user) return
+    const check=()=>{
+      const t=localDate()
+      const pool=(allLeads.length?allLeads:leads)
+      const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"
+        &&(!l.assignedTo||l.assignedTo===user)
+        &&(!l.last_called_at||String(l.last_called_at).slice(0,10)<t))
+      if(due.length&&Date.now()-cbNudgeRef.current>2*3600*1000){
+        cbNudgeRef.current=Date.now()
+        notify(`🔔 ${due.length} callback${due.length>1?"s":""} due today — tap "Who's next?"`)
+      }
+    }
+    const iv=setInterval(check, 30*60*1000)
+    return()=>clearInterval(iv)
+  },[user,allLeads,leads]) // eslint-disable-line
+
   async function doLogout(){
-    if(!window.confirm("Sign out?")) return
+    // End-of-shift recap — her day at a glance before signing out.
+    let msg="Sign out?"
+    try{
+      const t=localDate()
+      const r=await api(`/api/calls/history?caller=${encodeURIComponent(user)}&date_from=${t}&date_to=${t}`)
+      const calls=(r&&r.calls)||[]
+      if(calls.length){
+        const cbs=calls.filter(c=>c.outcome==="callback").length
+        const inter=calls.filter(c=>["interested","interested_no_dm","converted"].includes(c.outcome)).length
+        msg=`Today: ${calls.length} calls · ${cbs} callback${cbs===1?"":"s"} booked · ${inter} interested.\n\nNice work — sign out?`
+      }
+    }catch(e){}
+    if(!window.confirm(msg)) return
     const sessId=localStorage.getItem("lf_session_id")
     if(sessId){
       try{await api("/api/auth/logout",{method:"POST",body:JSON.stringify({session_id:sessId})})}catch(e){}
@@ -3716,6 +3811,17 @@ export default function App(){
             </div>
           )}
         </div>
+        <button onClick={()=>{const l=pickNextLead(); if(l){setCallModal(l)}else{notify("Nothing queued — pull fresh leads or check follow-ups","error")}}}
+          title="Jump to the single best next dial: due callbacks → warm → freshest"
+          style={{fontSize:12,fontWeight:700,padding:"8px 14px",borderRadius:9,cursor:"pointer",fontFamily:"inherit",
+            border:"1px solid #69f6b855",background:"#69f6b818",color:"#69f6b8",whiteSpace:"nowrap"}}>
+          📞 Who's next?</button>
+        <button onClick={toggleClock}
+          title={clockedIn?"Clock out — closes your paid session":"Clock in — starts a paid session"}
+          style={{fontSize:11,padding:"8px 12px",borderRadius:9,cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap",
+            border:`1px solid ${clockedIn?"#ffe08355":"#40485d55"}`,background:clockedIn?"#ffe08315":"transparent",
+            color:clockedIn?"#ffe083":"#a3aac4"}}>
+          {clockedIn?"🕐 Clock out":"🕐 Clock in"}</button>
         <IconBtn onClick={()=>setShowScripts(true)} title="Settings / Scripts"><IconSettings/></IconBtn>
 
         {/* User avatar */}
@@ -4268,6 +4374,12 @@ export default function App(){
                           </div>
                         </div>
                         <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6}}>
+                          <button title="One tap: log No Answer (no modal)" disabled={quickLogging===lead.id}
+                            onClick={e=>{e.stopPropagation();quickLog(lead)}}
+                            style={{fontSize:11,fontWeight:700,padding:"6px 10px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                              border:"1px solid #ffe08340",background:"#ffe08312",color:"#ffe083",whiteSpace:"nowrap",
+                              opacity:quickLogging===lead.id?.5:1}}>
+                            {quickLogging===lead.id?"…":"⚡ No answer"}</button>
                           <LogCallBtn onClick={e=>{e.stopPropagation();setCallModal(lead)}}/>
                           <IconBtn onClick={e=>{e.stopPropagation();setEmailModal(lead)}} title="Send Email"
                             hoverColor="#69f6b8" baseColor="#40485d"><IconMail/></IconBtn>
@@ -4859,6 +4971,13 @@ export default function App(){
                           fontWeight:700,boxShadow:"0 8px 32px rgba(163,166,255,.25)"}}
                         onClick={()=>setCallModal(lead)}>
                         📞 Log Call
+                      </button>
+                      <button disabled={quickLogging===lead.id}
+                        style={{width:"100%",padding:"12px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,
+                          marginTop:8,borderRadius:10,cursor:"pointer",border:"1px solid #ffe08340",
+                          background:"#ffe08312",color:"#ffe083",opacity:quickLogging===lead.id?.5:1}}
+                        onClick={()=>{quickLog(lead);setDialerIdx(i=>i+1)}}>
+                        {quickLogging===lead.id?"…":"⚡ No Answer → next"}
                       </button>
                       <button className="btn btn-g"
                         style={{width:"100%",padding:"13px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",

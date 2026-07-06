@@ -5,7 +5,7 @@ LeadFlow Railway Backend — Google Places scraper
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt, os, re, time, json as json_lib, requests as req_lib
 import imaplib, email as email_lib, threading
@@ -465,6 +465,36 @@ def login(req: LoginRequest):
         print(f"[SESSION] Exception creating session: {e}")
     token = create_token(req.username, role)
     return {"token": token, "username": req.username, "role": role, "session_id": session_id}
+
+@app.post("/api/auth/clock-in")
+def clock_in(user: str = Depends(verify_token)):
+    """Explicit clock-in — opens a fresh user_sessions row (bulletproof payroll
+    vs inferring from login). Returns the session id for the matching clock-out."""
+    try:
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/user_sessions",
+            headers=SB_ADMIN_HEADERS,
+            json={"username": user, "signed_in": datetime.utcnow().isoformat()}, timeout=10)
+        rows = r.json() if r.status_code in (200, 201) else []
+        sid = rows[0].get("id") if isinstance(rows, list) and rows else None
+        return {"ok": bool(sid), "session_id": sid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/auth/clock-out")
+async def clock_out(request: Request, user: str = Depends(verify_token)):
+    """Explicit clock-out — closes the given session (must belong to the user)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sid = body.get("session_id")
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id required")
+    r = req_lib.patch(
+        f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{url_quote(str(sid), safe='')}&username=eq.{url_quote(user, safe='')}",
+        headers=SB_ADMIN_HEADERS,
+        json={"signed_out": datetime.utcnow().isoformat()}, timeout=10)
+    return {"ok": r.status_code in (200, 204)}
 
 @app.post("/api/auth/logout-beacon")
 async def logout_beacon(request: Request):
@@ -2127,6 +2157,11 @@ def _bg_maintenance_loop():
             run_weekly_digest_if_due()
         except Exception as e:
             print(f"[WEEKLY-DIGEST] loop exception: {e}")
+        # Daily digest — fires once per UTC day after DAILY_DIGEST_HOUR_UTC.
+        try:
+            run_daily_digest_if_due()
+        except Exception as e:
+            print(f"[DAILY-DIGEST] loop exception: {e}")
         # Monthly macro snapshot — banks one FRED reading per calendar month so a
         # paired macro × receptivity history builds up. No-op once banked.
         try:
@@ -5251,6 +5286,88 @@ def _notify_angelo(appt):
     except Exception as e:
         print(f"[APPT] angelo notify failed: {e}")
 
+def _appt_approve_link(lead_id):
+    """Signed one-click approve URL for the Slack ping (7-day expiry)."""
+    tok = jwt.encode({"leadId": str(lead_id), "act": "approve_appt",
+                      "exp": datetime.utcnow() + timedelta(days=7)}, SECRET_KEY, algorithm=ALGORITHM)
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    return f"{app_url}/appt-approve?t={tok}"
+
+def _notify_pending_appointment(appt):
+    """Ping the admin channel when a caller books a walkthrough — with a
+    one-click Approve link so Eric can approve from Slack (mobile included)."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    txt = (f"*Company:* {appt.get('company','—')}\n*When:* {appt.get('date','—')}\n"
+           f"*Area:* {appt.get('area','—')}\n*Booked by:* {appt.get('createdBy','—')}"
+           + (f"\n*Notes:* {appt['notes']}" if appt.get("notes") else ""))
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "🆕 Appointment pending your approval", "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": txt}},
+        {"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve & send to Angelo", "emoji": True},
+             "url": _appt_approve_link(appt.get("leadId")), "style": "primary"},
+            {"type": "button", "text": {"type": "plain_text", "text": "Open LeadFlow", "emoji": True}, "url": app_url},
+        ]},
+    ]
+    try:
+        req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
+    except Exception as e:
+        print(f"[APPT] pending notify failed: {e}")
+
+def _approve_appointment(lead_id, by):
+    """Shared approve transition (board button + Slack link)."""
+    key = f"appt_{lead_id}"
+    appt = _settings_get_json(key)
+    if not appt:
+        return None
+    now = datetime.utcnow().isoformat() + "Z"
+    already = appt.get("stage") == "approved"
+    appt["stage"] = "approved"
+    appt.setdefault("history", []).append({"stage": "approved", "at": now, "by": by})
+    appt["updatedAt"] = now
+    _settings_set_json(key, appt)
+    if not already:
+        _notify_angelo(appt)
+    return appt
+
+@app.get("/appt-approve")
+def appt_approve_page(t: str = ""):
+    """Confirmation page for the Slack approve link. GET renders a button that
+    POSTs — Slack's link-prefetch bot only GETs, so it can't auto-approve."""
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        assert payload.get("act") == "approve_appt"
+        appt = _settings_get_json(f"appt_{payload['leadId']}") or {}
+    except Exception:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired or invalid — approve from the LeadFlow Appointments board instead.</h3>", status_code=400)
+    body = f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+      <div style="text-align:center;max-width:420px">
+        <h2>Approve this appointment?</h2>
+        <p style="color:#a3aac4">{appt.get('company','(unknown)')} · {appt.get('date','—')} · {appt.get('area','—')}<br/>booked by {appt.get('createdBy','—')}</p>
+        <form method="post" action="/appt-approve"><input type="hidden" name="t" value="{t}"/>
+          <button type="submit" style="background:#69f6b8;color:#06301c;border:0;border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer">✅ Approve &amp; send to Angelo</button>
+        </form>
+      </div></body></html>"""
+    return HTMLResponse(body)
+
+@app.post("/appt-approve")
+async def appt_approve_submit(request: Request):
+    form = await request.form()
+    t = form.get("t", "")
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        assert payload.get("act") == "approve_appt"
+    except Exception:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired or invalid.</h3>", status_code=400)
+    appt = _approve_appointment(payload["leadId"], "slack-link")
+    if not appt:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Appointment not found — it may have been removed.</h3>", status_code=404)
+    return HTMLResponse(f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+      <div style="text-align:center"><h2>✅ Approved</h2>
+      <p style="color:#a3aac4">{appt.get('company','')} sent to Angelo for hiring.</p></div></body></html>""")
+
 @app.post("/api/appointments/{lead_id}")
 async def upsert_appointment(lead_id: str, request: Request, user: str = Depends(verify_token)):
     """Book/update a walkthrough appointment (any caller). New ones start at
@@ -5261,8 +5378,9 @@ async def upsert_appointment(lead_id: str, request: Request, user: str = Depends
         body = {}
     now = datetime.utcnow().isoformat() + "Z"
     key = f"appt_{lead_id}"
-    appt = _settings_get_json(key) or {"leadId": lead_id, "stage": "pending",
-                                       "createdBy": user, "createdAt": now, "history": []}
+    existing = _settings_get_json(key)
+    appt = existing or {"leadId": lead_id, "stage": "pending",
+                        "createdBy": user, "createdAt": now, "history": []}
     try:
         lr = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=company,phone,city,state", headers=SB_HEADERS, timeout=10)
         lead = (lr.json() or [{}])[0] if lr.status_code == 200 else {}
@@ -5281,6 +5399,8 @@ async def upsert_appointment(lead_id: str, request: Request, user: str = Depends
                           headers=SB_HEADERS, json={"callbackDate": appt["date"][:10], "updatedAt": now}, timeout=10)
         except Exception:
             pass
+    if not existing:
+        _notify_pending_appointment(appt)   # Slack ping w/ one-click approve
     return appt
 
 @app.get("/api/appointments")
@@ -8766,9 +8886,19 @@ def build_weekly_digest():
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
     label = wk_start.strftime("%b %-d") + " – " + now.strftime("%b %-d")
 
+    # Hours worked this week per caller (payroll view, admins excluded)
+    hours_line = ""
+    try:
+        per, _cb = _compute_hours(wk_start, now)
+        hrs = [(n, round(b["total_hours"], 1)) for n, b in per.items() if not is_admin(n) and b["total_hours"] > 0.05]
+        hrs.sort(key=lambda x: -x[1])
+        if hrs:
+            hours_line = "\n*Hours worked:*\n" + "\n".join(f"  {n}: *{h}h*" for n, h in hrs[:5])
+    except Exception as e:
+        print(f"[WEEKLY-DIGEST] hours failed: {e}")
     metrics = (f"*Calls:* {total} {_trend_arrow(total, prior_n)} _(prev {prior_n})_\n"
                f"*Interest rate:* {wk_rate}% {_trend_arrow(wk_rate, prior_rate)} _(prev {prior_rate}%)_\n"
-               f"*Conversions:* {conv}\n*By caller:*\n{top_callers}")
+               f"*Conversions:* {conv}\n*By caller:*\n{top_callers}{hours_line}")
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "🧠 LeadFlow Weekly Review", "emoji": True}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Week of {label}* · {ins.get('sample', 0)} notes analyzed"}},
@@ -8835,6 +8965,34 @@ def weekly_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
         print(f"[weekly-summary] error: {e}")
         return {"error": str(e)}
 
+# Daily digest self-schedule — fires once per UTC day on/after the target hour
+# (default 01:00 UTC ≈ 9pm ET = end of the caller's shift). No Railway cron needed.
+DAILY_DIGEST_ENABLED  = os.getenv("DAILY_DIGEST_ENABLED", "1") == "1"
+DAILY_DIGEST_HOUR_UTC = int(os.getenv("DAILY_DIGEST_HOUR_UTC", "1"))
+
+def run_daily_digest_if_due():
+    if not DAILY_DIGEST_ENABLED or not SLACK_WEBHOOK_URL:
+        return
+    try:
+        now = datetime.utcnow()
+        if now.hour < DAILY_DIGEST_HOUR_UTC:
+            return
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_daily_digest&select=value",
+                        headers=SB_ADMIN_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return   # fail closed — don't risk double-posting
+        rows = r.json()
+        if rows and (rows[0].get("value") or "")[:10] == now.strftime("%Y-%m-%d"):
+            return   # already sent today
+        # record BEFORE sending (rolling-deploy double-post guard)
+        req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                     headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                     json={"key": "last_daily_digest", "value": now.isoformat() + "Z"}, timeout=10)
+        res = daily_summary(user="cron")
+        print(f"[DAILY-DIGEST] auto-sent: {res}")
+    except Exception as e:
+        print(f"[DAILY-DIGEST] loop exception: {e}")
+
 def run_weekly_digest_if_due():
     if not WEEKLY_DIGEST_ENABLED or not SLACK_WEBHOOK_URL:
         return
@@ -8886,17 +9044,10 @@ def _parse_iso(s):
 # A session longer than this = a forgotten logout, not a 16-hour shift. Capped.
 MAX_SESSION_HOURS = float(os.getenv("MAX_SESSION_HOURS", "12"))
 
-@app.get("/api/analytics/hours")
-def hours_worked(start: str = "", end: str = "", user: str = Depends(verify_token)):
-    """Consolidated hours-worked per caller for payroll. Built from user_sessions
-    (sign-in → sign-out); a missing sign-out (left-open tab) is capped at the
-    caller's LAST CALL that session, then at MAX_SESSION_HOURS — so you don't pay
-    for an idle overnight tab. Defaults to the current week (Mon → now). Admin."""
-    if not is_admin(user):
-        raise HTTPException(status_code=403, detail="Admin only")
-    now = datetime.utcnow()
-    start_dt = _parse_iso(start + "T00:00:00") if start else (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    end_dt = _parse_iso(end + "T23:59:59") if end else now
+def _compute_hours(start_dt, end_dt):
+    """Session-hours math shared by /api/analytics/hours and the weekly digest.
+    Returns (per_caller_dict, calls_by). Missing sign-outs are capped at the last
+    call (+5m) then MAX_SESSION_HOURS."""
     s_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     sessions = _paginated_get(
@@ -8943,6 +9094,20 @@ def hours_worked(start: str = "", end: str = "", user: str = Depends(verify_toke
         day["last_out"] = max(day["last_out"] or "", so.strftime("%H:%M"))
         day["capped"] = day["capped"] or capped
         bucket["total_hours"] += hrs
+    return per, calls_by
+
+@app.get("/api/analytics/hours")
+def hours_worked(start: str = "", end: str = "", user: str = Depends(verify_token)):
+    """Consolidated hours-worked per caller for payroll. Built from user_sessions
+    (sign-in → sign-out); a missing sign-out (left-open tab) is capped at the
+    caller's LAST CALL that session, then at MAX_SESSION_HOURS — so you don't pay
+    for an idle overnight tab. Defaults to the current week (Mon → now). Admin."""
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    now = datetime.utcnow()
+    start_dt = _parse_iso(start + "T00:00:00") if start else (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = _parse_iso(end + "T23:59:59") if end else now
+    per, calls_by = _compute_hours(start_dt, end_dt)
 
     # Attach per-day call counts + talk time.
     for name, (lst) in calls_by.items():
