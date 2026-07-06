@@ -611,7 +611,7 @@ def set_kill_switch(on: bool):
     """Admin-write. Upserts app_settings and invalidates the cache."""
     req_lib.post(
         f"{SUPABASE_URL}/rest/v1/app_settings",
-        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
+        headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
         json={"key": "places_kill_switch", "value": "1" if on else "0"},
         timeout=10,
     )
@@ -710,7 +710,7 @@ def places_cache_write(entries):
         r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/places_search_cache"
             f"?on_conflict=pipeline,city,keyword",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json=payload, timeout=10,
         )
         if r.status_code not in (200, 201, 204):
@@ -2438,7 +2438,7 @@ def _record_hot_digest_run():
     try:
         r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={"key": "last_hot_digest", "value": datetime.utcnow().isoformat() + "Z"},
             timeout=10,
         )
@@ -2560,7 +2560,7 @@ def _record_once_called_recycle_run():
     try:
         r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={"key": "last_once_called_recycle", "value": datetime.utcnow().isoformat() + "Z"},
             timeout=10,
         )
@@ -2642,7 +2642,7 @@ def _record_dedupe_sweep_run():
     try:
         r = req_lib.post(
             f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={"key": "last_dedupe_sweep", "value": datetime.utcnow().isoformat() + "Z"},
             timeout=10,
         )
@@ -2802,7 +2802,7 @@ def apollo_cache_set(company: str, person):
     try:
         req_lib.post(
             f"{SUPABASE_URL}/rest/v1/apollo_enrich_cache",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={
                 "company_key": key,
                 "person":      person,
@@ -2887,7 +2887,7 @@ def _check_apollo_budget_alert():
     try:
         req_lib.post(
             f"{SUPABASE_URL}/rest/v1/app_settings",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
             json={"key": state_key, "value": json_lib.dumps(cur)},
             timeout=5,
         )
@@ -5554,11 +5554,15 @@ def set_quota(body: dict, user: str = Depends(verify_admin)):
         if new_quota < 1 or new_quota > 500:
             raise HTTPException(status_code=400, detail="Quota must be 1-500")
         key = f"quota_{caller.lower()}" if caller else "daily_quota"
-        req_lib.post(
-            f"{SUPABASE_URL}/rest/v1/app_settings",
-            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
+        r = req_lib.post(
+            f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+            headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
             json={"key": key, "value": str(new_quota)},
             timeout=10)
+        # Fail loudly — a 200 with a silently-dropped write is how the quota
+        # feature was broken for weeks (anon key + RLS).
+        if r.status_code not in (200, 201, 204):
+            raise HTTPException(status_code=500, detail=f"Quota save failed: {r.text[:150]}")
         return {"quota": new_quota, "caller": caller or "all"}
     except HTTPException:
         raise
@@ -6409,7 +6413,7 @@ def guidance_switch(body: dict, user: str = Depends(verify_token)):
         try:
             req_lib.post(
                 f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-                headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+                headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates"},
                 json={"key": ck, "value": datetime.utcnow().isoformat()},
                 timeout=10,
             )
