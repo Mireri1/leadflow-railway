@@ -487,6 +487,34 @@ def login(req: LoginRequest):
     token = create_token(req.username, role)
     return {"token": token, "username": req.username, "role": role, "session_id": session_id}
 
+@app.get("/health")
+def health():
+    """Public liveness+depth probe for external monitors (uptime pingers, the
+    cloud health routine). No auth — exposes only booleans and timestamps."""
+    out = {"ok": True, "time": datetime.utcnow().isoformat() + "Z",
+           "bg_loop_last_tick": _BG_HEARTBEAT["ts"],
+           "db_ok": False, "last_daily_digest": None, "last_weekly_digest": None}
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=in.(last_daily_digest,last_weekly_digest)&select=key,value",
+                        headers=SB_ADMIN_HEADERS, timeout=8)
+        if r.status_code == 200:
+            out["db_ok"] = True
+            for row in r.json():
+                out["last_" + row["key"].replace("last_", "").replace("_digest", "") + "_digest"] = row.get("value")
+    except Exception:
+        pass
+    # stale bg loop = digests/sweeps/email nudges silently dead
+    try:
+        if out["bg_loop_last_tick"]:
+            age = (datetime.utcnow() - datetime.fromisoformat(out["bg_loop_last_tick"].replace("Z",""))).total_seconds()
+            out["bg_loop_stale"] = age > 3600
+        else:
+            out["bg_loop_stale"] = None   # just booted
+    except Exception:
+        out["bg_loop_stale"] = None
+    out["ok"] = bool(out["db_ok"]) and out.get("bg_loop_stale") is not True
+    return out
+
 @app.post("/api/auth/clock-in")
 def clock_in(user: str = Depends(verify_token)):
     """Explicit clock-in — opens a fresh user_sessions row (bulletproof payroll
@@ -2395,6 +2423,8 @@ def imap_poll_replies():
         _imap_poll_state["last_run"] = datetime.utcnow().isoformat()
         _imap_poll_lock.release()
 
+_BG_HEARTBEAT = {"ts": None}   # set every loop tick; /health exposes staleness
+
 def _bg_maintenance_loop():
     """Background thread — two independent jobs every cycle:
        1. IMAP reply poll (skipped silently if IMAP not configured)
@@ -2405,6 +2435,7 @@ def _bg_maintenance_loop():
           f" — IMAP={'on' if imap_on else 'off'}, stale-release=on")
     time.sleep(60)  # let app finish startup before first run
     while True:
+        _BG_HEARTBEAT["ts"] = datetime.utcnow().isoformat() + "Z"
         if imap_on:
             try:
                 res = imap_poll_replies()
