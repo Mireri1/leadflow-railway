@@ -1939,18 +1939,31 @@ _INBOX_SKIP_SENDERS = ("no-reply", "noreply", "donotreply", "do-not-reply", "not
                        "notification@", "mailer-daemon", "postmaster", "newsletter", "marketing@",
                        "billing@stripe", "receipts@", "alerts@", "updates@")
 
+_EMAIL_VOICE_RULES = (
+    "You write email replies AS Eric, the owner of Vision Cleaning Company (commercial cleaning). "
+    "Voice rules — this must read like a busy small-business owner typing a quick, genuine reply, "
+    "NOT like AI or a corporate template:\n"
+    "- use contractions, short sentences, plain words\n"
+    "- NO 'I hope this email finds you well', no 'Thank you for reaching out', no 'I appreciate your...', "
+    "no 'Please don't hesitate', no 'at your earliest convenience'\n"
+    "- open by responding directly to what they actually said\n"
+    "- mirror their tone and length — casual gets casual, formal gets slightly formal, short gets short\n"
+    "- one thing per email: answer, then (if it fits) one clear next step\n"
+    "- if they want a quote/walkthrough: offer to swing by for a quick 15-minute walkthrough and ask what "
+    "day works\n"
+    "- if you're missing info: ask ONE specific question, not a list\n"
+    "- no placeholders like [Name] — use what you know or just skip it\n"
+    "- sign off simply:\nEric\nVision Cleaning Company\n"
+    "Return ONLY the reply text, plain text, under 110 words."
+)
+
 def suggest_email_reply(from_addr, subject, body):
-    """Draft a short professional reply as Vision Cleaning. Opus first (few/day,
+    """Draft a human-sounding reply as Eric/Vision Cleaning. Opus first (few/day,
     quality matters), Haiku fallback; '' if no key/API trouble."""
     if not ANTHROPIC_API_KEY:
         return ""
-    system = ("You draft replies for Eric, owner of Vision Cleaning Company (commercial cleaning). "
-              "Given an inbound email, write a short, warm, professional reply (under 120 words, plain text, "
-              "no subject line, no placeholders like [Name] — use what you know or omit). Sign off as:\n"
-              "Eric\nVision Cleaning Company\n"
-              "If the email asks for a quote/walkthrough, propose scheduling a 15-minute walkthrough. "
-              "If it needs info you don't have, ask one crisp clarifying question. Return ONLY the reply text.")
-    user = f"From: {from_addr}\nSubject: {subject}\n\n{(body or '')[:3000]}"
+    system = _EMAIL_VOICE_RULES
+    user = f"Reply to this email.\n\nFrom: {from_addr}\nSubject: {subject}\n\n{(body or '')[:3000]}"
     for model in [INSIGHTS_MODEL, HAIKU_MODEL]:
         try:
             r = req_lib.post("https://api.anthropic.com/v1/messages",
@@ -2002,7 +2015,8 @@ def _handle_general_inbox_email(from_addr, subject, body, headers, notified, sta
     # stash the draft for the one-click send link
     if reply:
         _settings_set_json(f"inbox_reply_{h}", {"to": from_addr, "subject": subject,
-                                                "reply": reply, "received_at": datetime.utcnow().isoformat() + "Z"})
+                                                "reply": reply, "original": (body or "")[:1800],
+                                                "history": [], "received_at": datetime.utcnow().isoformat() + "Z"})
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
     gmail_url = f"https://mail.google.com/mail/u/0/#search/{url_quote('from:' + from_addr)}"
     blocks = [
@@ -2029,9 +2043,46 @@ def _handle_general_inbox_email(from_addr, subject, body, headers, notified, sta
         print(f"[INBOX] slack failed: {e}")
         return None
 
+def _render_inbox_reply_page(t, draft, note=""):
+    """Shared renderer: editable draft + a refine box to converse with the AI
+    until the reply is right. Send always uses whatever is in the textarea."""
+    import html as html_lib
+    subj = draft.get("subject") or ""
+    resubj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
+    esc = html_lib.escape
+    hist = ""
+    for turn in (draft.get("history") or [])[-6:]:
+        hist += (f"<div style='margin:6px 0;padding:8px 12px;background:#0f1930;border-radius:8px;font-size:12px'>"
+                 f"<span style='color:#a3a6ff'>you:</span> {esc(turn.get('ask',''))}</div>")
+    orig = esc((draft.get("original") or "")[:600])
+    note_html = f"<p style='color:#69f6b8;font-size:13px'>{esc(note)}</p>" if note else ""
+    body = f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;margin:0;padding:40px 20px;display:flex;justify-content:center">
+      <div style="max-width:640px;width:100%">
+        <h2 style="margin-bottom:4px">✉️ Reply to {esc(draft.get('to',''))}</h2>
+        <p style="color:#a3aac4;margin-top:4px">Subject: <b>{esc(resubj)}</b> · sends from {esc(os.getenv('OUTREACH_NAME','Vision Cleaning Company'))} &lt;{esc(OUTREACH_EMAIL)}&gt;</p>
+        {f'<details style="margin:10px 0;color:#8893b0;font-size:13px"><summary style="cursor:pointer">What they wrote</summary><p style="white-space:pre-wrap">{orig}</p></details>' if orig else ''}
+        {note_html}
+        <form method="post" action="/inbox-reply" id="send"><input type="hidden" name="t" value="{t}"/>
+          <textarea name="reply" rows="10" form="send" id="draft" style="width:100%;background:#0f1930;color:#dee5ff;border:1px solid #40485d;border-radius:10px;padding:14px;font-size:15px;font-family:inherit;line-height:1.5">{esc(draft.get('reply',''))}</textarea>
+        </form>
+        {hist}
+        <form method="post" action="/inbox-reply-refine" style="display:flex;gap:8px;margin-top:10px">
+          <input type="hidden" name="t" value="{t}"/>
+          <input type="hidden" name="current" id="current"/>
+          <input name="ask" placeholder="Tell it what to change — 'shorter', 'mention we're insured', 'don't commit to Friday'…"
+            style="flex:1;background:#0f1930;color:#dee5ff;border:1px solid #40485d;border-radius:9px;padding:12px;font-size:14px;font-family:inherit"/>
+          <button type="submit" onclick="document.getElementById('current').value=document.getElementById('draft').value"
+            style="background:#a3a6ff;color:#111433;border:0;border-radius:9px;padding:12px 18px;font-size:14px;font-weight:700;cursor:pointer">🔁 Redraft</button>
+        </form>
+        <button type="submit" form="send"
+          style="margin-top:16px;width:100%;background:#69f6b8;color:#06301c;border:0;border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer">✉️ Send reply</button>
+        <p style="color:#5a6a8a;font-size:11px;margin-top:8px">You can also edit the draft directly — Send uses exactly what's in the box.</p>
+      </div></body></html>"""
+    return HTMLResponse(body)
+
 @app.get("/inbox-reply")
 def inbox_reply_page(t: str = ""):
-    """Editable confirm page for the suggested reply (GET = prefetch-safe)."""
+    """Editable draft + AI-refine loop (GET = prefetch-safe)."""
     try:
         payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
         assert payload.get("act") == "send_inbox_reply"
@@ -2039,18 +2090,52 @@ def inbox_reply_page(t: str = ""):
         assert draft
     except Exception:
         return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired or draft not found — reply from Gmail instead.</h3>", status_code=400)
-    subj = draft.get("subject") or ""
-    resubj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
-    body = f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;margin:0;padding:40px;display:flex;justify-content:center">
-      <div style="max-width:620px;width:100%">
-        <h2>✉️ Reply to {draft.get('to','')}</h2>
-        <p style="color:#a3aac4">Subject: <b>{resubj}</b> · sends from {os.getenv('OUTREACH_NAME','Vision Cleaning Company')} &lt;{OUTREACH_EMAIL}&gt;</p>
-        <form method="post" action="/inbox-reply"><input type="hidden" name="t" value="{t}"/>
-          <textarea name="reply" rows="10" style="width:100%;background:#0f1930;color:#dee5ff;border:1px solid #40485d;border-radius:10px;padding:14px;font-size:15px;font-family:inherit">{draft.get('reply','')}</textarea>
-          <button type="submit" style="margin-top:16px;background:#69f6b8;color:#06301c;border:0;border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer">✉️ Send reply</button>
-        </form>
-      </div></body></html>"""
-    return HTMLResponse(body)
+    return _render_inbox_reply_page(t, draft)
+
+@app.post("/inbox-reply-refine")
+async def inbox_reply_refine(request: Request):
+    """One conversational turn: Eric says what to change, the AI redrafts.
+    Keeps his manual edits (revises the CURRENT textarea content)."""
+    form = await request.form()
+    t = form.get("t", ""); ask = (form.get("ask") or "").strip()
+    current = (form.get("current") or "").strip()
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        assert payload.get("act") == "send_inbox_reply"
+        key = payload["key"]
+        draft = _settings_get_json(f"inbox_reply_{key}")
+        assert draft
+    except Exception:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired or draft not found.</h3>", status_code=400)
+    if not ask:
+        return _render_inbox_reply_page(t, draft, note="Type what you want changed, then hit Redraft.")
+    base = current or draft.get("reply", "")
+    revised = ""
+    if ANTHROPIC_API_KEY:
+        user = (f"Original email from {draft.get('to','')} (subject: {draft.get('subject','')}):\n"
+                f"{(draft.get('original') or '')[:1800]}\n\n"
+                f"Current draft reply:\n{base}\n\n"
+                f"Eric's change request: {ask}\n\n"
+                f"Rewrite the reply applying his request. Keep everything else that works.")
+        for model in [INSIGHTS_MODEL, HAIKU_MODEL]:
+            try:
+                r = req_lib.post("https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": model, "max_tokens": 400, "system": _EMAIL_VOICE_RULES,
+                          "messages": [{"role": "user", "content": user}]}, timeout=40)
+                if r.status_code != 200:
+                    continue
+                revised = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+                if revised:
+                    break
+            except Exception as e:
+                print(f"[INBOX] refine failed ({model}): {e}")
+    if not revised:
+        return _render_inbox_reply_page(t, draft, note="Couldn't redraft right now — edit the box directly or try again.")
+    draft["reply"] = revised[:1200]
+    draft.setdefault("history", []).append({"ask": ask[:200], "at": datetime.utcnow().isoformat() + "Z"})
+    _settings_set_json(f"inbox_reply_{payload['key']}", draft)
+    return _render_inbox_reply_page(t, draft, note="Redrafted ✓ — tweak again or send.")
 
 @app.post("/inbox-reply")
 async def inbox_reply_send(request: Request):
