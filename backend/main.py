@@ -2070,14 +2070,18 @@ def imap_poll_replies():
                           {"sentiment": sentiment, "company": target.get("company"),
                            "from": from_addr, "snippet": snippet[:200]})
                 try:
-                    emoji = "🛑" if is_negative else ("🔥" if sentiment == "positive" else "📬")
-                    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
-                    send_slack(
-                        f"{emoji} Email reply — {target.get('company') or from_addr}",
-                        f"*From:* {from_addr}\n*Sentiment:* {sentiment}\n*They said:* {snippet[:280]}"
-                        + ("" if is_negative else "\n\n_Lead flipped to *interested* — worth a same-day call._"),
-                        actions=[{"label": "Open LeadFlow", "url": app_url, "style": "primary"}],
-                    )
+                    # Only ping on a real matched reply — and never render an
+                    # empty body (attachment-only replies show a fallback).
+                    if from_addr and lead_id:
+                        emoji = "🛑" if is_negative else ("🔥" if sentiment == "positive" else "📬")
+                        said = snippet[:280].strip() or "(no readable text — check the inbox)"
+                        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+                        send_slack(
+                            f"{emoji} Email reply — {target.get('company') or from_addr}",
+                            f"*From:* {from_addr}\n*Sentiment:* {sentiment}\n*They said:* {said}"
+                            + ("" if is_negative else "\n\n_Lead flipped to *interested* — worth a same-day call._"),
+                            actions=[{"label": "Open LeadFlow", "url": app_url, "style": "primary"}],
+                        )
                 except Exception as e:
                     print(f"[IMAP-POLL] reply slack failed: {e}")
 
@@ -8927,9 +8931,9 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
             {"label": "Interested/Callback", "value": f":fire: *{interested}*"},
             {"label": "Leads Scraped", "value": f":busts_in_silhouette: *{total_leads}*"},
             {"label": "Emails Sent", "value": f":email: *{total_emails}*"},
-            {"label": "Email Replies", "value": (f":mailbox_with_mail: *{len(replies)}*" +
-                ("\n" + "\n".join(f"  • {(x.get('company') or x.get('from') or '?')} ({x.get('sentiment','?')})"
-                                    for x in replies[:5]) if replies else ""))},
+            *([{"label": "Email Replies", "value": (f":mailbox_with_mail: *{len(replies)}*\n" +
+                "\n".join(f"  • {(x.get('company') or x.get('from') or '?')} ({x.get('sentiment','?')})"
+                           for x in replies[:5]))}] if replies else []),
             {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
             {"label": "Top Callers", "value": lb_text},
             {"label": "Today's objections / themes", "value": themes_txt},
