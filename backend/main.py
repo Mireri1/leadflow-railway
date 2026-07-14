@@ -221,6 +221,22 @@ HAIKU_MODEL       = os.getenv("HAIKU_MODEL", "claude-haiku-4-5-20251001")
 INSIGHTS_MODEL    = os.getenv("INSIGHTS_MODEL", "claude-opus-4-8")
 VALID_NOTE_OUTCOMES = ["no_answer", "voicemail", "not_interested", "callback", "interested", "converted"]
 
+# ── Business-day helpers ─────────────────────────────────────────────────────
+# "Today" means the ET business day, not the UTC date — UTC flips at ~8pm ET,
+# mid-shift, which zeroed every "today" counter (quota bar, stats, leaderboard,
+# daily digest) for the caller's evening hours.
+BUSINESS_TZ_OFFSET_HOURS = int(os.getenv("RECEPTIVITY_TZ_OFFSET_HOURS", "-4"))
+
+def local_today():
+    """ET business date (YYYY-MM-DD)."""
+    return (datetime.utcnow() + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d")
+
+def local_day_start_utc():
+    """ET midnight expressed as a UTC timestamp — for calledAt/createdAt filters."""
+    local = datetime.utcnow() + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)
+    return (local.replace(hour=0, minute=0, second=0, microsecond=0)
+            - timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)).strftime("%Y-%m-%dT%H:%M:%S")
+
 def _heuristic_note_analysis(note: str):
     """Keyword fallback so sentiment/outcome still populate without the API."""
     n = (note or "").lower()
@@ -254,7 +270,7 @@ def haiku_analyze_note(note: str, company: str = "", status: str = ""):
         return {"sentiment": "neutral", "outcome": "", "callbackDate": "", "summary": "", "engine": "empty"}
     if not ANTHROPIC_API_KEY:
         return _heuristic_note_analysis(note)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = local_today()
     system = (
         "You are a sales-call note assistant for a commercial cleaning company. "
         "Read one cold-call note written by the rep and return STRICT JSON only "
@@ -571,7 +587,7 @@ def get_sessions(days: int = 0, user: str = Depends(verify_admin)):
         if days > 0:
             since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
         else:
-            since = datetime.utcnow().strftime("%Y-%m-%d")
+            since = local_today()
         # Get sessions that started in the window
         r1 = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/user_sessions?select=*&signed_in=gte.{since}T00:00:00&order=signed_in.desc&limit=500",
@@ -2508,7 +2524,7 @@ def run_hot_lead_digest_if_due():
     _record_hot_digest_run()
     cutoff_dt   = datetime.utcnow() - timedelta(days=HOT_LEAD_STALE_DAYS)
     cutoff_iso  = cutoff_dt.isoformat()
-    today_str   = datetime.utcnow().strftime("%Y-%m-%d")
+    today_str   = local_today()
     try:
         # Engaged + stale (not contacted within window). nullsfirst on
         # last_called_at would also catch "never called engaged leads."
@@ -4770,7 +4786,7 @@ def get_usage(days: int = 7, user: str = Depends(verify_token)):
         # Queries the leads table directly (not usage_events) so it counts
         # actual rows created, not just scrape_call events. Today's counts
         # are the headline; the window total is in byRep for context.
-        today_date = datetime.utcnow().strftime("%Y-%m-%d")
+        today_start_utc = local_day_start_utc()
         leads_by_rep_today  = {}  # {username: int}
         leads_by_rep_window = {}  # {username: int}
         try:
@@ -4782,7 +4798,7 @@ def get_usage(days: int = 7, user: str = Depends(verify_token)):
                 for lrow in lead_rows:
                     rep = lrow.get("createdBy") or "unknown"
                     leads_by_rep_window[rep] = leads_by_rep_window.get(rep, 0) + 1
-                    if (lrow.get("createdAt") or "")[:10] == today_date:
+                    if (lrow.get("createdAt") or "") >= today_start_utc:
                         leads_by_rep_today[rep] = leads_by_rep_today.get(rep, 0) + 1
         except Exception as e:
             print(f"[USAGE] leads aggregation failed: {e}")
@@ -5003,7 +5019,7 @@ def list_leads(status: str = "", search: str = "", sort: str = "smart",
         if status:   base_url += f"&status=eq.{status}"
         if source:   base_url += f"&source=eq.{url_quote(source)}"
         if callbacks == "true":
-            today = datetime.utcnow().strftime("%Y-%m-%d")
+            today = local_today()
             base_url += f"&callbackDate=lte.{today}&callbackDate=neq.&status=neq.converted"
 
         if not search:
@@ -5639,8 +5655,7 @@ def log_call(call: dict, user: str = Depends(verify_token)):
 @app.get("/api/calls/today")
 def get_calls_today(user: str = Depends(verify_token)):
     try:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{today}T00:00:00",
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{local_day_start_utc()}",
                        headers=SB_HEADERS, timeout=30)
         return r.json()
     except Exception as e:
@@ -5670,10 +5685,9 @@ def get_quota(user: str = Depends(verify_token)):
             quota = int(default_rows[0]["value"]) if isinstance(default_rows, list) and default_rows else DEFAULT_QUOTA
 
         # Get this user's calls today
-        today = datetime.utcnow().strftime("%Y-%m-%d")
         r2 = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/call_outcomes?select=id&calledBy=eq.{user}"
-            f"&calledAt=gte.{today}T00:00:00",
+            f"&calledAt=gte.{local_day_start_utc()}",
             headers={**SB_HEADERS, "Prefer": ""}, timeout=10)
         my_calls = r2.json() if r2.status_code == 200 else []
         my_count = len(my_calls) if isinstance(my_calls, list) else 0
@@ -6897,7 +6911,7 @@ def get_insights(days: int = 90, user: str = Depends(verify_token)):
         raise HTTPException(status_code=403, detail="Admin only")
     days = max(1, min(int(days or 90), 365))
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+    today_iso = local_today()
 
     leads = _paginated_get(
         f"{SUPABASE_URL}/rest/v1/leads"
@@ -8642,18 +8656,19 @@ def get_calls(lead_id: str, user: str = Depends(verify_token)):
 @app.get("/api/stats")
 def get_stats(user: str = Depends(verify_token)):
     try:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = local_today()
+        day_start = local_day_start_utc()
         # Paginate — Supabase caps single requests at 1000 rows, so without
         # this the 'total' field undercounts once the DB grows past 1000.
         sl = _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=status,score,callbackDate,createdAt")
-        r2 = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{today}T00:00:00",
+        r2 = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy&calledAt=gte.{day_start}",
                         headers=SB_HEADERS, timeout=30)
         sc = r2.json() if r2.status_code == 200 else []
         total     = len(sl)
         converted = len([l for l in sl if l.get("status")=="converted"])
         return {
             "total": total,
-            "newToday": len([l for l in sl if (l.get("createdAt","")).startswith(today)]),
+            "newToday": len([l for l in sl if (l.get("createdAt") or "") >= day_start]),
             "interested": len([l for l in sl if l.get("status")=="interested"]),
             "converted": converted,
             "callbacksDue": len([l for l in sl if (l.get("callbackDate") or "")<=today and l.get("callbackDate") and l.get("status")!="converted"]),
@@ -8698,13 +8713,21 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
     CRON_SECRET) or an admin. Includes objection patterns + week-over-week trend."""
     try:
         now = datetime.utcnow()
-        today = now.strftime("%Y-%m-%d")
+        # "Today" is the ET BUSINESS day, not the UTC date. The digest fires
+        # ~9pm ET = just past UTC midnight, so UTC-today covered only the last
+        # hour and every count came back 0 (the whole 4-9pm ET shift belongs to
+        # the previous UTC date). Same offset the receptivity analytics use.
+        tz_off = int(os.getenv("RECEPTIVITY_TZ_OFFSET_HOURS", "-4"))
+        local_now = now + timedelta(hours=tz_off)
+        today = local_now.strftime("%Y-%m-%d")                      # ET date for display + callback compare
+        day_start_utc = (local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+                         - timedelta(hours=tz_off)).strftime("%Y-%m-%dT%H:%M:%S")  # ET midnight in UTC
         wk_start = (now - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00")
         prior_start = (now - timedelta(days=14)).strftime("%Y-%m-%dT00:00:00")
 
         # Calls today (with notes for theme tally)
         r_calls = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,notes,vendorstatus&calledAt=gte.{today}T00:00:00",
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,notes,vendorstatus&calledAt=gte.{day_start_utc}",
             headers=SB_HEADERS, timeout=30)
         calls = r_calls.json() if r_calls.status_code == 200 else []
 
@@ -8716,13 +8739,13 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
 
         # Leads created today
         r_leads = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?select=id,createdBy&createdAt=gte.{today}T00:00:00",
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,createdBy&createdAt=gte.{day_start_utc}",
             headers=SB_HEADERS, timeout=30)
         new_leads = r_leads.json() if r_leads.status_code == 200 else []
 
         # Emails sent today
         r_emails = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/email_log?select=id,sent_by&sent_at=gte.{today}T00:00:00",
+            f"{SUPABASE_URL}/rest/v1/email_log?select=id,sent_by&sent_at=gte.{day_start_utc}",
             headers=SB_HEADERS, timeout=30)
         emails = r_emails.json() if r_emails.status_code == 200 else []
 
@@ -9678,7 +9701,7 @@ def conversion_analytics(user: str = Depends(verify_token)):
 @app.get("/api/leaderboard")
 def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
     try:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = local_today()
         # Calculate date filter based on range
         if range == "7d":
             since = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -9695,7 +9718,8 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
         # the /api/leads + /api/stats fix in commit 6142f2c.
         calls_url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration"
         if since:
-            calls_url += f"&calledAt=gte.{since}T00:00:00"
+            since_ts = local_day_start_utc() if since == today else f"{since}T00:00:00"
+            calls_url += f"&calledAt=gte.{since_ts}"
         calls = _paginated_get(calls_url)
         leads = _paginated_get(
             f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo,status,score,createdBy,createdAt"
@@ -9879,7 +9903,7 @@ def increment_script_usage(script_id: str, user: str = Depends(verify_token)):
 def get_caller_detail(username: str, date: str = "", date_to: str = "", user: str = Depends(verify_admin)):
     """Admin: get detailed breakdown of a caller's activity for a date or range"""
     try:
-        today = date if date else datetime.utcnow().strftime("%Y-%m-%d")
+        today = date if date else local_today()
         end_date = date_to if date_to else today
         # Get calls for this caller in the date range
         r_calls = req_lib.get(
@@ -10079,14 +10103,14 @@ def get_email_history(lead_id: int = 0, user: str = Depends(verify_token)):
 def get_email_stats(user: str = Depends(verify_admin)):
     """Admin: email sending stats."""
     try:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        day_start = local_day_start_utc()
         r = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/email_log?select=id,sent_by,sent_at,status&order=sent_at.desc&limit=500",
             headers=SB_ADMIN_HEADERS, timeout=30)
         emails = r.json() if r.status_code == 200 else []
         if not isinstance(emails, list):
             emails = []
-        today_count = len([e for e in emails if (e.get("sent_at") or "").startswith(today)])
+        today_count = len([e for e in emails if (e.get("sent_at") or "") >= day_start])
         by_user = {}
         for e in emails:
             u = e.get("sent_by", "unknown")
