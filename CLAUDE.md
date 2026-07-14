@@ -153,6 +153,8 @@ ACTIONS TAKEN: [list or "None needed"]
 - Caller: ⚡ one-tap "No answer" (lead rows + dialer), 📞 "Who's next?" header button (due callbacks → warm → fresh), year-typo date guard (`confirmFarDate`), end-of-shift recap on sign-out, mid-shift due-callback nudge (max 1/2h).
 - Admin: 🕐 Clock in/out header button + `POST /api/auth/clock-in|clock-out` (user_sessions); weekly digest includes hours/caller via shared `_compute_hours()`.
 - Slack appointment approve: new pending appointment pings Slack with a one-click approve link → `GET /appt-approve?t=<signed JWT>` renders a confirm page, `POST /appt-approve` approves + fires the Angelo handoff. GET is side-effect-free so Slack link-prefetch can't auto-approve.
+- Slack email queue: `run_email_queue_nudge_if_due()` (bg loop, once per ET day post-shift, `EMAIL_QUEUE_NUDGE_ENABLED`) pings when tried-to-call leads are email-eligible → `GET/POST /email-queue?t=<JWT>` review page sends ≤50 via `campaigns_batch_send` (same prefetch-safe pattern). `_get_campaign_eligible()` shared with `/api/admin/campaigns/eligible`.
+- Email replies: IMAP poller writes `email_reply` audit rows + fires an instant Slack ping per matched reply (sentiment + snippet). Daily digest shows reply count + companies; weekly digest shows replies w/ WoW arrow. Requires IMAP_SERVER/IMAP_USERNAME/IMAP_PASSWORD env.
 
 ## Appointments (sales → fulfillment loop)
 - LeadFlow is the system of record. Stored as JSON in `app_settings` (`appt_<leadId>`) — no DDL. Stages: pending → approved → confirmed → won/lost.
