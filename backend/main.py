@@ -2064,6 +2064,23 @@ def imap_poll_replies():
                     stats["errors"] += 1
                     continue
 
+                # Track + notify: audit row powers the digest counts; the
+                # Slack ping is the instant "someone replied!" notification.
+                audit_log("system", "email_reply", "lead", lead_id,
+                          {"sentiment": sentiment, "company": target.get("company"),
+                           "from": from_addr, "snippet": snippet[:200]})
+                try:
+                    emoji = "🛑" if is_negative else ("🔥" if sentiment == "positive" else "📬")
+                    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+                    send_slack(
+                        f"{emoji} Email reply — {target.get('company') or from_addr}",
+                        f"*From:* {from_addr}\n*Sentiment:* {sentiment}\n*They said:* {snippet[:280]}"
+                        + ("" if is_negative else "\n\n_Lead flipped to *interested* — worth a same-day call._"),
+                        actions=[{"label": "Open LeadFlow", "url": app_url, "style": "primary"}],
+                    )
+                except Exception as e:
+                    print(f"[IMAP-POLL] reply slack failed: {e}")
+
                 # Suppress + cross-sync to vlm-scraper. Both are fire-and-
                 # forget enough that a failure here doesn't block lead
                 # status patching above.
@@ -2178,6 +2195,11 @@ def _bg_maintenance_loop():
             run_daily_digest_if_due()
         except Exception as e:
             print(f"[DAILY-DIGEST] loop exception: {e}")
+        # Email queue nudge — once per ET day when follow-up emails are ready.
+        try:
+            run_email_queue_nudge_if_due()
+        except Exception as e:
+            print(f"[EMAIL-NUDGE] loop exception: {e}")
         # Monthly macro snapshot — banks one FRED reading per calendar month so a
         # paired macro × receptivity history builds up. No-op once banked.
         try:
@@ -8004,13 +8026,11 @@ def emailed_flags(days: int = 90, user: str = Depends(verify_token)):
             flags[key]["email_count"] += 1
     return {"flags": flags, "window_days": days, "total_leads_emailed": len(flags)}
 
-@app.get("/api/admin/campaigns/eligible")
-def campaigns_eligible(window_days: int = 7, user: str = Depends(verify_admin)):
-    """Returns leads with recent no-answer/voicemail outcomes that haven't
-    yet been emailed and meet the prerequisites: email + firstName populated,
-    not currently awaiting a reply, not within the suppression window.
-    Designed for the EOD batch-send queue — admin reviews + bulk-fires
-    instead of relying on callers to check the per-call box."""
+def _get_campaign_eligible(window_days: int = 7):
+    """Leads with recent no-answer/voicemail outcomes that haven't been emailed
+    and meet prerequisites (email + firstName, not awaiting reply, not
+    suppressed). Shared by the admin endpoint AND the Slack review-and-send
+    queue."""
     if not RESEND_API_KEY:
         return {"eligible": [], "count": 0, "window_days": window_days,
                 "error": "RESEND_API_KEY not configured"}
@@ -8114,6 +8134,110 @@ def campaigns_eligible(window_days: int = 7, user: str = Depends(verify_admin)):
 
     eligible.sort(key=lambda x: x.get("last_call_at") or "", reverse=True)
     return {"eligible": eligible, "count": len(eligible), "window_days": window_days}
+
+@app.get("/api/admin/campaigns/eligible")
+def campaigns_eligible(window_days: int = 7, user: str = Depends(verify_admin)):
+    return _get_campaign_eligible(window_days)
+
+# ── Slack email queue: review & send from Slack ─────────────────────────────
+def _email_queue_link():
+    tok = jwt.encode({"act": "send_email_queue",
+                      "exp": datetime.utcnow() + timedelta(days=3)}, SECRET_KEY, algorithm=ALGORITHM)
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    return f"{app_url}/email-queue?t={tok}"
+
+EMAIL_QUEUE_NUDGE_ENABLED = os.getenv("EMAIL_QUEUE_NUDGE_ENABLED", "1") == "1"
+
+def run_email_queue_nudge_if_due():
+    """Once per ET day (after the digest hour): if there are leads eligible for
+    the tried-to-call email, ping Slack with a one-click Review & Send link."""
+    if not EMAIL_QUEUE_NUDGE_ENABLED or not SLACK_WEBHOOK_URL or not RESEND_API_KEY:
+        return
+    try:
+        now = datetime.utcnow()
+        if now.hour < DAILY_DIGEST_HOUR_UTC:
+            return
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_email_nudge&select=value",
+                        headers=SB_ADMIN_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return
+        rows = r.json()
+        if rows and (rows[0].get("value") or "")[:10] == local_today():
+            return
+        data = _get_campaign_eligible(7)
+        n = data.get("count", 0)
+        # record BEFORE posting (rolling-deploy double-post guard); record even
+        # when 0 so we don't recheck every tick all night.
+        req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                     headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                     json={"key": "last_email_nudge", "value": local_today()}, timeout=10)
+        if not n:
+            return
+        sample = "\n".join(f"• {e.get('company','?')} — {e.get('first_name','')} ({e.get('email','')})"
+                            for e in data.get("eligible", [])[:6])
+        if n > 6:
+            sample += f"\n…and {n-6} more"
+        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": f"📧 {n} follow-up email{'s' if n!=1 else ''} ready to send", "emoji": True}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"Tried-to-call leads from the last 7 days with an email + contact name:\n{sample}"}},
+            {"type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "✉️ Review & Send", "emoji": True},
+                 "url": _email_queue_link(), "style": "primary"},
+                {"type": "button", "text": {"type": "plain_text", "text": "Open LeadFlow", "emoji": True}, "url": app_url},
+            ]},
+        ]
+        req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
+        print(f"[EMAIL-NUDGE] pinged Slack — {n} eligible")
+    except Exception as e:
+        print(f"[EMAIL-NUDGE] failed: {e}")
+
+@app.get("/email-queue")
+def email_queue_page(t: str = ""):
+    """Review page for the Slack link. GET is side-effect-free (Slack prefetch
+    safe); the send happens on the form POST below."""
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        assert payload.get("act") == "send_email_queue"
+    except Exception:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired or invalid — use the Email Campaigns page in LeadFlow instead.</h3>", status_code=400)
+    data = _get_campaign_eligible(7)
+    items = data.get("eligible", [])
+    if not items:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Nothing to send — the queue is empty. ✅</h3>")
+    rows = "".join(f"<tr><td style='padding:6px 12px;border-bottom:1px solid #22304f'>{e.get('company','?')}</td>"
+                   f"<td style='padding:6px 12px;border-bottom:1px solid #22304f'>{e.get('first_name','')} {e.get('last_name','')}</td>"
+                   f"<td style='padding:6px 12px;border-bottom:1px solid #22304f;color:#8893b0'>{e.get('email','')}</td></tr>"
+                   for e in items[:50])
+    extra = f"<p style='color:#8893b0'>…and {len(items)-50} more (capped at 50 per send)</p>" if len(items) > 50 else ""
+    body = f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;margin:0;padding:40px;display:flex;justify-content:center">
+      <div style="max-width:640px">
+        <h2>✉️ Send {min(len(items),50)} follow-up email{'s' if len(items)!=1 else ''}?</h2>
+        <p style="color:#a3aac4">Tried-to-call leads — each gets the campaign email and flips to <b>awaiting reply</b>. Suppression rules apply automatically.</p>
+        <table style="border-collapse:collapse;font-size:14px">{rows}</table>{extra}
+        <form method="post" action="/email-queue" style="margin-top:24px"><input type="hidden" name="t" value="{t}"/>
+          <button type="submit" style="background:#69f6b8;color:#06301c;border:0;border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer">✉️ Send all</button>
+        </form>
+      </div></body></html>"""
+    return HTMLResponse(body)
+
+@app.post("/email-queue")
+async def email_queue_send(request: Request):
+    form = await request.form()
+    t = form.get("t", "")
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        assert payload.get("act") == "send_email_queue"
+    except Exception:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired or invalid.</h3>", status_code=400)
+    data = _get_campaign_eligible(7)
+    ids = [e["lead_id"] for e in data.get("eligible", [])][:50]
+    if not ids:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Nothing to send — the queue is empty. ✅</h3>")
+    res = campaigns_batch_send({"lead_ids": ids, "trigger": "slack_queue_approve"}, user="slack-link")
+    return HTMLResponse(f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+      <div style="text-align:center"><h2>✉️ Done</h2>
+      <p style="color:#a3aac4">Sent {res.get('sent',0)} · skipped {res.get('skipped',0)} · failed {res.get('failed',0)}.<br/>Replies will land in Slack as they come in.</p></div></body></html>""")
 
 @app.post("/api/admin/campaigns/batch-send")
 def campaigns_batch_send(body: dict, user: str = Depends(verify_admin)):
@@ -8749,6 +8873,21 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
             headers=SB_HEADERS, timeout=30)
         emails = r_emails.json() if r_emails.status_code == 200 else []
 
+        # Email replies today (audit rows written by the IMAP poller)
+        replies = []
+        try:
+            rr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.email_reply&created_at=gte.{day_start_utc}"
+                f"&select=details&order=created_at.desc&limit=50",
+                headers=SB_ADMIN_HEADERS, timeout=15)
+            for row in (rr.json() if rr.status_code == 200 else []):
+                try:
+                    replies.append(json_lib.loads(row.get("details") or "{}"))
+                except Exception:
+                    replies.append({})
+        except Exception as e:
+            print(f"[daily-summary] replies fetch failed: {e}")
+
         # Callbacks due
         r_cb = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/leads?select=id&callbackDate=lte.{today}&status=not.in.(converted)",
@@ -8788,6 +8927,9 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
             {"label": "Interested/Callback", "value": f":fire: *{interested}*"},
             {"label": "Leads Scraped", "value": f":busts_in_silhouette: *{total_leads}*"},
             {"label": "Emails Sent", "value": f":email: *{total_emails}*"},
+            {"label": "Email Replies", "value": (f":mailbox_with_mail: *{len(replies)}*" +
+                ("\n" + "\n".join(f"  • {(x.get('company') or x.get('from') or '?')} ({x.get('sentiment','?')})"
+                                    for x in replies[:5]) if replies else ""))},
             {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
             {"label": "Top Callers", "value": lb_text},
             {"label": "Today's objections / themes", "value": themes_txt},
@@ -8895,6 +9037,19 @@ def build_weekly_digest():
     total, prior_n = len(wk), len(prior)
     conv = sum(1 for c in wk if c.get("outcome") == "converted")
     wk_rate, prior_rate = _interest_rate(wk), _interest_rate(prior)
+    # Email replies this week vs prior (audit rows from the IMAP poller)
+    def _reply_count(since_iso, before_iso=None):
+        try:
+            url = (f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.email_reply"
+                   f"&created_at=gte.{since_iso}&select=id")
+            if before_iso:
+                url += f"&created_at=lt.{before_iso}"
+            rows = _paginated_get(url, headers=SB_ADMIN_HEADERS)
+            return len(rows)
+        except Exception:
+            return 0
+    wk_replies = _reply_count(wk_iso)
+    prior_replies = _reply_count(prior_iso, wk_iso)
     callers = {}
     for c in wk:
         callers[c.get("calledBy", "Unknown")] = callers.get(c.get("calledBy", "Unknown"), 0) + 1
@@ -8921,6 +9076,7 @@ def build_weekly_digest():
         print(f"[WEEKLY-DIGEST] hours failed: {e}")
     metrics = (f"*Calls:* {total} {_trend_arrow(total, prior_n)} _(prev {prior_n})_\n"
                f"*Interest rate:* {wk_rate}% {_trend_arrow(wk_rate, prior_rate)} _(prev {prior_rate}%)_\n"
+               f"*Email replies:* {wk_replies} {_trend_arrow(wk_replies, prior_replies)} _(prev {prior_replies})_\n"
                f"*Conversions:* {conv}\n*By caller:*\n{top_callers}{hours_line}")
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "🧠 LeadFlow Weekly Review", "emoji": True}},
