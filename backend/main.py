@@ -1927,6 +1927,155 @@ def release_stale_email_leads():
     res = process_email_sequences()
     return res.get("released", 0)
 
+# ── General-inbox → Slack (missed-email killer) ─────────────────────────────
+# Any real email landing in the Vision inbox that ISN'T a campaign reply gets
+# forwarded to Slack with an AI-suggested reply + a one-click send. Emails are
+# NEVER marked read (Gmail unread state is Eric's own backstop) — dedup is a
+# rolling message-hash list in app_settings.
+INBOX_TO_SLACK_ENABLED   = os.getenv("INBOX_TO_SLACK_ENABLED", "1") == "1"
+INBOX_NOTIFY_MAX_AGE_DAYS = int(os.getenv("INBOX_NOTIFY_MAX_AGE_DAYS", "3"))
+INBOX_NOTIFY_MAX_PER_POLL = int(os.getenv("INBOX_NOTIFY_MAX_PER_POLL", "5"))
+_INBOX_SKIP_SENDERS = ("no-reply", "noreply", "donotreply", "do-not-reply", "notifications@",
+                       "notification@", "mailer-daemon", "postmaster", "newsletter", "marketing@",
+                       "billing@stripe", "receipts@", "alerts@", "updates@")
+
+def suggest_email_reply(from_addr, subject, body):
+    """Draft a short professional reply as Vision Cleaning. Opus first (few/day,
+    quality matters), Haiku fallback; '' if no key/API trouble."""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    system = ("You draft replies for Eric, owner of Vision Cleaning Company (commercial cleaning). "
+              "Given an inbound email, write a short, warm, professional reply (under 120 words, plain text, "
+              "no subject line, no placeholders like [Name] — use what you know or omit). Sign off as:\n"
+              "Eric\nVision Cleaning Company\n"
+              "If the email asks for a quote/walkthrough, propose scheduling a 15-minute walkthrough. "
+              "If it needs info you don't have, ask one crisp clarifying question. Return ONLY the reply text.")
+    user = f"From: {from_addr}\nSubject: {subject}\n\n{(body or '')[:3000]}"
+    for model in [INSIGHTS_MODEL, HAIKU_MODEL]:
+        try:
+            r = req_lib.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": model, "max_tokens": 400, "system": system,
+                      "messages": [{"role": "user", "content": user}]}, timeout=40)
+            if r.status_code != 200:
+                continue
+            txt = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+            if txt:
+                return txt[:1200]
+        except Exception as e:
+            print(f"[INBOX] suggest failed ({model}): {e}")
+    return ""
+
+def _inbox_msg_hash(msg_id, from_addr, subject):
+    import hashlib
+    return hashlib.sha1(f"{msg_id}|{from_addr}|{subject}".encode()).hexdigest()[:16]
+
+def _handle_general_inbox_email(from_addr, subject, body, headers, notified, stats):
+    """Notify Slack about a non-campaign inbound email (with AI reply + one-click
+    send). Returns the msg hash when a notification fired, else None."""
+    if not INBOX_TO_SLACK_ENABLED or not SLACK_WEBHOOK_URL:
+        return None
+    if stats.get("inbox_notified", 0) >= INBOX_NOTIFY_MAX_PER_POLL:
+        return None
+    fa = (from_addr or "").lower()
+    if not fa:
+        return None
+    # own addresses + obvious machine mail + newsletters
+    own = {(IMAP_USERNAME or "").lower(), (OUTREACH_EMAIL or "").lower(), (OUTREACH_REPLY_TO or "").lower()}
+    if fa in own or any(k in fa for k in _INBOX_SKIP_SENDERS):
+        return None
+    if headers.get("list-unsubscribe"):
+        return None
+    # age gate — don't dredge up week-old unread on first run
+    try:
+        from email.utils import parsedate_to_datetime
+        d = parsedate_to_datetime(headers.get("date", ""))
+        if d and (datetime.utcnow() - d.replace(tzinfo=None)) > timedelta(days=INBOX_NOTIFY_MAX_AGE_DAYS):
+            return None
+    except Exception:
+        pass
+    h = _inbox_msg_hash(headers.get("message-id", ""), fa, subject)
+    if h in notified:
+        return None
+    snippet = (body or "").replace("\n", " ").strip()[:400] or "(no readable text — check the inbox)"
+    reply = suggest_email_reply(from_addr, subject, body)
+    # stash the draft for the one-click send link
+    if reply:
+        _settings_set_json(f"inbox_reply_{h}", {"to": from_addr, "subject": subject,
+                                                "reply": reply, "received_at": datetime.utcnow().isoformat() + "Z"})
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    gmail_url = f"https://mail.google.com/mail/u/0/#search/{url_quote('from:' + from_addr)}"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"📥 New email — {(subject or '(no subject)')[:80]}", "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*From:* {from_addr}\n*They said:* {snippet}"}},
+    ]
+    if reply:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*💡 Suggested reply:*\n>{reply[:800]}"}})
+        tok = jwt.encode({"act": "send_inbox_reply", "key": h,
+                          "exp": datetime.utcnow() + timedelta(days=3)}, SECRET_KEY, algorithm=ALGORITHM)
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✉️ Review & send this reply", "emoji": True},
+             "url": f"{app_url}/inbox-reply?t={tok}", "style": "primary"},
+            {"type": "button", "text": {"type": "plain_text", "text": "Open in Gmail", "emoji": True}, "url": gmail_url},
+        ]})
+    else:
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "Open in Gmail", "emoji": True}, "url": gmail_url}]})
+    try:
+        req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
+        stats["inbox_notified"] = stats.get("inbox_notified", 0) + 1
+        return h
+    except Exception as e:
+        print(f"[INBOX] slack failed: {e}")
+        return None
+
+@app.get("/inbox-reply")
+def inbox_reply_page(t: str = ""):
+    """Editable confirm page for the suggested reply (GET = prefetch-safe)."""
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        assert payload.get("act") == "send_inbox_reply"
+        draft = _settings_get_json(f"inbox_reply_{payload['key']}")
+        assert draft
+    except Exception:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired or draft not found — reply from Gmail instead.</h3>", status_code=400)
+    subj = draft.get("subject") or ""
+    resubj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
+    body = f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;margin:0;padding:40px;display:flex;justify-content:center">
+      <div style="max-width:620px;width:100%">
+        <h2>✉️ Reply to {draft.get('to','')}</h2>
+        <p style="color:#a3aac4">Subject: <b>{resubj}</b> · sends from {os.getenv('OUTREACH_NAME','Vision Cleaning Company')} &lt;{OUTREACH_EMAIL}&gt;</p>
+        <form method="post" action="/inbox-reply"><input type="hidden" name="t" value="{t}"/>
+          <textarea name="reply" rows="10" style="width:100%;background:#0f1930;color:#dee5ff;border:1px solid #40485d;border-radius:10px;padding:14px;font-size:15px;font-family:inherit">{draft.get('reply','')}</textarea>
+          <button type="submit" style="margin-top:16px;background:#69f6b8;color:#06301c;border:0;border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer">✉️ Send reply</button>
+        </form>
+      </div></body></html>"""
+    return HTMLResponse(body)
+
+@app.post("/inbox-reply")
+async def inbox_reply_send(request: Request):
+    form = await request.form()
+    t = form.get("t", ""); text = (form.get("reply") or "").strip()
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        assert payload.get("act") == "send_inbox_reply"
+        draft = _settings_get_json(f"inbox_reply_{payload['key']}")
+        assert draft and text
+    except Exception:
+        return HTMLResponse("<h3 style='font-family:sans-serif'>Link expired, draft missing, or empty reply.</h3>", status_code=400)
+    subj = draft.get("subject") or ""
+    resubj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
+    r = req_lib.post("https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json={"from": f"{os.getenv('OUTREACH_NAME','Vision Cleaning Company')} <{OUTREACH_EMAIL}>",
+              "to": [draft["to"]], "subject": resubj, "text": text,
+              "reply_to": IMAP_USERNAME or OUTREACH_REPLY_TO or OUTREACH_EMAIL}, timeout=15)
+    if r.status_code not in (200, 201, 202):
+        return HTMLResponse(f"<h3 style='font-family:sans-serif'>Send failed: {r.text[:200]}</h3>", status_code=500)
+    audit_log("slack-link", "inbox_reply_sent", "email", None, {"to": draft["to"], "subject": resubj})
+    return HTMLResponse(f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+      <div style="text-align:center"><h2>✉️ Sent</h2><p style="color:#a3aac4">Reply delivered to {draft.get('to','')}.</p></div></body></html>""")
+
 def imap_poll_replies():
     """Connect to IMAP, scan unread messages, match to awaiting-email leads.
     Returns a stats dict for the manual endpoint + activity panel."""
@@ -1937,6 +2086,10 @@ def imap_poll_replies():
 
     stats = {"checked": 0, "matched": 0, "auto_replies_skipped": 0, "no_match": 0, "errors": 0}
     started = datetime.utcnow()
+    # rolling dedup for general-inbox Slack pings (emails stay UNREAD in Gmail)
+    notified_list = _settings_get_json("inbox_notified_ids") or []
+    notified = set(notified_list)
+    notified_new = []
     try:
         try:
             # 30s timeout — without it, a slow Gmail handshake hangs forever
@@ -2016,6 +2169,9 @@ def imap_poll_replies():
                 if not (is_re or has_in_reply or addressed_to_us):
                     stats.setdefault("not_a_reply", 0)
                     stats["not_a_reply"] += 1
+                    h = _handle_general_inbox_email(from_addr, subject, body, headers, notified, stats)
+                    if h:
+                        notified.add(h); notified_new.append(h)
                     continue
 
                 # Find a lead awaiting email reply with this email address.
@@ -2035,6 +2191,9 @@ def imap_poll_replies():
 
                 if not isinstance(leads, list) or not leads:
                     stats["no_match"] += 1
+                    h = _handle_general_inbox_email(from_addr, subject, body, headers, notified, stats)
+                    if h:
+                        notified.add(h); notified_new.append(h)
                     continue
 
                 # Prefer awaiting_email_reply lead; fall back to most recent
@@ -2136,6 +2295,15 @@ def imap_poll_replies():
 
         try: mbox.logout()
         except: pass
+
+        # persist the general-inbox dedup list (rolling, capped at 400)
+        if notified_new:
+            try:
+                # chronological trim — a set would evict arbitrary (possibly
+                # recent) hashes and re-ping the same email
+                _settings_set_json("inbox_notified_ids", (notified_list + notified_new)[-400:])
+            except Exception as e:
+                print(f"[INBOX] dedup persist failed: {e}")
 
         return {"ok": True, "stats": stats, "took_ms": int((datetime.utcnow()-started).total_seconds()*1000)}
     finally:
