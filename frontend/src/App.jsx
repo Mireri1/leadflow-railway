@@ -1746,7 +1746,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         followupsequence: followUpSeq||null,
         script_id: scriptId ? parseInt(scriptId) : null,
         converted: outcome === "converted",
-        send_email_followup: emailEligible && sendEmailFollowup,
+        // email follow-up is now fully server-side (auto on no-answer/voicemail)
       }
       if(!callPostedRef.current){
         await api("/api/calls",{method:"POST",body:JSON.stringify(callPayload)})
@@ -2195,23 +2195,23 @@ function CallModal({lead: leadProp,onClose,onSaved}){
                 {FOLLOW_UP_DAYS[followUpSeq].slice(1).map(d=>"+"+d+"d").join(" \u00b7 ")}
               </div>
             )}
-            {/* Per-call email follow-up — only show when this is a failed dial,
-                lead has email + name, VCC is configured, not already in campaign */}
+            {/* Auto follow-up email — server sends on EVERY saved no-answer/
+                voicemail (when the lead has email + name); this is just the
+                heads-up so the caller knows it's handled. */}
             {(primary==="no_answer"||primary==="voicemail")
               && lead.email && lead.firstName
               && campaignInfo?.email_configured
               && !campaignInfo?.in_campaign && (
-              <label style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",marginBottom:10,
-                background:"#a3a6ff10",border:"1px solid #a3a6ff30",borderRadius:8,cursor:"pointer",fontSize:12,color:"#dee5ff"}}>
-                <input type="checkbox" checked={sendEmailFollowup} onChange={e=>setSendEmailFollowup(e.target.checked)}
-                  style={{cursor:"pointer",width:16,height:16}}/>
+              <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",marginBottom:10,
+                background:"#69f6b810",border:"1px solid #69f6b830",borderRadius:8,fontSize:12,color:"#dee5ff"}}>
+                <span style={{fontSize:16}}>📧</span>
                 <div>
-                  <div style={{fontWeight:600}}>📧 Send "tried to call you" email after saving</div>
+                  <div style={{fontWeight:600}}>"Tried to call you" email sends automatically</div>
                   <div style={{fontSize:10,color:"#a3aac4",marginTop:2}}>
-                    To {lead.email} via VCC. Lead will move to "Awaiting Reply" so you don't re-dial.
+                    To {lead.email} on save. Lead moves to "Awaiting Reply" so you don't re-dial.
                   </div>
                 </div>
-              </label>
+              </div>
             )}
             <button className="btn btn-p" onClick={log} disabled={saving||
               (primary==="answered"&&!secondary)||

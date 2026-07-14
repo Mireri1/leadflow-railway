@@ -58,8 +58,13 @@ APOLLO_PHONE_REVEAL_MONTHLY_CAP = int(os.getenv("APOLLO_PHONE_REVEAL_MONTHLY_CAP
 # After a caller can't reach a lead by phone, LeadFlow sends a "tried to
 # call you" follow-up directly via Resend (same API key + from-address that
 # already powers other Vision Cleaning sends, so deliverability matches).
-AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD = int(os.getenv("AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD", "2"))
-AUTO_CAMPAIGN_AFTER_FAILED_CALL = os.getenv("AUTO_CAMPAIGN_AFTER_FAILED_CALL", "0") == "1"
+# ON by default, threshold 1: EVERY no-answer/voicemail call auto-sends the
+# tried-to-call email (when the lead has email + firstName). Suppression
+# (CAMPAIGN_SUPPRESSION_DAYS) + the do-not-contact gate inside
+# send_lead_to_campaign prevent repeats — a lead dialed 4× in a week still
+# gets exactly one email.
+AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD = int(os.getenv("AUTO_CAMPAIGN_FAILED_CALL_THRESHOLD", "1"))
+AUTO_CAMPAIGN_AFTER_FAILED_CALL = os.getenv("AUTO_CAMPAIGN_AFTER_FAILED_CALL", "1") == "1"
 CAMPAIGN_SUPPRESSION_DAYS = int(os.getenv("CAMPAIGN_SUPPRESSION_DAYS", "7"))
 # Resend webhook secret — random token in URL path. Configure the URL
 # (with this secret) in Resend dashboard → Webhooks. Auth is URL-as-bearer.
