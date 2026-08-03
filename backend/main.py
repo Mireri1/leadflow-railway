@@ -358,6 +358,10 @@ SB_ADMIN_HEADERS = {
 app = FastAPI()
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "https://leadflow-railway-production.up.railway.app,http://localhost:5173,http://localhost:3000").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+# Compress every response >1KB — the /api/leads payload alone is multi-MB of
+# highly-compressible JSON fetched ~100×/day, and the 500KB JS bundle drops ~4×.
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 security = HTTPBearer(auto_error=False)
 
 def create_token(username, role="caller"):
@@ -388,9 +392,14 @@ def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = D
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload["sub"]
+        username = payload["sub"]
     except (jwt.exceptions.InvalidTokenError, KeyError, Exception):
         raise HTTPException(status_code=401, detail="Invalid token")
+    # Blocking must revoke live sessions too, not just future logins — a JWT
+    # is otherwise good for 24h after the block.
+    if username.lower() in BLOCKED_USERS:
+        raise HTTPException(status_code=401, detail="Account blocked")
+    return username
 
 def verify_cron_or_admin(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
     """For cron-triggered endpoints (daily/weekly digest): allow an admin JWT,
@@ -555,9 +564,11 @@ async def logout_beacon(request: Request):
         return {"ok": False}
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        # Token is valid — record sign-out
+        # Token is valid — record sign-out, scoped to the token's own user so
+        # one rep can't close another's payroll session.
         req_lib.patch(
-            f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{session_id}",
+            f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{url_quote(str(session_id), safe='')}"
+            f"&username=eq.{url_quote(payload.get('sub',''), safe='')}",
             headers=SB_ADMIN_HEADERS,
             json={"signed_out": datetime.utcnow().isoformat()},
             timeout=5)
@@ -598,12 +609,13 @@ def get_login_log(user: str = Depends(verify_admin)):
 
 @app.post("/api/auth/logout")
 def logout_session(body: dict, user: str = Depends(verify_token)):
-    """Record sign-out timestamp for the session"""
+    """Record sign-out timestamp for the session (own sessions only)"""
     session_id = body.get("session_id")
     if session_id:
         try:
             req_lib.patch(
-                f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{session_id}",
+                f"{SUPABASE_URL}/rest/v1/user_sessions?id=eq.{url_quote(str(session_id), safe='')}"
+                f"&username=eq.{url_quote(user, safe='')}",
                 headers=SB_ADMIN_HEADERS,
                 json={"signed_out": datetime.utcnow().isoformat()},
                 timeout=5)
@@ -1767,7 +1779,7 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str,
     next_offset_days = {1: 3, 2: 4, 3: 5}[step]
     next_followup = (datetime.utcnow() + timedelta(days=next_offset_days)).date().isoformat()
     try:
-        req_lib.patch(
+        pr = req_lib.patch(
             f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead.get('id')))}",
             headers=SB_HEADERS,
             json={
@@ -1779,6 +1791,12 @@ def send_lead_to_campaign(lead: dict, trigger: str, user: str,
             },
             timeout=10,
         )
+        # req_lib doesn't raise on 4xx — a silently failed PATCH left the lead
+        # looking "still due", and the bg loop would re-send the same email
+        # every tick. The audit-row dedupe in process_email_sequences is the
+        # backstop; log loudly here so the root cause is visible.
+        if pr.status_code not in (200, 201, 204):
+            print(f"[CAMPAIGN] post-send status patch HTTP {pr.status_code} for lead {lead.get('id')}: {pr.text[:200]}")
     except Exception as e:
         # Don't fail the send if the status patch fails — Resend already has the email
         print(f"[CAMPAIGN] post-send status patch failed for lead {lead.get('id')}: {e}")
@@ -1908,6 +1926,26 @@ def process_email_sequences():
         print(f"[EMAIL-SEQ] query failed: {e}")
         return {"sent_2": 0, "sent_3": 0, "released": 0}
 
+    # Re-send backstop: if the post-send lead PATCH silently failed (RLS, bad
+    # column — req_lib doesn't raise on 4xx), the lead still looks "due" next
+    # tick and we'd re-email the same prospect every 10 minutes forever. The
+    # campaign_sent audit row IS written on every successful send, so refuse
+    # to fire a step for any lead that already got one in the last 48h.
+    def _recently_sent(lead_id, hours=48):
+        try:
+            since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+            ar = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.campaign_sent"
+                f"&resource_id=eq.{url_quote(str(lead_id), safe='')}"
+                f"&created_at=gte.{since}&select=id&limit=1",
+                headers=SB_ADMIN_HEADERS, timeout=10)
+            rows = ar.json() if ar.status_code == 200 else None
+            if rows is None:
+                return True   # can't verify → fail CLOSED (skip this tick, retry next)
+            return bool(rows)
+        except Exception:
+            return True       # same: never risk a re-send blast on a flaky check
+
     sent_2 = sent_3 = released = 0
     for lead in leads:
         step = lead.get("followupstep")
@@ -1927,11 +1965,15 @@ def process_email_sequences():
             continue
 
         if step == 1:
+            if _recently_sent(lead.get("id")):
+                continue
             ok, _ = send_lead_to_campaign(lead, trigger="auto_followup_2",
                                           user="auto_sequencer",
                                           step=2, bypass_suppression=True)
             if ok: sent_2 += 1
         elif step == 2:
+            if _recently_sent(lead.get("id")):
+                continue
             ok, _ = send_lead_to_campaign(lead, trigger="auto_followup_3",
                                           user="auto_sequencer",
                                           step=3, bypass_suppression=True)
@@ -2356,7 +2398,8 @@ def imap_poll_replies():
                         send_slack(
                             f"{emoji} Email reply — {target.get('company') or from_addr}",
                             f"*From:* {from_addr}\n*Sentiment:* {sentiment}\n*They said:* {said}"
-                            + ("" if is_negative else "\n\n_Lead flipped to *interested* — worth a same-day call._"),
+                            + ("\n\n_Said NO — added to suppression list. Do NOT call._" if is_negative
+                               else "\n\n_Lead flipped to *interested* — worth a same-day call._"),
                             actions=[{"label": "Open LeadFlow", "url": app_url, "style": "primary"}],
                         )
                 except Exception as e:
@@ -2380,22 +2423,8 @@ def imap_poll_replies():
                     "from": from_addr, "subject": subject[:200],
                     "snippet": snippet, "sentiment": sentiment,
                 })
-                send_slack(
-                    ":no_entry_sign: Negative Reply" if is_negative else ":incoming_envelope: Email Reply",
-                    (f"*{target.get('firstName','')} {target.get('lastName','')}* at "
-                     f"*{target.get('company','')}* "
-                     + ("said NO — added to suppression list. "
-                        "Do NOT call." if is_negative else "replied.")),
-                    fields=[
-                        {"label": "From",      "value": from_addr},
-                        {"label": "Sentiment", "value": sentiment},
-                        {"label": "Assigned",  "value": target.get("assignedTo") or "unassigned"},
-                        {"label": "Snippet",   "value": snippet[:200] or "(empty)"},
-                    ],
-                    actions=[{"label": "📋 Open LeadFlow",
-                              "url": os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app"),
-                              "style": "primary"}],
-                )
+                # (Single Slack ping above — a second one here duplicated
+                # every reply notification.)
                 stats["matched"] += 1
 
                 # Mark seen so we don't re-process
@@ -5708,7 +5737,9 @@ def _get_walkthrough_followups():
                 a = json_lib.loads(row.get("value") or "{}")
             except Exception:
                 continue
-            if a.get("stage") in ("pending", "approved", "confirmed") and (a.get("date") or "")[:10] <= today and a.get("date"):
+            # Strictly BEFORE today — a walkthrough scheduled for today hasn't
+            # happened yet (or just did); it becomes a follow-up tomorrow.
+            if a.get("stage") in ("pending", "approved", "confirmed") and a.get("date") and (a.get("date") or "")[:10] < today:
                 out.append({"leadId": a.get("leadId"), "company": a.get("company"),
                             "date": (a.get("date") or "")[:10], "stage": a.get("stage"),
                             "createdBy": a.get("createdBy"), "phone": a.get("phone"),
@@ -6028,6 +6059,11 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         if flags:
             call["follow_up_outcome"] = ",".join(flags)  # repurpose unused field for flags
 
+        # Store the AUTHENTICATED identity, not the client-supplied name —
+        # otherwise a spoofed calledBy dodges the cooldown/cadence checks
+        # above (they filter on `caller`) and fabricates leaderboard rows.
+        call["calledBy"] = caller
+
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_outcomes",
                         headers=SB_HEADERS, json=call, timeout=30)
         # A PostgREST 400 (e.g. unexpected column) used to return the error
@@ -6238,18 +6274,21 @@ def get_qualified_calls(user: str = Depends(verify_token)):
         # Belt-and-braces: PostgREST not.is.null passes empty strings; keep rows
         # with at least one truthy qual value (matches old behavior).
         qualified = [c for c in all_calls if any(c.get(f) for f in qual_fields)]
-        # Batch-fetch all lead data in one request instead of N+1
+        # Batch-fetch lead data in CHUNKS — one giant id=in.() list blows the
+        # URL length limit somewhere past ~1.5k ids and every row would come
+        # back with leads:null. Same chunking as get_caller_detail.
         lead_ids = list(set(c.get("leadId") for c in qualified if c.get("leadId")))
         leads_map = {}
-        if lead_ids:
-            ids_filter = ",".join(str(lid) for lid in lead_ids)
+        CHUNK = 150
+        for i in range(0, len(lead_ids), CHUNK):
+            ids_filter = ",".join(str(lid) for lid in lead_ids[i:i+CHUNK])
             lr = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})"
                 f"&select=id,company,firstName,lastName,phone,email,industry,state,score,status,assignedTo",
                 headers=SB_HEADERS, timeout=30)
             leads_data = lr.json() if lr.status_code == 200 else []
             if isinstance(leads_data, list):
-                leads_map = {l["id"]: l for l in leads_data}
+                leads_map.update({l["id"]: l for l in leads_data})
         for c in qualified:
             c["leads"] = leads_map.get(c.get("leadId"))
         return qualified
@@ -6287,6 +6326,39 @@ def delete_call(call_id: str, user: str = Depends(verify_admin)):
             raise HTTPException(status_code=r.status_code, detail=r.text)
         return {"deleted": True}
     except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/calls/{call_id}/undo")
+def undo_own_call(call_id: str, user: str = Depends(verify_token)):
+    """Caller-safe undo for a mis-tapped ⚡ quick log: delete the call ONLY if
+    it belongs to the requesting user and is under 2 minutes old. (Full delete
+    stays admin-only.)"""
+    try:
+        cr = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{url_quote(str(call_id), safe='')}"
+            f"&select=id,calledBy,calledAt",
+            headers=SB_HEADERS, timeout=15)
+        rows = cr.json() if cr.status_code == 200 else []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Call not found")
+        row = rows[0]
+        if (row.get("calledBy") or "").lower() != user.lower() and not is_admin(user):
+            raise HTTPException(status_code=403, detail="Not your call")
+        try:
+            called_at = datetime.fromisoformat((row.get("calledAt") or "").replace("Z", "").replace("+00:00", ""))
+        except Exception:
+            called_at = None
+        if not called_at or (datetime.utcnow() - called_at) > timedelta(minutes=2):
+            raise HTTPException(status_code=400, detail="Undo window (2 min) has passed")
+        dr = req_lib.delete(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{url_quote(str(call_id), safe='')}",
+                            headers=SB_HEADERS, timeout=15)
+        if dr.status_code >= 400:
+            raise HTTPException(status_code=500, detail="Delete failed")
+        audit_log(user, "undo_quick_call", "call", call_id, {})
+        return {"undone": True}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -6407,6 +6479,24 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
 
         # Unique callers for dropdown
         all_callers = sorted(set(c.get("calledBy", "") for c in calls if c.get("calledBy")))
+
+        # Attach company/phone so the History table + CSV can answer "which
+        # business was this call to?" without cross-referencing Analytics.
+        try:
+            hist_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
+            lmap = {}
+            for i in range(0, len(hist_ids), 150):
+                chunk = ",".join(str(x) for x in hist_ids[i:i+150])
+                lr = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})&select=id,company,phone",
+                                 headers=SB_HEADERS, timeout=20)
+                if lr.status_code == 200 and isinstance(lr.json(), list):
+                    lmap.update({l["id"]: l for l in lr.json()})
+            for c in calls:
+                lead = lmap.get(c.get("leadId")) or {}
+                c["lead_company"] = lead.get("company") or ""
+                c["lead_phone"] = lead.get("phone") or ""
+        except Exception as e:
+            print(f"[HISTORY] lead enrich failed: {e}")
 
         return {
             "calls": calls,
@@ -8627,14 +8717,18 @@ def run_walkthrough_followup_nudge_if_due():
         if r.status_code != 200:
             return
         rows = r.json()
-        if rows and (rows[0].get("value") or "")[:10] == local_today():
+        # Cooldown on the UTC date, matching the hour gate above — an ET-date
+        # cooldown + UTC-hour gate made this fire at ~midnight ET instead of
+        # the intended ~9pm slot (ET date flips at 04:00 UTC, hour gate long open).
+        utc_today = now.strftime("%Y-%m-%d")
+        if rows and (rows[0].get("value") or "")[:10] == utc_today:
             return
         fus = _get_walkthrough_followups()
         # record BEFORE posting (rolling-deploy double-post guard); record even
         # when 0 so we don't recheck every tick all night.
         req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
                      headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
-                     json={"key": "last_walkthrough_nudge", "value": local_today()}, timeout=10)
+                     json={"key": "last_walkthrough_nudge", "value": utc_today}, timeout=10)
         if not fus:
             return
         today_dt = datetime.strptime(local_today(), "%Y-%m-%d")
@@ -8679,7 +8773,10 @@ def run_email_queue_nudge_if_due():
         if r.status_code != 200:
             return
         rows = r.json()
-        if rows and (rows[0].get("value") or "")[:10] == local_today():
+        # UTC-date cooldown to match the UTC hour gate — the ET-date cooldown
+        # made this fire at ~midnight ET instead of ~9pm (see walkthrough nudge).
+        utc_today = now.strftime("%Y-%m-%d")
+        if rows and (rows[0].get("value") or "")[:10] == utc_today:
             return
         data = _get_campaign_eligible(7)
         n = data.get("count", 0)
@@ -8687,7 +8784,7 @@ def run_email_queue_nudge_if_due():
         # when 0 so we don't recheck every tick all night.
         req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
                      headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
-                     json={"key": "last_email_nudge", "value": local_today()}, timeout=10)
+                     json={"key": "last_email_nudge", "value": utc_today}, timeout=10)
         if not n:
             return
         sample = "\n".join(f"• {e.get('company','?')} — {e.get('first_name','')} ({e.get('email','')})"
@@ -9042,6 +9139,24 @@ def campaign_status(lead_id: str, user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/leads/{lead_id}")
+def get_single_lead(lead_id: str, user: str = Depends(verify_token)):
+    """One lead, fresh from the DB — powers the frontend's targeted refresh
+    after a call save (instead of refetching the entire leads table).
+    NOTE: registered AFTER /api/leads/lookup and /api/leads/emailed-flags so
+    the path param can't shadow them (FastAPI matches in order)."""
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}&select=*",
+                        headers=SB_HEADERS, timeout=15)
+        rows = r.json() if r.status_code == 200 else []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/webhooks/resend/{secret}")
 async def resend_webhook(secret: str, request: Request):
     """Receives email events from Resend (delivered/opened/clicked/bounced/
@@ -9172,20 +9287,28 @@ def reassign_leads(body: dict, user: str = Depends(verify_admin)):
         to_rep = body.get("to", "")  # empty string = back to pool
         if not from_rep:
             raise HTTPException(status_code=400, detail="'from' rep is required")
-        r = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?select=id&assignedTo=eq.{from_rep}",
-            headers=SB_HEADERS, timeout=30)
-        leads = r.json() if r.status_code == 200 else []
+        # Paginated (plain GET caps at 1000 → partial reassignment) + chunked,
+        # status-checked PATCHes (one giant id=in.() risks URL-length failures
+        # that used to be reported as success anyway).
+        leads = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id&assignedTo=eq.{url_quote(from_rep, safe='')}")
         if not isinstance(leads, list) or not leads:
             return {"reassigned": 0, "message": f"No leads assigned to {from_rep}"}
-        # Bulk reassign in one request
-        ids_filter = ",".join(str(l["id"]) for l in leads)
-        req_lib.patch(
-            f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})",
-            headers=SB_HEADERS,
-            json={"assignedTo": to_rep, "updatedAt": datetime.utcnow().isoformat()},
-            timeout=30)
-        count = len(leads)
+        now = datetime.utcnow().isoformat()
+        count = 0
+        CHUNK = 100
+        ids = [str(l["id"]) for l in leads]
+        for i in range(0, len(ids), CHUNK):
+            chunk = ids[i:i+CHUNK]
+            rr = req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({','.join(chunk)})",
+                headers=SB_HEADERS,
+                json={"assignedTo": to_rep, "updatedAt": now},
+                timeout=30)
+            if rr.status_code in (200, 204):
+                count += len(chunk)
+            else:
+                print(f"[REASSIGN] chunk PATCH HTTP {rr.status_code}: {rr.text[:150]}")
         dest = to_rep if to_rep else "unassigned pool"
         audit_log(user, "reassign_leads", "lead", None, {"from": from_rep, "to": dest, "count": count})
         return {"reassigned": count, "from": from_rep, "to": dest}
@@ -9248,8 +9371,13 @@ def get_reps(user: str = Depends(verify_admin)):
     try:
         # All assigned leads / calls — paginated: plain GETs cap at 1000 rows,
         # which undercounted leads and dropped reps from Team Management.
+        # Calls windowed to 90d: the roster only needs last-activity, and a
+        # lifetime scan grows ~36k rows/yr for no extra information (anyone
+        # silent 90d is already "inactive").
+        since_90d = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%dT00:00:00")
         leads = _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=assignedTo")
-        calls = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=calledBy,calledAt&order=calledAt.desc")
+        calls = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=calledBy,calledAt"
+                               f"&calledAt=gte.{since_90d}&order=calledAt.desc")
 
         reps = {}
         for l in (leads if isinstance(leads, list) else []):
@@ -9486,11 +9614,21 @@ def daily_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
             headers=SB_HEADERS, timeout=30)
         new_leads = r_leads.json() if r_leads.status_code == 200 else []
 
-        # Emails sent today
+        # Emails sent today — manual sends (email_log) PLUS campaign/sequence
+        # sends (audit_log campaign_sent), which used to be excluded so the
+        # digest read 0 on auto-campaign-heavy days.
         r_emails = req_lib.get(
             f"{SUPABASE_URL}/rest/v1/email_log?select=id,sent_by&sent_at=gte.{day_start_utc}",
             headers=SB_HEADERS, timeout=30)
         emails = r_emails.json() if r_emails.status_code == 200 else []
+        try:
+            r_camp = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.campaign_sent"
+                f"&created_at=gte.{day_start_utc}&select=id",
+                headers=SB_ADMIN_HEADERS, timeout=15)
+            campaign_sends = len(r_camp.json()) if r_camp.status_code == 200 else 0
+        except Exception:
+            campaign_sends = 0
 
         # Email replies today (audit rows written by the IMAP poller)
         replies = []
@@ -9509,13 +9647,13 @@ def daily_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
 
         # Callbacks due
         r_cb = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/leads?select=id&callbackDate=lte.{today}&status=not.in.(converted)",
+            f"{SUPABASE_URL}/rest/v1/leads?select=id&callbackDate=lte.{today}&callbackDate=neq.&status=not.in.(converted)",
             headers=SB_HEADERS, timeout=30)
         callbacks = r_cb.json() if r_cb.status_code == 200 else []
 
         total_calls = len(calls) if isinstance(calls, list) else 0
         total_leads = len(new_leads) if isinstance(new_leads, list) else 0
-        total_emails = len(emails) if isinstance(emails, list) else 0
+        total_emails = (len(emails) if isinstance(emails, list) else 0) + campaign_sends
         total_callbacks = len(callbacks) if isinstance(callbacks, list) else 0
 
         # Per-caller breakdown
@@ -10483,9 +10621,17 @@ def conversion_analytics(user: str = Depends(verify_token)):
         "note": "conv_rate = converted ÷ called. New sources read ~0 until the caller works them.",
     }
 
+# 30s response cache — the frontend polls this endpoint every 30s while the
+# analytics tab is open, and each miss drags the full leads table.
+_leaderboard_cache = {}
+
 @app.get("/api/leaderboard")
 def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
     try:
+        cache_key = (range, is_admin(user))   # flags differ by role — don't cross-serve
+        hit = _leaderboard_cache.get(cache_key)
+        if hit and (time.time() - hit[0]) < 30:
+            return hit[1]
         today = local_today()
         # Calculate date filter based on range
         if range == "7d":
@@ -10545,7 +10691,9 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             u = users[name]
             u["total_calls"] += 1
             u["talk_time"] += c.get("duration") or 0
-            if (c.get("calledAt") or "").startswith(today):
+            # ET business day, not UTC-date prefix — the prefix compare dropped
+            # every call logged after ~8pm ET (UTC had rolled to tomorrow).
+            if (c.get("calledAt") or "") >= local_day_start_utc():
                 u["calls_today"] += 1
             outcome = c.get("outcome", "")
             if outcome in ("answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"):
@@ -10601,6 +10749,7 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
 
         # Sort by calls today desc, then total calls
         result.sort(key=lambda x: (-x["calls_today"], -x["total_calls"]))
+        _leaderboard_cache[cache_key] = (time.time(), result)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

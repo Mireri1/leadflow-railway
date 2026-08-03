@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from "react"
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 
 const API_BASE = ""
 
@@ -387,7 +387,7 @@ async function api(path, opts={}) {
   })
   // On 401: reload is async, so returning undefined let in-flight callers deref
   // the result and throw. A never-resolving promise parks them until reload.
-  if (res.status===401) { localStorage.clear(); window.location.reload(); return new Promise(()=>{}) }
+  if (res.status===401) { ["lf_token","lf_user","lf_role","lf_session_id"].forEach(k=>localStorage.removeItem(k)); window.location.reload(); return new Promise(()=>{}) }
   const body = await res.json()
   if (!res.ok) throw new Error(body.detail || JSON.stringify(body))
   return body
@@ -1591,6 +1591,14 @@ function addDays(days){
   d.setDate(d.getDate() + days)
   return localDate(d)
 }
+// UTC timestamp → LOCAL date string. Slicing a UTC ISO timestamp [:10] gives
+// tomorrow's date after ~8pm ET, which broke every "called today?" compare
+// during the evening shift. Always convert through Date first.
+function tsLocalDate(ts){
+  if(!ts) return ""
+  try{ const d=new Date(ts); return isNaN(d)?String(ts).slice(0,10):localDate(d) }
+  catch{ return String(ts).slice(0,10) }
+}
 // Year-typo guard: cristine once booked an appointment for 2027 instead of
 // 2026. Soft-confirm any date >6 months out (or in the past).
 function confirmFarDate(dateStr,label){
@@ -1625,7 +1633,7 @@ function QualChip({label, value, options, onChange}){
 
 // ─── CallModal ───────────────────────────────────────────────────────────────
 
-function CallModal({lead: leadProp,onClose,onSaved}){
+function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   // Local mirror so the Find-DM button can update the displayed contact info
   // without closing the modal or refetching from the server. lead.id is
   // stable, so the existing useEffect on lead.id stays correct.
@@ -1650,9 +1658,10 @@ function CallModal({lead: leadProp,onClose,onSaved}){
   const [saving,setSave]          = useState(false)
   const [followUpSeq,setFuSeq]    = useState("")
   // Auto-timer
-  const [timerStart]              = useState(()=>Date.now())
+  const [timerStart,setTimerStart] = useState(()=>Date.now())
   const [timerNow,setTimerNow]    = useState(Date.now())
   const [timerRunning,setTimerRunning] = useState(true)
+  const [timerAccum,setTimerAccum] = useState(0)   // seconds banked from prior run segments
   // Guards retry-after-partial-failure: if POST /api/calls succeeded but the
   // lead PATCH failed, a retry must NOT insert a second call_outcomes row
   // (which also tripped the anti-gaming duplicate-cooldown flag on the rep).
@@ -1662,7 +1671,7 @@ function CallModal({lead: leadProp,onClose,onSaved}){
     const iv=setInterval(()=>setTimerNow(Date.now()),1000)
     return()=>clearInterval(iv)
   },[timerRunning])
-  const timerSeconds=Math.floor((timerNow-timerStart)/1000)
+  const timerSeconds=timerAccum+(timerRunning?Math.floor((timerNow-timerStart)/1000):0)
   const timerDisplay=`${Math.floor(timerSeconds/60).toString().padStart(2,"0")}:${(timerSeconds%60).toString().padStart(2,"0")}`
   const [budgetFocus,setBudget]   = useState("")
   const [vendorStatus,setVendor]  = useState("")
@@ -1696,6 +1705,25 @@ function CallModal({lead: leadProp,onClose,onSaved}){
     api("/api/admin/apollo/budget").then(setPhoneBudget).catch(()=>setPhoneBudget(null))
     api(`/api/leads/${lead.id}/campaign-status`).then(setCampaignInfo).catch(()=>setCampaignInfo(null))
   },[lead.id])
+
+  // Keyboard shortcuts for the 100-dials/day loop: 1=No Answer, 2=Voicemail,
+  // 3=Answered, Enter=Log Call (same guards as the button). Ignored while
+  // typing in an input/textarea/select.
+  useEffect(()=>{
+    const h=e=>{
+      const tag=e.target?.tagName
+      if(["INPUT","TEXTAREA","SELECT"].includes(tag)||e.metaKey||e.ctrlKey||e.altKey) return
+      if(e.key==="1"){ setPrimary("no_answer"); setSecondary(""); setCbReason("") }
+      else if(e.key==="2"){ setPrimary("voicemail"); setSecondary(""); setCbReason("") }
+      else if(e.key==="3"){ setPrimary("answered") }
+      else if(e.key==="Enter"&&primary&&!saving
+        &&!(primary==="answered"&&!secondary)
+        &&!(needsQual&&!hasQualData)
+        &&!(secondary==="callback"&&!cbDate)){ e.preventDefault(); log() }
+    }
+    window.addEventListener("keydown",h)
+    return()=>window.removeEventListener("keydown",h)
+  }) // eslint-disable-line — re-binds each render so log() and guards stay fresh
 
   // Phone reveal allowed when industry is in allowlist AND budget remaining
   const phoneRevealAllowed = (()=>{
@@ -1760,9 +1788,16 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         not_interested:"not_interested",converted:"converted"}
       const fuDays = FOLLOW_UP_DAYS[followUpSeq]
       const nextFollowUp = fuDays ? addDays(fuDays[0]) : (secondary==="callback"?cbDate:"")
+      // callbackDate rules: set it when this call produced a new date; CLEAR it
+      // only when the deal is dead (not interested / converted). A plain
+      // no-answer/voicemail on a lead with a scheduled callback must NOT wipe
+      // the date — that silently dropped leads out of Follow-Ups and the bell.
+      const newCb = secondary==="callback" ? cbDate : (nextFollowUp||"")
+      const cbPatch = newCb ? {callbackDate:newCb}
+        : (["not_interested","converted"].includes(outcome) ? {callbackDate:""} : {})
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
         status:statusMap[outcome]||"called",
-        callbackDate:secondary==="callback"?cbDate:nextFollowUp||"",
+        ...cbPatch,
         followupsequence: followUpSeq||null,
         nextfollowup: nextFollowUp||null,
         followupstep: fuDays ? 0 : null,
@@ -1770,9 +1805,16 @@ function CallModal({lead: leadProp,onClose,onSaved}){
         ...(!lead.assignedTo ? {assignedTo: getUser()} : {}),
         updatedAt:new Date().toISOString()
       })})
-      // Booked a walkthrough → create the appointment (pending admin approval)
+      // Booked a walkthrough → create the appointment (pending admin approval).
+      // This is the revenue event — if it fails, KEEP the modal open and say so
+      // (the call itself saved; callPostedRef prevents a duplicate on retry).
       if(apptDate){
-        try{ await api(`/api/appointments/${lead.id}`,{method:"POST",body:JSON.stringify({date:apptDate,area:apptArea,notes:cleanNote(notes)})}) }catch{}
+        try{
+          await api(`/api/appointments/${lead.id}`,{method:"POST",body:JSON.stringify({date:apptDate,area:apptArea,notes:cleanNote(notes)})})
+        }catch{
+          setModalError("Call saved, but the walkthrough booking FAILED — tap Save again to retry the booking.")
+          return
+        }
       }
       onSaved(); onClose()
     }catch(ex){setModalError("Couldn't save — check your internet and try again.")}
@@ -1959,6 +2001,49 @@ function CallModal({lead: leadProp,onClose,onSaved}){
           <span>⚠</span>{modalError}
         </div>}
 
+        {/* Timer bar */}
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16,
+          background:"#060e20",borderRadius:8,padding:"10px 14px"}}>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:24,fontWeight:700,
+            color:timerRunning?"#69f6b8":"#a3a6ff",letterSpacing:".05em",minWidth:70}}>
+            {timerDisplay}
+          </div>
+          <button type="button" onClick={()=>{
+              if(timerRunning){ setTimerAccum(a=>a+Math.floor((Date.now()-timerStart)/1000)) }
+              else { setTimerStart(Date.now()); setTimerNow(Date.now()) }
+              setTimerRunning(r=>!r)
+            }}
+            style={{fontSize:11,padding:"5px 10px",borderRadius:6,border:"1px solid #40485d40",
+              background:"transparent",color:"#a3aac4",cursor:"pointer",fontFamily:"inherit"}}>
+            {timerRunning?"Pause":"Resume"}
+          </button>
+          <div style={{flex:1}}/>
+          <span style={{fontSize:10,color:"#40485d"}}>Manual:</span>
+          <input type="number" value={duration} onChange={e=>setDur(e.target.value)}
+            placeholder="min" min="0" style={{width:50,fontSize:12}}/>
+        </div>
+
+        {/* Step 1: What happened? */}
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".1em",fontWeight:700,marginBottom:10}}>
+            STEP 1 — WHAT HAPPENED?
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            {PRIMARY_OUTCOMES.map(p=>(
+              <button key={p.value} onClick={()=>{setPrimary(p.value);if(p.value!=="answered"){setSecondary("");setCbReason("")}}}
+                style={{flex:1,padding:"14px 12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",
+                  textAlign:"center",fontSize:13,fontWeight:600,transition:"all .15s",
+                  background:primary===p.value?p.color+"25":"#060e20",
+                  color:primary===p.value?p.color:"#a3aac4",
+                  border:`2px solid ${primary===p.value?p.color:"#40485d30"}`}}>
+                <div style={{fontSize:20,marginBottom:4}}>{p.icon}</div>
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+
         {/* Last reported inspection — so the caller can answer "when was ours?" */}
         {(()=>{
           const insp = fmtInspection(parseInspection(lead.notes))
@@ -2041,44 +2126,6 @@ function CallModal({lead: leadProp,onClose,onSaved}){
             )}
           </div>
         )}
-
-        {/* Timer bar */}
-        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16,
-          background:"#060e20",borderRadius:8,padding:"10px 14px"}}>
-          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:24,fontWeight:700,
-            color:timerRunning?"#69f6b8":"#a3a6ff",letterSpacing:".05em",minWidth:70}}>
-            {timerDisplay}
-          </div>
-          <button type="button" onClick={()=>setTimerRunning(r=>!r)}
-            style={{fontSize:11,padding:"5px 10px",borderRadius:6,border:"1px solid #40485d40",
-              background:"transparent",color:"#a3aac4",cursor:"pointer",fontFamily:"inherit"}}>
-            {timerRunning?"Pause":"Resume"}
-          </button>
-          <div style={{flex:1}}/>
-          <span style={{fontSize:10,color:"#40485d"}}>Manual:</span>
-          <input type="number" value={duration} onChange={e=>setDur(e.target.value)}
-            placeholder="min" min="0" style={{width:50,fontSize:12}}/>
-        </div>
-
-        {/* Step 1: What happened? */}
-        <div style={{marginBottom:16}}>
-          <div style={{fontSize:10,color:"#a3aac4",letterSpacing:".1em",fontWeight:700,marginBottom:10}}>
-            STEP 1 — WHAT HAPPENED?
-          </div>
-          <div style={{display:"flex",gap:8}}>
-            {PRIMARY_OUTCOMES.map(p=>(
-              <button key={p.value} onClick={()=>{setPrimary(p.value);if(p.value!=="answered"){setSecondary("");setCbReason("")}}}
-                style={{flex:1,padding:"14px 12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",
-                  textAlign:"center",fontSize:13,fontWeight:600,transition:"all .15s",
-                  background:primary===p.value?p.color+"25":"#060e20",
-                  color:primary===p.value?p.color:"#a3aac4",
-                  border:`2px solid ${primary===p.value?p.color:"#40485d30"}`}}>
-                <div style={{fontSize:20,marginBottom:4}}>{p.icon}</div>
-                {p.label}
-              </button>
-            ))}
-          </div>
-        </div>
 
         {/* Step 2: If answered — what was the result? */}
         {primary==="answered"&&(
@@ -2165,7 +2212,14 @@ function CallModal({lead: leadProp,onClose,onSaved}){
             <div className="ff" style={{marginBottom:12}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
                 <label style={{margin:0}}>Notes {aiSent&&<SentimentDot notes={`[sent:${aiSent}]`}/>}</label>
-                <MicButton onText={t=>setNotes(n=>(n?n+" ":"")+t)}/>
+                <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                  {onEmail&&(
+                    <button type="button" onClick={()=>onEmail(lead)} title='They asked for an email? Opens the "Asked for info" script'
+                      style={{fontSize:11,padding:"5px 10px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",
+                        border:"1px solid #69f6b840",background:"#69f6b812",color:"#69f6b8"}}>✉ Email info</button>
+                  )}
+                  <MicButton onText={t=>setNotes(n=>(n?n+" ":"")+t)}/>
+                </div>
               </div>
               <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{resize:"vertical"}}
                 placeholder={secondary==="callback"?"What did they say? When should you call back?":"Dictate or type — then hit Smart-fill…"}/>
@@ -2338,7 +2392,8 @@ function EmailModal({lead,onClose,onSent}){
     if(!body.trim()){setErr("Email body is required");return}
     setSending(true);setErr("")
     try{
-      const htmlBody=body.split("\n").map(l=>`<p>${l}</p>`).join("")
+      const esc=t=>t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+      const htmlBody=body.split("\n").map(l=>`<p>${esc(l)||"&nbsp;"}</p>`).join("")
       const r=await api("/api/email/send",{method:"POST",body:JSON.stringify({
         lead_id:lead?.id||null,to_email:toEmail.trim(),to_name:toName.trim(),
         subject:subject.trim(),body:htmlBody,company:lead?.company||""
@@ -2521,7 +2576,8 @@ function EmailTemplatesModal({onClose}){
 
   async function del(id){
     if(!window.confirm("Delete this template?")) return
-    await api(`/api/email-templates/${id}`,{method:"DELETE"})
+    try{ await api(`/api/email-templates/${id}`,{method:"DELETE"}) }
+    catch{ alert("Couldn't delete template — try again") }
     fetchTemplates()
   }
 
@@ -2769,7 +2825,8 @@ function ScriptsModal({onClose}){
 
   async function del(id){
     if(!window.confirm("Delete this script?")) return
-    await api(`/api/scripts/${id}`,{method:"DELETE"})
+    try{ await api(`/api/scripts/${id}`,{method:"DELETE"}) }
+    catch{ alert("Couldn't delete script — try again") }
     fetchScripts()
   }
 
@@ -2977,7 +3034,7 @@ function MyWeekActionPanel({lead, mode, setMode, noteText, setNoteText, fuDate, 
     </div>
   )
 }
-function MyWeek({user, leads, onCall, onReload, notify}){
+function MyWeek({user, leads, onCall, onReload, notify, reloadSignal}){
   const [weekOffset,setWeekOffset]=useState(0)
   const [calls,setCalls]=useState([])
   const [loading,setLoading]=useState(false)
@@ -3008,7 +3065,7 @@ function MyWeek({user, leads, onCall, onReload, notify}){
     try{ const r=await api(`/api/calls/history?caller=${encodeURIComponent(user)}&date_from=${b.start}&date_to=${b.end}`); setCalls(r.calls||[]) }
     catch{ setCalls([]) } finally{ setLoading(false) }
   }
-  useEffect(()=>{ load(weekOffset) },[]) // eslint-disable-line
+  useEffect(()=>{ load(weekOffset) },[weekOffset, reloadSignal]) // eslint-disable-line
 
   // Her due/overdue follow-ups (the worklist) for the top strip.
   const myDue=leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted"&&(!l.assignedTo||l.assignedTo===user))
@@ -3086,12 +3143,12 @@ function MyWeek({user, leads, onCall, onReload, notify}){
 
       {/* Week navigator */}
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
-        <button onClick={()=>{const o=weekOffset-1;setWeekOffset(o);load(o)}} className="btn btn-g" style={{fontSize:12,padding:"6px 12px"}}>◀ Prev week</button>
+        <button onClick={()=>setWeekOffset(o=>o-1)} className="btn btn-g" style={{fontSize:12,padding:"6px 12px"}}>◀ Prev week</button>
         <div style={{fontSize:13,color:"#dee5ff",fontWeight:600,minWidth:200,textAlign:"center"}}>
           {weekOffset===0?"This week":weekOffset===-1?"Last week":`${-weekOffset} weeks ago`}
           <div style={{fontSize:10,color:"#5a6a8a"}}>{bounds.start} → {bounds.end} · {calls.length} calls</div>
         </div>
-        <button onClick={()=>{const o=Math.min(0,weekOffset+1);setWeekOffset(o);load(o)}} disabled={weekOffset>=0}
+        <button onClick={()=>setWeekOffset(o=>Math.min(0,o+1))} disabled={weekOffset>=0}
           className="btn btn-g" style={{fontSize:12,padding:"6px 12px",opacity:weekOffset>=0?.4:1}}>Next week ▶</button>
       </div>
 
@@ -3242,10 +3299,10 @@ function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
   const [busy,setBusy]=useState("")
   const [noteFor,setNoteFor]=useState(null)
   const [noteText,setNoteText]=useState("")
-  function load(){ api("/api/appointments/attended").then(setData).catch(()=>setData({attended:[]})) }
+  function load(){ api("/api/appointments/attended").then(setData).catch(()=>setData({attended:[],error:true})) }
   useEffect(()=>{ load() },[reloadSignal]) // eslint-disable-line
   const today=data?.today||localDate()
-  const calledToday=a=>((a.lead?.last_called_at||"").slice(0,10)===today)
+  const calledToday=a=>(tsLocalDate(a.lead?.last_called_at)===today)
   const items=(data?.attended||[]).slice().sort((a,b)=>{
     const ca=calledToday(a)?1:0, cb=calledToday(b)?1:0
     if(ca!==cb) return ca-cb                                   // needs-call first
@@ -3289,6 +3346,11 @@ function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
       </div>
       {data===null?(
         <div style={{padding:60,textAlign:"center",color:"#40485d"}}>Loading…</div>
+      ):data.error?(
+        <div style={{background:"#0f1930",borderRadius:16,padding:48,textAlign:"center"}}>
+          <div style={{fontSize:32,marginBottom:10}}>⚠️</div>
+          <div style={{color:"#ff6e84",fontSize:14}}>Couldn't load walkthroughs — check your connection and hit Refresh</div>
+        </div>
       ):items.length===0?(
         <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
           <div style={{fontSize:40,marginBottom:12}}>🚶</div>
@@ -3321,7 +3383,7 @@ function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
                     <div style={{fontSize:11,color:"#5a6a8a",marginTop:2}}>
                       booked by {a.createdBy||"—"}
                       {a.lead?.callbackDate?` · next callback ${a.lead.callbackDate}`:""}
-                      {a.lead?.last_called_at?` · last called ${String(a.lead.last_called_at).slice(0,10)}`:" · never called since"}
+                      {a.lead?.last_called_at?` · last called ${tsLocalDate(a.lead.last_called_at)}`:" · never called since"}
                     </div>
                     {a.notes&&<div style={{fontSize:12,color:"#c9d2ee",marginTop:6,whiteSpace:"pre-line",lineHeight:1.45}}>{a.notes}</div>}
                   </div>
@@ -3417,9 +3479,16 @@ export default function App(){
   // Dialer scope: optionally restrict the queue to one state and/or to
   // unanswered (no_answer) leads — lets a caller "go back and call the CT
   // leads that never picked up" without leaving the dialer.
-  const [dialerState,setDialerState] = useState("")
-  const [dialerCity,setDialerCity] = useState("")
-  const [dialerUnanswered,setDialerUnanswered] = useState(false)
+  // Dialer scope persists across reloads — cristine re-scoped to "CT,
+  // unanswered" after every refresh before this.
+  const [dialerState,setDialerState] = useState(()=>localStorage.getItem("lf_dialer_scope_state")||"")
+  const [dialerCity,setDialerCity] = useState(()=>localStorage.getItem("lf_dialer_scope_city")||"")
+  const [dialerUnanswered,setDialerUnanswered] = useState(()=>localStorage.getItem("lf_dialer_scope_unans")==="1")
+  useEffect(()=>{
+    localStorage.setItem("lf_dialer_scope_state",dialerState)
+    localStorage.setItem("lf_dialer_scope_city",dialerCity)
+    localStorage.setItem("lf_dialer_scope_unans",dialerUnanswered?"1":"0")
+  },[dialerState,dialerCity,dialerUnanswered])
   useEffect(()=>{ setDialerIdx(0) },[dialerState,dialerCity,dialerUnanswered])
   // Snooze: hide leads dialed within the last N hours where the outcome was
   // a non-engagement (no_answer / voicemail / called). Default 4h; caller
@@ -3549,21 +3618,58 @@ export default function App(){
   // ⚡ One-tap outcome logging — most of a 100-dial day is no-answers; this
   // skips the modal entirely (POST call + status patch in one tap).
   const [quickLogging,setQuickLogging]=useState(null)
+  // 20s undo window for the one-tap ⚡ logs — a mis-tap otherwise writes a
+  // call row + status change with no recovery path.
+  const [lastQuick,setLastQuick]=useState(null) // {callId,leadId,prevStatus,prevLastCalled,company,at}
+  useEffect(()=>{
+    if(!lastQuick) return
+    const t=setTimeout(()=>setLastQuick(null), 20000)
+    return()=>clearTimeout(t)
+  },[lastQuick])
+
   async function quickLog(lead, outcome="no_answer"){
     if(quickLogging) return
     setQuickLogging(lead.id)
     try{
-      await api("/api/calls",{method:"POST",body:JSON.stringify({
+      const r=await api("/api/calls",{method:"POST",body:JSON.stringify({
         leadId:lead.id, outcome, notes:"", duration:0,
         calledBy:getUser(), calledAt:new Date().toISOString(), converted:false})})
+      const callId=Array.isArray(r)&&r[0]?.id
+      // Never demote an engaged lead (interested/callback/…) to no_answer on a
+      // one-tap — only fresh/cold statuses flip.
+      const demotable=!lead.status||["new","called","no_answer"].includes(lead.status)
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
-        status:"no_answer",
+        ...(demotable?{status:"no_answer"}:{}),
         ...(!lead.assignedTo?{assignedTo:getUser()}:{}),
         updatedAt:new Date().toISOString()})})
-      notify(`⚡ No answer — ${lead.company||lead.firstName||"lead"}`)
-      loadLeads()
+      // Optimistic local update instead of a full-table refetch per tap.
+      const nowIso=new Date().toISOString()
+      const upd=l=>l.id===lead.id?{...l,
+        ...(demotable?{status:"no_answer"}:{}),
+        assignedTo:l.assignedTo||getUser(),
+        last_called_at:nowIso,
+        total_calls:(l.total_calls||0)+1}:l
+      setLeads(p=>p.map(upd)); setAllLeads(p=>p.map(upd))
+      if(callId) setLastQuick({callId,leadId:lead.id,prevStatus:lead.status||"new",
+        prevLastCalled:lead.last_called_at||null,
+        company:lead.company||lead.firstName||"lead",at:Date.now()})
+      notify(`⚡ ${outcome==="voicemail"?"Voicemail":"No answer"} — ${lead.company||lead.firstName||"lead"}`)
     }catch{ notify("Couldn't log — try again","error") }
     finally{ setQuickLogging(null) }
+  }
+
+  async function undoQuickLog(){
+    const q=lastQuick; if(!q) return
+    setLastQuick(null)
+    try{
+      await api(`/api/calls/${q.callId}/undo`,{method:"POST",body:"{}"})
+      await api(`/api/leads/${q.leadId}`,{method:"PATCH",body:JSON.stringify({
+        status:q.prevStatus, last_called_at:q.prevLastCalled, updatedAt:new Date().toISOString()})})
+      const upd=l=>l.id===q.leadId?{...l,status:q.prevStatus,last_called_at:q.prevLastCalled,
+        total_calls:Math.max(0,(l.total_calls||1)-1)}:l
+      setLeads(p=>p.map(upd)); setAllLeads(p=>p.map(upd))
+      notify(`↩ Undone — ${q.company} restored`)
+    }catch{ notify("Couldn't undo — the 2-minute window may have passed","error") }
   }
 
   // 📞 "Who's next?" — the single best next dial: walkthrough follow-ups →
@@ -3613,7 +3719,7 @@ export default function App(){
       const pool=(allLeads.length?allLeads:leads)
       const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"
         &&(!l.assignedTo||l.assignedTo===user)
-        &&(!l.last_called_at||String(l.last_called_at).slice(0,10)<t))
+        &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
       const wtN=apptFollowups.length
       if((due.length||wtN)&&Date.now()-cbNudgeRef.current>2*3600*1000){
         cbNudgeRef.current=Date.now()
@@ -3645,7 +3751,7 @@ export default function App(){
     if(sessId){
       try{await api("/api/auth/logout",{method:"POST",body:JSON.stringify({session_id:sessId})})}catch(e){}
     }
-    localStorage.clear(); setUser(null)
+    ;["lf_token","lf_user","lf_role","lf_session_id"].forEach(k=>localStorage.removeItem(k)); setUser(null)
   }
 
   useEffect(()=>{
@@ -3688,21 +3794,47 @@ export default function App(){
       }
       try{ const s=await api("/api/stats"); if(s) setStats(s) }catch{}
       try{ const q=await api("/api/quota"); if(q) setQuota(q) }catch{}
-      // Persistent email-history map for the 📧 badges.
-      // 90-day window covers most workflows; older history is fine to forget.
-      try{
-        const f=await api("/api/leads/emailed-flags?days=90")
-        if(f?.flags) setEmailedFlags(f.flags)
-      }catch{}
     }catch(ex){ notify("Error loading leads","error") }
     finally{ setLoad(false) }
   },[search,fStatus,sortBy,cbOnly])
+
+  // 📧 badge map — off the loadLeads hot path (it refired on every keystroke
+  // and every call save). Once per login + every 5 min is plenty.
+  useEffect(()=>{
+    if(!user) return
+    const loadFlags=()=>api("/api/leads/emailed-flags?days=90")
+      .then(f=>{ if(f?.flags) setEmailedFlags(f.flags) }).catch(()=>{})
+    loadFlags()
+    const iv=setInterval(loadFlags, 5*60*1000)
+    return()=>clearInterval(iv)
+  },[user])
+
+  // Targeted refresh after a call save — merge ONE lead + the quota bar
+  // instead of refetching the entire multi-MB leads table per dial.
+  async function refreshLead(leadId){
+    try{
+      const fresh=await api(`/api/leads/${leadId}`)
+      if(fresh&&fresh.id){
+        const upd=l=>l.id===fresh.id?{...l,...fresh}:l
+        setLeads(p=>p.map(upd)); setAllLeads(p=>p.map(upd))
+      }
+      api("/api/quota").then(q=>q&&setQuota(q)).catch(()=>{})
+    }catch{ loadLeads() }   // fall back to the full refresh on any trouble
+  }
 
   useEffect(()=>{
     if(!user) return
     const t=setTimeout(loadLeads,search?350:0)
     return()=>clearTimeout(t)
   },[user,loadLeads])
+
+  // Auto-load the team roster for admins (once per login) — powers the Team
+  // panel without the old "Load Reps" click AND the roster guard on the
+  // assign/reassign prompts.
+  useEffect(()=>{
+    if(!user||!isAdmin()) return
+    api("/api/reps").then(r=>{ if(Array.isArray(r)) setReps(r) }).catch(()=>{})
+  },[user]) // eslint-disable-line
 
   useEffect(()=>{
     if(activeNav!=="analytics"||!user) return
@@ -3747,9 +3879,9 @@ export default function App(){
     const params = new URLSearchParams()
     const now = new Date()
     let from = ""
-    if(range==="today"){ from = now.toISOString().split("T")[0] }
-    else if(range==="week"){ const d=new Date(now); d.setDate(d.getDate()-7); from=d.toISOString().split("T")[0] }
-    else if(range==="month"){ const d=new Date(now); d.setMonth(d.getMonth()-1); from=d.toISOString().split("T")[0] }
+    if(range==="today"){ from = localDate(now) }
+    else if(range==="week"){ const d=new Date(now); d.setDate(d.getDate()-7); from=localDate(d) }
+    else if(range==="month"){ const d=new Date(now); d.setMonth(d.getMonth()-1); from=localDate(d) }
     else if(range==="custom"){ if(histFrom) params.set("date_from",histFrom); if(histTo) params.set("date_to",histTo) }
     if(range!=="custom"&&from) params.set("date_from",from)
     if(caller) params.set("caller",caller)
@@ -3776,7 +3908,13 @@ export default function App(){
       if(!window.confirm(`${lead.company||lead.firstName||"This lead"} hasn't answered yet — only ${n} of 4 attempts.\n\nTeam rule: try unanswered leads at least 4× before marking Not Interested.\n\nMark Not Interested anyway?`)) return
     }
     let cbDate=""
-    if(status==="callback") cbDate=window.prompt("Callback date (YYYY-MM-DD):",new Date().toISOString().split("T")[0])||""
+    if(status==="callback"){
+      const inp=window.prompt("Callback date (YYYY-MM-DD):",localDate())
+      if(inp===null) return                       // Cancel = do nothing (used to save a dateless callback)
+      cbDate=(inp||"").trim()
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(cbDate)){ notify("Callback not saved — date must be YYYY-MM-DD","error"); return }
+      if(!confirmFarDate(cbDate,"Callback")) return
+    }
     try{
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({status,callbackDate:cbDate,updatedAt:new Date().toISOString()})})
       setLeads(p=>p.map(l=>l.id===lead.id?{...l,status,callbackDate:cbDate}:l))
@@ -3788,7 +3926,7 @@ export default function App(){
     if(!window.confirm("Delete this lead?")) return
     try{
       await api(`/api/leads/${id}`,{method:"DELETE"})
-      setLeads(p=>p.filter(l=>l.id!==id)); notify("Deleted","error")
+      setLeads(p=>p.filter(l=>l.id!==id)); notify("Deleted")
       loadLeads()
     }catch(ex){ notify("Error","error") }
   }
@@ -3805,10 +3943,61 @@ export default function App(){
     finally{ setLookupLoad(false) }
   }
 
+  // ⚠ ALL hooks must live ABOVE the `if(!user) return <Login/>` early return —
+  // a hook below it changes the hook count between logged-out and logged-in
+  // renders, which hard-crashes React to a blank screen on every login/logout.
+  const today=localDate(new Date())
+  const notifiedOnRef = useRef("")
+  useEffect(()=>{
+    if(!user||!leads.length || notifiedOnRef.current===today) return
+    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+    if(overdue.length>0&&"Notification" in window){
+      if(Notification.permission==="granted"){
+        notifiedOnRef.current=today
+        new Notification(`LeadFlow: ${overdue.length} overdue follow-up${overdue.length>1?"s":""}`,{
+          body:overdue.slice(0,3).map(l=>l.company||l.firstName).join(", "),icon:"/favicon.ico"})
+      }else if(Notification.permission!=="denied"){
+        Notification.requestPermission()
+      }
+    }
+  },[user, leads.length, today]) // eslint-disable-line
+
+  // segBase = everything EXCEPT the source/intent segment filters, so the
+  // quick-segment bar can show true totals per source/intent in this view.
+  // Memoized — these re-filtered every lead (with regex note parsing) on
+  // EVERY App render: each keystroke, toast, and timer tick.
+  const segBase=useMemo(()=>leads.filter(l=>{
+    if(fIndustry&&l.industry!==fIndustry) return false
+    if(fState&&l.state!==fState) return false
+    if(fCity){
+      const cityLower = l.city?.toLowerCase()||""
+      const filterLower = fCity.toLowerCase().trim()
+      if(!cityLower.startsWith(filterLower) && cityLower !== filterLower) return false
+    }
+    if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
+    if(emailedOnly&&!emailedFlags[l.id]) return false
+    if(needsAttemptOnly&&!(l.status==="no_answer"&&(l.total_calls||0)<4)) return false
+    return true
+  }),[leads,fIndustry,fState,fCity,availableOnly,emailedOnly,needsAttemptOnly,user,emailedFlags])
+  const displayLeads=useMemo(()=>segBase.filter(l=>{
+    if(fSource&&(l.source||"").toLowerCase()!==fSource) return false
+    if(fIntent&&!parseIntents(l.notes).includes(fIntent)) return false
+    return true
+  }),[segBase,fSource,fIntent])
+  // Counts for the quick-segment bar (over segBase so totals don't collapse
+  // when you click into one segment).
+  const {segIntentCounts,segSourceCounts}=useMemo(()=>{
+    const segIntentCounts={}, segSourceCounts={}
+    segBase.forEach(l=>{
+      parseIntents(l.notes).forEach(k=>{segIntentCounts[k]=(segIntentCounts[k]||0)+1})
+      const s=(l.source||"").toLowerCase(); if(s) segSourceCounts[s]=(segSourceCounts[s]||0)+1
+    })
+    return {segIntentCounts,segSourceCounts}
+  },[segBase])
+
   if(!user) return <Login onLogin={u=>setUser(u)}/>
 
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
-  const today=localDate(new Date())
   const tomorrow=(()=>{const d=new Date();d.setDate(d.getDate()+1);return localDate(d)})()
   const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return localDate(d)})()
 
@@ -3825,53 +4014,9 @@ export default function App(){
     return(order[a.urgency]||4)-(order[b.urgency]||4)
   })
 
-  // Browser notification on load if overdue — at most once per calendar day.
-  // Keying the effect on leads.length re-fired it on every search keystroke /
-  // filter change / post-mutation refresh → OS notification spam all day.
-  const notifiedOnRef = useRef("")
-  useEffect(()=>{
-    if(!leads.length || notifiedOnRef.current===today) return
-    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
-    if(overdue.length>0&&"Notification" in window){
-      if(Notification.permission==="granted"){
-        notifiedOnRef.current=today
-        new Notification(`LeadFlow: ${overdue.length} overdue follow-up${overdue.length>1?"s":""}`,{
-          body:overdue.slice(0,3).map(l=>l.company||l.firstName).join(", "),icon:"/favicon.ico"})
-      }else if(Notification.permission!=="denied"){
-        Notification.requestPermission()
-      }
-    }
-  },[leads.length, today])
 
-  // segBase = everything EXCEPT the source/intent segment filters, so the
-  // quick-segment bar can show true totals per source/intent in this view.
-  const segBase=leads.filter(l=>{
-    if(fIndustry&&l.industry!==fIndustry) return false
-    if(fState&&l.state!==fState) return false
-    if(fCity){
-      const cityLower = l.city?.toLowerCase()||""
-      const filterLower = fCity.toLowerCase().trim()
-      if(!cityLower.startsWith(filterLower) && cityLower !== filterLower) return false
-    }
-    if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
-    if(emailedOnly&&!emailedFlags[l.id]) return false
-    if(needsAttemptOnly&&!(l.status==="no_answer"&&(l.total_calls||0)<4)) return false
-    return true
-  })
-  const displayLeads=segBase.filter(l=>{
-    if(fSource&&(l.source||"").toLowerCase()!==fSource) return false
-    if(fIntent&&!parseIntents(l.notes).includes(fIntent)) return false
-    return true
-  })
-  // Counts for the quick-segment bar (over segBase so totals don't collapse
-  // when you click into one segment).
-  const segIntentCounts={}, segSourceCounts={}
-  segBase.forEach(l=>{
-    parseIntents(l.notes).forEach(k=>{segIntentCounts[k]=(segIntentCounts[k]||0)+1})
-    const s=(l.source||"").toLowerCase(); if(s) segSourceCounts[s]=(segSourceCounts[s]||0)+1
-  })
-  const newTodayLeads = displayLeads.filter(l=>(l.createdAt||"").startsWith(today))
-  const olderLeads = displayLeads.filter(l=>!(l.createdAt||"").startsWith(today))
+  const newTodayLeads = displayLeads.filter(l=>tsLocalDate(l.createdAt)===today)
+  const olderLeads = displayLeads.filter(l=>tsLocalDate(l.createdAt)!==today)
 
   // Source-based segmentation for the Leads tab — keeps Apollo-pulled
   // decision-maker contacts visually separate from Google Places / manual
@@ -3886,8 +4031,8 @@ export default function App(){
   // Leads are grouped by state below; within each state the Apollo / Warm
   // split is applied with "new today" surfaced first inside each sub-section.
   const sortNewFirst = (arr) => {
-    const newToday = arr.filter(l=>(l.createdAt||"").startsWith(today))
-    const older    = arr.filter(l=>!(l.createdAt||"").startsWith(today))
+    const newToday = arr.filter(l=>tsLocalDate(l.createdAt)===today)
+    const older    = arr.filter(l=>tsLocalDate(l.createdAt)!==today)
     return [...newToday, ...older]
   }
 
@@ -3940,7 +4085,7 @@ export default function App(){
 
         {/* Callbacks badge */}
         {stats?.callbacksDue>0&&(
-          <button className="btn btn-amber" onClick={()=>setCbOnly(p=>!p)}>
+          <button className="btn btn-amber" onClick={()=>{setNav("leads");setCbOnly(p=>!p)}}>
             🔔 {stats.callbacksDue}
           </button>
         )}
@@ -3955,7 +4100,7 @@ export default function App(){
               <span style={{position:"absolute",top:2,right:2,width:18,height:18,borderRadius:"50%",
                 background:"#ff6e84",color:"#fff",fontSize:10,fontWeight:700,
                 display:"flex",alignItems:"center",justifyContent:"center",
-                fontFamily:"'Space Grotesk',sans-serif"}}>{notifItems.length>9?"9+":notifItems.length}</span>
+                fontFamily:"'Space Grotesk',sans-serif"}}>{(n=>n>9?"9+":n)(notifItems.filter(i=>i.urgency==="overdue"||i.urgency==="today").length||notifItems.length)}</span>
             )}
           </button>
           {showNotifs&&(
@@ -4060,7 +4205,7 @@ export default function App(){
             style={{width:"100%",padding:"13px",fontSize:14,
               fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,
               boxShadow:"0 8px 32px rgba(163,166,255,.18)"}}
-            onClick={()=>leads.length>0?setCallModal(leads[0]):setEditModal(true)}>
+            onClick={()=>setNav("dialer")}>
             Start Dialing
           </button>
         </div>
@@ -4147,9 +4292,9 @@ export default function App(){
                   "called but still carrying an old date" so overdue reads as
                   a caller-accountability signal, not a data-staleness one. */}
               {(()=>{
-                const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                const overdue=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
                 if(!overdue.length) return null
-                const attempted=overdue.filter(l=>l.last_called_at&&String(l.last_called_at).slice(0,10)>=l.callbackDate).length
+                const attempted=overdue.filter(l=>l.last_called_at&&tsLocalDate(l.last_called_at)>=l.callbackDate).length
                 const untouched=overdue.length-attempted
                 return (
                   <div style={{background:"#2d0a0a",border:"1px solid #92400e",borderRadius:12,padding:"14px 20px",
@@ -4168,12 +4313,12 @@ export default function App(){
                 )
               })()}
 
-              {leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length>0&&(
+              {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length>0&&(
                 <div style={{marginTop:32}}>
                   <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",
                     textTransform:"uppercase",marginBottom:14}}>🔔 Callbacks Due</div>
                   <div style={{display:"flex",flexDirection:"column",gap:8}}>
-                    {leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").slice(0,5).map(lead=>{
+                    {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").slice(0,5).map(lead=>{
                       const ac=avatarColor(lead.company||lead.firstName||"?")
                       return(
                         <div key={lead.id} style={{background:"#1a1030",borderRadius:10,padding:"14px 18px",
@@ -4402,9 +4547,14 @@ export default function App(){
                       <button
                         onClick={async()=>{
                           if(ids.length===0){ notify("No leads in this view","error"); return }
-                          const raw = window.prompt(`Assign these ${ids.length} lead(s) to which caller?\n(leave blank = release to the unassigned pool)`)
+                          const known=reps.map(r=>r.name).filter(Boolean)
+                          const raw = window.prompt(`Assign these ${ids.length} lead(s) to which caller?`+
+                            (known.length?`\nKnown reps: ${known.join(", ")}`:"")+`\n(leave blank = release to the unassigned pool)`)
                           if(raw===null) return
                           const to = raw.trim()
+                          // Ghost-rep guard: a typo'd name assigns leads to nobody
+                          if(to&&known.length&&!known.some(n=>n.toLowerCase()===to.toLowerCase())
+                            &&!window.confirm(`"${to}" isn't a known rep (${known.join(", ")}).\nAssign anyway?`)) return
                           if(!window.confirm(`Assign ${ids.length} lead${ids.length!==1?"s":""} to ${to||"the unassigned pool"}?`)) return
                           try{
                             const r=await api("/api/leads/assign-ids",{method:"POST",body:JSON.stringify({ids,to})})
@@ -4479,7 +4629,7 @@ export default function App(){
                     const ac=avatarColor(lead.company||lead.firstName||"?")
                     const isMine=!lead.assignedTo||lead.assignedTo===user
                     const takenBy=!isMine?lead.assignedTo:null
-                    const isNewToday=(lead.createdAt||"").startsWith(today)
+                    const isNewToday=tsLocalDate(lead.createdAt)===today
                     return(
                       <div key={lead.id} className={isCb?"lrow-cb":""}
                         style={{display:"grid",gridTemplateColumns:"3fr 2fr 2fr 2fr 3fr",
@@ -4633,7 +4783,7 @@ export default function App(){
                         const list = groups[sk]
                         const fullName = sk==="__none__" ? "No State / Unknown" : (STATE_NAMES[sk]||sk)
                         const collapsed = !!collapsedStates[sk]
-                        const newToday = list.filter(l=>(l.createdAt||"").startsWith(today)).length
+                        const newToday = list.filter(l=>tsLocalDate(l.createdAt)===today).length
                         const stDm   = sortNewFirst(list.filter(isApolloLead))
                         const stWarm = sortNewFirst(list.filter(l=>!isApolloLead(l)))
                         return (
@@ -4672,7 +4822,7 @@ export default function App(){
                                     <Banner color="#8b5cf6" icon="🎯"
                                       label="Decision Makers (Apollo)" count={stDm.length}
                                       subtitle="Direct contacts pulled from Apollo"/>
-                                    {stDm.map(renderRow)}
+                                    {(collapsedStates["showall:"+sk]?stDm:stDm.slice(0,100)).map(renderRow)}
                                   </>
                                 )}
                                 {stWarm.length>0&&(
@@ -4680,8 +4830,17 @@ export default function App(){
                                     <Banner color="#ffe083" icon="🌡️"
                                       label="Warm Leads" count={stWarm.length}
                                       subtitle="Companies — call switchboard, ask for the DM by name if known"/>
-                                    {stWarm.map(renderRow)}
+                                    {(collapsedStates["showall:"+sk]?stWarm:stWarm.slice(0,100)).map(renderRow)}
                                   </>
+                                )}
+                                {/* DOM cap: 100 rows per sub-section until expanded — 10k
+                                    mounted rows made typing in search visibly stall. */}
+                                {!collapsedStates["showall:"+sk]&&(stDm.length>100||stWarm.length>100)&&(
+                                  <button onClick={()=>setCollapsedStates(p=>({...p,["showall:"+sk]:true}))}
+                                    style={{width:"100%",padding:"12px",fontSize:12,fontWeight:700,cursor:"pointer",
+                                      fontFamily:"inherit",border:"none",background:"#141f38",color:"#a3a6ff"}}>
+                                    Show all {stDm.length+stWarm.length} in this state ▾
+                                  </button>
                                 )}
                               </div>
                             )}
@@ -4693,18 +4852,12 @@ export default function App(){
                 })()}
               </div>
 
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:24,padding:"0 4px"}}>
+              {/* (Dead prev/next pagination chrome removed — it never had
+                  handlers; the state sections are the real navigation.) */}
+              <div style={{marginTop:24,padding:"0 4px"}}>
                 <p style={{fontSize:14,color:"#a3aac4"}}>
                   {loading?"Loading…":`Showing ${displayLeads.length} of ${leads.length} lead${leads.length!==1?"s":""}`}
                 </p>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
-                    border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}><IconChevLeft/></button>
-                  <span style={{fontSize:14,fontWeight:700,color:"#a3a6ff",padding:"0 12px",
-                    fontFamily:"'Space Grotesk',sans-serif"}}>1</span>
-                  <button style={{padding:8,borderRadius:8,background:"#141f38",color:"#dee5ff",
-                    border:"none",cursor:"pointer",display:"flex",alignItems:"center"}}><IconChevRight/></button>
-                </div>
               </div>
             </div>
           )}
@@ -5027,9 +5180,10 @@ export default function App(){
                   if(!SNOOZED_OUTCOMES.has(l.status)) return false
                   return l.last_called_at >= snoozeCutoff
                 }
-                const dialerLeads=leads.filter(l=>
+                const dialerLeads=(allLeads.length?allLeads:leads).filter(l=>
                   (!l.assignedTo||l.assignedTo===user)
                   && !NO_DIAL_STATUSES.has(l.status)
+                  && !["not_interested","converted"].includes(l.status)
                   && isValidUsPhone(l.phone)
                   && !isSnoozed(l)
                   && (!dialerState || l.state===dialerState)
@@ -5047,7 +5201,7 @@ export default function App(){
                   // unanswered leads that still need attempts (no_answer, <4
                   // calls). They may be hidden here by the snooze window, but
                   // the caller can still work them — the 4×-before-giveup rule.
-                  const needAttempt = leads.filter(l=>(!l.assignedTo||l.assignedTo===user)&&l.status==="no_answer"&&(l.total_calls||0)<4)
+                  const needAttempt = (allLeads.length?allLeads:leads).filter(l=>(!l.assignedTo||l.assignedTo===user)&&l.status==="no_answer"&&(l.total_calls||0)<4)
                   const scoped = dialerState||dialerCity||dialerUnanswered
                   const scopeLabel = [dialerUnanswered?"unanswered":"",dialerCity||"",dialerState||""].filter(Boolean).join(" ")
                   return(
@@ -5156,8 +5310,16 @@ export default function App(){
                         )}
                       </div>
                       {lead.phone&&(
-                        <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:32,fontWeight:700,
-                          color:"#a3a6ff",letterSpacing:".04em",marginBottom:20}}>{lead.phone}</div>
+                        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20,flexWrap:"wrap"}}>
+                          {/* tel: link — one tap dials on mobile / Google Voice desktop handler */}
+                          <a href={`tel:${lead.phone.replace(/[^\d+]/g,"")}`}
+                            style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:32,fontWeight:700,
+                              color:"#a3a6ff",letterSpacing:".04em",textDecoration:"none"}}>{lead.phone}</a>
+                          <button title="Copy number"
+                            onClick={()=>{navigator.clipboard?.writeText(lead.phone).then(()=>notify("📋 Number copied")).catch(()=>{})}}
+                            style={{fontSize:13,padding:"7px 12px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",
+                              border:"1px solid #40485d40",background:"transparent",color:"#a3aac4"}}>📋 Copy</button>
+                        </div>
                       )}
                       {/* Claim before calling */}
                       {!lead.assignedTo&&(
@@ -5179,13 +5341,24 @@ export default function App(){
                         onClick={()=>setCallModal(lead)}>
                         📞 Log Call
                       </button>
-                      <button disabled={quickLogging===lead.id}
-                        style={{width:"100%",padding:"12px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,
-                          marginTop:8,borderRadius:10,cursor:"pointer",border:"1px solid #ffe08340",
-                          background:"#ffe08312",color:"#ffe083",opacity:quickLogging===lead.id?.5:1}}
-                        onClick={()=>{quickLog(lead);setDialerIdx(i=>i+1)}}>
-                        {quickLogging===lead.id?"…":"⚡ No Answer → next"}
-                      </button>
+                      {/* No manual index bump — the logged lead leaves/reorders in
+                          the queue, so bumping too skipped every other lead. */}
+                      <div style={{display:"flex",gap:8,marginTop:8}}>
+                        <button disabled={quickLogging===lead.id}
+                          style={{flex:1,padding:"12px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,
+                            borderRadius:10,cursor:"pointer",border:"1px solid #ffe08340",
+                            background:"#ffe08312",color:"#ffe083",opacity:quickLogging===lead.id?.5:1}}
+                          onClick={()=>quickLog(lead)}>
+                          {quickLogging===lead.id?"…":"⚡ No Answer"}
+                        </button>
+                        <button disabled={quickLogging===lead.id}
+                          style={{flex:1,padding:"12px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,
+                            borderRadius:10,cursor:"pointer",border:"1px solid #a3a6ff40",
+                            background:"#a3a6ff12",color:"#a3a6ff",opacity:quickLogging===lead.id?.5:1}}
+                          onClick={()=>quickLog(lead,"voicemail")}>
+                          {quickLogging===lead.id?"…":"⚡ Voicemail"}
+                        </button>
+                      </div>
                       <button className="btn btn-g"
                         style={{width:"100%",padding:"13px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",
                           fontWeight:600,marginTop:8,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}
@@ -5256,11 +5429,11 @@ export default function App(){
                       <details style={{marginTop:16,background:"#0f1930",borderRadius:12,padding:"12px 16px"}}>
                         <summary style={{cursor:"pointer",fontSize:"0.6rem",color:"#a3a6ff",fontWeight:700,
                           letterSpacing:".1em",textTransform:"uppercase"}}>
-                          📜 Script: {industryScript.title || industryScript.industry} {industryScript.usage_count>0?`· used ${industryScript.usage_count}×`:""}
+                          📜 Script: {industryScript.name || industryScript.industry} {industryScript.usage_count>0?`· used ${industryScript.usage_count}×`:""}
                         </summary>
                         <div style={{fontSize:13,color:"#dee5ff",lineHeight:1.6,marginTop:10,
                           whiteSpace:"pre-wrap",fontFamily:"'Inter',sans-serif"}}>
-                          {industryScript.body || industryScript.content || industryScript.script || ""}
+                          {industryScript.script_text || industryScript.body || industryScript.content || ""}
                         </div>
                       </details>
                     )}
@@ -5470,7 +5643,7 @@ export default function App(){
 
           {/* ── MY WEEK — caller's call/note workspace ── */}
           {activeNav==="myweek"&&(
-            <MyWeek user={user} leads={allLeads.length?allLeads:leads} onCall={setCallModal} onReload={loadLeads} notify={notify}/>
+            <MyWeek user={user} leads={allLeads.length?allLeads:leads} onCall={setCallModal} onReload={loadLeads} notify={notify} reloadSignal={callModal}/>
           )}
 
           {activeNav==="appointments"&&isAdmin()&&<AppointmentsBoard/>}
@@ -5482,7 +5655,7 @@ export default function App(){
 
           {/* ── FOLLOW-UPS (overdue + today + week + month + later + future) ── */}
           {activeNav==="followups"&&(()=>{
-            const allFollowups = leads
+            const allFollowups = (allLeads.length?allLeads:leads)
               .filter(l=>l.callbackDate&&l.status!=="converted")
               .sort((a,b)=>a.callbackDate.localeCompare(b.callbackDate))
 
@@ -5492,14 +5665,16 @@ export default function App(){
             // 🚶 Completed walkthroughs awaiting a decision get their own
             // top-priority bucket (and are pulled out of the date buckets).
             const wtSet=new Set(apptFollowups.map(f=>String(f.leadId)))
-            const wtLeads=allFollowups.filter(l=>wtSet.has(String(l.id)))
+            const wtLeads=(allLeads.length?allLeads:leads)
+              .filter(l=>wtSet.has(String(l.id))&&l.status!=="converted")
+              .map(l=>l.callbackDate?l:{...l,callbackDate:today})   // row renderer expects a date
             const rest=allFollowups.filter(l=>!wtSet.has(String(l.id)))
             // Overdue splits into UNTOUCHED (nobody called since it came due —
             // the accountability list) vs ATTEMPTED (called, but still carrying
             // the old date). Within both, interested leads outrank routine
             // retries, then oldest first — so the top row is always the most
             // important miss, no matter how long the list gets.
-            const attemptedSince=l=>l.last_called_at&&String(l.last_called_at).slice(0,10)>=l.callbackDate
+            const attemptedSince=l=>l.last_called_at&&tsLocalDate(l.last_called_at)>=l.callbackDate
             const statusPrio={interested:0,interested_no_dm:1,callback:2}
             const byUrgency=(a,b)=>((statusPrio[a.status]??9)-(statusPrio[b.status]??9))
               ||a.callbackDate.localeCompare(b.callbackDate)
@@ -5623,7 +5798,7 @@ export default function App(){
                                 </div>
                                 {/* Attempted bucket: show WHEN the try happened */}
                                 {b.key==="overdue_tried"&&lead.last_called_at&&(
-                                  <div style={{fontSize:10,color:"#69f6b8",marginTop:2}}>✆ tried {String(lead.last_called_at).slice(5,10)}</div>
+                                  <div style={{fontSize:10,color:"#69f6b8",marginTop:2}}>✆ tried {tsLocalDate(lead.last_called_at).slice(5)}</div>
                                 )}
                               </div>
                               <span className="pill" style={{background:info.color+"20",color:info.color,
@@ -6181,12 +6356,12 @@ export default function App(){
                   <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
                     onClick={()=>{
                       api("/api/reps").then(r=>{ if(Array.isArray(r)) setReps(r) }).catch(()=>{})
-                    }}>Load Reps</button>
+                    }}>Refresh</button>
                 </div>
                 {(()=>{
                   if(!reps.length) return(
                     <div style={{padding:32,textAlign:"center",color:"#40485d",fontSize:13}}>
-                      Click "Load Reps" to see team status
+                      Loading team status…
                     </div>
                   )
                   return(
@@ -6232,7 +6407,9 @@ export default function App(){
                                 }}>Set Quota</button>
                               <button className="btn btn-g" style={{fontSize:11,padding:"5px 10px"}}
                                 onClick={async()=>{
-                                  const to=window.prompt(`Reassign all of ${rep.name}'s leads to whom?\n(Leave blank to return to pool)`)
+                                  const known=reps.map(r=>r.name).filter(n=>n&&n!==rep.name)
+                                  const to=window.prompt(`Reassign all of ${rep.name}'s leads to whom?`+
+                                    (known.length?`\nKnown reps: ${known.join(", ")}`:"")+`\n(Leave blank to return to pool)`)
                                   if(to===null) return
                                   try{
                                     const r=await api("/api/leads/reassign",{method:"POST",
@@ -6332,10 +6509,12 @@ export default function App(){
                 <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}}
                   onClick={()=>{
                     if(!callHistory.length){notify("No data to export","error");return}
-                    const headers=["Date","Time","Rep","Outcome","Duration (min)","Notes"]
+                    const headers=["Date","Time","Company","Phone","Rep","Outcome","Duration (min)","Notes"]
                     const rows=callHistory.map(c=>[
                       c.calledAt?new Date(c.calledAt).toLocaleDateString():"",
                       c.calledAt?new Date(c.calledAt).toLocaleTimeString():"",
+                      `"${(c.lead_company||"").replace(/"/g,'""')}"`,
+                      c.lead_phone||"",
                       c.calledBy||"",
                       c.outcome||"",
                       c.duration?Math.round(c.duration/60):"0",
@@ -6487,24 +6666,26 @@ export default function App(){
                       fontSize:"0.55rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase"}}>
                       Call Log ({callHistory.length})
                     </div>
-                    <div style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 3fr",
+                    <div style={{display:"grid",gridTemplateColumns:"2fr 3fr 1.5fr 2fr 3fr",
                       padding:"8px 20px",fontSize:"0.5rem",fontWeight:700,
                       color:"#a3aac4",textTransform:"uppercase",letterSpacing:".08em",
                       borderBottom:"1px solid #40485d15"}}>
-                      <div>Outcome</div><div>Rep</div><div>Date / Time</div><div>Notes</div>
+                      <div>Outcome</div><div>Company</div><div>Rep</div><div>Date / Time</div><div>Notes</div>
                     </div>
                     {callHistory.slice(0,100).map((call,i)=>{
                       const oc=CALL_OUTCOMES.find(o=>o.value===call.outcome)||{label:call.outcome||"Call"}
                       const col=call.outcome==="converted"?"#69f6b8":call.outcome==="interested"?"#ffe083":
                         call.outcome==="callback"?"#8b5cf6":call.outcome==="no_answer"?"#40485d":"#dee5ff"
                       return(
-                        <div key={call.id||i} style={{display:"grid",gridTemplateColumns:"2fr 2fr 2fr 3fr",
+                        <div key={call.id||i} style={{display:"grid",gridTemplateColumns:"2fr 3fr 1.5fr 2fr 3fr",
                           padding:"12px 20px",alignItems:"center",borderBottom:"1px solid #40485d08",
                           transition:"background .12s"}}
                           onMouseEnter={e=>e.currentTarget.style.background="#192540"}
                           onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
                           <span className="pill" style={{background:col+"20",color:col,
                             border:`1px solid ${col}30`,width:"fit-content"}}>{oc.label}</span>
+                          <div style={{fontSize:12,color:"#dee5ff",overflow:"hidden",textOverflow:"ellipsis",
+                            whiteSpace:"nowrap"}} title={call.lead_phone||""}>{call.lead_company||"\u2014"}</div>
                           <div style={{fontSize:13,color:"#dee5ff"}}>{call.calledBy||"\u2014"}</div>
                           <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:12,color:"#a3aac4"}}>
                             {call.calledAt?new Date(call.calledAt).toLocaleDateString():""}
@@ -6561,7 +6742,7 @@ export default function App(){
       </nav>
 
       {/* ── Modals ───────────────────────────────────────────────────────── */}
-      {callModal&&<CallModal lead={callModal} onClose={()=>setCallModal(null)} onSaved={loadLeads}/>}
+      {callModal&&<CallModal lead={callModal} onClose={()=>setCallModal(null)} onSaved={()=>refreshLead(callModal.id)} onEmail={l=>setEmailModal(l)}/>}
       {emailModal&&<EmailModal lead={emailModal} onClose={()=>setEmailModal(null)} onSent={()=>notify("Email sent!")}/>}
       {editModal&&(
         <LeadModal lead={editModal===true?null:editModal} onClose={()=>setEditModal(null)}
@@ -6575,6 +6756,16 @@ export default function App(){
             color:toast.type==="error"?"#ff6e84":"#dee5ff"}}>
           {toast.msg}
         </div>
+      )}
+      {/* ↩ Undo chip for the last ⚡ quick log (20s window, 2-min server cap) */}
+      {lastQuick&&(
+        <button onClick={undoQuickLog}
+          style={{position:"fixed",bottom:24,left:24,zIndex:450,padding:"10px 18px",
+            borderRadius:12,fontSize:13,fontWeight:700,fontFamily:"'Space Grotesk',sans-serif",
+            cursor:"pointer",border:"1px solid #ffe08360",background:"#1a2440",
+            color:"#ffe083",boxShadow:"0 8px 24px rgba(0,0,0,.4)"}}>
+          ↩ Undo ⚡ {lastQuick.company.slice(0,24)}
+        </button>
       )}
     </div>
   )
@@ -8901,7 +9092,7 @@ function AuditLogPanel(){
       .catch(()=>setEntries([]))
       .finally(()=>setLoad(false))
   }
-  useEffect(()=>{ if(open) load() },[open, filterAction, filterUser])
+  useEffect(()=>{ if(!open) return; const t=setTimeout(load, filterUser?400:0); return()=>clearTimeout(t) },[open, filterAction, filterUser]) // eslint-disable-line
 
   const fmt = (iso)=>iso?new Date(iso).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):""
 

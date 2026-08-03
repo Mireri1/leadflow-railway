@@ -82,7 +82,19 @@ Supabase columns: `budgetfocus`, `vendorstatus`, `decisionmaker`, `timeline`, `q
 ### Route Ordering
 - `/api/calls/qualified` MUST be defined BEFORE `/api/calls/{lead_id}` in main.py
 - `/api/calls/history` MUST be defined BEFORE `/api/calls/{lead_id}`
+- `GET /api/leads/{lead_id}` (single-lead, powers frontend targeted refresh) MUST stay AFTER `/api/leads/lookup` and `/api/leads/emailed-flags`
 - FastAPI matches routes in order — wildcard catches everything if first
+
+### 2026-08 audit fixes (don't regress these)
+- **All App hooks above `if(!user) return <Login/>`** — a hook below it crashed React to a blank screen on every login/logout (proven live).
+- CallModal PATCH must NOT send `callbackDate:""` on neutral outcomes (wiped scheduled callbacks); clears only on not_interested/converted.
+- ⚡ quickLog: optimistic single-lead update (no full loadLeads), never demotes engaged statuses, 20s undo via `POST /api/calls/{id}/undo` (own call, ≤2min).
+- `tsLocalDate(ts)` for ANY timestamp-vs-business-date compare (UTC slice [:10] breaks after ~8pm ET). Backend: `local_day_start_utc()` for calls-today.
+- Dialer/Follow-Ups/Dashboard widgets derive from `allLeads.length?allLeads:leads`, never the filter-scoped `leads`.
+- log_call stores `calledBy = authenticated caller` (spoof defeated anti-gaming). Sequencer has a 48h `_recently_sent` audit-row dedupe (fail-closed) so a failed post-send PATCH can't cause an email re-send loop.
+- Nudges (email-queue, walkthrough) cooldown on the UTC date to match the UTC hour gate — ET-date cooldown fired them at midnight ET.
+- Leaderboard responses cached 30s (`_leaderboard_cache`); GZipMiddleware on; `/api/leads?…` refetch after saves replaced by `refreshLead()`; segBase/displayLeads are useMemo'd; lead sections DOM-capped at 100 rows.
+- `supabase_indexes.sql` at repo root — run in Supabase SQL editor after major query changes.
 
 ### React Hooks
 - Never use `useState`/`useEffect` inside IIFEs or conditionals
