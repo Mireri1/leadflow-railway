@@ -3454,6 +3454,9 @@ export default function App(){
     const iv=setInterval(load, 30*60*1000)
     return()=>clearInterval(iv)
   },[user]) // eslint-disable-line
+  // Follow-Ups tab: far-out buckets start collapsed so the page stays
+  // scannable as volume grows. (State lives here — no hooks in the IIFE.)
+  const [fuCollapsed,setFuCollapsed] = useState({month:true,later:true,future:true})
   // Industry → top script lookup. Populated lazily when the dialer opens.
   // Cached per industry so we don't hammer /api/scripts on every navigation.
   const [scriptCache,setScriptCache] = useState({})  // {industry: script}
@@ -5491,16 +5494,29 @@ export default function App(){
             const wtSet=new Set(apptFollowups.map(f=>String(f.leadId)))
             const wtLeads=allFollowups.filter(l=>wtSet.has(String(l.id)))
             const rest=allFollowups.filter(l=>!wtSet.has(String(l.id)))
+            // Overdue splits into UNTOUCHED (nobody called since it came due —
+            // the accountability list) vs ATTEMPTED (called, but still carrying
+            // the old date). Within both, interested leads outrank routine
+            // retries, then oldest first — so the top row is always the most
+            // important miss, no matter how long the list gets.
+            const attemptedSince=l=>l.last_called_at&&String(l.last_called_at).slice(0,10)>=l.callbackDate
+            const statusPrio={interested:0,interested_no_dm:1,callback:2}
+            const byUrgency=(a,b)=>((statusPrio[a.status]??9)-(statusPrio[b.status]??9))
+              ||a.callbackDate.localeCompare(b.callbackDate)
+            const overdueAll=rest.filter(l=>l.callbackDate<today)
             const buckets = [
               {key:"walkthrough", label:"Walkthrough Follow-Ups", color:"#ff9f43", icon:"🚶",
                 desc:"Walkthrough completed, no decision yet — call these first",
                 leads: wtLeads},
-              {key:"overdue", label:"Overdue", color:"#ff6e84", icon:"⚠",
-                desc:"Past due — these callbacks didn't happen yet",
-                leads: rest.filter(l=>l.callbackDate<today)},
+              {key:"overdue", label:"Overdue — Untouched", color:"#ff6e84", icon:"🚨",
+                desc:"Past due and nobody has called since — the real misses",
+                leads: overdueAll.filter(l=>!attemptedSince(l)).sort(byUrgency)},
+              {key:"overdue_tried", label:"Overdue — Attempted", color:"#ffb86b", icon:"✆",
+                desc:"Called since due but still on the old date — reschedule or close out",
+                leads: overdueAll.filter(attemptedSince).sort(byUrgency)},
               {key:"today",   label:"Today",   color:"#ffe083", icon:"📞",
                 desc:"Call back today",
-                leads: rest.filter(l=>l.callbackDate===today)},
+                leads: rest.filter(l=>l.callbackDate===today).sort(byUrgency)},
               {key:"week",    label:"This Week", color:"#69f6b8", icon:"🗓",
                 desc:"Next 7 days",
                 leads: rest.filter(l=>l.callbackDate>today&&l.callbackDate<=d7)},
@@ -5558,7 +5574,8 @@ export default function App(){
                     {buckets.filter(b=>b.leads.length>0).map(b=>(
                       <div key={b.key} style={{background:"#0f1930",borderRadius:12,overflow:"hidden",
                         borderTop:`3px solid ${b.color}`}}>
-                        <div style={{padding:"14px 24px",display:"flex",alignItems:"center",gap:12,
+                        <div onClick={()=>setFuCollapsed(p=>({...p,[b.key]:!p[b.key]}))}
+                          style={{padding:"14px 24px",display:"flex",alignItems:"center",gap:12,cursor:"pointer",
                           borderBottom:"1px solid #40485d20",background:`${b.color}08`,flexWrap:"wrap"}}>
                           <span style={{fontSize:18}}>{b.icon}</span>
                           <span style={{fontSize:13,fontWeight:700,color:b.color,letterSpacing:".05em",textTransform:"uppercase"}}>
@@ -5569,8 +5586,10 @@ export default function App(){
                             {b.leads.length}
                           </span>
                           <span style={{fontSize:11,color:"#a3aac4",marginLeft:6}}>{b.desc}</span>
+                          <span style={{marginLeft:"auto",fontSize:11,color:"#5a6a8a",
+                            transition:"transform .15s",transform:fuCollapsed[b.key]?"rotate(0)":"rotate(180deg)"}}>▼</span>
                         </div>
-                        {b.leads.map(lead=>{
+                        {!fuCollapsed[b.key]&&b.leads.map(lead=>{
                           const ac=avatarColor(lead.company||lead.firstName||"?")
                           const info=STATUS_OPTIONS.find(s=>s.value===lead.status)||STATUS_OPTIONS[0]
                           return(
@@ -5602,11 +5621,9 @@ export default function App(){
                                 <div style={{fontSize:11,color:"#40485d",marginTop:2}}>
                                   {relativeTime(lead.callbackDate)}
                                 </div>
-                                {/* Overdue accountability: did anyone actually try since it came due? */}
-                                {b.key==="overdue"&&(
-                                  lead.last_called_at&&String(lead.last_called_at).slice(0,10)>=lead.callbackDate
-                                    ?<div style={{fontSize:10,color:"#69f6b8",marginTop:2}}>✆ tried {String(lead.last_called_at).slice(5,10)}</div>
-                                    :<div style={{fontSize:10,color:"#ff9f43",marginTop:2}}>no call since due</div>
+                                {/* Attempted bucket: show WHEN the try happened */}
+                                {b.key==="overdue_tried"&&lead.last_called_at&&(
+                                  <div style={{fontSize:10,color:"#69f6b8",marginTop:2}}>✆ tried {String(lead.last_called_at).slice(5,10)}</div>
                                 )}
                               </div>
                               <span className="pill" style={{background:info.color+"20",color:info.color,
