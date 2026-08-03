@@ -34,3 +34,18 @@ jobs:
           echo "ASSETS:"
           grep -o '/assets/index-[A-Za-z0-9_-]*\.js' /tmp/root.html | sort -u || echo "(none found)"
           grep -o '/assets/index-[A-Za-z0-9_-]*\.css' /tmp/root.html | sort -u || true
+
+      - name: Is the latest main commit actually live?
+        run: |
+          BASE="https://leadflow-railway-production.up.railway.app"
+          curl -sS -o /tmp/root.html --max-time 30 "$BASE/"
+          JS=$(grep -o '/assets/index-[A-Za-z0-9_-]*\.js' /tmp/root.html | sort -u | head -1)
+          echo "BUNDLE: $JS"
+          curl -sS -o /tmp/bundle.js --max-time 60 "$BASE$JS"
+          echo "BUNDLE_BYTES: $(wc -c < /tmp/bundle.js)"
+          # "Untouched" (Follow-Ups overdue split) ships only in the 2026-08 batch.
+          if grep -q 'Untouched' /tmp/bundle.js; then
+            echo "MARKER_UNTOUCHED: PRESENT  -> Aug-02 batch is deployed"
+          else
+            echo "MARKER_UNTOUCHED: ABSENT   -> deployed bundle predates the Aug-02 batch"
+          fi
