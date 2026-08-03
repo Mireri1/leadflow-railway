@@ -2493,6 +2493,12 @@ def _bg_maintenance_loop():
             run_email_queue_nudge_if_due()
         except Exception as e:
             print(f"[EMAIL-NUDGE] loop exception: {e}")
+        # Walkthrough follow-up nudge — once per ET day to the Eric+Angelo
+        # channel when completed walkthroughs are still awaiting a decision.
+        try:
+            run_walkthrough_followup_nudge_if_due()
+        except Exception as e:
+            print(f"[WALKTHROUGH-NUDGE] loop exception: {e}")
         # Monthly macro snapshot — banks one FRED reading per calendar month so a
         # paired macro × receptivity history builds up. No-op once banked.
         try:
@@ -5617,6 +5623,53 @@ def _notify_angelo(appt):
     except Exception as e:
         print(f"[APPT] angelo notify failed: {e}")
 
+def _notify_walkthrough_update(appt, stage, by):
+    """Post a walkthrough progress update to the Eric+Angelo channel (the
+    Angelo webhook) — separate from the main team channel so the two of them
+    get a clean thread of walkthrough outcomes and follow-ups."""
+    hook = ANGELO_SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL
+    if not hook:
+        return
+    titles = {"confirmed": "📍 Walkthrough confirmed",
+              "won":       "🏆 Walkthrough WON — new client",
+              "lost":      "❌ Walkthrough lost"}
+    fields = [f"*Company:* {appt.get('company','—')}", f"*Walkthrough date:* {(appt.get('date') or '—')[:10]}",
+              f"*Area:* {appt.get('area','—')}", f"*Updated by:* {by}"]
+    if appt.get("decision"):
+        fields.append(f"*Decision:* {appt['decision']}")
+    if appt.get("phone"):
+        fields.append(f"*Phone:* {appt['phone']}")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": titles.get(stage, f"Walkthrough → {stage}"), "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(fields)}},
+    ]
+    try:
+        req_lib.post(hook, json={"blocks": blocks}, timeout=10)
+    except Exception as e:
+        print(f"[APPT] walkthrough update notify failed: {e}")
+
+def _get_walkthrough_followups():
+    """Appointments whose walkthrough date has passed without a won/lost
+    decision — the highest-priority follow-ups in the system."""
+    out = []
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=like.appt_*&select=value",
+                        headers=SB_ADMIN_HEADERS, timeout=15)
+        today = local_today()
+        for row in (r.json() if r.status_code == 200 else []):
+            try:
+                a = json_lib.loads(row.get("value") or "{}")
+            except Exception:
+                continue
+            if a.get("stage") in ("approved", "confirmed") and (a.get("date") or "")[:10] <= today and a.get("date"):
+                out.append({"leadId": a.get("leadId"), "company": a.get("company"),
+                            "date": (a.get("date") or "")[:10], "stage": a.get("stage"),
+                            "createdBy": a.get("createdBy"), "phone": a.get("phone")})
+    except Exception as e:
+        print(f"[APPT] followups scan failed: {e}")
+    out.sort(key=lambda a: a.get("date") or "9999")
+    return out
+
 def _appt_approve_link(lead_id):
     """Signed one-click approve URL for the Slack ping (7-day expiry)."""
     tok = jwt.encode({"leadId": str(lead_id), "act": "approve_appt",
@@ -5753,6 +5806,12 @@ def list_appointments(user: str = Depends(verify_token)):
     out.sort(key=lambda a: a.get("date", "") or "9999")
     return {"appointments": out, "stages": APPT_STAGES}
 
+@app.get("/api/appointments/followups")
+def walkthrough_followups(user: str = Depends(verify_token)):
+    """Completed-walkthrough follow-ups (any caller — these outrank ordinary
+    due callbacks in the dialer's 'Who's next?' priority)."""
+    return {"followups": _get_walkthrough_followups()}
+
 @app.post("/api/appointments/{lead_id}/transition")
 async def transition_appointment(lead_id: str, request: Request, user: str = Depends(verify_token)):
     """Move an appointment to a new stage (admin). 'approved' fires the Angelo
@@ -5781,6 +5840,8 @@ async def transition_appointment(lead_id: str, request: Request, user: str = Dep
     _settings_set_json(key, appt)
     if stage == "approved":
         _notify_angelo(appt)
+    elif stage in ("confirmed", "won", "lost"):
+        _notify_walkthrough_update(appt, stage, user)
     return appt
 
 @app.delete("/api/appointments/{lead_id}")
@@ -6077,7 +6138,7 @@ def get_qualified_calls(user: str = Depends(verify_token)):
             ids_filter = ",".join(str(lid) for lid in lead_ids)
             lr = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})"
-                f"&select=id,company,firstName,lastName,phone,industry,state,score,status,assignedTo",
+                f"&select=id,company,firstName,lastName,phone,email,industry,state,score,status,assignedTo",
                 headers=SB_HEADERS, timeout=30)
             leads_data = lr.json() if lr.status_code == 200 else []
             if isinstance(leads_data, list):
@@ -8441,6 +8502,62 @@ def _email_queue_link():
 
 EMAIL_QUEUE_NUDGE_ENABLED = os.getenv("EMAIL_QUEUE_NUDGE_ENABLED", "1") == "1"
 
+WALKTHROUGH_FOLLOWUP_NUDGE_ENABLED = os.getenv("WALKTHROUGH_FOLLOWUP_NUDGE_ENABLED", "1") == "1"
+
+def run_walkthrough_followup_nudge_if_due():
+    """Once per ET day (after the digest hour): if any walkthroughs happened but
+    still have no won/lost decision, ping the Eric+Angelo channel with the list.
+    Separate channel from the team digest so walkthrough follow-through has its
+    own clean thread."""
+    if not WALKTHROUGH_FOLLOWUP_NUDGE_ENABLED or not (ANGELO_SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL):
+        return
+    try:
+        now = datetime.utcnow()
+        if now.hour < DAILY_DIGEST_HOUR_UTC:
+            return
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_walkthrough_nudge&select=value",
+                        headers=SB_ADMIN_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return
+        rows = r.json()
+        if rows and (rows[0].get("value") or "")[:10] == local_today():
+            return
+        fus = _get_walkthrough_followups()
+        # record BEFORE posting (rolling-deploy double-post guard); record even
+        # when 0 so we don't recheck every tick all night.
+        req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                     headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                     json={"key": "last_walkthrough_nudge", "value": local_today()}, timeout=10)
+        if not fus:
+            return
+        today_dt = datetime.strptime(local_today(), "%Y-%m-%d")
+        def _days_ago(d):
+            try:
+                return (today_dt - datetime.strptime(d, "%Y-%m-%d")).days
+            except Exception:
+                return 0
+        lines = "\n".join(
+            f"• *{f.get('company','?')}* — walkthrough {f['date']} ({_days_ago(f['date'])}d ago), "
+            f"booked by {f.get('createdBy','—')}" + (f" · {f['phone']}" if f.get("phone") else "")
+            for f in fus[:8])
+        if len(fus) > 8:
+            lines += f"\n…and {len(fus)-8} more"
+        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text",
+             "text": f"🚶 {len(fus)} walkthrough{'s' if len(fus)!=1 else ''} awaiting decision", "emoji": True}},
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": f"Walkthroughs done but not closed won/lost — top follow-up priority:\n{lines}"}},
+            {"type": "actions", "elements": [{"type": "button",
+             "text": {"type": "plain_text", "text": "Open Appointments board", "emoji": True},
+             "url": app_url, "style": "primary"}]},
+        ]
+        hook = ANGELO_SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL
+        req_lib.post(hook, json={"blocks": blocks}, timeout=10)
+        print(f"[WALKTHROUGH-NUDGE] pinged — {len(fus)} awaiting decision")
+    except Exception as e:
+        print(f"[WALKTHROUGH-NUDGE] failed: {e}")
+
 def run_email_queue_nudge_if_due():
     """Once per ET day (after the digest hour): if there are leads eligible for
     the tried-to-call email, ping Slack with a one-click Review & Send link."""
@@ -9124,6 +9241,51 @@ def _trend_arrow(now, prev):
     d = now - prev
     return "↑" if d > 0 else "↓" if d < 0 else "→"
 
+# Interest parked further out than this many days is "long nurture", not
+# actionable — it stays out of the daily digest's qualified-highlights section.
+DIGEST_ACTIONABLE_MAX_DAYS = int(os.getenv("DIGEST_ACTIONABLE_MAX_DAYS", "90"))
+
+def _strip_note_tags(note: str) -> str:
+    """Remove machine tokens ([sent:*], [INTENT:*], [seq:*] etc.) for display."""
+    return re.sub(r"\[[A-Za-z]+:[^\]]*\]", "", note or "").strip()
+
+def _digest_qualified_highlights(calls: list, today: str) -> str:
+    """Bullets for today's actionable qualified/interested calls (with notes).
+    Skips leads whose callback is parked > DIGEST_ACTIONABLE_MAX_DAYS out."""
+    try:
+        actionable = [c for c in calls
+                      if (c.get("outcome") in ("interested", "converted", "callback") or c.get("qualified"))
+                      and _strip_note_tags(c.get("notes"))]
+        if not actionable:
+            return ""
+        horizon = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=DIGEST_ACTIONABLE_MAX_DAYS)).strftime("%Y-%m-%d")
+        lead_ids = list({c["leadId"] for c in actionable if c.get("leadId")})
+        leads_map = {}
+        if lead_ids:
+            lr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({','.join(str(i) for i in lead_ids)})"
+                f"&select=id,company,callbackDate", headers=SB_HEADERS, timeout=15)
+            if lr.status_code == 200 and isinstance(lr.json(), list):
+                leads_map = {l["id"]: l for l in lr.json()}
+        lines = []
+        for c in actionable:
+            lead = leads_map.get(c.get("leadId")) or {}
+            cb = (lead.get("callbackDate") or "")[:10]
+            if cb and cb > horizon:
+                continue   # parked months out — long nurture, not actionable today
+            note = _strip_note_tags(c.get("notes"))
+            if len(note) > 140:
+                note = note[:137] + "…"
+            tag = c.get("qualified") or c.get("outcome") or ""
+            cb_part = f", cb {cb}" if cb else ""
+            lines.append(f"  • *{lead.get('company') or 'Unknown'}* ({tag}{cb_part}) — {note}")
+            if len(lines) >= 5:
+                break
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[daily-summary] qualified highlights failed: {e}")
+        return ""
+
 @app.get("/api/daily-summary")
 def daily_summary(user: str = Depends(verify_cron_or_admin)):
     """Send end-of-day summary to Slack. Triggered by Railway cron (?secret=
@@ -9142,9 +9304,10 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
         wk_start = (now - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00")
         prior_start = (now - timedelta(days=14)).strftime("%Y-%m-%dT00:00:00")
 
-        # Calls today (with notes for theme tally)
+        # Calls today (with notes for theme tally + qual fields for the
+        # qualified-highlights section)
         r_calls = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,notes,vendorstatus&calledAt=gte.{day_start_utc}",
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,notes,vendorstatus,qualified,timeline,leadId&calledAt=gte.{day_start_utc}",
             headers=SB_HEADERS, timeout=30)
         calls = r_calls.json() if r_calls.status_code == 200 else []
 
@@ -9202,6 +9365,11 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
 
         interested = len([c for c in (calls if isinstance(calls, list) else []) if c.get("outcome") in ("interested", "converted", "callback")])
 
+        # ── Qualified highlights: today's actionable interest, with notes ──
+        # Only near-term signal makes the digest — interest parked months out
+        # (long-nurture / Future Follow-Ups) is noise at the daily cadence.
+        qual_lines = _digest_qualified_highlights(calls if isinstance(calls, list) else [], today)
+
         # ── Patterns + week-over-week trend (the seasonality base) ──
         themes_today = _theme_tally(calls).most_common(3)
         themes_txt = "\n".join(f"  • {t}: *{n}*" for t, n in themes_today) or "  No notes logged"
@@ -9224,6 +9392,7 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
                 "\n".join(f"  • {(x.get('company') or x.get('from') or '?')} ({x.get('sentiment','?')})"
                            for x in replies[:5]))}] if replies else []),
             {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
+            *([{"label": "⭐ Qualified highlights (actionable)", "value": qual_lines}] if qual_lines else []),
             {"label": "Top Callers", "value": lb_text},
             {"label": "Today's objections / themes", "value": themes_txt},
             {"label": "📈 This week vs last (trend)", "value": trend_txt},

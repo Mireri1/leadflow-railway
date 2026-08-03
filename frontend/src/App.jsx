@@ -2267,12 +2267,34 @@ function CallModal({lead: leadProp,onClose,onSaved}){
 // ─── EmailModal ──────────────────────────────────────────────────────────────
 
 function EmailModal({lead,onClose,onSent}){
-  const defaultBody=(name)=>`Hi ${name},\n\nThank you for taking our call today. It was great connecting with you.\n\nIf you'd like a free, no obligation estimate, simply reply to this email with your approximate square footage and how often you'd like service (daily, weekly, bi weekly, monthly) and we'll send a custom quote your way as soon as possible.\n\nYou can also learn more about Vision Cleaning Company and the services we offer at https://visioncleaningcompanyllc.com. Feel free to request your quote directly through our site any time.\n\nWe appreciate the opportunity and look forward to the chance to work with you.\n\nBest regards,\nVision Cleaning Company\nconnect@visioncleaningcompanyllc.com\nhttps://visioncleaningcompanyllc.com`
+  // Built-in scripts, picked by situation. "asked" = a qualified/interested
+  // prospect said "just email me something"; "missed" = we couldn't reach them;
+  // "spoke" = the original post-call thank-you. Defaults from lead status.
+  const _name=lead?.firstName||lead?.company||"there"
+  const _co=lead?.company||"your facility"
+  const SIG=`Best regards,\nVision Cleaning Company\nconnect@visioncleaningcompanyllc.com\nhttps://visioncleaningcompanyllc.com`
+  const PRESETS={
+    asked:{
+      label:"✉️ Asked for info",
+      subject:lead?.company?`Cleaning info + quote for ${lead.company} — Vision Cleaning`:"Cleaning info + quote — Vision Cleaning",
+      body:`Hi ${_name},\n\nThank you for your interest — as requested, here's a quick overview of Vision Cleaning Company.\n\nWe provide commercial cleaning for offices, medical facilities, schools, gyms, and more — daily, weekly, bi-weekly, or monthly, on a schedule built around your operation. Every plan is customized and flat-rate, so there are no surprises.\n\nFor a free, no-obligation quote for ${_co}, simply reply with:\n• Approximate square footage\n• How often you'd like service (daily / weekly / bi-weekly / monthly)\n• Any priority areas (restrooms, floors, windows, etc.)\n\nWe'll have a custom quote back to you within 24 hours. You can also learn more or request a quote any time at https://visioncleaningcompanyllc.com.\n\nWe appreciate the opportunity and look forward to working with you.\n\n${SIG}`},
+    spoke:{
+      label:"🤝 We spoke",
+      subject:lead?.company?`Following Up — ${lead.company}`:"Following Up",
+      body:`Hi ${_name},\n\nThank you for taking our call today. It was great connecting with you.\n\nIf you'd like a free, no obligation estimate, simply reply to this email with your approximate square footage and how often you'd like service (daily, weekly, bi weekly, monthly) and we'll send a custom quote your way as soon as possible.\n\nYou can also learn more about Vision Cleaning Company and the services we offer at https://visioncleaningcompanyllc.com. Feel free to request your quote directly through our site any time.\n\nWe appreciate the opportunity and look forward to the chance to work with you.\n\n${SIG}`},
+    missed:{
+      label:"📵 Missed call",
+      subject:lead?.company?`Sorry we missed you — ${lead.company}`:"Sorry we missed you",
+      body:`Hi ${_name},\n\nSorry we missed each other — we tried reaching you about cleaning service at ${_co}.\n\nVision Cleaning Company provides commercial cleaning on daily, weekly, bi-weekly, or monthly schedules, and we'd love to put a free, no-obligation quote together for you. If a call is tough to fit in, simply reply to this email with your approximate square footage and how often you'd like service, and we'll send a custom quote your way within 24 hours.\n\nYou can also learn more about us and the services we offer at https://visioncleaningcompanyllc.com.\n\nHope to connect soon.\n\n${SIG}`},
+  }
+  const defaultPreset=["interested","callback","converted"].includes(lead?.status)?"asked"
+    :lead?.status==="no_answer"?"missed":"spoke"
 
+  const [preset,setPreset]=useState(defaultPreset)
   const [toEmail,setToEmail]=useState(lead?.email||"")
   const [toName,setToName]=useState(lead?[lead.firstName,lead.lastName].filter(Boolean).join(" "):"")
-  const [subject,setSubject]=useState(lead?.company?`Following Up — ${lead.company}`:"Following Up")
-  const [body,setBody]=useState(()=>defaultBody(lead?.firstName||lead?.company||"there"))
+  const [subject,setSubject]=useState(PRESETS[defaultPreset].subject)
+  const [body,setBody]=useState(PRESETS[defaultPreset].body)
   const [sending,setSending]=useState(false)
   const [err,setErr]=useState("")
   const [sent,setSent]=useState(false)
@@ -2291,10 +2313,15 @@ function EmailModal({lead,onClose,onSent}){
     }
   },[lead?.id])
 
+  const applyPreset=(k)=>{
+    setPreset(k);setSelectedTpl("")
+    setSubject(PRESETS[k].subject);setBody(PRESETS[k].body)
+  }
+
   const applyTemplate=(tplId)=>{
     const tpl=templates.find(t=>t.id===parseInt(tplId))
     if(!tpl){setSelectedTpl("");return}
-    setSelectedTpl(tplId)
+    setSelectedTpl(tplId);setPreset("")
     // Personalize: replace {{name}}, {{company}}, {{firstName}}
     const name=lead?.firstName||lead?.company||"there"
     const co=lead?.company||"your company"
@@ -2360,6 +2387,20 @@ function EmailModal({lead,onClose,onSent}){
               display:"flex",alignItems:"center",gap:8}}>
               <span>&#9888;</span>{err}
             </div>}
+
+            {/* Built-in script picker — situation-specific starting points */}
+            <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+              {Object.entries(PRESETS).map(([k,p])=>(
+                <button key={k} onClick={()=>applyPreset(k)}
+                  style={{padding:"8px 14px",borderRadius:10,fontSize:12,fontWeight:700,cursor:"pointer",
+                    fontFamily:"inherit",
+                    background:preset===k?"#a3a6ff22":"transparent",
+                    color:preset===k?"#a3a6ff":"#a3aac4",
+                    border:"1px solid "+(preset===k?"#a3a6ff60":"#40485d40")}}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
 
             {/* Template selector */}
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
@@ -3270,6 +3311,17 @@ export default function App(){
   const [warmLeads,setWarmLeads] = useState([])
   const [warmLoading,setWarmLoading] = useState(false)
   const [emailModal,setEmailModal] = useState(null)
+  // 🚶 Completed walkthroughs still awaiting a won/lost decision — the
+  // highest-priority follow-ups in the system (outrank due callbacks).
+  const [apptFollowups,setApptFollowups] = useState([])
+  useEffect(()=>{
+    if(!user) return
+    const load=()=>api("/api/appointments/followups")
+      .then(r=>setApptFollowups(Array.isArray(r?.followups)?r.followups:[])).catch(()=>{})
+    load()
+    const iv=setInterval(load, 30*60*1000)
+    return()=>clearInterval(iv)
+  },[user]) // eslint-disable-line
   // Industry → top script lookup. Populated lazily when the dialer opens.
   // Cached per industry so we don't hammer /api/scripts on every navigation.
   const [scriptCache,setScriptCache] = useState({})  // {industry: script}
@@ -3379,11 +3431,17 @@ export default function App(){
     finally{ setQuickLogging(null) }
   }
 
-  // 📞 "Who's next?" — the single best next dial: due callbacks → warm → fresh.
+  // 📞 "Who's next?" — the single best next dial: walkthrough follow-ups →
+  // due callbacks → warm → fresh.
   function pickNextLead(){
     const pool=(allLeads.length?allLeads:leads)
     const t=localDate()
     const mine=l=>!l.assignedTo||l.assignedTo===user
+    // 🚶 Completed walkthroughs awaiting a decision outrank everything.
+    const wt=new Map(apptFollowups.map(f=>[String(f.leadId),f]))
+    const walk=pool.filter(l=>wt.has(String(l.id))&&l.status!=="converted"&&mine(l))
+      .sort((a,b)=>(wt.get(String(a.id)).date||"").localeCompare(wt.get(String(b.id)).date||""))
+    if(walk.length) return walk[0]
     const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l))
       .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
     if(due.length) return due[0]
@@ -3421,14 +3479,18 @@ export default function App(){
       const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"
         &&(!l.assignedTo||l.assignedTo===user)
         &&(!l.last_called_at||String(l.last_called_at).slice(0,10)<t))
-      if(due.length&&Date.now()-cbNudgeRef.current>2*3600*1000){
+      const wtN=apptFollowups.length
+      if((due.length||wtN)&&Date.now()-cbNudgeRef.current>2*3600*1000){
         cbNudgeRef.current=Date.now()
-        notify(`🔔 ${due.length} callback${due.length>1?"s":""} due today — tap "Who's next?"`)
+        const parts=[]
+        if(wtN) parts.push(`🚶 ${wtN} walkthrough follow-up${wtN>1?"s":""}`)
+        if(due.length) parts.push(`${due.length} callback${due.length>1?"s":""} due today`)
+        notify(`🔔 ${parts.join(" + ")} — tap "Who's next?"`)
       }
     }
     const iv=setInterval(check, 30*60*1000)
     return()=>clearInterval(iv)
-  },[user,allLeads,leads]) // eslint-disable-line
+  },[user,allLeads,leads,apptFollowups]) // eslint-disable-line
 
   async function doLogout(){
     // End-of-shift recap — her day at a glance before signing out.
@@ -5176,6 +5238,10 @@ export default function App(){
                             </div>
                           </div>
                           <div style={{display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+                            {lead.id&&(
+                              <IconBtn onClick={e=>{e.stopPropagation();setEmailModal(lead)}} title="Send Email"
+                                hoverColor="#69f6b8" baseColor="#40485d"><IconMail/></IconBtn>
+                            )}
                             {review&&(
                               <span className="pill" style={{background:reviewColor+"20",color:reviewColor,
                                 border:`1px solid ${reviewColor}30`,fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".05em"}}>
@@ -5273,25 +5339,33 @@ export default function App(){
             const d7  = addDays(7)
             const d30 = addDays(30)
             const d180= addDays(180)
+            // 🚶 Completed walkthroughs awaiting a decision get their own
+            // top-priority bucket (and are pulled out of the date buckets).
+            const wtSet=new Set(apptFollowups.map(f=>String(f.leadId)))
+            const wtLeads=allFollowups.filter(l=>wtSet.has(String(l.id)))
+            const rest=allFollowups.filter(l=>!wtSet.has(String(l.id)))
             const buckets = [
+              {key:"walkthrough", label:"Walkthrough Follow-Ups", color:"#ff9f43", icon:"🚶",
+                desc:"Walkthrough completed, no decision yet — call these first",
+                leads: wtLeads},
               {key:"overdue", label:"Overdue", color:"#ff6e84", icon:"⚠",
                 desc:"Past due — these callbacks didn't happen yet",
-                leads: allFollowups.filter(l=>l.callbackDate<today)},
+                leads: rest.filter(l=>l.callbackDate<today)},
               {key:"today",   label:"Today",   color:"#ffe083", icon:"📞",
                 desc:"Call back today",
-                leads: allFollowups.filter(l=>l.callbackDate===today)},
+                leads: rest.filter(l=>l.callbackDate===today)},
               {key:"week",    label:"This Week", color:"#69f6b8", icon:"🗓",
                 desc:"Next 7 days",
-                leads: allFollowups.filter(l=>l.callbackDate>today&&l.callbackDate<=d7)},
+                leads: rest.filter(l=>l.callbackDate>today&&l.callbackDate<=d7)},
               {key:"month",   label:"Next 30 Days", color:"#a3a6ff", icon:"📅",
                 desc:"Coming up — schedule outreach",
-                leads: allFollowups.filter(l=>l.callbackDate>d7&&l.callbackDate<=d30)},
+                leads: rest.filter(l=>l.callbackDate>d7&&l.callbackDate<=d30)},
               {key:"later",   label:"Later (1 to 6 months)", color:"#8b5cf6", icon:"⏳",
                 desc:"30 days to 6 months out",
-                leads: allFollowups.filter(l=>l.callbackDate>d30&&l.callbackDate<d180)},
+                leads: rest.filter(l=>l.callbackDate>d30&&l.callbackDate<d180)},
               {key:"future",  label:"Future (6+ months)", color:"#06d6a0", icon:"🌱",
                 desc:"Long-tail — quarterly check-in candidates",
-                leads: allFollowups.filter(l=>l.callbackDate>=d180)},
+                leads: rest.filter(l=>l.callbackDate>=d180)},
             ]
 
             function relativeTime(dateStr){
