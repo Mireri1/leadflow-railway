@@ -5648,6 +5648,51 @@ def _notify_walkthrough_update(appt, stage, by):
     except Exception as e:
         print(f"[APPT] walkthrough update notify failed: {e}")
 
+def _notify_walkthrough_client_call(appt, call, caller, lead_full):
+    """Instant ping to the Eric+Angelo channel when a call is logged against a
+    walkthrough client. This is the relay layer for updates that previously
+    lived only in-app: interested / needs a callback / not interested / etc.
+    High-leverage — a missed update here can cost a deal, so it fires on every
+    engagement outcome (or any call with notes) for a lead with an appointment."""
+    hook = ANGELO_SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL
+    if not hook:
+        return
+    outcome = (call.get("outcome") or "").strip().lower()
+    notes = _strip_note_tags(call.get("notes"))
+    if outcome not in ("interested", "callback", "converted", "not_interested", "answered") and not notes:
+        return   # routine no-answer with nothing new — skip the ping
+    company = lead_full.get("company") or appt.get("company") or "Unknown"
+    outcome_label = {
+        "interested":     "🔥 INTERESTED",
+        "callback":       "📞 Wants a callback",
+        "converted":      "🏆 CONVERTED",
+        "not_interested": "❄️ Not interested",
+        "answered":       "Answered",
+        "no_answer":      "No answer",
+        "voicemail":      "Voicemail",
+    }.get(outcome, outcome or "—")
+    fields = [f"*Outcome:* {outcome_label}"]
+    cb = (call.get("callbackDate") or lead_full.get("callbackDate") or "")[:10]
+    if outcome == "callback" and cb:
+        fields[0] += f" on *{cb}*"
+    if notes:
+        fields.append(f"*Notes:* {notes[:600]}")
+    qual = call.get("qualified")
+    if qual:
+        fields.append(f"*Qualified:* {qual}")
+    fields.append(f"*Walkthrough:* {(appt.get('date') or '—')[:10]} ({appt.get('stage','—')}) · logged by {caller}")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text",
+         "text": f"🚶 Walkthrough client update — {company}", "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(fields)}},
+    ]
+    try:
+        r = req_lib.post(hook, json={"blocks": blocks}, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[APPT-CALL] slack HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[APPT-CALL] client-call notify failed: {e}")
+
 def _get_walkthrough_followups():
     """Appointments whose walkthrough date has passed without a won/lost
     decision — the highest-priority follow-ups in the system."""
@@ -5988,6 +6033,17 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                 headers=SB_HEADERS,
                 json=patch_payload,
                 timeout=30)
+
+            # 🚶 Walkthrough-client relay — a lead with an appointment is a
+            # live deal; push what the caller just logged (interested /
+            # callback / notes) to the Eric+Angelo channel immediately so
+            # updates never sit unseen in-app. Never let this break the save.
+            try:
+                appt = _settings_get_json(f"appt_{lead_id}")
+                if appt:
+                    _notify_walkthrough_client_call(appt, call, caller, lead_full)
+            except Exception as e:
+                print(f"[APPT-CALL] relay failed for lead {lead_id}: {e}")
 
             # Email follow-up trigger. Two paths:
             #   (a) Caller checked "Send follow-up email" in the modal → fire now,
@@ -9249,9 +9305,48 @@ def _strip_note_tags(note: str) -> str:
     """Remove machine tokens ([sent:*], [INTENT:*], [seq:*] etc.) for display."""
     return re.sub(r"\[[A-Za-z]+:[^\]]*\]", "", note or "").strip()
 
+def _ai_action_snippets(items: list) -> list:
+    """Model pass: turn each raw caller note into one high-level action line
+    ('Arizona Hospital — interested, wants an email with info'). Returns []
+    on ANY doubt (no key, API error, wrong count) so the caller falls back to
+    raw notes — a dropped update here could cost a deal, so raw > pretty."""
+    if not ANTHROPIC_API_KEY or not items:
+        return []
+    system = (
+        "You compress cold-call notes for the daily owner digest of a commercial cleaning company. "
+        "For EACH item, write exactly one line: '<Company> — <status>, <action the owner must take>', "
+        "keeping every deal-relevant detail from the note: urgency, requested service frequency "
+        "(e.g. 5x/week), square footage, budget, timing, decision-maker info, specific requests. "
+        "Examples: 'Arizona Hospital — interested, send email with service info; needs 5x/week cleaning, URGENT', "
+        "'Key School — wants a callback Aug 12, DM was out; ~20k sqft, budget ~$2k/mo', "
+        "'Van Law Firm — warm, waiting on our quote for 3x/week service'. "
+        "Keep the caller's meaning exactly; do not invent details; under 180 characters per line. "
+        "Return ONLY a JSON array of strings, one per item, same order. No markdown, no commentary.")
+    user = json_lib.dumps(items, ensure_ascii=False)
+    for model in [INSIGHTS_MODEL, HAIKU_MODEL]:
+        try:
+            r = req_lib.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": model, "max_tokens": 1000, "system": system,
+                      "messages": [{"role": "user", "content": user}]}, timeout=45)
+            if r.status_code != 200:
+                continue
+            txt = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+            m = re.search(r"\[.*\]", txt, re.DOTALL)
+            lines = json_lib.loads(m.group(0)) if m else []
+            # Hard gate: one line per item or we don't trust it.
+            if (isinstance(lines, list) and len(lines) == len(items)
+                    and all(isinstance(x, str) and x.strip() for x in lines)):
+                return [x.strip()[:200] for x in lines]
+        except Exception as e:
+            print(f"[daily-summary] AI snippets failed ({model}): {e}")
+    return []
+
 def _digest_qualified_highlights(calls: list, today: str) -> str:
-    """Bullets for today's actionable qualified/interested calls (with notes).
-    Skips leads whose callback is parked > DIGEST_ACTIONABLE_MAX_DAYS out."""
+    """Bullets for today's actionable qualified/interested calls (with notes),
+    written by the model as owner-action one-liners; raw note snippets as the
+    fail-safe. Skips leads whose callback is parked > DIGEST_ACTIONABLE_MAX_DAYS
+    out (long nurture ≠ actionable today)."""
     try:
         actionable = [c for c in calls
                       if (c.get("outcome") in ("interested", "converted", "callback") or c.get("qualified"))
@@ -9267,29 +9362,46 @@ def _digest_qualified_highlights(calls: list, today: str) -> str:
                 f"&select=id,company,callbackDate", headers=SB_HEADERS, timeout=15)
             if lr.status_code == 200 and isinstance(lr.json(), list):
                 leads_map = {l["id"]: l for l in lr.json()}
-        lines = []
+        items = []
         for c in actionable:
             lead = leads_map.get(c.get("leadId")) or {}
             cb = (lead.get("callbackDate") or "")[:10]
             if cb and cb > horizon:
                 continue   # parked months out — long nurture, not actionable today
-            note = _strip_note_tags(c.get("notes"))
-            if len(note) > 140:
-                note = note[:137] + "…"
-            tag = c.get("qualified") or c.get("outcome") or ""
-            cb_part = f", cb {cb}" if cb else ""
-            lines.append(f"  • *{lead.get('company') or 'Unknown'}* ({tag}{cb_part}) — {note}")
-            if len(lines) >= 5:
+            items.append({
+                "company":  lead.get("company") or "Unknown",
+                "outcome":  c.get("outcome") or "",
+                "qualified": c.get("qualified") or "",
+                "timeline": c.get("timeline") or "",
+                "vendor":   c.get("vendorstatus") or "",
+                "callback": cb,
+                "note":     _strip_note_tags(c.get("notes"))[:500],
+            })
+            if len(items) >= 8:
                 break
+        if not items:
+            return ""
+        ai_lines = _ai_action_snippets(items)
+        if ai_lines:
+            return "\n".join(f"  • {ln}" for ln in ai_lines)
+        # Fail-safe: raw snippets — every item still reaches the digest.
+        lines = []
+        for it in items:
+            note = it["note"] if len(it["note"]) <= 140 else it["note"][:137] + "…"
+            tag = it["qualified"] or it["outcome"]
+            cb_part = f", cb {it['callback']}" if it["callback"] else ""
+            lines.append(f"  • *{it['company']}* ({tag}{cb_part}) — {note}")
         return "\n".join(lines)
     except Exception as e:
         print(f"[daily-summary] qualified highlights failed: {e}")
         return ""
 
 @app.get("/api/daily-summary")
-def daily_summary(user: str = Depends(verify_cron_or_admin)):
+def daily_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
     """Send end-of-day summary to Slack. Triggered by Railway cron (?secret=
-    CRON_SECRET) or an admin. Includes objection patterns + week-over-week trend."""
+    CRON_SECRET) or an admin. Includes objection patterns + week-over-week trend.
+    ?preview=1 returns the assembled fields WITHOUT posting — for verifying the
+    AI qualified-highlights against real data."""
     try:
         now = datetime.utcnow()
         # "Today" is the ET BUSINESS day, not the UTC date. The digest fires
@@ -9382,6 +9494,10 @@ def daily_summary(user: str = Depends(verify_cron_or_admin)):
                      f"  Top objection: {top_obj}")
 
         app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+
+        if preview:
+            return {"preview": True, "date": today, "calls": total_calls,
+                    "qualified_highlights": qual_lines, "themes": themes_txt, "trend": trend_txt}
 
         fields = [
             {"label": "Calls Made", "value": f":telephone_receiver: *{total_calls}*"},
