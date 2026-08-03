@@ -2938,6 +2938,7 @@ const SIDEBAR_NAV = [
   { key:"warm",      label:"Warm Leads",      Icon:IconChart },
   { key:"dialer",    label:"Dialer",          Icon:IconPhone },
   { key:"followups", label:"Follow-Ups",      Icon:IconCalendarFar },
+  { key:"walkthroughs", label:"Walkthroughs",  Icon:IconClipCheck },
   { key:"appointments", label:"Appointments",  Icon:IconCalendarFar, admin:true },
   { key:"qualified", label:"Qualified",        Icon:IconClipCheck },
   { key:"campaigns", label:"Email Campaigns",  Icon:IconMail },
@@ -3228,6 +3229,137 @@ function AppointmentsBoard(){
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+// ─── WalkthroughsPanel — post-walkthrough deal workspace (all users) ──────────
+// Attended appointments awaiting a won/lost decision. These need frequent
+// follow-up calls; every call logged on them is auto-relayed to Eric & Angelo's
+// Slack chat, so working this list IS the update channel.
+function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
+  const [data,setData]=useState(null)
+  const [busy,setBusy]=useState("")
+  const [noteFor,setNoteFor]=useState(null)
+  const [noteText,setNoteText]=useState("")
+  function load(){ api("/api/appointments/attended").then(setData).catch(()=>setData({attended:[]})) }
+  useEffect(()=>{ load() },[reloadSignal]) // eslint-disable-line
+  const today=data?.today||localDate()
+  const calledToday=a=>((a.lead?.last_called_at||"").slice(0,10)===today)
+  const items=(data?.attended||[]).slice().sort((a,b)=>{
+    const ca=calledToday(a)?1:0, cb=calledToday(b)?1:0
+    if(ca!==cb) return ca-cb                                   // needs-call first
+    return (a.date||"").localeCompare(b.date||"")              // oldest walkthrough first
+  })
+  const daysAgo=d=>{try{return Math.max(0,Math.round((new Date(today+"T12:00:00")-new Date(d+"T12:00:00"))/864e5))}catch{return 0}}
+  async function decide(a,stage){
+    if(!window.confirm(`Mark ${a.company||"this deal"} as ${stage.toUpperCase()}?`)) return
+    setBusy(a.leadId+stage)
+    try{
+      await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage})})
+      notify(stage==="won"?"🏆 Won — update sent to your chat":"Marked lost — update sent to your chat");load()
+    }catch{ notify("Couldn't update — try again","error") }
+    finally{ setBusy("") }
+  }
+  async function addNote(a){
+    if(!noteText.trim()){ setNoteFor(null); return }
+    try{
+      await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage:a.stage,note:noteText.trim()})})
+      notify("Note saved")
+    }catch{ notify("Couldn't save note","error") }
+    setNoteFor(null); setNoteText(""); load()
+  }
+  return (
+    <div>
+      <div style={{marginBottom:20,display:"flex",alignItems:"flex-end",justifyContent:"space-between",gap:20,flexWrap:"wrap"}}>
+        <div>
+          <h1 style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:36,fontWeight:700,color:"#dee5ff",letterSpacing:"-.02em"}}>🚶 Walkthroughs</h1>
+          <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
+            Attended walkthroughs waiting on a decision — call these daily until they close.
+          </p>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {items.length>0&&<span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,color:"#ff9f43"}}>{items.length}</span>}
+          <button className="btn btn-g" style={{fontSize:11,padding:"5px 12px"}} onClick={load}>Refresh</button>
+        </div>
+      </div>
+      <div style={{padding:"10px 14px",marginBottom:16,background:"#ff9f4312",border:"1px solid #ff9f4330",
+        borderRadius:10,fontSize:12,color:"#ffc78a"}}>
+        📡 Every call logged here (interested, callback, notes…) is sent straight to Eric &amp; Angelo's Slack chat — no need to relay updates separately.
+      </div>
+      {data===null?(
+        <div style={{padding:60,textAlign:"center",color:"#40485d"}}>Loading…</div>
+      ):items.length===0?(
+        <div style={{background:"#0f1930",borderRadius:16,padding:72,textAlign:"center"}}>
+          <div style={{fontSize:40,marginBottom:12}}>🚶</div>
+          <div style={{color:"#a3aac4",fontSize:14}}>No attended walkthroughs awaiting a decision</div>
+          <div style={{color:"#40485d",fontSize:12,marginTop:6}}>
+            Appointments land here the day after their walkthrough date, until they're marked won or lost
+          </div>
+        </div>
+      ):(
+        <div style={{display:"grid",gap:12}}>
+          {items.map(a=>{
+            const needs=!calledToday(a)
+            const badgeColor=needs?"#ffe083":"#69f6b8"
+            return (
+              <div key={a.leadId} style={{background:"#0f1930",borderRadius:12,padding:"16px 18px",
+                borderLeft:`4px solid ${needs?"#ff9f43":"#69f6b8"}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap"}}>
+                  <div style={{minWidth:0}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                      <span style={{fontSize:16,color:"#dee5ff",fontWeight:700}}>{a.company||a.lead?.company||"(lead)"}</span>
+                      <span className="pill" style={{background:badgeColor+"20",color:badgeColor,
+                        border:`1px solid ${badgeColor}30`,fontSize:11,fontWeight:700}}>
+                        {needs?"📞 Needs call":"✓ Called today"}
+                      </span>
+                    </div>
+                    <div style={{fontSize:12,color:"#a3aac4",marginTop:4}}>
+                      🚶 Walkthrough <b style={{color:"#dee5ff"}}>{a.date}</b> ({daysAgo(a.date)}d ago)
+                      {a.area?` · 📍 ${a.area}`:""}{(a.phone||a.lead?.phone)?` · ${a.phone||a.lead?.phone}`:""}
+                    </div>
+                    <div style={{fontSize:11,color:"#5a6a8a",marginTop:2}}>
+                      booked by {a.createdBy||"—"}
+                      {a.lead?.callbackDate?` · next callback ${a.lead.callbackDate}`:""}
+                      {a.lead?.last_called_at?` · last called ${String(a.lead.last_called_at).slice(0,10)}`:" · never called since"}
+                    </div>
+                    {a.notes&&<div style={{fontSize:12,color:"#c9d2ee",marginTop:6,whiteSpace:"pre-line",lineHeight:1.45}}>{a.notes}</div>}
+                  </div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap",justifyContent:"flex-end",alignItems:"center"}}>
+                    {a.lead&&(
+                      <button className="btn btn-p" style={{fontSize:12,padding:"8px 16px",fontWeight:700}}
+                        onClick={()=>onCall(a.lead)}>📞 Log Call</button>
+                    )}
+                    {admin&&(
+                      <>
+                        <button disabled={busy===a.leadId+"won"} onClick={()=>decide(a,"won")}
+                          style={{fontSize:11,padding:"7px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                            border:"1px solid #69f6b866",background:"#69f6b818",color:"#69f6b8"}}>
+                          {busy===a.leadId+"won"?"…":"🏆 Won"}</button>
+                        <button disabled={busy===a.leadId+"lost"} onClick={()=>decide(a,"lost")}
+                          style={{fontSize:11,padding:"7px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                            border:"1px solid #ff6e8466",background:"#ff6e8418",color:"#ff6e84"}}>
+                          {busy===a.leadId+"lost"?"…":"❌ Lost"}</button>
+                        <button onClick={()=>{setNoteFor(noteFor===a.leadId?null:a.leadId);setNoteText("")}}
+                          style={{fontSize:11,padding:"7px 10px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                            border:"1px solid #40485d40",background:"transparent",color:"#a3aac4"}}>📝 Note</button>
+                      </>
+                    )}
+                  </div>
+                </div>
+                {noteFor===a.leadId&&(
+                  <div style={{marginTop:10,display:"flex",gap:8}}>
+                    <input value={noteText} onChange={e=>setNoteText(e.target.value)} autoFocus
+                      placeholder="Update from the client, decision status, next step…"
+                      style={{flex:1,background:"#060e20",border:"1px solid #40485d40",borderRadius:7,color:"#dee5ff",padding:"7px 10px",fontSize:12,fontFamily:"inherit"}}/>
+                    <button className="btn btn-p" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>addNote(a)}>Save</button>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }
@@ -5329,6 +5461,11 @@ export default function App(){
           )}
 
           {activeNav==="appointments"&&isAdmin()&&<AppointmentsBoard/>}
+
+          {/* ── WALKTHROUGHS — post-walkthrough deals needing daily calls ── */}
+          {activeNav==="walkthroughs"&&(
+            <WalkthroughsPanel onCall={setCallModal} notify={notify} admin={isAdmin()} reloadSignal={callModal}/>
+          )}
 
           {/* ── FOLLOW-UPS (overdue + today + week + month + later + future) ── */}
           {activeNav==="followups"&&(()=>{

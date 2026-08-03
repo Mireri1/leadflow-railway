@@ -5695,7 +5695,9 @@ def _notify_walkthrough_client_call(appt, call, caller, lead_full):
 
 def _get_walkthrough_followups():
     """Appointments whose walkthrough date has passed without a won/lost
-    decision — the highest-priority follow-ups in the system."""
+    decision — the highest-priority follow-ups in the system. Includes
+    'pending' too: attendance is a matter of the date passing, not of the
+    admin having clicked approve in-app."""
     out = []
     try:
         r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=like.appt_*&select=value",
@@ -5706,10 +5708,11 @@ def _get_walkthrough_followups():
                 a = json_lib.loads(row.get("value") or "{}")
             except Exception:
                 continue
-            if a.get("stage") in ("approved", "confirmed") and (a.get("date") or "")[:10] <= today and a.get("date"):
+            if a.get("stage") in ("pending", "approved", "confirmed") and (a.get("date") or "")[:10] <= today and a.get("date"):
                 out.append({"leadId": a.get("leadId"), "company": a.get("company"),
                             "date": (a.get("date") or "")[:10], "stage": a.get("stage"),
-                            "createdBy": a.get("createdBy"), "phone": a.get("phone")})
+                            "createdBy": a.get("createdBy"), "phone": a.get("phone"),
+                            "area": a.get("area"), "notes": a.get("notes")})
     except Exception as e:
         print(f"[APPT] followups scan failed: {e}")
     out.sort(key=lambda a: a.get("date") or "9999")
@@ -5856,6 +5859,54 @@ def walkthrough_followups(user: str = Depends(verify_token)):
     """Completed-walkthrough follow-ups (any caller — these outrank ordinary
     due callbacks in the dialer's 'Who's next?' priority)."""
     return {"followups": _get_walkthrough_followups()}
+
+@app.get("/api/appointments/attended")
+def attended_walkthroughs(user: str = Depends(verify_token)):
+    """The post-walkthrough workspace (any caller): every appointment whose
+    date has passed without a won/lost decision, joined with its lead so the
+    UI can show call status and open the CallModal. These deals need frequent
+    follow-up calls, and every update logged on them relays to the Eric+Angelo
+    Slack channel."""
+    fus = _get_walkthrough_followups()
+    lead_ids = [f["leadId"] for f in fus if f.get("leadId")]
+    leads_map = {}
+    if lead_ids:
+        try:
+            lr = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({','.join(str(i) for i in lead_ids)})"
+                f"&select=id,company,firstName,lastName,phone,email,industry,city,state,status,"
+                f"callbackDate,last_called_at,notes,assignedTo,score,total_calls",
+                headers=SB_HEADERS, timeout=15)
+            if lr.status_code == 200 and isinstance(lr.json(), list):
+                leads_map = {str(l["id"]): l for l in lr.json()}
+        except Exception as e:
+            print(f"[APPT] attended lead join failed: {e}")
+    for f in fus:
+        f["lead"] = leads_map.get(str(f.get("leadId")))
+    return {"attended": fus, "today": local_today()}
+
+@app.get("/api/admin/walkthrough-channel-test")
+def walkthrough_channel_test(user: str = Depends(verify_admin)):
+    """Posts a test ping through the walkthrough-update hook so the admin can
+    see which Slack channel it lands in. Also reports whether a dedicated
+    ANGELO_SLACK_WEBHOOK_URL is configured (vs falling back to the team channel)."""
+    hook = ANGELO_SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL
+    if not hook:
+        return {"sent": False, "dedicated_webhook_configured": False,
+                "detail": "No Slack webhook configured at all."}
+    blocks = [{"type": "section", "text": {"type": "mrkdwn",
+               "text": "🔧 *Test ping from LeadFlow* — walkthrough client updates "
+                       "and the daily awaiting-decision list will be sent to THIS channel."}}]
+    try:
+        r = req_lib.post(hook, json={"blocks": blocks}, timeout=10)
+        return {"sent": r.status_code in (200, 204),
+                "dedicated_webhook_configured": bool(ANGELO_SLACK_WEBHOOK_URL),
+                "detail": ("Dedicated Angelo webhook is set — check the Eric+Angelo group chat for the ping."
+                           if ANGELO_SLACK_WEBHOOK_URL else
+                           "ANGELO_SLACK_WEBHOOK_URL is NOT set — the ping went to the main team channel. "
+                           "Set it in Railway to route walkthrough updates to the group chat.")}
+    except Exception as e:
+        return {"sent": False, "dedicated_webhook_configured": bool(ANGELO_SLACK_WEBHOOK_URL), "detail": str(e)}
 
 @app.post("/api/appointments/{lead_id}/transition")
 async def transition_appointment(lead_id: str, request: Request, user: str = Depends(verify_token)):
