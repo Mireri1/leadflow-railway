@@ -4140,20 +4140,30 @@ export default function App(){
               {/* Email Campaigns summary — clickable, jumps to full campaigns tab */}
               <CampaignSummaryCard onClick={()=>setNav("campaigns")}/>
 
-              {/* Overdue callbacks */}
-              {leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted").length>0&&(
-                <div style={{background:"#2d0a0a",border:"1px solid #92400e",borderRadius:12,padding:"14px 20px",
-                  marginTop:16,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-                  <div>
-                    <span style={{color:"#fca5a5",fontWeight:700,fontSize:13}}>
-                      {leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted").length} overdue callback{leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted").length!==1?"s":""}
-                    </span>
-                    <span style={{color:"#a3aac4",fontSize:12,marginLeft:8}}>— these leads expected a call back</span>
+              {/* Overdue callbacks — split "never attempted since due" from
+                  "called but still carrying an old date" so overdue reads as
+                  a caller-accountability signal, not a data-staleness one. */}
+              {(()=>{
+                const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                if(!overdue.length) return null
+                const attempted=overdue.filter(l=>l.last_called_at&&String(l.last_called_at).slice(0,10)>=l.callbackDate).length
+                const untouched=overdue.length-attempted
+                return (
+                  <div style={{background:"#2d0a0a",border:"1px solid #92400e",borderRadius:12,padding:"14px 20px",
+                    marginTop:16,display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
+                    <div>
+                      <span style={{color:"#fca5a5",fontWeight:700,fontSize:13}}>
+                        {overdue.length} overdue callback{overdue.length!==1?"s":""}
+                      </span>
+                      <span style={{color:"#a3aac4",fontSize:12,marginLeft:8}}>
+                        — {untouched} not called since due{attempted?` · ${attempted} attempted but need a new date`:""}
+                      </span>
+                    </div>
+                    <button className="btn btn-p" style={{fontSize:12,padding:"7px 14px"}}
+                      onClick={()=>{setNav("leads");setCbOnly(true)}}>View</button>
                   </div>
-                  <button className="btn btn-p" style={{fontSize:12,padding:"7px 14px"}}
-                    onClick={()=>{setNav("leads");setCbOnly(true)}}>View</button>
-                </div>
-              )}
+                )
+              })()}
 
               {leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length>0&&(
                 <div style={{marginTop:32}}>
@@ -5592,6 +5602,12 @@ export default function App(){
                                 <div style={{fontSize:11,color:"#40485d",marginTop:2}}>
                                   {relativeTime(lead.callbackDate)}
                                 </div>
+                                {/* Overdue accountability: did anyone actually try since it came due? */}
+                                {b.key==="overdue"&&(
+                                  lead.last_called_at&&String(lead.last_called_at).slice(0,10)>=lead.callbackDate
+                                    ?<div style={{fontSize:10,color:"#69f6b8",marginTop:2}}>✆ tried {String(lead.last_called_at).slice(5,10)}</div>
+                                    :<div style={{fontSize:10,color:"#ff9f43",marginTop:2}}>no call since due</div>
+                                )}
                               </div>
                               <span className="pill" style={{background:info.color+"20",color:info.color,
                                 border:`1px solid ${info.color}30`,width:"fit-content"}}>{info.label}</span>
