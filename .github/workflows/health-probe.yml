@@ -1,0 +1,36 @@
+name: LeadFlow Health Probe (diagnostic)
+
+# Temporary diagnostic. The scheduled health-check session runs in an
+# environment whose egress allowlist permits GitHub only, so it cannot reach
+# the production host directly. A GitHub runner can. Only PUBLIC, unauthenticated
+# endpoints are probed here — no credentials belong in this file.
+
+on:
+  push:
+    branches: [main-0dax8n]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe /health
+        run: |
+          BASE="https://leadflow-railway-production.up.railway.app"
+          echo "=== GET /health ==="
+          code=$(curl -sS -o /tmp/health.json -w "%{http_code}" --max-time 30 "$BASE/health" || echo "000")
+          echo "HTTP_STATUS: $code"
+          echo "BODY_START"
+          cat /tmp/health.json || true
+          echo ""
+          echo "BODY_END"
+
+      - name: Probe deployed bundle (deploy drift)
+        run: |
+          BASE="https://leadflow-railway-production.up.railway.app"
+          echo "=== GET / ==="
+          code=$(curl -sS -o /tmp/root.html -w "%{http_code}" --max-time 30 "$BASE/" || echo "000")
+          echo "HTTP_STATUS: $code"
+          echo "ASSETS:"
+          grep -o '/assets/index-[A-Za-z0-9_-]*\.js' /tmp/root.html | sort -u || echo "(none found)"
+          grep -o '/assets/index-[A-Za-z0-9_-]*\.css' /tmp/root.html | sort -u || true
