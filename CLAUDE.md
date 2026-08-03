@@ -149,6 +149,9 @@ ACTIONS TAKEN: [list or "None needed"]
 - `DAILY_DIGEST_ENABLED` / `DAILY_DIGEST_HOUR_UTC` — daily digest self-schedules from the bg loop, once per UTC day on/after the hour (default 1 ≈ 9pm ET). No Railway cron needed.
 - `CRON_SECRET` — optional; lets an external cron hit /api/daily-summary or /api/weekly-summary via ?secret= (they otherwise require an admin token)
 
+## Follow-Ups tab structure (2026-08)
+Buckets in priority order: 🚶 Walkthrough Follow-Ups → 🚨 **Overdue — Untouched** (no call since callbackDate came due; `last_called_at < callbackDate`) → ✆ **Overdue — Attempted** (called since due, still on old date; shows tried-date chip) → Today → This Week → Next 30 Days → Later → Future. Near-term buckets sort Interested > interested_no_dm > callback > rest, then oldest date. Headers toggle collapse (`fuCollapsed` state at App level — never inside the IIFE); month/later/future default collapsed. Dashboard overdue banner shows the untouched/attempted split. This split exists so Eric can tell "caller ignoring it" from "logged via ⚡ quick no-answer, which deliberately doesn't touch callbackDate."
+
 ## QoL features (2026-06)
 - Caller: ⚡ one-tap "No answer" (lead rows + dialer), 📞 "Who's next?" header button (due callbacks → warm → fresh), year-typo date guard (`confirmFarDate`), end-of-shift recap on sign-out, mid-shift due-callback nudge (max 1/2h).
 - Admin: 🕐 Clock in/out header button + `POST /api/auth/clock-in|clock-out` (user_sessions); weekly digest includes hours/caller via shared `_compute_hours()`.
