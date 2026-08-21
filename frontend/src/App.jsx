@@ -2195,7 +2195,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
               <QualChip label="Focus" value={budgetFocus} onChange={setBudget}
                 options={["Budget Focused","Quality Focused","Value Balanced"]}/>
               <QualChip label="Vendor Status" value={vendorStatus} onChange={setVendor}
-                options={["Happy with Current","Open to Options","Actively Shopping","No Vendor"]}/>
+                options={["Happy with Current","Open to Options","Actively Shopping","No Vendor","In-House Staff"]}/>
               <QualChip label="Contact Type" value={decisionMaker} onChange={setDM}
                 options={["Decision Maker","Influencer","Gatekeeper","Unknown"]}/>
               <QualChip label="Timeline" value={timeline} onChange={setTimeline}
