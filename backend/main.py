@@ -9148,8 +9148,12 @@ def run_walkthrough_followup_nudge_if_due():
 # WEEKLY_REVIEW_SCAN_ENABLED.
 WEEKLY_REFILL_ENABLED      = os.getenv("WEEKLY_REFILL_ENABLED", "1") == "1"
 WEEKLY_REVIEW_SCAN_ENABLED = os.getenv("WEEKLY_REVIEW_SCAN_ENABLED", "1") == "1"
+# Rotation ordered by measured first-dial connect/engagement (2026-08 audit):
+# NV 17.9%/5.8% eng · CT 17.1% · MO 12.7% · KS 3.1% eng · OH/NC ~16-17% probes ·
+# ID 3.1% eng · Tampa 4 engaged. TX/CA/GA/WA (7-9%) dropped from the default.
 WEEKLY_REFILL_METROS = [m.strip() for m in os.getenv("WEEKLY_REFILL_METROS",
-    "Phoenix, AZ|Las Vegas, NV|Dallas, TX|Houston, TX|Tucson, AZ|Reno, NV|Atlanta, GA|Orlando, FL"
+    "Las Vegas, NV|Hartford, CT|New Haven, CT|Kansas City, MO|Reno, NV|St. Louis, MO|"
+    "Charlotte, NC|Columbus, OH|Wichita, KS|Boise, ID|Tampa, FL|Phoenix, AZ"
     ).split("|") if m.strip()]
 WEEKLY_REFILL_INDUSTRIES = os.getenv("WEEKLY_REFILL_INDUSTRIES",
     "Manufacturing,Logistics,Industrial,Healthcare,Medical Equipment")
