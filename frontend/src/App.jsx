@@ -217,7 +217,8 @@ function isWarmList(l){
 // Newest "📧 Reply (YYYY-MM-DD…" stamp the IMAP poller prepends when a
 // lead-gen email gets answered — the strongest buy signal in the system.
 function lastReplyDate(notes){
-  let m, d="", re=/📧 Reply \((\d{4}-\d{2}-\d{2})/g
+  // email replies AND inbound-call voicemails both count as inquiries
+  let m, d="", re=/(?:📧 Reply|📞 Inbound call) \((\d{4}-\d{2}-\d{2})/g
   while((m=re.exec(notes||""))) if(m[1]>d) d=m[1]
   return d
 }
@@ -4297,7 +4298,7 @@ export default function App(){
                 const rungs=[
                   {icon:"⭐",label:"Eric's warm list",desc:"Hand-picked follow-ups — add more from Slack with /warmlead",
                     color:"#69f6b8",list:warmlist},
-                  {icon:"📨",label:"Inquiries & replies",desc:"Someone reached out — call back within the hour",
+                  {icon:"📨",label:"Inquiries & replies",desc:"Email replies + inbound calls — call back within the hour",
                     color:"#ff6e84",list:inq},
                   {icon:"🚶",label:"Walkthrough follow-ups",desc:"Walkthrough done, decision pending",
                     color:"#ff9f43",list:walk},

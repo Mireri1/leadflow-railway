@@ -2624,6 +2624,11 @@ def _bg_maintenance_loop():
             run_weekly_refill_if_due()
         except Exception as e:
             print(f"[WEEKLY-REFILL] loop exception: {e}")
+        # Low-inventory refill — fires whenever the fresh pool runs low (20h cooldown).
+        try:
+            run_inventory_refill_if_due()
+        except Exception as e:
+            print(f"[INV-REFILL] loop exception: {e}")
         try:
             run_weekly_review_scan_if_due()
         except Exception as e:
@@ -5941,6 +5946,136 @@ async def appt_approve_submit(request: Request):
       <div style="text-align:center"><h2>✅ Approved</h2>
       <p style="color:#a3aac4">{appt.get('company','')} sent to Angelo for hiring.</p></div></body></html>""")
 
+# ── Twilio inbound (after-hours concierge + shift-hours forwarding) ──────────
+# Point the Twilio number's Voice webhook at POST {APP_URL}/twilio/voice.
+# During INBOUND_FORWARD_HOURS_PT (default 6-14 = cristine's shift) calls ring
+# through to INBOUND_FORWARD_NUMBER; after hours — or if she doesn't pick up —
+# the concierge answers, records the caller's need, transcribes it, files it
+# as an inquiry on the matching lead (by phone), and pings Slack instantly.
+# INBOUND ONLY — this system never places or automates outbound calls.
+import hmac as _hmac, hashlib as _hashlib, base64 as _b64
+
+INBOUND_FORWARD_NUMBER   = os.getenv("INBOUND_FORWARD_NUMBER", "")   # cristine's number, E.164 or 10-digit
+INBOUND_FORWARD_HOURS_PT = os.getenv("INBOUND_FORWARD_HOURS_PT", "6-14")
+PT_OFFSET_HOURS          = int(os.getenv("PT_OFFSET_HOURS", "-7"))
+
+def _twilio_sig_ok(request: Request, form) -> bool:
+    """Validate X-Twilio-Signature (HMAC-SHA1 of public URL + sorted params).
+    TWILIO_VALIDATE_SIGNATURE=0 disables for debugging."""
+    if os.getenv("TWILIO_VALIDATE_SIGNATURE", "1") != "1":
+        return True
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    if not token:
+        return False
+    url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app") + request.url.path
+    data = url + "".join(k + str(form.get(k) or "") for k in sorted(form.keys()))
+    mac = _b64.b64encode(_hmac.new(token.encode(), data.encode(), _hashlib.sha1).digest()).decode()
+    return _hmac.compare_digest(mac, request.headers.get("X-Twilio-Signature", ""))
+
+def _twiml(body: str):
+    return HTMLResponse(f'<?xml version="1.0" encoding="UTF-8"?><Response>{body}</Response>',
+                        media_type="application/xml")
+
+def _voicemail_twiml() -> str:
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    greeting = os.getenv("INBOUND_GREETING",
+        "Thanks for calling Vision Cleaning Company. We're helping other customers right now. "
+        "After the tone, please leave your name, company, and what you need — "
+        "and we'll call you back within one business hour.")
+    return (f'<Say voice="Polly.Joanna">{greeting}</Say>'
+            f'<Record maxLength="120" playBeep="true" transcribe="true" '
+            f'transcribeCallback="{app_url}/twilio/transcription" '
+            f'action="{app_url}/twilio/voice-done"/>')
+
+def _in_forward_window() -> bool:
+    if not INBOUND_FORWARD_NUMBER:
+        return False
+    try:
+        lo, hi = (int(x) for x in INBOUND_FORWARD_HOURS_PT.split("-"))
+        h = (datetime.utcnow() + timedelta(hours=PT_OFFSET_HOURS)).hour
+        return lo <= h < hi
+    except Exception:
+        return False
+
+@app.post("/twilio/voice")
+async def twilio_voice(request: Request):
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    if _in_forward_window():
+        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+        digits = re.sub(r"[^\d+]", "", INBOUND_FORWARD_NUMBER)
+        if not digits.startswith("+"):
+            digits = "+1" + digits.lstrip("1")
+        return _twiml(f'<Dial timeout="20" action="{app_url}/twilio/voice-fallback">{digits}</Dial>')
+    return _twiml(_voicemail_twiml())
+
+@app.post("/twilio/voice-fallback")
+async def twilio_voice_fallback(request: Request):
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    if (form.get("DialCallStatus") or "") == "completed":
+        return _twiml("<Hangup/>")
+    return _twiml(_voicemail_twiml())          # she didn't pick up → concierge
+
+@app.post("/twilio/voice-done")
+async def twilio_voice_done(request: Request):
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    return _twiml('<Say voice="Polly.Joanna">Got it — we will call you back shortly. Thank you!</Say><Hangup/>')
+
+@app.post("/twilio/transcription")
+async def twilio_transcription(request: Request):
+    """Async transcription callback: file the voicemail as an INQUIRY.
+    Matched lead → prepend a 📞 Inbound note (Day Plan rung 1 detects it);
+    unknown caller → create a lead. Always ping Slack with the transcript."""
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    text = (form.get("TranscriptionText") or "").strip()
+    from_raw = form.get("From") or form.get("Caller") or ""
+    rec_url = form.get("RecordingUrl") or ""
+    phone = normalize_us_phone(from_raw)
+    today = local_today()
+    now = datetime.utcnow().isoformat()
+    stamp = f"📞 Inbound call ({today}): {text or '(no speech transcribed — listen to the recording)'}"
+    company = None
+    lead_id = None
+    try:
+        if phone:
+            r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?phone=eq.{url_quote(phone, safe='')}&select=id,notes,status,company",
+                            headers=SB_HEADERS, timeout=10)
+            rows = r.json() if r.status_code == 200 else []
+            if rows:
+                l = rows[0]; lead_id = l["id"]; company = l.get("company")
+                patch = {"notes": (stamp + "\n" + (l.get("notes") or ""))[:4000],
+                         "callbackDate": today, "updatedAt": now}
+                if l.get("status") not in ("converted", "do_not_contact"):
+                    patch["status"] = "callback"
+                req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}", headers=SB_HEADERS, json=patch, timeout=10)
+        if not lead_id:
+            lead = {"company": f"Inbound caller {phone or from_raw}", "phone": phone or "",
+                    "notes": stamp, "status": "callback", "callbackDate": today,
+                    "source": "Inbound call", "createdBy": "twilio-inbound",
+                    "createdAt": now, "updatedAt": now}
+            lead["score"] = score_lead(lead)
+            ir = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=lead, timeout=10)
+            if ir.status_code in (200, 201):
+                try: lead_id = ir.json()[0]["id"]
+                except Exception: pass
+    except Exception as e:
+        print(f"[TWILIO-IN] lead filing failed: {e}")
+    audit_log("twilio-inbound", "inbound_call", "lead", lead_id,
+              {"from": from_raw, "transcript": text[:300], "recording": rec_url})
+    send_slack(
+        "📞 Inbound call" + (f" — {company}" if company else " — new caller"),
+        (f"*From:* {phone or from_raw}\n*They said:* {text or '(no speech — check recording)'}"
+         + (f"\n*Recording:* {rec_url}.mp3" if rec_url else "")
+         + "\n\n_Filed at the top of the Day Plan — call back within the hour._"))
+    return {"ok": True}
+
 # ── Slack → warm list (slash command) ────────────────────────────────────────
 # Eric adds warm leads from Slack: /warmlead Acme Cleaning Co, (555) 123-4567,
 # met at the chamber event — wants a quote next week
@@ -9045,6 +9180,24 @@ def _record_weekly_run(cooldown_key: str):
                  headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
                  json={"key": cooldown_key, "value": datetime.utcnow().isoformat() + "Z"}, timeout=10)
 
+def _do_refill_scrape(trigger: str):
+    """Shared core for the weekly AND the low-inventory refill: scrape the next
+    2 metros in the rotation across the target verticals, Slack the result."""
+    idx = int(_settings_get_json("refill_rotation_idx") or 0)
+    metros = [WEEKLY_REFILL_METROS[idx % len(WEEKLY_REFILL_METROS)],
+              WEEKLY_REFILL_METROS[(idx + 1) % len(WEEKLY_REFILL_METROS)]]
+    _settings_set_json("refill_rotation_idx", (idx + 2) % len(WEEKLY_REFILL_METROS))
+    res = run_scrape(ScrapeRequest(industry="Manufacturing",
+                                   industries=WEEKLY_REFILL_INDUSTRIES,
+                                   locations=metros, limit=30), user="eric")
+    saved = res.get("saved", 0) if isinstance(res, dict) else 0
+    dupes = res.get("alreadyInDb", 0) if isinstance(res, dict) else 0
+    print(f"[REFILL:{trigger}] {metros}: saved={saved} dupes={dupes}")
+    send_slack(f"🔄 Lead refill ({trigger})",
+               f"Scraped *{', '.join(metros)}* across {WEEKLY_REFILL_INDUSTRIES}: "
+               f"*{saved} fresh leads* saved ({dupes} already in DB). Live in the dialer now.")
+    return saved
+
 def run_weekly_refill_if_due():
     if not WEEKLY_REFILL_ENABLED or not GOOGLE_KEY:
         return
@@ -9052,22 +9205,51 @@ def run_weekly_refill_if_due():
         return
     _record_weekly_run("last_weekly_refill")   # record BEFORE work (deploy-race guard)
     try:
-        idx = int(_settings_get_json("refill_rotation_idx") or 0)
-        metros = [WEEKLY_REFILL_METROS[idx % len(WEEKLY_REFILL_METROS)],
-                  WEEKLY_REFILL_METROS[(idx + 1) % len(WEEKLY_REFILL_METROS)]]
-        _settings_set_json("refill_rotation_idx", (idx + 2) % len(WEEKLY_REFILL_METROS))
-        res = run_scrape(ScrapeRequest(industry="Manufacturing",
-                                       industries=WEEKLY_REFILL_INDUSTRIES,
-                                       locations=metros, limit=30), user="eric")
-        saved = res.get("saved", 0) if isinstance(res, dict) else 0
-        dupes = res.get("alreadyInDb", 0) if isinstance(res, dict) else 0
-        print(f"[WEEKLY-REFILL] {metros}: saved={saved} dupes={dupes}")
-        send_slack("🔄 Weekly lead refill",
-                   f"Scraped *{', '.join(metros)}* across {WEEKLY_REFILL_INDUSTRIES}: "
-                   f"*{saved} fresh leads* saved ({dupes} already in DB). They're live in the dialer now.")
+        _do_refill_scrape("weekly")
     except Exception as e:
         print(f"[WEEKLY-REFILL] failed: {e}")
         send_slack("⚠️ Weekly lead refill failed", f"`{str(e)[:200]}` — run a manual Find Leads pull.")
+
+# Low-inventory refill: when the undialed pool drops below REFILL_MIN_FRESH,
+# scrape the next rotation immediately — cristine never runs dry mid-week.
+# 20h cooldown so a broken scrape can't loop-spend the Places budget.
+REFILL_MIN_FRESH = int(os.getenv("REFILL_MIN_FRESH", "250"))
+
+def run_inventory_refill_if_due():
+    if not WEEKLY_REFILL_ENABLED or not GOOGLE_KEY:
+        return
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.last_inventory_refill&select=value",
+                        headers=SB_ADMIN_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return
+        rows = r.json()
+        if rows:
+            try:
+                last = datetime.fromisoformat((rows[0].get("value") or "").replace("Z", ""))
+                if (datetime.utcnow() - last) < timedelta(hours=20):
+                    return
+            except Exception:
+                pass
+        # Fresh dialable inventory: never dialed, has a phone, dialable status.
+        cr = req_lib.get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id&phone=neq."
+            f"&or=(total_calls.is.null,total_calls.eq.0)"
+            f"&status=not.in.(retired,do_not_contact,awaiting_email_reply,converted,not_interested)"
+            f"&limit=1",
+            headers={**SB_HEADERS, "Prefer": "count=exact"}, timeout=15)
+        cnt = None
+        cr_range = cr.headers.get("content-range", "")
+        if "/" in cr_range:
+            try: cnt = int(cr_range.split("/")[-1])
+            except Exception: cnt = None
+        if cnt is None or cnt >= REFILL_MIN_FRESH:
+            return
+        _record_weekly_run("last_inventory_refill")   # record BEFORE work
+        print(f"[REFILL:low-inventory] fresh pool at {cnt} (<{REFILL_MIN_FRESH}) — scraping")
+        _do_refill_scrape(f"low inventory: {cnt} fresh left")
+    except Exception as e:
+        print(f"[INV-REFILL] failed: {e}")
 
 def run_weekly_review_scan_if_due():
     if not WEEKLY_REVIEW_SCAN_ENABLED or not GOOGLE_KEY:
