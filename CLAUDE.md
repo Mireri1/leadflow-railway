@@ -85,6 +85,12 @@ Supabase columns: `budgetfocus`, `vendorstatus`, `decisionmaker`, `timeline`, `q
 - `GET /api/leads/{lead_id}` (single-lead, powers frontend targeted refresh) MUST stay AFTER `/api/leads/lookup` and `/api/leads/emailed-flags`
 - FastAPI matches routes in order — wildcard catches everything if first
 
+### 2026-08 pipeline recalibration (don't regress these)
+- **Retirement**: `RETIRE_AFTER_DIALS` (default 4) — log_call auto-parks status `retired` on the Nth no-contact dial (status still new/no_answer); excluded from dialer queue, NO_DIAL sets, stale-recycle, and guidance availability counts. `POST /api/admin/retire-exhausted?dry_run=1` sweeps the backlog (skips leads with ANY historical contact outcome). Manual status edit un-retires.
+- **Targeting (data-driven, 11.5k-call audit)**: hospitals/nursing/public schools = in-house janitorial (5.8% connect, 0.4% engaged) → demoted to a 14-pt fit tier, dropped from NPI taxonomies, CMS fetchers (default `CMS_HEALTH_TYPES=dialysis`), and OSM selectors. Dialysis/urgent-care/clinics/daycare + manufacturing/logistics are the priority tiers. DaVita/Fresenius deliberately NOT chain-penalized (their local managers book walkthroughs). Guidance auto-pull now passes `GUIDANCE_PULL_INDUSTRIES`. Permits no longer dial contractor_phone.
+- **Phone validation**: `lookup_phone_line()` + `POST /api/admin/validate-phones` — env-gated on TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN (~$0.008/lookup); dead numbers → do_not_contact + `[phone:dead]` notes tag.
+- **Dialing is the caller's own Google Voice via tel: links** — no caller-ID management exists in code; spam-reputation is a manual/ops concern.
+
 ### 2026-08 audit fixes (don't regress these)
 - **All App hooks above `if(!user) return <Login/>`** — a hook below it crashed React to a blank screen on every login/logout (proven live).
 - CallModal PATCH must NOT send `callbackDate:""` on neutral outcomes (wiped scheduled callbacks); clears only on not_interested/converted.

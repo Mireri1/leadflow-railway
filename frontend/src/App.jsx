@@ -34,6 +34,7 @@ const STATUS_OPTIONS = [
   { value:"converted",             label:"Converted",             color:"#06d6a0" },
   { value:"awaiting_email_reply",  label:"Awaiting Email Reply",  color:"#a3a6ff" },
   { value:"do_not_contact",        label:"Do Not Contact",        color:"#ff6e84" },
+  { value:"retired",               label:"Retired (4× no contact)",color:"#5a6376" },
 ]
 // Hours to suppress a lead from the dialer after a no-answer/voicemail.
 // Caller's "leads repeating" complaint partly came from re-dialing the same
@@ -43,7 +44,7 @@ const DIALER_SNOOZE_HOURS_DEFAULT = 4
 
 // Statuses callers should NEVER auto-dial — used to filter the dialer queue
 // and to show a "don't call" warning in the call modal.
-const NO_DIAL_STATUSES = new Set(["awaiting_email_reply","do_not_contact"])
+const NO_DIAL_STATUSES = new Set(["awaiting_email_reply","do_not_contact","retired"])
 
 const CALL_OUTCOMES = [
   { value:"answered",       label:"Answered" },

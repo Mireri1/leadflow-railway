@@ -141,6 +141,12 @@ PLACES_KILL_SWITCH = os.getenv("PLACES_KILL_SWITCH", "0") == "1"
 # Non-admin daily scrape cap. UTC midnight reset. Eric (in ADMIN_USERS) is
 # unlimited. Silently no-ops if usage_events table isn't migrated yet.
 NON_ADMIN_DAILY_SCRAPE_CAP = int(os.getenv("NON_ADMIN_DAILY_SCRAPE_CAP", "3"))
+# Dead-number retirement: after this many dials with zero human contact the
+# lead is parked as status='retired' — out of the dialer queue and every
+# recycle path. A number that never picks up in 4 tries is dead or useless;
+# re-dialing it is what rotted the Aug 2026 queue (78% re-dials at 5.5% connect).
+RETIRE_AFTER_DIALS = int(os.getenv("RETIRE_AFTER_DIALS", "4"))
+
 # Non-admin daily Apollo-pull cap. Apollo burns ~1 credit per qualified contact
 # (the /people/match enrichment), so callers get a tighter leash than Eric, who
 # is unlimited. Phone reveals (5-8 credits each) are force-disabled for callers
@@ -878,26 +884,33 @@ def clean(v): return str(v).strip() if v else ""
 # how frequently-cleaned, and how outsourcing-prone the facility is. Matched
 # against industry + company name (lowercased). First tier that matches wins.
 CLEANING_FIT_TIERS = [
-    # (points, [keywords]) — high to low. Keywords are substrings, matched
-    # against industry + company + title, so they must catch NPI taxonomy
-    # strings ("Family Medicine", "Skilled Nursing Facility, Internal Medicine")
-    # and Apollo/OSM labels alike.
-    (40, ["hospital", "surgery", "surgical", "surgeon", "nursing home", "nursing facility",
-          "skilled nursing", "assisted living", "senior living", "long term care",
-          "dialysis", "rehabilitation", "rehab", "medical center", "health system",
-          "imaging center", "radiology", "urgent care", "emergency", "trauma",
-          "behavioral health", "psychiatric", "hospice", "ambulatory"]),
-    (36, ["clinic", "medical", "medicine", "physician", "practice", "dental", "dentist",
-          "orthodont", "veterinary", "veterinarian", "physical therapy", "therapy",
-          "health", "healthcare", "pediatric", "dermatology", "cardiology", "oncology",
-          "orthopedic", "ophthalmology", "optometr", "chiropract", "pharmacy",
-          "family medicine", "internal medicine", "primary care", "outpatient", "wellness"]),
+    # (points, [keywords]) — high to low, FIRST MATCH WINS. Keywords are
+    # substrings matched against industry + company + title.
+    # 2026-08 audit recalibration: 11.5k-call outcome data showed hospitals/
+    # nursing/public schools connect at ~6% and engage at 0.4% (in-house
+    # janitorial), while dialysis/urgent-care/clinics engage 3-5% and
+    # manufacturing/logistics connect 17-18%. Specific outsourcing-friendly
+    # medical keywords are listed BEFORE the institutional demotion tier.
+    (40, ["dialysis", "urgent care", "imaging center", "radiology", "ambulatory",
+          "surgery center", "surgical center", "outpatient", "rehabilitation", "rehab",
+          "assisted living", "senior living", "hospice"]),
     (38, ["manufacturing", "manufacturer", "warehouse", "distribution", "factory", "plant",
           "industrial", "fabrication", "machining", "processing", "logistics", "freight",
           "fulfillment", "storage", "cold storage", "assembly", "foundry", "refinery"]),
-    (36, ["school", "university", "college", "campus", "academy", "daycare", "day care",
-          "preschool", "pre-school", "childcare", "child care", "education", "educational",
-          "montessori", "charter", "learning center", "institute", "seminary", "head start"]),
+    (36, ["clinic", "dental", "dentist", "orthodont", "veterinary", "veterinarian",
+          "physical therapy", "therapy", "pediatric", "dermatology", "cardiology", "oncology",
+          "orthopedic", "ophthalmology", "optometr", "chiropract",
+          "family medicine", "internal medicine", "primary care", "wellness",
+          "physician", "practice", "medicine", "medical"]),
+    (32, ["daycare", "day care", "preschool", "pre-school", "childcare", "child care",
+          "montessori", "learning center", "academy", "private school"]),
+    # In-house institutions — hospitals, nursing, public education, chains'
+    # HQ-decided categories. Kept dialable but bottom of every queue.
+    (14, ["hospital", "health system", "medical center", "nursing home", "nursing facility",
+          "skilled nursing", "long term care", "trauma", "emergency", "surgery", "surgical",
+          "surgeon", "behavioral health", "psychiatric", "school", "university", "college",
+          "campus", "education", "educational", "charter", "head start", "institute",
+          "seminary", "pharmacy", "laboratory", "home health", "health", "healthcare"]),
     (34, ["casino", "arena", "stadium", "convention", "event venue", "events venue", "banquet",
           "theater", "theatre", "cinema", "fitness", "gym", "athletic", "recreation",
           "bowling", "hotel", "motel", "resort", "conference center", "nightclub", "country club"]),
@@ -911,7 +924,12 @@ CLEANING_FIT_TIERS = [
 # National chains decide cleaning at HQ — a local rep can't close them. Demote.
 CHAIN_MARKERS = ["mcdonald", "starbucks", "walmart", "target", "cvs", "walgreens",
                  "subway", "burger king", "wendy", "taco bell", "dunkin", "kfc",
-                 "home depot", "lowe's", "costco", "kroger", "7-eleven", "dollar general"]
+                 "home depot", "lowe's", "costco", "kroger", "7-eleven", "dollar general",
+                 # institutional healthcare chains — HQ-decided, 0-engagement in our data
+                 # (deliberately NOT davita/fresenius: local dialysis managers book walkthroughs)
+                 "brookdale", "genesis healthcare", "kindred", "encompass health",
+                 "select medical", "life care center", "hca ", "ascension", "providence health",
+                 "commonspirit", "trinity health", "lifepoint"]
 
 # Intent markers a source can stamp into a lead's notes via add_intent_marker().
 # Each maps to a score boost — intent (active need) outranks raw fit.
@@ -1447,6 +1465,79 @@ def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: 
           f"saved={saved} dupes={already_in_db} dropped={dropped_uncallable}")
     return {"found": len(raw_leads or []), "saved": saved,
             "alreadyInDb": already_in_db, "droppedUncallable": dropped_uncallable}
+
+# ── Phone line validation (Twilio Lookup v2, env-gated) ─────────────────────
+# Set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in Railway to activate. ~$0.008/
+# lookup. Without creds every check returns "unknown" and nothing changes.
+TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+
+def lookup_phone_line(phone: str):
+    """Returns ('ok'|'dead'|'unknown', line_type). 'dead' = carrier says the
+    number is invalid/unallocated. Fail-open: any API trouble → 'unknown'."""
+    if not (TWILIO_SID and TWILIO_TOKEN):
+        return ("unknown", "")
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 10:
+        digits = "1" + digits
+    if len(digits) != 11:
+        return ("dead", "invalid_format")
+    try:
+        r = req_lib.get(
+            f"https://lookups.twilio.com/v2/PhoneNumbers/+{digits}?Fields=line_type_intelligence",
+            auth=(TWILIO_SID, TWILIO_TOKEN), timeout=8)
+        if r.status_code == 404:
+            return ("dead", "unallocated")
+        if r.status_code != 200:
+            return ("unknown", "")
+        data = r.json()
+        if data.get("valid") is False:
+            return ("dead", "invalid")
+        lti = (data.get("line_type_intelligence") or {})
+        ltype = (lti.get("type") or "").lower()
+        # landline/mobile/fixedVoip all ring; 'nonFixedVoip' often burner but
+        # still dialable. Nothing here retires — only hard-invalid does.
+        return ("ok", ltype)
+    except Exception as e:
+        print(f"[LOOKUP] {phone}: {e}")
+        return ("unknown", "")
+
+@app.post("/api/admin/validate-phones")
+def validate_phones(limit: int = 200, dry_run: int = 0, user: str = Depends(verify_admin)):
+    """Sweep undialed/no-contact leads through carrier lookup; dead numbers
+    get status=do_not_contact + a notes tag so no dial is ever spent on them.
+    Requires TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN; runs newest leads first.
+    Re-runnable: already-tagged leads are skipped."""
+    if not (TWILIO_SID and TWILIO_TOKEN):
+        return {"configured": False, "detail": "Set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in Railway first."}
+    rows = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/leads?select=id,phone,notes"
+        f"&status=in.(new,no_answer)&phone=neq.&order=createdAt.desc")
+    todo = [l for l in rows if "[phone:" not in (l.get("notes") or "")][:max(1, min(limit, 1000))]
+    dead = ok = unknown = 0
+    now = datetime.utcnow().isoformat()
+    for l in todo:
+        verdict, ltype = lookup_phone_line(l.get("phone"))
+        if verdict == "dead":
+            dead += 1
+            if not dry_run:
+                req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{l['id']}",
+                    headers=SB_HEADERS,
+                    json={"status": "do_not_contact", "updatedAt": now,
+                          "notes": ((l.get("notes") or "") + f"\n[phone:dead {ltype}]").strip()},
+                    timeout=10)
+        elif verdict == "ok":
+            ok += 1
+            if not dry_run:
+                req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{l['id']}",
+                    headers=SB_HEADERS,
+                    json={"notes": ((l.get("notes") or "") + f"\n[phone:ok {ltype}]").strip(),
+                          "updatedAt": now}, timeout=10)
+        else:
+            unknown += 1
+    audit_log(user, "validate_phones", "lead", None, {"checked": len(todo), "dead": dead})
+    return {"configured": True, "checked": len(todo), "dead": dead, "ok": ok,
+            "unknown": unknown, "remaining_unchecked": max(0, len([l for l in rows if '[phone:' not in (l.get('notes') or '')]) - len(todo))}
 
 # ── VCC campaign helpers ───────────────────────────────────────────────────
 
@@ -3978,17 +4069,19 @@ def run_scrape(body: ScrapeRequest, user: str = Depends(verify_token)):
 
 # Cleaning-vertical → Overpass tag selectors. `nwr` = node|way|relation.
 OSM_CATEGORY_SELECTORS = {
-    "Healthcare":    ['["amenity"="hospital"]', '["amenity"="clinic"]', '["amenity"="doctors"]',
-                      '["amenity"="dentist"]', '["amenity"="nursing_home"]', '["healthcare"="centre"]',
-                      '["healthcare"="hospital"]', '["healthcare"="clinic"]'],
-    "Education":     ['["amenity"="school"]', '["amenity"="college"]', '["amenity"="university"]',
-                      '["amenity"="kindergarten"]'],
+    # 2026-08 audit: hospitals/nursing_home dropped (in-house EVS); public
+    # schools/colleges dropped (district janitorial) — kindergarten kept
+    # (private daycare/preschools, an engaging segment).
+    "Healthcare":    ['["amenity"="clinic"]', '["amenity"="doctors"]',
+                      '["amenity"="dentist"]', '["healthcare"="centre"]',
+                      '["healthcare"="clinic"]'],
+    "Education":     ['["amenity"="kindergarten"]'],
     "Industrial":    ['["building"="industrial"]', '["building"="warehouse"]', '["landuse"="industrial"]',
                       '["man_made"="works"]', '["industrial"]'],
     "Entertainment": ['["amenity"="theatre"]', '["amenity"="cinema"]', '["amenity"="conference_centre"]',
                       '["amenity"="events_venue"]', '["leisure"="sports_centre"]', '["leisure"="fitness_centre"]',
                       '["leisure"="bowling_alley"]'],
-    "Offices":       ['["office"]', '["amenity"="bank"]'],
+    "Offices":       ['["office"]'],
     "Hospitality":   ['["tourism"="hotel"]', '["amenity"="events_venue"]', '["leisure"="resort"]'],
 }
 # Map a category to the industry label stored on the lead (drives fit scoring).
@@ -4102,9 +4195,11 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
 # NPPES rejects a state-only query ("requires additional search criteria"), so a
 # statewide pull (no city, no taxonomy) fans out across these facility types —
 # the high-cleaning-value healthcare verticals — to cover the whole state.
-NPI_STATEWIDE_TAXONOMIES = ["Clinic/Center", "Nursing", "Skilled Nursing", "Hospital",
-    "General Acute Care", "Assisted Living", "Home Health", "Dental", "Rehabilitation",
-    "Pharmacy", "Laboratory", "Urgent Care", "Surgical", "Dialysis"]
+# 2026-08 audit: dropped Hospital/General Acute Care/Nursing/Skilled Nursing
+# (in-house EVS, 5.8% connect, 0.4% engagement), Home Health (no facility to
+# clean), Pharmacy + Laboratory (chains). Kept the outsourcing-friendly types.
+NPI_STATEWIDE_TAXONOMIES = ["Clinic/Center", "Assisted Living", "Dental", "Rehabilitation",
+    "Urgent Care", "Surgical", "Dialysis"]
 
 def _npi_query(state_abbrev: str, city: str, taxonomy: str, limit: int) -> list:
     params = {"version": "2.1", "enumeration_type": "NPI-2",
@@ -4338,7 +4433,8 @@ def _detect_permit_fields(k: list) -> dict:
                   "contractor_company", "contractor_name", "contractorname", "contractor",
                   "applicant_name", "applicantname", "owner_name", "ownername", "contact_1_name", "owner"],
                   exclude=["address", "city", "state", "zip", "phone", "trade", "type"]),
-        "phone":  _pick_field(k, ["applicant_phone", "contractor_phone", "phone"]),
+        # contractor_phone dropped — it reaches the builder, not the facility
+        "phone":  _pick_field(k, ["applicant_phone", "phone"]),
         "name":   _pick_field(k, ["applicant_full_name", "contractor_full_name", "applicantname",
                   "contact_1_name"]),
         "klass":  _pick_field(k, ["permit_class_mapped", "permitclassmapped", "permit_class",
@@ -4669,11 +4765,16 @@ def fetch_cms_dialysis(state_abbrev: str) -> list:
 
 # Registry — add a facility type by dropping in (label, fetcher). The endpoint
 # pulls every type for a state. Nursing homes carry the deepest signal.
-CMS_HEALTHCARE_FETCHERS = [
+# 2026-08 audit: nursing homes + hospitals run in-house EVS (0.4% engagement
+# on 519 dials); dialysis centers engage at 3.1% and booked real walkthroughs.
+# Default pulls dialysis only; re-enable others via CMS_HEALTH_TYPES env.
+_CMS_ALL_FETCHERS = [
     ("nursing",  fetch_cms_nursing),
     ("hospital", fetch_cms_hospitals),
     ("dialysis", fetch_cms_dialysis),
 ]
+CMS_HEALTH_TYPES = set(t.strip() for t in os.getenv("CMS_HEALTH_TYPES", "dialysis").split(",") if t.strip())
+CMS_HEALTHCARE_FETCHERS = [t for t in _CMS_ALL_FETCHERS if t[0] in CMS_HEALTH_TYPES]
 
 def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
     """Pull recent FAILED health inspections for configured metros in a state.
@@ -5488,7 +5589,7 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
     # eq.<empty> branch as well as is.null. Tested both branches in prod.
     base = (f"{SUPABASE_URL}/rest/v1/leads?select=*"
             f"&or=(assignedTo.eq.{url_quote(user)},assignedTo.is.null,assignedTo.eq.)"
-            f"&status=not.in.(awaiting_email_reply,do_not_contact)"
+            f"&status=not.in.(awaiting_email_reply,do_not_contact,retired)"
             f"&phone=neq."  # empty-string check matches the legacy convention
             f"&order=total_calls.asc.nullsfirst,last_called_at.asc.nullsfirst,score.desc")
     rows = _paginated_get(base, page_size=1000, max_pages=5)
@@ -5496,7 +5597,7 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
         rows = []
 
     # NANP guard (PostgREST regex would need a function; keep in Python).
-    NO_DIAL = {"awaiting_email_reply", "do_not_contact"}
+    NO_DIAL = {"awaiting_email_reply", "do_not_contact", "retired"}
     SNOOZED_OUTCOMES = {"no_answer", "voicemail", "called", "not_interested"}
     cutoff_iso = None
     if snooze_hours > 0:
@@ -6108,6 +6209,14 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                 "updatedAt":      now_iso,
                 "last_called_at": called_at,
             }
+            # ☠ Auto-retire: Nth consecutive-no-contact dial parks the lead.
+            # Status new/no_answer means no human was ever reached (any contact
+            # outcome rewrites status), so count>=N ⇒ N failures. Manual
+            # status edit un-retires if a caller wants another shot.
+            if (outcome in ("no_answer", "voicemail")
+                    and new_count is not None and new_count >= RETIRE_AFTER_DIALS
+                    and (lead_full.get("status") or "new") in ("new", "no_answer")):
+                patch_payload["status"] = "retired"
             # Only update total_calls when we have a trustworthy count.
             # Skipping (vs. writing a wrong value) is the safe failure mode —
             # the next successful log_call self-heals the counter.
@@ -7053,7 +7162,7 @@ def guidance_best_region(days: int = 30, min_sample: int = 20,
             f"?select=id&state=eq.{top['state']}"
             f"&or=(assignedTo.is.null,assignedTo.eq.)"
             f"&phone=not.is.null"
-            f"&status=not.in.(converted,interested)"
+            f"&status=not.in.(converted,interested,retired,do_not_contact)"
             "&limit=1000",
             headers=SB_HEADERS, timeout=20,
         )
@@ -7079,7 +7188,7 @@ def guidance_switch(body: dict, user: str = Depends(verify_token)):
             f"?select=id&state=eq.{state}"
             f"&or=(assignedTo.is.null,assignedTo.eq.)"
             f"&phone=not.is.null"
-            f"&status=not.in.(converted,interested)"
+            f"&status=not.in.(converted,interested,retired,do_not_contact)"
             "&limit=1000",
             headers=SB_HEADERS, timeout=20,
         )
@@ -7123,7 +7232,9 @@ def guidance_switch(body: dict, user: str = Depends(verify_token)):
     pull_body = ApolloPullRequest(
         titles=["Facility Manager","Director of Operations",
                 "Operations Manager","Property Manager"],
-        industries=[],
+        industries=[i.strip() for i in os.getenv("GUIDANCE_PULL_INDUSTRIES",
+            "medical practice,hospital & health care,machinery,logistics and supply chain,warehousing"
+            ).split(",") if i.strip()],
         locations=[US_STATES_FULL.get(state, state)],
         per_page=25, page=1, reveal_phones=False,
         auto_paginate=False, min_new_leads=10, max_pages=1,
@@ -7149,6 +7260,46 @@ def guidance_switch(body: dict, user: str = Depends(verify_token)):
         resp["message"] = f"Switched to {state}. Apollo pull error: {e}"
     return resp
 
+@app.post("/api/admin/retire-exhausted")
+def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
+    """One-time (re-runnable) sweep: retire every lead already sitting at
+    RETIRE_AFTER_DIALS+ no-contact dials. Safety: skips any lead with a human-
+    contact outcome anywhere in its call history, even if its status decayed
+    back to no_answer later."""
+    try:
+        cands = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,status,total_calls"
+            f"&status=in.(new,no_answer)&total_calls=gte.{RETIRE_AFTER_DIALS}")
+        cand_ids = [l["id"] for l in cands]
+        # exclude anything that EVER reached a human
+        contacted = set()
+        CONTACT_SET = "answered,interested,interested_no_dm,converted,callback,not_interested"
+        for i in range(0, len(cand_ids), 150):
+            chunk = ",".join(str(x) for x in cand_ids[i:i+150])
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=in.({chunk})"
+                f"&outcome=in.({CONTACT_SET})&select=leadId",
+                headers=SB_HEADERS, timeout=20)
+            if r.status_code == 200:
+                contacted.update(row["leadId"] for row in r.json())
+        to_retire = [i for i in cand_ids if i not in contacted]
+        if dry_run:
+            return {"would_retire": len(to_retire), "skipped_had_contact": len(contacted),
+                    "candidates": len(cand_ids)}
+        now = datetime.utcnow().isoformat()
+        done = 0
+        for i in range(0, len(to_retire), 100):
+            chunk = ",".join(str(x) for x in to_retire[i:i+100])
+            rr = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})",
+                headers=SB_HEADERS, json={"status": "retired", "updatedAt": now}, timeout=30)
+            if rr.status_code in (200, 204):
+                done += min(100, len(to_retire)-i)
+        audit_log(user, "retire_exhausted", "lead", None,
+                  {"retired": done, "skipped_had_contact": len(contacted)})
+        return {"retired": done, "skipped_had_contact": len(contacted), "candidates": len(cand_ids)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/leads/recycle-stale")
 def recycle_stale_leads(user: str = Depends(verify_admin)):
     """Unassign leads that haven't been touched in 7+ days"""
@@ -7156,7 +7307,7 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
         cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
         stale = _paginated_get(
             f"{SUPABASE_URL}/rest/v1/leads?select=id,assignedTo,updatedAt,status"
-            f"&assignedTo=neq.&status=not.in.(converted,interested)"
+            f"&assignedTo=neq.&status=not.in.(converted,interested,retired,do_not_contact)"
             f"&updatedAt=lt.{cutoff}")
         recycled_ids = [{"id": l["id"], "was_assigned_to": l.get("assignedTo")} for l in stale if l.get("assignedTo")]
         stale_ids = [item["id"] for item in recycled_ids]
