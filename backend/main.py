@@ -2619,6 +2619,15 @@ def _bg_maintenance_loop():
             run_walkthrough_followup_nudge_if_due()
         except Exception as e:
             print(f"[WALKTHROUGH-NUDGE] loop exception: {e}")
+        # Weekly self-driving sourcing: Monday refill scrape + complaint scan.
+        try:
+            run_weekly_refill_if_due()
+        except Exception as e:
+            print(f"[WEEKLY-REFILL] loop exception: {e}")
+        try:
+            run_weekly_review_scan_if_due()
+        except Exception as e:
+            print(f"[WEEKLY-SCAN] loop exception: {e}")
         # Monthly macro snapshot — banks one FRED reading per calendar month so a
         # paired macro × receptivity history builds up. No-op once banked.
         try:
@@ -5932,6 +5941,63 @@ async def appt_approve_submit(request: Request):
       <div style="text-align:center"><h2>✅ Approved</h2>
       <p style="color:#a3aac4">{appt.get('company','')} sent to Angelo for hiring.</p></div></body></html>""")
 
+# ── Slack → warm list (slash command) ────────────────────────────────────────
+# Eric adds warm leads from Slack: /warmlead Acme Cleaning Co, (555) 123-4567,
+# met at the chamber event — wants a quote next week
+# Slack app setup: create a slash command pointing at POST {APP_URL}/slack/warm-lead
+# and set the app's Verification Token as SLACK_COMMAND_TOKEN in Railway.
+SLACK_COMMAND_TOKEN = os.getenv("SLACK_COMMAND_TOKEN", "")
+
+@app.post("/slack/warm-lead")
+async def slack_warm_lead(request: Request):
+    form = await request.form()
+    if not SLACK_COMMAND_TOKEN or form.get("token") != SLACK_COMMAND_TOKEN:
+        raise HTTPException(status_code=403, detail="Bad or missing Slack token")
+    text = (form.get("text") or "").strip()
+    who  = form.get("user_name") or "slack"
+    if not text:
+        return {"response_type": "ephemeral",
+                "text": "Usage: /warmlead Company Name, (555) 123-4567, any notes"}
+    m = re.search(r"(\+?1?[\s.\-]?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4})", text)
+    phone = normalize_us_phone(m.group(1)) if m else ""
+    company = text[:m.start()].strip(" ,-|") if m else text.split(",")[0].strip()
+    note = text[m.end():].strip(" ,-|") if m else ",".join(text.split(",")[1:]).strip()
+    if not company:
+        return {"response_type": "ephemeral", "text": "Couldn't read a company name — put it first: /warmlead Company, phone, note"}
+    today = local_today()
+    now = datetime.utcnow().isoformat()
+    stamp = f"[warm-list] ⭐ Added via Slack by {who} ({today})" + (f": {note}" if note else "")
+    # Phone dedupe → tag + bump the existing lead instead of duplicating
+    if phone:
+        try:
+            r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?phone=eq.{url_quote(phone, safe='')}&select=id,notes,status,company",
+                            headers=SB_HEADERS, timeout=10)
+            rows = r.json() if r.status_code == 200 else []
+        except Exception:
+            rows = []
+        if rows:
+            l = rows[0]
+            patch = {"notes": (stamp + "\n" + (l.get("notes") or ""))[:4000],
+                     "callbackDate": today, "updatedAt": now}
+            if l.get("status") not in ("converted", "do_not_contact"):
+                patch["status"] = "callback"
+            pr = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{l['id']}", headers=SB_HEADERS, json=patch, timeout=10)
+            ok = pr.status_code in (200, 204)
+            audit_log(f"slack:{who}", "warm_lead_slack", "lead", l["id"], {"existing": True, "ok": ok})
+            return {"response_type": "in_channel",
+                    "text": (f"⭐ *{l.get('company') or company}* was already in LeadFlow — bumped to the top of the warm list for today." if ok
+                             else "⚠️ Found the lead but couldn't update it — add it in the app.")}
+    lead = {"company": company, "phone": phone, "notes": stamp, "status": "callback",
+            "callbackDate": today, "source": "Eric warm", "createdBy": f"slack:{who}",
+            "createdAt": now, "updatedAt": now}
+    lead["score"] = score_lead(lead)
+    ir = req_lib.post(f"{SUPABASE_URL}/rest/v1/leads", headers=SB_HEADERS, json=lead, timeout=10)
+    ok = ir.status_code in (200, 201)
+    audit_log(f"slack:{who}", "warm_lead_slack", "lead", None, {"company": company, "ok": ok})
+    return {"response_type": "in_channel",
+            "text": (f"⭐ *{company}*{f' · {phone}' if phone else ''} added to the warm list — top of cristine's Day Plan today."
+                     if ok else f"⚠️ Couldn't save *{company}* — add it in the app.")}
+
 @app.post("/api/appointments/{lead_id}")
 async def upsert_appointment(lead_id: str, request: Request, user: str = Depends(verify_token)):
     """Book/update a walkthrough appointment (any caller). New ones start at
@@ -8937,6 +9003,89 @@ def run_walkthrough_followup_nudge_if_due():
         print(f"[WALKTHROUGH-NUDGE] pinged — {len(fus)} awaiting decision")
     except Exception as e:
         print(f"[WALKTHROUGH-NUDGE] failed: {e}")
+
+# ── Weekly self-driving sourcing ─────────────────────────────────────────────
+# Monday (UTC ISO-week gated, record-before-work like the weekly digest):
+#   1. refill: Google Places scrape for 2 rotating metros × target verticals
+#      (~150-200 fresh leads, ~$10/wk of Places calls)
+#   2. complaint scan: 50-lead review batch (~$2.50/wk) to feed Day Plan rung 4
+# Both post a one-line Slack summary. Kill switches: WEEKLY_REFILL_ENABLED /
+# WEEKLY_REVIEW_SCAN_ENABLED.
+WEEKLY_REFILL_ENABLED      = os.getenv("WEEKLY_REFILL_ENABLED", "1") == "1"
+WEEKLY_REVIEW_SCAN_ENABLED = os.getenv("WEEKLY_REVIEW_SCAN_ENABLED", "1") == "1"
+WEEKLY_REFILL_METROS = [m.strip() for m in os.getenv("WEEKLY_REFILL_METROS",
+    "Phoenix, AZ|Las Vegas, NV|Dallas, TX|Houston, TX|Tucson, AZ|Reno, NV|Atlanta, GA|Orlando, FL"
+    ).split("|") if m.strip()]
+WEEKLY_REFILL_INDUSTRIES = os.getenv("WEEKLY_REFILL_INDUSTRIES",
+    "Manufacturing,Logistics,Industrial,Healthcare,Medical Equipment")
+WEEKLY_REVIEW_SCAN_INDUSTRIES = os.getenv("WEEKLY_REVIEW_SCAN_INDUSTRIES",
+    "clinic,dialysis,urgent,dental,daycare,kindergarten,manufacturing,logistics")
+
+def _iso_week_due(cooldown_key: str) -> bool:
+    """True once per ISO week (any weekday ≥ Monday). Fail closed."""
+    try:
+        now = datetime.utcnow()
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{cooldown_key}&select=value",
+                        headers=SB_ADMIN_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return False
+        rows = r.json()
+        if not rows:
+            return True
+        try:
+            last = datetime.fromisoformat((rows[0].get("value") or "").replace("Z", ""))
+        except Exception:
+            return True
+        return last.isocalendar()[:2] != now.isocalendar()[:2]
+    except Exception:
+        return False
+
+def _record_weekly_run(cooldown_key: str):
+    req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                 headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                 json={"key": cooldown_key, "value": datetime.utcnow().isoformat() + "Z"}, timeout=10)
+
+def run_weekly_refill_if_due():
+    if not WEEKLY_REFILL_ENABLED or not GOOGLE_KEY:
+        return
+    if not _iso_week_due("last_weekly_refill"):
+        return
+    _record_weekly_run("last_weekly_refill")   # record BEFORE work (deploy-race guard)
+    try:
+        idx = int(_settings_get_json("refill_rotation_idx") or 0)
+        metros = [WEEKLY_REFILL_METROS[idx % len(WEEKLY_REFILL_METROS)],
+                  WEEKLY_REFILL_METROS[(idx + 1) % len(WEEKLY_REFILL_METROS)]]
+        _settings_set_json("refill_rotation_idx", (idx + 2) % len(WEEKLY_REFILL_METROS))
+        res = run_scrape(ScrapeRequest(industry="Manufacturing",
+                                       industries=WEEKLY_REFILL_INDUSTRIES,
+                                       locations=metros, limit=30), user="eric")
+        saved = res.get("saved", 0) if isinstance(res, dict) else 0
+        dupes = res.get("alreadyInDb", 0) if isinstance(res, dict) else 0
+        print(f"[WEEKLY-REFILL] {metros}: saved={saved} dupes={dupes}")
+        send_slack("🔄 Weekly lead refill",
+                   f"Scraped *{', '.join(metros)}* across {WEEKLY_REFILL_INDUSTRIES}: "
+                   f"*{saved} fresh leads* saved ({dupes} already in DB). They're live in the dialer now.")
+    except Exception as e:
+        print(f"[WEEKLY-REFILL] failed: {e}")
+        send_slack("⚠️ Weekly lead refill failed", f"`{str(e)[:200]}` — run a manual Find Leads pull.")
+
+def run_weekly_review_scan_if_due():
+    if not WEEKLY_REVIEW_SCAN_ENABLED or not GOOGLE_KEY:
+        return
+    if not _iso_week_due("last_weekly_review_scan"):
+        return
+    _record_weekly_run("last_weekly_review_scan")
+    try:
+        res = enrich_reviews(ReviewScanRequest(limit=50, industries=WEEKLY_REVIEW_SCAN_INDUSTRIES), user="eric")
+        flagged = res.get("flagged", 0) if isinstance(res, dict) else 0
+        scanned = res.get("scanned", 0) if isinstance(res, dict) else 0
+        print(f"[WEEKLY-SCAN] scanned={scanned} flagged={flagged}")
+        if flagged:
+            send_slack("🚨 Weekly complaint scan",
+                       f"Scanned {scanned} leads — *{flagged}* have fresh cleanliness complaints. "
+                       f"They just jumped up the Day Plan complaint list.")
+    except Exception as e:
+        print(f"[WEEKLY-SCAN] failed: {e}")
 
 def run_email_queue_nudge_if_due():
     """Once per ET day (after the digest hour): if there are leads eligible for

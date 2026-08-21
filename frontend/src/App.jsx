@@ -208,6 +208,12 @@ const SOURCE_META = {
   "health inspection":         { label: "Health Inspection", color: "#ff4d6d" },
   "google places":             { label: "Google Places",  color: "#a3a6ff" },
 }
+// Eric's warm list: hand-picked follow-ups. Matched by the [warm-list] tag
+// (Slack /warmlead adds it) or by the hand-curated import sources.
+const WARM_LIST_SOURCES=new Set(["angelo list","eric follow-ups","eric warm"])
+function isWarmList(l){
+  return (l.notes||"").includes("[warm-list]")||WARM_LIST_SOURCES.has((l.source||"").toLowerCase())
+}
 // Newest "📧 Reply (YYYY-MM-DD…" stamp the IMAP poller prepends when a
 // lead-gen email gets answered — the strongest buy signal in the system.
 function lastReplyDate(notes){
@@ -3687,6 +3693,11 @@ export default function App(){
     const pool=(allLeads.length?allLeads:leads)
     const t=localDate()
     const mine=l=>!l.assignedTo||l.assignedTo===user
+    // 0 · ⭐ Eric's warm list — hand-picked follow-ups, worked before anything.
+    const warmlist=pool.filter(l=>mine(l)&&isWarmList(l)
+        &&!["converted","not_interested","do_not_contact","retired"].includes(l.status)
+        &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
+      .sort((a,b)=>((a.callbackDate||"9999").localeCompare(b.callbackDate||"9999"))||((b.score||0)-(a.score||0)))
     // 1 · 📨 Inbound inquiry/reply not yet called back — speed-to-lead wins.
     const inq=pool.filter(l=>mine(l)&&!["converted","do_not_contact"].includes(l.status)&&(()=>{
         const d=lastReplyDate(l.notes)
@@ -3709,10 +3720,11 @@ export default function App(){
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t)
         &&parseIntents(l.notes).some(k=>k==="health_violation"||k==="cleanliness"))
       .sort((a,b)=>(b.score||0)-(a.score||0))
-    return {inq,walk,due,complaints,pool,mine,t}
+    return {warmlist,inq,walk,due,complaints,pool,mine,t}
   }
   function pickNextLead(){
-    const {inq,walk,due,complaints,pool,mine}=dayPlanRungs()
+    const {warmlist,inq,walk,due,complaints,pool,mine}=dayPlanRungs()
+    if(warmlist.length) return warmlist[0]
     if(inq.length) return inq[0]
     if(walk.length) return walk[0]
     if(due.length) return due[0]
@@ -4281,8 +4293,10 @@ export default function App(){
                   Always shows every rung (even at 0) so the priority model
                   itself is what the caller learns. */}
               {(()=>{
-                const {inq,walk,due,complaints}=dayPlanRungs()
+                const {warmlist,inq,walk,due,complaints}=dayPlanRungs()
                 const rungs=[
+                  {icon:"⭐",label:"Eric's warm list",desc:"Hand-picked follow-ups — add more from Slack with /warmlead",
+                    color:"#69f6b8",list:warmlist},
                   {icon:"📨",label:"Inquiries & replies",desc:"Someone reached out — call back within the hour",
                     color:"#ff6e84",list:inq},
                   {icon:"🚶",label:"Walkthrough follow-ups",desc:"Walkthrough done, decision pending",
