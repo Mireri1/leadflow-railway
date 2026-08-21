@@ -208,6 +208,13 @@ const SOURCE_META = {
   "health inspection":         { label: "Health Inspection", color: "#ff4d6d" },
   "google places":             { label: "Google Places",  color: "#a3a6ff" },
 }
+// Newest "📧 Reply (YYYY-MM-DD…" stamp the IMAP poller prepends when a
+// lead-gen email gets answered — the strongest buy signal in the system.
+function lastReplyDate(notes){
+  let m, d="", re=/📧 Reply \((\d{4}-\d{2}-\d{2})/g
+  while((m=re.exec(notes||""))) if(m[1]>d) d=m[1]
+  return d
+}
 function parseIntents(notes){
   const out = []
   const s = (notes||"").toLowerCase()
@@ -3673,20 +3680,43 @@ export default function App(){
     }catch{ notify("Couldn't undo — the 2-minute window may have passed","error") }
   }
 
-  // 📞 "Who's next?" — the single best next dial: walkthrough follow-ups →
-  // due callbacks → warm → fresh.
-  function pickNextLead(){
+  // 📞 "Who's next?" — Eric's operating order, top to bottom:
+  // 1 inquiries/replies · 2 walkthrough follow-ups · 3 due callbacks ·
+  // 4 fresh complaint list · then warm → fresh queue.
+  function dayPlanRungs(){
     const pool=(allLeads.length?allLeads:leads)
     const t=localDate()
     const mine=l=>!l.assignedTo||l.assignedTo===user
-    // 🚶 Completed walkthroughs awaiting a decision outrank everything.
+    // 1 · 📨 Inbound inquiry/reply not yet called back — speed-to-lead wins.
+    const inq=pool.filter(l=>mine(l)&&!["converted","do_not_contact"].includes(l.status)&&(()=>{
+        const d=lastReplyDate(l.notes)
+        return d&&(!l.last_called_at||tsLocalDate(l.last_called_at)<d)
+      })())
+      .sort((a,b)=>lastReplyDate(b.notes).localeCompare(lastReplyDate(a.notes)))
+    // 2 · 🚶 Completed walkthroughs awaiting a decision.
     const wt=new Map(apptFollowups.map(f=>[String(f.leadId),f]))
     const walk=pool.filter(l=>wt.has(String(l.id))&&l.status!=="converted"&&mine(l))
       .sort((a,b)=>(wt.get(String(a.id)).date||"").localeCompare(wt.get(String(b.id)).date||""))
-    if(walk.length) return walk[0]
-    const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l))
+    // 3 · ⏰ Callbacks due, not yet tried today.
+    const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l)
+        &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
       .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
+    // 4 · 🚨 Complaint list: violation/review-flagged, still fresh (<4 tries),
+    //     not already dialed today. Newest complaints score highest.
+    const complaints=pool.filter(l=>mine(l)
+        &&["","new","no_answer","called"].includes(l.status||"")
+        &&(l.total_calls||0)<4
+        &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t)
+        &&parseIntents(l.notes).some(k=>k==="health_violation"||k==="cleanliness"))
+      .sort((a,b)=>(b.score||0)-(a.score||0))
+    return {inq,walk,due,complaints,pool,mine,t}
+  }
+  function pickNextLead(){
+    const {inq,walk,due,complaints,pool,mine}=dayPlanRungs()
+    if(inq.length) return inq[0]
+    if(walk.length) return walk[0]
     if(due.length) return due[0]
+    if(complaints.length) return complaints[0]
     const warm=pool.filter(l=>parseSentiment(l.notes)==="warm"&&mine(l)&&!["converted","not_interested"].includes(l.status))
       .sort((a,b)=>(b.score||0)-(a.score||0))
     if(warm.length) return warm[0]
@@ -4246,6 +4276,64 @@ export default function App(){
                 onSwitch={switchToRegion} onDismiss={dismissBestRegion}
                 switching={switchingRegion}/>
               <StatsBar stats={stats} onCallbacks={()=>{setNav("leads");setCbOnly(p=>!p)}}/>
+
+              {/* 📋 Day Plan — the operating order, worked top to bottom.
+                  Always shows every rung (even at 0) so the priority model
+                  itself is what the caller learns. */}
+              {(()=>{
+                const {inq,walk,due,complaints}=dayPlanRungs()
+                const rungs=[
+                  {icon:"📨",label:"Inquiries & replies",desc:"Someone reached out — call back within the hour",
+                    color:"#ff6e84",list:inq},
+                  {icon:"🚶",label:"Walkthrough follow-ups",desc:"Walkthrough done, decision pending",
+                    color:"#ff9f43",list:walk},
+                  {icon:"⏰",label:"Due callbacks",desc:"Promised call-backs, not yet tried today",
+                    color:"#ffe083",list:due},
+                  {icon:"🚨",label:"Complaint list",desc:"Failed inspections & bad-review flags — lead with the complaint",
+                    color:"#a3a6ff",list:complaints},
+                ]
+                return(
+                  <div style={{background:"#0f1930",borderRadius:12,padding:"16px 20px",marginTop:16}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,flexWrap:"wrap"}}>
+                      <span style={{fontSize:"0.62rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+                        textTransform:"uppercase"}}>📋 Day Plan — work top to bottom</span>
+                      <span style={{fontSize:11,color:"#5a6a8a"}}>then hit the Dialer for the fresh queue</span>
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                      {rungs.map((r,i)=>(
+                        <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",
+                          background:r.list.length?"#0a1428":"transparent",borderRadius:9,
+                          border:`1px solid ${r.list.length?r.color+"35":"#40485d20"}`,
+                          opacity:r.list.length?1:.45}}>
+                          <span style={{fontSize:17,width:24,textAlign:"center"}}>{r.icon}</span>
+                          <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:18,fontWeight:700,
+                            color:r.list.length?r.color:"#40485d",minWidth:28,textAlign:"right"}}>{r.list.length}</span>
+                          <div style={{minWidth:0,flex:1}}>
+                            <div style={{fontSize:13,fontWeight:700,color:r.list.length?"#dee5ff":"#5a6a8a"}}>{r.label}</div>
+                            <div style={{fontSize:11,color:"#5a6a8a"}}>{r.desc}</div>
+                          </div>
+                          {r.list.length>0&&(
+                            <button className="btn btn-p" style={{fontSize:12,padding:"7px 14px",whiteSpace:"nowrap"}}
+                              onClick={()=>setCallModal(r.list[0])}>📞 Call next</button>
+                          )}
+                        </div>
+                      ))}
+                      <div style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",
+                        borderRadius:9,border:"1px solid #40485d20"}}>
+                        <span style={{fontSize:17,width:24,textAlign:"center"}}>☎️</span>
+                        <span style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:18,fontWeight:700,
+                          color:"#69f6b8",minWidth:28,textAlign:"right"}}>∞</span>
+                        <div style={{minWidth:0,flex:1}}>
+                          <div style={{fontSize:13,fontWeight:700,color:"#dee5ff"}}>Fresh queue</div>
+                          <div style={{fontSize:11,color:"#5a6a8a"}}>New leads, best-fit first — the rest of the day</div>
+                        </div>
+                        <button className="btn btn-g" style={{fontSize:12,padding:"7px 14px",whiteSpace:"nowrap"}}
+                          onClick={()=>setNav("dialer")}>Open Dialer</button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
 
               {/* Daily Call Quota */}
               {(()=>{

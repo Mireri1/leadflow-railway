@@ -170,6 +170,9 @@ ACTIONS TAKEN: [list or "None needed"]
 ## Follow-Ups tab structure (2026-08)
 Buckets in priority order: 🚶 Walkthrough Follow-Ups → 🚨 **Overdue — Untouched** (no call since callbackDate came due; `last_called_at < callbackDate`) → ✆ **Overdue — Attempted** (called since due, still on old date; shows tried-date chip) → Today → This Week → Next 30 Days → Later → Future. Near-term buckets sort Interested > interested_no_dm > callback > rest, then oldest date. Headers toggle collapse (`fuCollapsed` state at App level — never inside the IIFE); month/later/future default collapsed. Dashboard overdue banner shows the untouched/attempted split. This split exists so Eric can tell "caller ignoring it" from "logged via ⚡ quick no-answer, which deliberately doesn't touch callbackDate."
 
+## Day Plan (2026-08) — the calling priority ladder
+`dayPlanRungs()` in App.jsx defines Eric's operating order, surfaced as the 📋 Day Plan dashboard card AND powering "Who's next?": 1) 📨 inquiries/replies (`lastReplyDate()` parses the poller's "📧 Reply (date…" note stamp; pending = no call since the reply) → 2) 🚶 walkthrough follow-ups → 3) ⏰ due callbacks not tried today → 4) 🚨 complaint list ([INTENT:health_violation]/[INTENT:cleanliness], <4 calls, not called today, score-sorted) → fresh queue. The card always renders all rungs (zeros dimmed) so the order itself is the training. Review-scan (`POST /api/enrich/reviews`, admin, ~$0.05/lead, 100/run cap) stamps the cleanliness tag — run small batches over undialed NPI/OSM stock to feed rung 4.
+
 ## QoL features (2026-06)
 - Caller: ⚡ one-tap "No answer" (lead rows + dialer), 📞 "Who's next?" header button (due callbacks → warm → fresh), year-typo date guard (`confirmFarDate`), end-of-shift recap on sign-out, mid-shift due-callback nudge (max 1/2h).
 - Admin: 🕐 Clock in/out header button + `POST /api/auth/clock-in|clock-out` (user_sessions); weekly digest includes hours/caller via shared `_compute_hours()`.
