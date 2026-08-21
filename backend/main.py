@@ -7260,6 +7260,34 @@ def guidance_switch(body: dict, user: str = Depends(verify_token)):
         resp["message"] = f"Switched to {state}. Apollo pull error: {e}"
     return resp
 
+@app.post("/api/admin/rescore-all")
+def rescore_all(user: str = Depends(verify_admin)):
+    """Recompute score_lead for every lead and persist changes. Needed whenever
+    the fit tiers / boosts change — scores are stamped at insert, so without
+    this the old model keeps ordering the dialer queue. Groups PATCHes by new
+    score value (one request per distinct score)."""
+    try:
+        rows = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,score,industry,company,title,notes,phone,firstName,email")
+        by_new = {}
+        for l in rows:
+            ns = score_lead(l)
+            if ns != (l.get("score") or 0):
+                by_new.setdefault(ns, []).append(l["id"])
+        now = datetime.utcnow().isoformat()
+        changed = 0
+        for ns, ids in by_new.items():
+            for i in range(0, len(ids), 200):
+                chunk = ",".join(str(x) for x in ids[i:i+200])
+                rr = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})",
+                    headers=SB_HEADERS, json={"score": ns, "updatedAt": now}, timeout=30)
+                if rr.status_code in (200, 204):
+                    changed += min(200, len(ids)-i)
+        audit_log(user, "rescore_all", "lead", None, {"changed": changed, "total": len(rows)})
+        return {"total": len(rows), "changed": changed, "distinct_scores": len(by_new)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/admin/retire-exhausted")
 def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
     """One-time (re-runnable) sweep: retire every lead already sitting at
