@@ -3538,6 +3538,19 @@ export default function App(){
     const iv=setInterval(load, 30*60*1000)
     return()=>clearInterval(iv)
   },[user]) // eslint-disable-line
+  // ☎️ Twilio click-to-call config (local caller ID per market)
+  const [twilioCall,setTwilioCall]=useState(null)
+  useEffect(()=>{
+    if(!user) return
+    api("/api/call/config").then(setTwilioCall).catch(()=>setTwilioCall(null))
+  },[user])
+  async function startTwilioCall(lead){
+    try{
+      const r=await api("/api/call/start",{method:"POST",body:JSON.stringify({leadId:lead.id})})
+      notify(`☎️ ${r.detail||"Your phone is ringing"} — caller ID ${r.caller_id}${r.recording?" · 🔴 recording":""}`)
+    }catch(e){ notify("Couldn't start the call — "+(e.message||"check Twilio setup"),"error") }
+  }
+
   // Follow-Ups tab: far-out buckets start collapsed so the page stays
   // scannable as volume grows. (State lives here — no hooks in the IIFE.)
   const [fuCollapsed,setFuCollapsed] = useState({month:true,later:true,future:true})
@@ -5413,6 +5426,15 @@ export default function App(){
                           <span style={{color:"#69f6b8",fontWeight:600}}>✨ Never called — fresh lead</span>
                         )}
                       </div>
+                      {lead.phone&&twilioCall?.ready&&(
+                        <button className="btn btn-p"
+                          style={{width:"100%",padding:"13px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",
+                            fontWeight:700,marginBottom:10}}
+                          onClick={()=>startTwilioCall(lead)}
+                          title="Rings your phone first, then connects with a local-area-code caller ID. Records where legal.">
+                          ☎️ Call — local caller ID
+                        </button>
+                      )}
                       {lead.phone&&(
                         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20,flexWrap:"wrap"}}>
                           {/* tel: link — one tap dials on mobile / Google Voice desktop handler */}

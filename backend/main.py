@@ -2629,6 +2629,11 @@ def _bg_maintenance_loop():
             run_inventory_refill_if_due()
         except Exception as e:
             print(f"[INV-REFILL] loop exception: {e}")
+        # Weekly call-coaching report (needs Voice Intelligence transcripts).
+        try:
+            run_call_coach_if_due()
+        except Exception as e:
+            print(f"[COACH] loop exception: {e}")
         try:
             run_weekly_review_scan_if_due()
         except Exception as e:
@@ -6076,6 +6081,213 @@ async def twilio_transcription(request: Request):
          + "\n\n_Filed at the top of the Day Plan — call back within the hour._"))
     return {"ok": True}
 
+# ── Twilio click-to-call + recording + Claude call coach ─────────────────────
+# POST /api/call/start bridges: Twilio rings the CALLER's phone first, then
+# dials the lead with a market-matched local caller ID (TWILIO_NUMBERS).
+# Recording only when the lead's state is one-party-consent (RECORD_STATES);
+# recordings flow → Voice Intelligence transcription (TWILIO_INTELLIGENCE_SID)
+# → audit_log 'call_transcript' rows → weekly Claude coaching report.
+# TWILIO_NUMBERS format: "+17025550100:NV,+16145550100:OH,+18165550100:MO"
+# (first entry is the default caller ID for unmatched states).
+TWILIO_NUMBERS_RAW = os.getenv("TWILIO_NUMBERS", "")
+def _twilio_numbers():
+    out = []
+    for part in TWILIO_NUMBERS_RAW.split(","):
+        part = part.strip()
+        if not part: continue
+        num, _, st = part.partition(":")
+        out.append((num.strip(), st.strip().upper()))
+    return out
+# One-party-consent states (conservative list) — recording is silently skipped
+# for leads anywhere else. Override with RECORD_STATES env if your counsel
+# says otherwise.
+RECORD_STATES = set(s.strip().upper() for s in os.getenv("RECORD_STATES",
+    "NV,OH,MO,KS,ID,NC,TN,AL,GA,NY,NJ,TX,AZ,CO,VA,SC,LA,OK,IA,IN,KY,ME,MN,MS,ND,NE,NM,SD,UT,WI,WY,AR,HI,RI,DC,WV,AK"
+    ).split(",") if s.strip())
+TWILIO_INTELLIGENCE_SID = os.getenv("TWILIO_INTELLIGENCE_SID", "")
+
+def _twilio_ready():
+    return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN")
+                and _twilio_numbers() and (os.getenv("CALLER_PHONE") or INBOUND_FORWARD_NUMBER))
+
+def _e164(num: str) -> str:
+    d = re.sub(r"[^\d+]", "", num or "")
+    if d.startswith("+"): return d
+    d = d.lstrip("1") if len(re.sub(r"\D","",d)) == 11 else d
+    return "+1" + re.sub(r"\D", "", d)
+
+@app.get("/api/call/config")
+def call_config(user: str = Depends(verify_token)):
+    return {"ready": _twilio_ready(),
+            "numbers": [{"number": n, "state": st} for n, st in _twilio_numbers()],
+            "recording_states": sorted(RECORD_STATES) if _twilio_ready() else [],
+            "transcription": bool(TWILIO_INTELLIGENCE_SID)}
+
+@app.post("/api/call/start")
+def call_start(body: dict, user: str = Depends(verify_token)):
+    """Click-to-call: ring the caller's phone, bridge to the lead with a
+    market-matched local caller ID. Recording per state consent rules."""
+    if not _twilio_ready():
+        raise HTTPException(status_code=400, detail="Twilio calling not configured (TWILIO_NUMBERS / creds / CALLER_PHONE).")
+    lead_id = body.get("leadId")
+    if not lead_id:
+        raise HTTPException(status_code=400, detail="leadId required")
+    r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}&select=id,phone,state,company",
+                    headers=SB_HEADERS, timeout=10)
+    rows = r.json() if r.status_code == 200 else []
+    if not rows or not rows[0].get("phone"):
+        raise HTTPException(status_code=404, detail="Lead has no phone")
+    lead = rows[0]
+    st = (lead.get("state") or "").strip().upper()
+    nums = _twilio_numbers()
+    from_num = next((n for n, ns in nums if ns == st), nums[0][0])
+    to_num = _e164(lead["phone"])
+    caller_phone = _e164(os.getenv("CALLER_PHONE") or INBOUND_FORWARD_NUMBER)
+    record = st in RECORD_STATES
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    twiml_url = (f"{app_url}/twilio/bridge?to={url_quote(to_num, safe='')}"
+                 f"&lead_id={url_quote(str(lead_id), safe='')}&rec={'1' if record else '0'}"
+                 f"&cid={url_quote(from_num, safe='')}")
+    try:
+        tr = req_lib.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{os.getenv('TWILIO_ACCOUNT_SID')}/Calls.json",
+            auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")),
+            data={"To": caller_phone, "From": from_num, "Url": twiml_url, "Timeout": "25"},
+            timeout=15)
+        if tr.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Twilio: {tr.text[:180]}")
+        sid = tr.json().get("sid")
+        audit_log(user, "click_to_call", "lead", lead_id,
+                  {"from": from_num, "to": to_num, "record": record, "call_sid": sid})
+        return {"started": True, "call_sid": sid, "caller_id": from_num,
+                "recording": record, "detail": "Your phone is ringing — answer to connect."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Twilio call failed: {e}")
+
+@app.post("/twilio/bridge")
+async def twilio_bridge(request: Request, to: str = "", lead_id: str = "", rec: str = "0", cid: str = ""):
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    rec_attrs = (f' record="record-from-answer-dual" '
+                 f'recordingStatusCallback="{app_url}/twilio/recording-status?lead_id={url_quote(str(lead_id), safe="")}"'
+                 if rec == "1" else "")
+    return _twiml(f'<Dial callerId="{cid}"{rec_attrs} timeout="25"><Number>{to}</Number></Dial>')
+
+@app.post("/twilio/recording-status")
+async def twilio_recording_status(request: Request, lead_id: str = ""):
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    rec_url = form.get("RecordingUrl") or ""
+    rec_sid = form.get("RecordingSid") or ""
+    call_sid = form.get("CallSid") or ""
+    dur = form.get("RecordingDuration") or "0"
+    audit_log("twilio", "call_recording", "lead", lead_id or None,
+              {"recording_url": rec_url, "recording_sid": rec_sid, "call_sid": call_sid, "duration": dur})
+    # Kick Voice Intelligence transcription when configured
+    if TWILIO_INTELLIGENCE_SID and rec_sid and int(dur or 0) >= 20:
+        try:
+            ir = req_lib.post(
+                "https://intelligence.twilio.com/v2/Transcripts",
+                auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")),
+                data={"ServiceSid": TWILIO_INTELLIGENCE_SID,
+                      "Channel": json_lib.dumps({"media_properties": {"source_sid": rec_sid}})},
+                timeout=15)
+            print(f"[INTEL] transcript requested for {rec_sid}: HTTP {ir.status_code}")
+        except Exception as e:
+            print(f"[INTEL] transcript request failed: {e}")
+    return {"ok": True}
+
+@app.post("/twilio/intelligence")
+async def twilio_intelligence_webhook(request: Request):
+    """Voice Intelligence completion webhook (set on the Intelligence Service):
+    fetch sentences, store the full transcript for the Claude coach."""
+    try:
+        payload = await request.json()
+    except Exception:
+        form = await request.form()
+        payload = dict(form)
+    t_sid = payload.get("transcript_sid") or payload.get("TranscriptSid") or ""
+    if not t_sid:
+        return {"ok": False}
+    try:
+        sr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}/Sentences?PageSize=500",
+                         auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=20)
+        sents = (sr.json() or {}).get("sentences", []) if sr.status_code == 200 else []
+        text = " ".join(f"[{x.get('media_channel','?')}] {x.get('transcript','')}" for x in sents)[:8000]
+        # link back to the lead via the recording audit row
+        lead_id = None
+        tr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}",
+                         auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=15)
+        src_sid = ((tr.json() or {}).get("channel") or {}).get("media_properties", {}).get("source_sid", "") if tr.status_code == 200 else ""
+        if src_sid:
+            ar = req_lib.get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
+                             f"&details=ilike.*{src_sid}*&select=resource_id&limit=1",
+                             headers=SB_ADMIN_HEADERS, timeout=10)
+            if ar.status_code == 200 and ar.json():
+                lead_id = ar.json()[0].get("resource_id")
+        audit_log("twilio", "call_transcript", "lead", lead_id, {"transcript_sid": t_sid, "text": text})
+        print(f"[INTEL] transcript stored ({len(text)} chars, lead {lead_id})")
+    except Exception as e:
+        print(f"[INTEL] webhook processing failed: {e}")
+    return {"ok": True}
+
+# ── Claude call coach: rate the week's recorded calls, propose script moves ──
+@app.post("/api/coach/run")
+def coach_run(days: int = 7, preview: int = 1, user: str = Depends(verify_admin)):
+    """Analyze recent call transcripts with the insights model: per-call scores
+    (opening / discovery / objection handling / close), aggregate patterns, and
+    concrete script recommendations. preview=1 returns without posting to Slack."""
+    if not ANTHROPIC_API_KEY:
+        return {"error": "ANTHROPIC_API_KEY not set"}
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_transcript"
+                          f"&created_at=gte.{since}&select=details,created_at&order=created_at.desc",
+                          headers=SB_ADMIN_HEADERS)
+    transcripts = []
+    for row in rows[:20]:
+        try:
+            d = json_lib.loads(row.get("details") or "{}")
+            if len(d.get("text") or "") > 200:
+                transcripts.append({"date": row.get("created_at", "")[:10], "text": d["text"][:4000]})
+        except Exception:
+            pass
+    if not transcripts:
+        return {"analyzed": 0, "detail": "No transcripts yet — they accumulate once TWILIO_INTELLIGENCE_SID is configured and calls are recorded."}
+    system = (
+        "You are a cold-call coach for Vision Cleaning Company (commercial janitorial). "
+        "You get transcripts of the caller's recorded outbound calls ([1]=caller, [2]=prospect). "
+        "Return STRICT JSON: {\"calls\":[{\"date\",\"score\":1-10,\"strength\",\"fix\"}],"
+        "\"patterns\":[str],\"script_changes\":[{\"situation\",\"say_this\"}],\"drill\":str}. "
+        "Score on: opening hook, discovery questions, objection handling, asking for the walkthrough. "
+        "Be specific and quote the transcript; no generic advice.")
+    try:
+        resp = req_lib.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": INSIGHTS_MODEL, "max_tokens": 2500, "system": system,
+                  "messages": [{"role": "user", "content": json_lib.dumps(transcripts, ensure_ascii=False)}]},
+            timeout=90)
+        txt = "".join(b.get("text","") for b in resp.json().get("content",[]) if b.get("type")=="text")
+        m = re.search(r"\{.*\}", txt, re.DOTALL)
+        result = json_lib.loads(m.group(0)) if m else {"raw": txt[:2000]}
+    except Exception as e:
+        return {"error": f"analysis failed: {e}", "analyzed": len(transcripts)}
+    if not preview and SLACK_WEBHOOK_URL:
+        try:
+            lines = [f"• {c.get('date')}: *{c.get('score')}/10* — {c.get('fix','')}" for c in (result.get("calls") or [])[:8]]
+            changes = [f"• _{c.get('situation')}_ → \"{c.get('say_this')}\"" for c in (result.get("script_changes") or [])[:5]]
+            send_slack("🎧 Weekly call coaching",
+                       f"*{len(transcripts)} calls analyzed*\n" + "\n".join(lines)
+                       + ("\n\n*Script changes:*\n" + "\n".join(changes) if changes else "")
+                       + (f"\n\n*This week's drill:* {result.get('drill')}" if result.get("drill") else ""))
+        except Exception as e:
+            print(f"[COACH] slack failed: {e}")
+    return {"analyzed": len(transcripts), **result}
+
 # ── Slack → warm list (slash command) ────────────────────────────────────────
 # Eric adds warm leads from Slack: /warmlead Acme Cleaning Co, (555) 123-4567,
 # met at the chamber event — wants a quote next week
@@ -9277,6 +9489,20 @@ def run_weekly_review_scan_if_due():
                        f"They just jumped up the Day Plan complaint list.")
     except Exception as e:
         print(f"[WEEKLY-SCAN] failed: {e}")
+
+def run_call_coach_if_due():
+    """Weekly Claude coaching report over the week's recorded calls — no-ops
+    until transcription is configured and transcripts exist."""
+    if not TWILIO_INTELLIGENCE_SID or not ANTHROPIC_API_KEY or not SLACK_WEBHOOK_URL:
+        return
+    if not _iso_week_due("last_call_coach"):
+        return
+    _record_weekly_run("last_call_coach")
+    try:
+        res = coach_run(days=7, preview=0, user="eric")
+        print(f"[COACH] weekly run: analyzed={res.get('analyzed')}")
+    except Exception as e:
+        print(f"[COACH] weekly run failed: {e}")
 
 def run_email_queue_nudge_if_due():
     """Once per ET day (after the digest hour): if there are leads eligible for
