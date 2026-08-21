@@ -9148,12 +9148,17 @@ def run_walkthrough_followup_nudge_if_due():
 # WEEKLY_REVIEW_SCAN_ENABLED.
 WEEKLY_REFILL_ENABLED      = os.getenv("WEEKLY_REFILL_ENABLED", "1") == "1"
 WEEKLY_REVIEW_SCAN_ENABLED = os.getenv("WEEKLY_REVIEW_SCAN_ENABLED", "1") == "1"
-# Rotation ordered by measured first-dial connect/engagement (2026-08 audit):
-# NV 17.9%/5.8% eng · CT 17.1% · MO 12.7% · KS 3.1% eng · OH/NC ~16-17% probes ·
-# ID 3.1% eng · Tampa 4 engaged. TX/CA/GA/WA (7-9%) dropped from the default.
+# Focus-market rotation (2026-08): three FOCUS metros get ~2× scrape weight —
+# Las Vegas (proven: 17.9% connect / 5.8% engaged), Columbus OH (17.0% probe,
+# logistics corridor), Kansas City (both-state signal). Behind them, single-slot
+# earn-your-slot bets: Charlotte, St. Louis, Boise, Wichita, Tampa, Denver
+# (untested big-market probe), Reno. Rule: ≥12% first-dial connect at ~150
+# dials keeps a metro; <9% drops it. TX/CA/GA/WA big metros measured 7-9% and
+# are out of the default.
 WEEKLY_REFILL_METROS = [m.strip() for m in os.getenv("WEEKLY_REFILL_METROS",
-    "Las Vegas, NV|Hartford, CT|New Haven, CT|Kansas City, MO|Reno, NV|St. Louis, MO|"
-    "Charlotte, NC|Columbus, OH|Wichita, KS|Boise, ID|Tampa, FL|Phoenix, AZ"
+    "Las Vegas, NV|Columbus, OH|Kansas City, MO|Las Vegas, NV|Columbus, OH|Kansas City, MO|"
+    "Charlotte, NC|Las Vegas, NV|St. Louis, MO|Columbus, OH|Kansas City, MO|Boise, ID|"
+    "Las Vegas, NV|Wichita, KS|Tampa, FL|Denver, CO|Columbus, OH|Reno, NV"
     ).split("|") if m.strip()]
 WEEKLY_REFILL_INDUSTRIES = os.getenv("WEEKLY_REFILL_INDUSTRIES",
     "Manufacturing,Logistics,Industrial,Healthcare,Medical Equipment")
