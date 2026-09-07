@@ -222,10 +222,28 @@ function lastReplyDate(notes){
   while((m=re.exec(notes||""))) if(m[1]>d) d=m[1]
   return d
 }
-function parseIntents(notes){
+// Hospitals are out of the complaint flow for good — in-house EVS + system-wide
+// RFPs meant a 0.4% engagement rate over 519 dials. Mirrors the backend's
+// is_complaint_excluded_vertical(): the industry label wins when it's a real
+// vertical (a "Dialysis Center" named "…Medical Center Dialysis" stays), and the
+// company name only decides when the industry is blank or Apollo's catch-all
+// sector bucket. \b keeps "hospitality" — a genuine venue vertical — out of it.
+const COMPLAINT_INTENTS = new Set(["cleanliness","health_violation"])
+const APOLLO_HEALTH_BUCKET = "hospital & health care"
+const HOSPITAL_IND_RE  = /\bhospitals?\b/i
+const HOSPITAL_NAME_RE = /\bhospitals?\b|\bmedical cent(?:er|re)s?\b/i
+function isComplaintExcluded(lead){
+  const ind = (lead?.industry||"").trim().toLowerCase()
+  if(ind && ind!==APOLLO_HEALTH_BUCKET) return HOSPITAL_IND_RE.test(ind)
+  return HOSPITAL_NAME_RE.test(lead?.company||"")
+}
+// `lead` is optional so old call sites keep working; pass it to get the
+// complaint-vertical filter (legacy tagged rows still carry the tag in notes).
+function parseIntents(notes, lead){
   const out = []
   const s = (notes||"").toLowerCase()
   for(const k in INTENT_META){ if(s.includes(`[intent:${k}]`)) out.push(k) }
+  if(lead && isComplaintExcluded(lead)) return out.filter(k=>!COMPLAINT_INTENTS.has(k))
   return out
 }
 function sourceMeta(src){
@@ -356,7 +374,7 @@ function NoteAssist({getNote, context, onApply}){
 // Signal-aware cold-call opener. Picks the script by the lead's hottest intent
 // (and facility type), fills in the name/city, ends with the walkthrough ask.
 function buildOpener(lead){
-  const ints = parseIntents(lead?.notes)
+  const ints = parseIntents(lead?.notes, lead)
   const ind = (lead?.industry||"").toLowerCase()
   const city = lead?.city || "your area"
   const ask = "Can we set up 15 minutes for us to stop by, walk the facility, and provide you a quote?"
@@ -3732,7 +3750,7 @@ export default function App(){
         &&["","new","no_answer","called"].includes(l.status||"")
         &&(l.total_calls||0)<4
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t)
-        &&parseIntents(l.notes).some(k=>k==="health_violation"||k==="cleanliness"))
+        &&parseIntents(l.notes, l).some(k=>k==="health_violation"||k==="cleanliness"))
       .sort((a,b)=>(b.score||0)-(a.score||0))
     return {warmlist,inq,walk,due,complaints,pool,mine,t}
   }
@@ -4038,7 +4056,7 @@ export default function App(){
   }),[leads,fIndustry,fState,fCity,availableOnly,emailedOnly,needsAttemptOnly,user,emailedFlags])
   const displayLeads=useMemo(()=>segBase.filter(l=>{
     if(fSource&&(l.source||"").toLowerCase()!==fSource) return false
-    if(fIntent&&!parseIntents(l.notes).includes(fIntent)) return false
+    if(fIntent&&!parseIntents(l.notes, l).includes(fIntent)) return false
     return true
   }),[segBase,fSource,fIntent])
   // Counts for the quick-segment bar (over segBase so totals don't collapse
@@ -4046,7 +4064,7 @@ export default function App(){
   const {segIntentCounts,segSourceCounts}=useMemo(()=>{
     const segIntentCounts={}, segSourceCounts={}
     segBase.forEach(l=>{
-      parseIntents(l.notes).forEach(k=>{segIntentCounts[k]=(segIntentCounts[k]||0)+1})
+      parseIntents(l.notes, l).forEach(k=>{segIntentCounts[k]=(segIntentCounts[k]||0)+1})
       const s=(l.source||"").toLowerCase(); if(s) segSourceCounts[s]=(segSourceCounts[s]||0)+1
     })
     return {segIntentCounts,segSourceCounts}
@@ -4777,7 +4795,7 @@ export default function App(){
                             <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}{lead.city&&lead.state?` · ${lead.city}, ${lead.state}`:lead.state?` · ${lead.state}`:lead.city?` · ${lead.city}`:""}</div>
                             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
                               {/* Hot-intent badges first — WHY this lead matters right now. */}
-                              {parseIntents(lead.notes).map(k=>{
+                              {parseIntents(lead.notes, lead).map(k=>{
                                 const m=INTENT_META[k]
                                 return <span key={k} title={m.pitch} style={{fontSize:9,fontWeight:700,
                                   background:m.color+"22",color:m.color,padding:"2px 7px",borderRadius:4,

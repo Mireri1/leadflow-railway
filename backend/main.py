@@ -950,9 +950,63 @@ def _fit_points(text: str) -> int:
             return pts
     return 15  # unknown vertical — neutral
 
+# ── Complaint-flow vertical exclusions ──────────────────────────────────────
+# Hospitals are OUT of the complaint flow entirely. They run in-house EVS
+# departments and buy cleaning through multi-year health-system RFPs, so a bad
+# review or an infection-rate flag never turns into a call we can win (0.4%
+# engagement over 519 dials — 2026-08 audit). Every complaint surface honors
+# this: no tag stamped, no intent score boost, no Slack summary line, no Day
+# Plan complaint row.
+#
+# Word-anchored on purpose:
+#   • "hospitality" (hotels, clubs, convention centers) is a DIFFERENT vertical
+#     and a real prospect — \b keeps "Hospitality Dental" out of the block list.
+#   • Apollo's "hospital & health care" is a generic SECTOR bucket holding home
+#     care, dental and even software companies, so the industry match exempts it
+#     and we fall through to the company-name test, which still catches the
+#     actual hospitals filed under it (e.g. "Southern Hills Hospital").
+COMPLAINT_EXCLUDED_INTENTS = {"cleanliness", "health_violation"}
+_APOLLO_GENERIC_HEALTH_BUCKET = "hospital & health care"
+_HOSPITAL_INDUSTRY_RE = re.compile(r"\bhospitals?\b", re.I)
+_HOSPITAL_NAME_RE     = re.compile(r"\bhospitals?\b|\bmedical cent(?:er|re)s?\b", re.I)
+
+def is_complaint_excluded_vertical(lead: dict) -> bool:
+    """True when a lead must never surface as a complaint lead (hospitals).
+
+    A real industry label is AUTHORITATIVE — "CHILDRESS REGIONAL MEDICAL CENTER
+    DIALYSIS" is filed as a Dialysis Center, which is a proven vertical (3.1%
+    engagement), and "GUARDIAN REHABILITATION HOSPITAL" is filed by CMS as a
+    Nursing Facility. Judging those two on their names alone would throw away
+    good leads, so the name test only runs when the industry can't answer:
+    it's blank, or it's Apollo's catch-all sector bucket."""
+    industry = (lead.get("industry") or "").strip().lower()
+    if industry and industry != _APOLLO_GENERIC_HEALTH_BUCKET:
+        return bool(_HOSPITAL_INDUSTRY_RE.search(industry))
+    return bool(_HOSPITAL_NAME_RE.search(lead.get("company") or ""))
+
+def strip_complaint_intents(lead: dict) -> bool:
+    """Drop complaint intent TAGS from an excluded vertical's notes, keeping the
+    descriptive text. Sources like CMS / health inspections build their notes as
+    a literal f-string rather than going through add_intent_marker, so this is
+    the ingest-side net that catches them. Returns True if anything was removed."""
+    notes = lead.get("notes") or ""
+    if not notes or not is_complaint_excluded_vertical(lead):
+        return False
+    out = notes
+    for kind in COMPLAINT_EXCLUDED_INTENTS:
+        out = re.sub(rf"\[INTENT:{kind}\]\s*", "", out, flags=re.I)
+    if out == notes:
+        return False
+    lead["notes"] = out.strip(" |")
+    return True
+
 def add_intent_marker(lead: dict, kind: str, label: str):
     """Stamp a machine-readable intent tag + human label into notes so the
     score model picks it up and reps see WHY a lead is hot. Idempotent-ish."""
+    # Choke point: an excluded vertical never receives a complaint tag, so it
+    # can't be scored, sorted, or reported as one from ANY source path.
+    if kind in COMPLAINT_EXCLUDED_INTENTS and is_complaint_excluded_vertical(lead):
+        return
     tag = f"[INTENT:{kind}]"
     notes = lead.get("notes") or ""
     if tag in notes:
@@ -960,8 +1014,15 @@ def add_intent_marker(lead: dict, kind: str, label: str):
     lead["notes"] = (f"{tag} {label} | {notes}").strip(" |") if notes else f"{tag} {label}"
 
 def lead_intent_kinds(lead: dict) -> list:
+    """Active intent tags on a lead. Excluded verticals never report a complaint
+    intent even if a legacy tag is still sitting in their notes — this is the
+    READ-side half of the hospital exclusion, so pre-existing rows drop out of
+    the complaint list and lose the intent score boost without a data migration."""
     notes = (lead.get("notes") or "").lower()
-    return [k for k in INTENT_BOOSTS if f"[intent:{k}]" in notes]
+    kinds = [k for k in INTENT_BOOSTS if f"[intent:{k}]" in notes]
+    if is_complaint_excluded_vertical(lead):
+        kinds = [k for k in kinds if k not in COMPLAINT_EXCLUDED_INTENTS]
+    return kinds
 
 def score_lead(lead):
     """Quality = contactability + cleaning-fit + active intent. 0-100.
@@ -1445,6 +1506,8 @@ def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: 
             if ph in seen_batch_phones:
                 continue
             seen_batch_phones.add(ph)
+        # Hospitals never enter the complaint flow, whatever source sent them.
+        strip_complaint_intents(lead)
         lead["score"] = score_lead(lead)
         # Callable: dialable phone OR a named DM with a deliverable email.
         if callable_filter:
@@ -4789,11 +4852,13 @@ def fetch_cms_dialysis(state_abbrev: str) -> list:
 # Default pulls dialysis only; re-enable others via CMS_HEALTH_TYPES env.
 _CMS_ALL_FETCHERS = [
     ("nursing",  fetch_cms_nursing),
-    ("hospital", fetch_cms_hospitals),
     ("dialysis", fetch_cms_dialysis),
 ]
 CMS_HEALTH_TYPES = set(t.strip() for t in os.getenv("CMS_HEALTH_TYPES", "dialysis").split(",") if t.strip())
 CMS_HEALTHCARE_FETCHERS = [t for t in _CMS_ALL_FETCHERS if t[0] in CMS_HEALTH_TYPES]
+# fetch_cms_hospitals is deliberately UNREGISTERED (2026-09): hospitals are out
+# of the complaint flow for good, so CMS_HEALTH_TYPES=hospital can no longer
+# pull them back in. The fetcher stays defined for reference only.
 
 def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
     """Pull recent FAILED health inspections for configured metros in a state.
@@ -5018,6 +5083,16 @@ def scan_cleanliness(reviews: list):
     label = f' ({rel})' if rel else ""
     return True, f'"{snippet}" ({best.get("rating", "?")}★{label})', age_days, rel
 
+# One sentence Cristine can read straight off the Slack card. A complaint lead
+# is worthless without the context of WHY it's on the list — she opens cold
+# otherwise. Kept to a single line on purpose: it has to be glanceable mid-dial.
+COMPLAINT_CALL_GUIDANCE = (
+    ":speech_balloon: *How to open (Cristine):* \"Hi, I'm calling because I noticed a "
+    "recent review mentioning cleanliness at your location — do you have a cleaning "
+    "team in now, or is that handled in-house?\" Listen for who owns it, then ask for "
+    "a walkthrough."
+)
+
 class ReviewScanRequest(BaseModel):
     state:      Optional[str] = ""
     cities:     Optional[str] = ""
@@ -5067,6 +5142,8 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
             break
         if "[INTENT:cleanliness]" in (lead.get("notes") or ""):
             continue
+        if is_complaint_excluded_vertical(lead):   # hospitals: never scanned, never reported
+            continue
         if want_inds:
             ind = (lead.get("industry") or "").lower()
             if not any(w in ind for w in want_inds):
@@ -5109,7 +5186,8 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
         send_slack("🔥 Cleanliness-complaint leads found",
                    f"*{user}* scanned {scanned} leads → *{flagged}* have Google reviews complaining "
                    f"about cleanliness. Freshest complaints are now top-scored in the dialer.",
-                   fields=[{"label": f"{s['company']} · {s['posted']}", "value": s["snippet"]} for s in samples[:5]])
+                   fields=[{"label": f"{s['company']} · {s['posted']}", "value": s["snippet"]} for s in samples[:5]]
+                          + [{"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
     return {"scanned": scanned, "flagged": flagged,
             "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (freshest = hottest)",
             "samples": samples}
@@ -9486,7 +9564,8 @@ def run_weekly_review_scan_if_due():
         if flagged:
             send_slack("🚨 Weekly complaint scan",
                        f"Scanned {scanned} leads — *{flagged}* have fresh cleanliness complaints. "
-                       f"They just jumped up the Day Plan complaint list.")
+                       f"They just jumped up the Day Plan complaint list.",
+                       fields=[{"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
     except Exception as e:
         print(f"[WEEKLY-SCAN] failed: {e}")
 
