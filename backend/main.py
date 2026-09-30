@@ -1286,6 +1286,99 @@ def state_to_iana_tz(state) -> str:
             return US_STATE_TIMEZONES.get(abbrev, "")
     return ""
 
+# ── Prospect-local calling window ───────────────────────────────────────────
+# Pickup rate is driven by what time it is at the desk being dialed, not on
+# the caller's clock. Cristine works 9am-2pm PT; through the state->tz map
+# above that is 9am-2pm in NV, 11am-4pm in MO and 12pm-5pm in OH — so she
+# never reached an Ohio prospect in their morning, and the dialer queue had
+# no idea, ordering purely by call count. These knobs let the queue prefer
+# leads whose OWN clock is inside business hours.
+#
+# The window is a COVERAGE heuristic (is anyone at the desk), not a measured
+# connect-rate optimum — within-month analysis showed no caller-local
+# time-of-day effect, and the prospect-local effect is still unmeasured.
+# That is exactly why the hours are env-tunable: when the prospect-local
+# heatmap in GET /api/analytics/connectivity has enough dials to rank the
+# hours per market, retune these without a deploy.
+DIALER_TZ_ORDER          = os.getenv("DIALER_TZ_ORDER", "1") == "1"
+DIALER_LOCAL_START_HOUR  = int(os.getenv("DIALER_LOCAL_START_HOUR", "8"))
+DIALER_LOCAL_END_HOUR    = int(os.getenv("DIALER_LOCAL_END_HOUR", "17"))
+DIALER_LOCAL_LUNCH_HOURS = {
+    int(h) for h in re.split(r"[,\s]+", os.getenv("DIALER_LOCAL_LUNCH_HOURS", "12"))
+    if h.strip().lstrip("-").isdigit()
+}
+
+# Bucket ordering. Lower sorts first. Deliberately a *sort* key and never a
+# filter: if her remaining stock is all Ohio at 5pm ET she still needs leads
+# to dial, so off-hours leads sink to the back of the queue but stay in it.
+TZ_BUCKET_PRIME = 0   # prospect-local business hours, outside lunch
+TZ_BUCKET_LUNCH = 1   # business hours, but the lunch hour
+TZ_BUCKET_OFF   = 2   # before open / after close in the prospect's own tz
+
+_tz_obj_cache = {}
+
+def _iana_tz(tz_str):
+    """Cached ZoneInfo, or None if unavailable/unknown (pre-3.9 or bad key)."""
+    if not tz_str:
+        return None
+    if tz_str in _tz_obj_cache:
+        return _tz_obj_cache[tz_str]
+    z = None
+    try:
+        from zoneinfo import ZoneInfo
+        z = ZoneInfo(tz_str)
+    except Exception:
+        z = None
+    _tz_obj_cache[tz_str] = z
+    return z
+
+def lead_local_hour(state, now_utc=None):
+    """Hour-of-day (0-23) at the prospect's desk, plus whether we had to guess.
+
+    Returns (hour, used_fallback). DST-aware via zoneinfo when the state
+    resolves; otherwise falls back to the fixed LEADFLOW_TZ_OFFSET_HOURS
+    offset (Vision's own tz) and flags it, same contract the connectivity
+    heatmap uses. Never raises — an unplaceable lead must not break the queue.
+    """
+    dt_utc = now_utc or datetime.now(timezone.utc)
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    tz = _iana_tz(state_to_iana_tz(state))
+    if tz is not None:
+        try:
+            return dt_utc.astimezone(tz).hour, False
+        except Exception:
+            pass
+    return (dt_utc + timedelta(hours=LEADFLOW_TZ_OFFSET_HOURS)).hour, True
+
+def dialer_tz_bucket(state, now_utc=None) -> int:
+    """TZ_BUCKET_* for a lead, by the clock at the prospect's own desk.
+
+    FAILS OPEN: a lead with a blank or unrecognised state is bucketed off the
+    fallback offset rather than dumped in TZ_BUCKET_OFF. Burying every
+    state-less lead would quietly starve the queue of perfectly dialable
+    stock — the same class of mistake as a flag that fires on half the table.
+    """
+    hour, _ = lead_local_hour(state, now_utc)
+    if not (DIALER_LOCAL_START_HOUR <= hour < DIALER_LOCAL_END_HOUR):
+        return TZ_BUCKET_OFF
+    return TZ_BUCKET_LUNCH if hour in DIALER_LOCAL_LUNCH_HOURS else TZ_BUCKET_PRIME
+
+def _tz_lookup_for_client() -> dict:
+    """state -> IANA tz, keyed by abbreviation AND upper-cased full name.
+
+    Exists so the browser can bucket a lead by the prospect's local hour with
+    a single lookup, instead of carrying its own copy of the timezone table
+    plus its own full-name fallback. Derived from US_STATE_TIMEZONES, never
+    hand-maintained — that is the whole point.
+    """
+    out = dict(US_STATE_TIMEZONES)
+    for abbrev, full in US_STATES_FULL.items():
+        tz = US_STATE_TIMEZONES.get(abbrev)
+        if tz:
+            out[full.upper()] = tz
+    return out
+
 def is_us_address(addr):
     """Check if a formatted address looks like it's in the USA"""
     if not addr:
@@ -6011,7 +6104,13 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
 
     Replaces the old pattern of fetching every lead and filtering client-side
     (a 1MB+ payload on every dialer-tab open). 50 leads is more than one
-    caller can churn through in a shift, with room to skip."""
+    caller can churn through in a shift, with room to skip.
+
+    ORDERING: prospect-local calling window first (see dialer_tz_bucket),
+    then the existing ladder — fewest calls, oldest contact, best score —
+    preserved within each bucket. Off-hours leads SINK, they are never
+    dropped: if the only stock left is Ohio at 5pm ET she still needs
+    numbers to dial. Set DIALER_TZ_ORDER=0 to restore the flat ordering."""
     limit = max(1, min(int(limit or 50), 200))
     snooze_hours = max(0, min(int(snooze_hours or 0), 168))
 
@@ -6035,6 +6134,11 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
     if snooze_hours > 0:
         cutoff_iso = (datetime.utcnow() - timedelta(hours=snooze_hours)).isoformat()
 
+    # Collect EVERY eligible row before trimming. This loop used to break at
+    # `limit`, which meant only the first 50 of up to 5000 fetched rows were
+    # ever considered — so any reordering below would have been reshuffling an
+    # already-truncated slice. The fetch cost is unchanged (pagination above
+    # pulls the same pages either way); only the early exit is gone.
     out = []
     for l in rows:
         if (l.get("status") or "") in NO_DIAL: continue
@@ -6044,10 +6148,48 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
             if lca and lca >= cutoff_iso and (l.get("status") or "") in SNOOZED_OUTCOMES:
                 continue
         out.append(l)
-        if len(out) >= limit:
-            break
-    return {"queue": out, "fetched": len(rows), "returned": len(out),
-            "user": user, "snooze_hours": snooze_hours}
+
+    # Prospect-local ordering. One `now` for the whole request so a lead can't
+    # land in a different bucket than its neighbour just because the loop
+    # crossed an hour boundary mid-iteration.
+    tz_counts = {}
+    if DIALER_TZ_ORDER:
+        now_utc = datetime.now(timezone.utc)
+        # Decorate-sort-undecorate rather than stamping a field onto the lead.
+        # These dicts are whole `leads` rows and callers PATCH rows straight
+        # back; Supabase rejects an ENTIRE write that names a column it does
+        # not have, so a cosmetic `_tz_bucket` key could break a lead save far
+        # from here. The bucket stays outside the row.
+        # Memoised per state: there are ~50 distinct values across thousands
+        # of rows, and state_to_iana_tz() falls back to a linear scan of the
+        # full-name table when a lead stores "Ohio" rather than "OH".
+        bucket_by_state = {}
+        decorated = []
+        for l in out:
+            st = l.get("state")
+            key = st if isinstance(st, str) else repr(st)
+            if key not in bucket_by_state:
+                bucket_by_state[key] = dialer_tz_bucket(st, now_utc)
+            b = bucket_by_state[key]
+            tz_counts[b] = tz_counts.get(b, 0) + 1
+            decorated.append((b, l))
+        # Stable sort on the bucket ALONE. Python's sort is stable and `rows`
+        # arrived in the PostgREST `order=` sequence (fewest calls, then oldest
+        # contact, then best score), so that whole ladder survives untouched
+        # *within* each bucket — no need to restate it here and no risk of the
+        # two definitions drifting apart.
+        decorated.sort(key=lambda pair: pair[0])
+        out = [l for _, l in decorated]
+
+    eligible = len(out)
+    out = out[:limit]
+    return {"queue": out, "fetched": len(rows), "eligible": eligible,
+            "returned": len(out), "user": user, "snooze_hours": snooze_hours,
+            "tz_order": DIALER_TZ_ORDER,
+            "tz_window": [DIALER_LOCAL_START_HOUR, DIALER_LOCAL_END_HOUR],
+            "tz_buckets": {"prime": tz_counts.get(TZ_BUCKET_PRIME, 0),
+                           "lunch": tz_counts.get(TZ_BUCKET_LUNCH, 0),
+                           "off_hours": tz_counts.get(TZ_BUCKET_OFF, 0)}}
 
 @app.post("/api/leads")
 def create_lead(lead: dict, user: str = Depends(verify_token)):
@@ -6605,7 +6747,25 @@ def call_config(user: str = Depends(verify_token)):
                                           else sorted(RECORD_EXCLUDE_STATES)),
             "recording_all_states": RECORD_ALL_STATES_WITH_NOTICE,
             "recording_notice": RECORDING_ANNOUNCEMENT,
-            "transcription": bool(DEEPGRAM_API_KEY and TRANSCRIBE_ENABLED)}
+            "transcription": bool(DEEPGRAM_API_KEY and TRANSCRIBE_ENABLED),
+            # Prospect-local calling window, shipped to the client so the
+            # dialer's own sort can bucket leads by the clock at the desk it
+            # is about to ring. The state->IANA map travels with it rather
+            # than being re-typed in JS: six copies of CONTACT_OUTCOMES had
+            # already drifted apart once (two were missing an outcome), and a
+            # duplicated timezone table would rot the same way. ~1.5KB, gzipped
+            # by GZipMiddleware, on a config call the app already makes once.
+            "dialer_tz": {"order": DIALER_TZ_ORDER,
+                          "start_hour": DIALER_LOCAL_START_HOUR,
+                          "end_hour": DIALER_LOCAL_END_HOUR,
+                          "lunch_hours": sorted(DIALER_LOCAL_LUNCH_HOURS),
+                          "fallback_offset_hours": LEADFLOW_TZ_OFFSET_HOURS,
+                          # Keyed by BOTH abbreviation and upper-cased full
+                          # name ("OH" and "OHIO"), so the client resolves a
+                          # lead's state with one dict lookup and needs no
+                          # name-matching logic of its own to drift from
+                          # state_to_iana_tz().
+                          "state_timezones": _tz_lookup_for_client()}}
 
 @app.post("/api/call/start")
 def call_start(body: dict, user: str = Depends(verify_token)):
