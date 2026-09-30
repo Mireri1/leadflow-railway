@@ -9983,6 +9983,13 @@ def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# One sweep at a time, whatever the caller. Two overlapping sweeps each read
+# the full candidate list, then each PATCHes rows the other is already parking
+# and counts them as its own: the first scheduled run reported 1,801 + 1,433
+# for 1,828 rows that actually moved. Non-blocking: a second caller gets
+# {"busy": true} back rather than a queue.
+_RETIRE_DEMOTED_LOCK = threading.Lock()
+
 @app.post("/api/admin/retire-demoted-verticals")
 def retire_demoted_verticals(dry_run: int = 1, limit: int = 5000,
                              user: str = Depends(verify_admin)):
@@ -10006,17 +10013,33 @@ def retire_demoted_verticals(dry_run: int = 1, limit: int = 5000,
     Reversible: the leads are set to `retired`, which a manual status edit
     un-retires, exactly like the dial-count retirement.
     """
+    if not _RETIRE_DEMOTED_LOCK.acquire(blocking=False):
+        return {"busy": True, "matched": 0, "considered": 0, "skipped_had_contact": 0,
+                "would_retire" if dry_run else "retired": 0, "by_industry": {},
+                "dry_run": bool(dry_run)}
     try:
+        return _retire_demoted_verticals_locked(dry_run, limit, user)
+    finally:
+        _RETIRE_DEMOTED_LOCK.release()
+
+def _retire_demoted_verticals_locked(dry_run: int, limit: int, user: str):
+    open_statuses = ','.join(sorted(ENGAGED_STATUSES | {'retired'}))
+    try:
+        # order=id: Range pagination with no ORDER BY walks heap order, and an
+        # UPDATE landing mid-walk shifts every later page — rows get skipped or
+        # read twice. Deduped by id below for the same reason.
         rows = _paginated_get(
             f"{SUPABASE_URL}/rest/v1/leads?select=id,industry,status,company"
-            f"&status=not.in.({','.join(sorted(ENGAGED_STATUSES | {'retired'}))})")
+            f"&status=not.in.({open_statuses})&order=id")
         by_industry = {}
-        cands = []
+        cands, seen = [], set()
         for l in rows:
-            if is_demoted_vertical(l.get("industry")):
-                cands.append(l)
-                k = (l.get("industry") or "").strip()[:40]
-                by_industry[k] = by_industry.get(k, 0) + 1
+            if l.get("id") in seen or not is_demoted_vertical(l.get("industry")):
+                continue
+            seen.add(l["id"])
+            cands.append(l)
+            k = (l.get("industry") or "").strip()[:40]
+            by_industry[k] = by_industry.get(k, 0) + 1
         cand_ids = [l["id"] for l in cands][:max(1, limit)]
 
         # Exclude anything that ever reached a human.
@@ -10048,11 +10071,24 @@ def retire_demoted_verticals(dry_run: int = 1, limit: int = 5000,
         now = datetime.utcnow().isoformat()
         done = 0
         for i in range(0, len(to_retire), 100):
-            chunk = ",".join(str(x) for x in to_retire[i:i+100])
-            rr = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})",
+            ids = to_retire[i:i+100]
+            chunk = ",".join(str(x) for x in ids)
+            # The status guard makes the PATCH a no-op on a row something else
+            # parked or engaged since the read, and the count comes from the
+            # rows Supabase says it changed (SB_HEADERS asks for
+            # return=representation), not from the batch size.
+            rr = req_lib.patch(
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})&status=not.in.({open_statuses})",
                 headers=SB_HEADERS, json={"status": "retired", "updatedAt": now}, timeout=30)
-            if rr.status_code in (200, 204):
-                done += min(100, len(to_retire) - i)
+            if rr.status_code == 200:
+                try:
+                    done += len(rr.json())
+                except Exception:
+                    done += len(ids)
+            elif rr.status_code == 204:
+                done += len(ids)
+            else:
+                print(f"[RETIRE-DEMOTED] batch {i//100 + 1} HTTP {rr.status_code}: {rr.text[:200]}")
         summary["retired"] = done
         audit_log(user, "retire_demoted_verticals", "lead", None,
                   {"retired": done, "skipped_had_contact": len(contacted),
@@ -11796,10 +11832,22 @@ def _iso_week_due(cooldown_key: str) -> bool:
     except Exception:
         return False
 
-def _record_weekly_run(cooldown_key: str):
-    req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-                 headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
-                 json={"key": cooldown_key, "value": datetime.utcnow().isoformat() + "Z"}, timeout=10)
+def _record_weekly_run(cooldown_key: str) -> bool:
+    """Stamp the cooldown row. Returns False, and says so in the log, when the
+    upsert did not land. Every weekly job records BEFORE it works, and
+    _iso_week_due reads this very row — so a caller that carries on after a
+    failed stamp fires again on every 10-minute tick until one lands. Callers
+    treat False as "not this tick"."""
+    try:
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                         headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                         json={"key": cooldown_key, "value": datetime.utcnow().isoformat() + "Z"}, timeout=10)
+        if r.status_code in (200, 201, 204):
+            return True
+        print(f"[WEEKLY-COOLDOWN] {cooldown_key} upsert HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[WEEKLY-COOLDOWN] {cooldown_key} upsert failed: {e}")
+    return False
 
 def _metro_state(metro: str) -> str:
     """'Las Vegas, NV' -> 'NV'. Blank when there is no state suffix."""
@@ -11884,7 +11932,8 @@ def run_weekly_refill_if_due():
         return
     if not _iso_week_due("last_weekly_refill"):
         return
-    _record_weekly_run("last_weekly_refill")   # record BEFORE work (deploy-race guard)
+    if not _record_weekly_run("last_weekly_refill"):
+        return   # record BEFORE work (deploy-race guard)
     try:
         _do_refill_scrape("weekly")
     except Exception as e:
@@ -11948,7 +11997,8 @@ def run_inventory_refill_if_due():
             except Exception: cnt = None
         if cnt is None or cnt >= REFILL_MIN_FRESH:
             return
-        _record_weekly_run("last_inventory_refill")   # record BEFORE work
+        if not _record_weekly_run("last_inventory_refill"):   # record BEFORE work
+            return
         print(f"[REFILL:low-inventory] fresh pool at {cnt} (<{REFILL_MIN_FRESH}) — scraping")
         _do_refill_scrape(f"low inventory: {cnt} fresh left")
     except Exception as e:
@@ -11959,7 +12009,8 @@ def run_weekly_review_scan_if_due():
         return
     if not _iso_week_due("last_weekly_review_scan"):
         return
-    _record_weekly_run("last_weekly_review_scan")
+    if not _record_weekly_run("last_weekly_review_scan"):
+        return
     try:
         res = enrich_reviews(ReviewScanRequest(limit=50, industries=WEEKLY_REVIEW_SCAN_INDUSTRIES), user="eric")
         flagged = res.get("flagged", 0) if isinstance(res, dict) else 0
@@ -11994,7 +12045,8 @@ def run_health_refresh_if_due():
         return
     if not _iso_week_due("last_health_refresh"):
         return
-    _record_weekly_run("last_health_refresh")
+    if not _record_weekly_run("last_health_refresh"):
+        return
     total_new, by_state = 0, {}
     for st in HEALTH_REFRESH_STATES:
         try:
@@ -12022,7 +12074,8 @@ def run_jobs_refresh_if_due():
         return
     if not _iso_week_due("last_jobs_refresh"):
         return
-    _record_weekly_run("last_jobs_refresh")
+    if not _record_weekly_run("last_jobs_refresh"):
+        return
     try:
         res = source_jobs(FreeSourceRequest(cities="|".join(JOBS_REFRESH_METROS),
                                             days=JOBS_MAX_DAYS_OLD), user="eric")
@@ -12044,9 +12097,13 @@ def run_demoted_retirement_if_due():
         return
     if not _iso_week_due("last_demoted_retire"):
         return
-    _record_weekly_run("last_demoted_retire")
+    if not _record_weekly_run("last_demoted_retire"):
+        return
     try:
         res = retire_demoted_verticals(dry_run=0, limit=DEMOTED_RETIRE_WEEKLY_CAP, user="eric")
+        if isinstance(res, dict) and res.get("busy"):
+            print("[DEMOTED-RETIRE] another sweep is still running — skipped")
+            return
         n = (res or {}).get("retired", 0) if isinstance(res, dict) else 0
         by = (res or {}).get("by_industry", {}) if isinstance(res, dict) else {}
         print(f"[DEMOTED-RETIRE] retired={n} by_industry={by}")
@@ -12067,7 +12124,8 @@ def run_call_coach_if_due():
         return
     if not _iso_week_due("last_call_coach"):
         return
-    _record_weekly_run("last_call_coach")
+    if not _record_weekly_run("last_call_coach"):
+        return
     try:
         res = coach_run(days=7, preview=0, user="eric")
         print(f"[COACH] weekly run: analyzed={res.get('analyzed')}")
