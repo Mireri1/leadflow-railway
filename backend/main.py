@@ -4511,6 +4511,21 @@ def fetch_npi(state_abbrev: str, city: str = "", taxonomy: str = "", limit: int 
             _collect(tx, per_tax, skip)
             if len(results) >= FREE_SOURCE_MAX_ROWS:
                 break
+        # SELF-HEAL. After the first run `skip` is always > 0, and _npi_query
+        # swallows errors and returns []. So if NPPES ever rejects or ignores
+        # `skip`, or a small state's offset simply runs past the end of the
+        # result set, EVERY later pull would come back empty and silent — the
+        # deep-paging fix would have turned a partly-working source into a dead
+        # one. A zero-row pass at a non-zero offset therefore rewinds to page one
+        # and resets the stored offset, so the source can never get stuck.
+        if skip and not results:
+            print(f"[NPI] 0 rows at skip={skip} for {state_abbrev.upper()} — "
+                  f"rewinding to page 1 (offset past end, or skip unsupported)")
+            for tx in taxos:
+                _collect(tx, per_tax, 0)
+                if len(results) >= FREE_SOURCE_MAX_ROWS:
+                    break
+            skip = 0
         # Small states exhaust a taxonomy before per_tax is filled. One top-up
         # pass spends the leftover budget rather than returning a short page.
         if len(results) < FREE_SOURCE_MAX_ROWS:
