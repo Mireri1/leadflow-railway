@@ -6377,6 +6377,13 @@ def _twilio_sig_ok(request: Request, form) -> bool:
     mac = _b64.b64encode(_hmac.new(token.encode(), data.encode(), _hashlib.sha1).digest()).decode()
     return _hmac.compare_digest(mac, request.headers.get("X-Twilio-Signature", ""))
 
+def _xml_escape(t: str) -> str:
+    """Escape operator-supplied text before it goes into TwiML. An ampersand in
+    something like RECORDING_ANNOUNCEMENT would otherwise produce invalid XML
+    and Twilio would drop the whole verb."""
+    return (str(t or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
 def _twiml(body: str):
     return HTMLResponse(f'<?xml version="1.0" encoding="UTF-8"?><Response>{body}</Response>',
                         media_type="application/xml")
@@ -6506,6 +6513,23 @@ RECORD_STATES = set(s.strip().upper() for s in os.getenv("RECORD_STATES",
     ).split(",") if s.strip())
 TWILIO_INTELLIGENCE_SID = os.getenv("TWILIO_INTELLIGENCE_SID", "")
 
+# Spoken notice played to the PROSPECT (not the caller) the moment they answer,
+# before the two legs are bridged, whenever the call is being recorded. Short on
+# purpose: this lands in the first seconds of a cold call, and a long
+# disclaimer kills the opener.
+RECORDING_ANNOUNCEMENT = os.getenv("RECORDING_ANNOUNCEMENT",
+    "Just so you know, this call may be recorded for quality and training purposes.")
+# Recording in all-party-consent states is a LEGAL decision, not a code one, so
+# it stays OFF by default even though the notice above is now in place. The
+# notice is the mechanism that makes consent possible; whether it is sufficient
+# in a given state is for counsel to say. CLAUDE.md: "don't widen without
+# counsel." Set to 1 only after that conversation.
+RECORD_ALL_STATES_WITH_NOTICE = os.getenv("RECORD_ALL_STATES_WITH_NOTICE", "0") == "1"
+
+def _should_record(state_abbrev: str) -> bool:
+    """Whether to record a call to a lead in this state."""
+    return RECORD_ALL_STATES_WITH_NOTICE or (state_abbrev or "").strip().upper() in RECORD_STATES
+
 def _twilio_ready():
     return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN")
                 and _twilio_numbers() and (os.getenv("CALLER_PHONE") or INBOUND_FORWARD_NUMBER))
@@ -6543,7 +6567,7 @@ def call_start(body: dict, user: str = Depends(verify_token)):
     from_num = next((n for n, ns in nums if ns == st), nums[0][0])
     to_num = _e164(lead["phone"])
     caller_phone = _e164(os.getenv("CALLER_PHONE") or INBOUND_FORWARD_NUMBER)
-    record = st in RECORD_STATES
+    record = _should_record(st)
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
     twiml_url = (f"{app_url}/twilio/bridge?to={url_quote(to_num, safe='')}"
                  f"&lead_id={url_quote(str(lead_id), safe='')}&rec={'1' if record else '0'}"
@@ -6582,7 +6606,12 @@ async def twilio_bridge(request: Request, to: str = "", lead_id: str = "", rec: 
     # lead's phone was still ringing.
     action = (f' action="{app_url}/twilio/dial-status?lead_id={url_quote(str(lead_id), safe="")}"'
               f' method="POST"')
-    return _twiml(f'<Dial callerId="{cid}"{rec_attrs}{action} timeout="25"><Number>{to}</Number></Dial>')
+    # The notice rides on <Number url>, so it plays to the PROSPECT only, and
+    # only when we are actually recording — announcing a recording we are not
+    # making would be both pointless and off-putting on a cold open.
+    num_attrs = f' url="{app_url}/twilio/announce" method="POST"' if rec == "1" else ""
+    return _twiml(f'<Dial callerId="{cid}"{rec_attrs}{action} timeout="25">'
+                  f'<Number{num_attrs}>{to}</Number></Dial>')
 
 # Carrier-true talk time, keyed by lead, written by the Twilio <Dial action>.
 # Kept in app_settings (no DDL, same pattern as appt_*) because the webhook and
@@ -6614,6 +6643,24 @@ def take_twilio_duration(lead_id):
     except Exception as e:
         print(f"[TWILIO-DUR] read failed for lead {lead_id}: {e}")
         return None
+
+@app.post("/twilio/announce")
+async def twilio_announce(request: Request):
+    """TwiML run on the PROSPECT's leg after they answer and before the two legs
+    are bridged (the `url` attribute on <Number>). It has to be their leg —
+    a <Say> before <Dial> would only be heard by our own caller, who already
+    knows.
+
+    Note on what this does and does not achieve: recording starts when the
+    prospect answers, so the notice itself is captured (useful — it evidences
+    that notice was given), but their "hello" precedes it. Whether that is
+    sufficient consent in an all-party-consent state is a question for counsel,
+    which is why RECORD_ALL_STATES_WITH_NOTICE defaults to off."""
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    notice = _xml_escape(RECORDING_ANNOUNCEMENT)
+    return _twiml(f'<Say voice="Polly.Joanna">{notice}</Say><Pause length="1"/>')
 
 @app.post("/twilio/dial-status")
 async def twilio_dial_status(request: Request, lead_id: str = ""):
