@@ -9910,8 +9910,18 @@ def rescore_all(user: str = Depends(verify_admin)):
 _DEMOTED_VERTICAL_RE = re.compile(
     r"(\bnursing\b|\bskilled nursing\b|\bassisted living\b|\bhospital\b"
     r"|\brehabilitation\b|^\s*clinic/center\b)", re.I)
+# "End-Stage Renal Disease" is NPI's name for a dialysis clinic (taxonomy
+# 261QE0700X). The first dry run against production matched 18 of them under
+# the Clinic/Center prefix — the best vertical in the book, about to be
+# parked because KEEP only knew the word "dialysis".
 _DEMOTED_KEEP_RE = re.compile(
-    r"(\bdialysis\b|\burgent care\b|\bdental\b|\bsurgical\b|\bhospitality\b)", re.I)
+    r"(\bdialysis\b|\bend[\s-]?stage renal\b|\brenal disease\b|\besrd\b|\bnephrology\b"
+    r"|\burgent care\b|\bdental\b|\bsurgical\b|\bhospitality\b)", re.I)
+# Apollo's catch-all "hospital & health care" is not a hospital — the
+# complaint-flow code documents it holding home care, dental, even software.
+# It is "unknown healthcare", and unknown is not evidence. Matched exactly so
+# a real "Hospital" label still demotes.
+_DEMOTED_UNKNOWN_LABELS = {"hospital & health care"}
 
 def is_demoted_vertical(industry) -> bool:
     """True when a lead's industry is one the 2026-08 audit ruled out.
@@ -9923,6 +9933,8 @@ def is_demoted_vertical(industry) -> bool:
     label = (industry if isinstance(industry, str) else "").strip()
     if not label:
         return False                      # unlabelled is not evidence of anything
+    if label.lower() in _DEMOTED_UNKNOWN_LABELS:
+        return False
     if _DEMOTED_KEEP_RE.search(label):
         return False
     return bool(_DEMOTED_VERTICAL_RE.search(label))
