@@ -6546,25 +6546,40 @@ RECORD_EXCLUDE_STATES = set(s.strip().upper() for s in os.getenv(
 # before the two legs are bridged, whenever the call is being recorded. Short on
 # purpose: this lands in the first seconds of a cold call, and a long
 # disclaimer kills the opener.
+# "is being recorded", not "may be". The notice only ever plays when we ARE
+# recording, and since notice-plus-continuing is now the consent basis in
+# all-party states, hedging with "may be" weakens the very thing it exists to
+# establish. Unambiguous notice is the point.
 RECORDING_ANNOUNCEMENT = os.getenv("RECORDING_ANNOUNCEMENT",
-    "Just so you know, this call may be recorded for quality and training purposes.")
-# Recording in all-party-consent states is a LEGAL decision, not a code one, so
-# it stays OFF by default even though the notice above is now in place. The
-# notice is the mechanism that makes consent possible; whether it is sufficient
-# in a given state is for counsel to say. CLAUDE.md: "don't widen without
-# counsel." Set to 1 only after that conversation.
-RECORD_ALL_STATES_WITH_NOTICE = os.getenv("RECORD_ALL_STATES_WITH_NOTICE", "0") == "1"
+    "This call is being recorded for quality and training purposes.")
+# ON as of 2026-09, by explicit owner decision, reaffirmed: the prospect hears
+# an unambiguous notice before any conversation happens and can decline by
+# hanging up, which is the standard implied-consent basis for recording into
+# all-party-consent states. RECORD_EXCLUDE_STATES is kept as the lever for
+# carving a state back out if that ever changes.
+#
+# THE INVARIANT THIS RELIES ON: we never record without delivering the notice.
+# See _should_record — an empty RECORDING_ANNOUNCEMENT disables recording
+# entirely rather than recording silently. Consent-by-notice with no notice is
+# just recording without consent, and a blanked-out env var must not be able to
+# produce that quietly.
+RECORD_ALL_STATES_WITH_NOTICE = os.getenv("RECORD_ALL_STATES_WITH_NOTICE", "1") == "1"
 
 def _should_record(state_abbrev: str) -> bool:
-    """Record unless the lead's state requires all-party consent.
+    """Whether to record a call to a lead in this state.
 
-    A blank/unknown state does NOT record: we cannot establish which law
-    applies, and the deny-list only protects states we can identify. That is
-    the one place this stays fail-closed.
-
-    RECORD_ALL_STATES_WITH_NOTICE=1 overrides the deny-list entirely — the
-    escape hatch for after counsel rules on whether the spoken notice satisfies
-    all-party consent. It is not a substitute for that ruling."""
+    Order matters:
+      1. No notice text  -> NEVER record, anywhere. The consent basis is the
+         spoken notice; without it there is nothing to consent to. This makes a
+         blanked-out RECORDING_ANNOUNCEMENT fail safe instead of silently
+         recording every call with no disclosure.
+      2. RECORD_ALL_STATES_WITH_NOTICE (default on) -> record everywhere,
+         including all-party-consent states, on the implied-consent basis that
+         the prospect hears the notice before the conversation and may hang up.
+      3. Otherwise -> deny-list: record unless the state requires all-party
+         consent, and not at all for an unidentifiable state."""
+    if not (RECORDING_ANNOUNCEMENT or "").strip():
+        return False
     st = (state_abbrev or "").strip().upper()
     if RECORD_ALL_STATES_WITH_NOTICE:
         return True
@@ -6586,8 +6601,10 @@ def _e164(num: str) -> str:
 def call_config(user: str = Depends(verify_token)):
     return {"ready": _twilio_ready(),
             "numbers": [{"number": n, "state": st} for n, st in _twilio_numbers()],
-            "recording_excluded_states": sorted(RECORD_EXCLUDE_STATES),
+            "recording_excluded_states": ([] if RECORD_ALL_STATES_WITH_NOTICE
+                                          else sorted(RECORD_EXCLUDE_STATES)),
             "recording_all_states": RECORD_ALL_STATES_WITH_NOTICE,
+            "recording_notice": RECORDING_ANNOUNCEMENT,
             "transcription": bool(DEEPGRAM_API_KEY and TRANSCRIBE_ENABLED)}
 
 @app.post("/api/call/start")
@@ -7751,6 +7768,107 @@ def caller_qa(days: int = 30, caller: str = "", user: str = Depends(verify_admin
             "note": "Rates carry their denominators on purpose — a 3-call sample "
                     "is not a trend. avg_assertiveness reads LANGUAGE (hedging), "
                     "not tone: a transcript cannot show vocal confidence."}
+
+@app.post("/api/admin/transcribe-backfill")
+def transcribe_backfill(days: int = 30, max_spend_usd: float = 25.0,
+                        dry_run: int = 1, user: str = Depends(verify_admin)):
+    """Rollout step 5 — one-time sweep over recordings already sitting in
+    Twilio that would pass the gate.
+
+    dry_run=1 (the DEFAULT) enqueues nothing and returns the projected cost and
+    skip distribution. Run it that way first: this is the one operation here
+    that can spend real money in bulk, and the spec caps it at $25.
+
+    The cost ceiling is enforced while BUILDING the queue, not while draining
+    it — once a job is enqueued the worker will run it, so the only place a cap
+    can actually hold is before the insert."""
+    days = max(1, min(int(days), 90))
+    cap = max(0.0, min(float(max_spend_usd), 200.0))
+    if not DEEPGRAM_API_KEY:
+        return {"error": "DEEPGRAM_API_KEY not set"}
+    if not TRANSCRIBE_ENABLED and not dry_run:
+        return {"error": "TRANSCRIBE_ENABLED is off — flip it before a live backfill"}
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    # Recordings are recorded in audit_log by /twilio/recording-status, which is
+    # the only place we know the RecordingUrl. call_outcomes.recording_sid only
+    # exists for calls logged after 008, so the audit rows are the fuller
+    # history — they go back to whenever click-to-call recording started.
+    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
+                          f"&created_at=gte.{since}&select=resource_id,details,created_at"
+                          f"&order=created_at.desc", headers=SB_ADMIN_HEADERS)
+    # Already-transcribed recording_sids, so a re-run is idempotent and free.
+    done = set()
+    for t in _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts?select=recording_sid",
+                            headers=SB_ADMIN_HEADERS):
+        if t.get("recording_sid"):
+            done.add(t["recording_sid"])
+
+    from collections import Counter
+    skipped = Counter()
+    queued, projected = [], 0.0
+    for r in rows:
+        try:
+            d = json_lib.loads(r.get("details") or "{}")
+        except Exception:
+            skipped["unparseable_audit_row"] += 1
+            continue
+        rec_sid = d.get("recording_sid") or ""
+        rec_url = d.get("recording_url") or ""
+        try:
+            dur = int(float(d.get("duration") or 0))
+        except (TypeError, ValueError):
+            dur = 0
+        if not rec_sid or not rec_url:
+            skipped["no_recording_url"] += 1
+            continue
+        if rec_sid in done:
+            skipped["duplicate"] += 1
+            continue
+        lead_id = r.get("resource_id")
+        call = _find_call_for_recording("", lead_id) if lead_id else {}
+        # Same gate as the live path — one definition, so a backfill can never
+        # transcribe something the live pipeline would have skipped.
+        reason = transcription_gate(call, {"recording_duration_sec": dur})
+        if reason:
+            skipped[reason] += 1
+            continue
+        cost = dur / 60.0 * DEEPGRAM_RATE_PER_MIN
+        if projected + cost > cap:
+            skipped["over_budget"] += 1
+            continue
+        projected += cost
+        queued.append({"recording_sid": rec_sid, "recording_url": rec_url,
+                       "recording_duration_sec": dur, "channels": 2,
+                       "lead_id": str(lead_id) if lead_id else None,
+                       "call_id": call.get("id")})
+
+    enqueued = 0
+    if not dry_run:
+        for job in queued:
+            if enqueue_job("transcribe_call", job, dedupe_key=job["recording_sid"]):
+                enqueued += 1
+        audit_log(user, "transcribe_backfill", None, None,
+                  {"days": days, "enqueued": enqueued,
+                   "projected_usd": round(projected, 2)})
+    print(f"[BACKFILL] {days}d: {len(rows)} recordings, {len(queued)} eligible, "
+          f"${projected:.2f} projected, enqueued={enqueued} (dry_run={bool(dry_run)})")
+    return {
+        "dry_run": bool(dry_run),
+        "window_days": days, "max_spend_usd": cap,
+        "recordings_found": len(rows),
+        "eligible": len(queued),
+        "enqueued": enqueued,
+        "projected_deepgram_usd": round(projected, 2),
+        # Claude is billed per analysis; ~$0.004/call at Haiku rates on a
+        # 3-minute transcript. Rough, but enough to see the order of magnitude.
+        "projected_claude_usd": round(len(queued) * 0.004, 2),
+        "skipped": dict(skipped),
+        "note": ("Nothing was enqueued. Re-run with dry_run=0 to spend."
+                 if dry_run else
+                 f"{enqueued} job(s) queued; the bg loop drains "
+                 f"{os.getenv('JOBS_PER_CYCLE', '5')} per cycle."),
+    }
 
 @app.get("/api/admin/transcription-stats")
 def transcription_stats(days: int = 7, user: str = Depends(verify_admin)):
