@@ -45,6 +45,13 @@ const DIALER_SNOOZE_HOURS_DEFAULT = 4
 // Statuses callers should NEVER auto-dial — used to filter the dialer queue
 // and to show a "don't call" warning in the call modal.
 const NO_DIAL_STATUSES = new Set(["awaiting_email_reply","do_not_contact","retired"])
+// Is this lead worth surfacing in a "call this" list? Closed deals are out, and
+// so is anything in NO_DIAL_STATUSES. Every callback surface (bell, dashboard
+// banners, Follow-Ups tab, Day Plan, My Week, dialer chip) filtered only on
+// status!=="converted", so a number the Twilio lookup sweep had just marked
+// do_not_contact kept its callbackDate and surfaced in the bell as due — a
+// caller sent at a disconnected line. One predicate so the surfaces can't drift.
+function isCallable(l){ return l.status!=="converted" && !NO_DIAL_STATUSES.has(l.status) }
 
 const CALL_OUTCOMES = [
   { value:"answered",       label:"Answered" },
@@ -256,7 +263,26 @@ function cleanNote(notes){
   return (notes||"").replace(/\[INTENT:[a-z_]+\]/gi,"").replace(/\[(hvage|clnage):\d+\]/gi,"")
     .replace(/\[inspected:[\d-]+\]/gi,"")
     .replace(/\[sent:(warm|neutral|cold)\]/gi,"")
+    .replace(/\[phonesrc:[^\]]*\]/gi,"")
+    .replace(/\[phone:[^\]]*\]/gi,"")
+    .replace(/\[act:[^\]]*\]/gi,"")
     .replace(/\s*\|\s*/g," · ").replace(/\s+/g," ").trim()
+}
+// Where a lead's phone number came from. [phonesrc:apollo_mobile] means Apollo
+// revealed a direct mobile — a decision-maker's own line, not a front desk —
+// so it's worth showing the caller before they pick their opener.
+function parsePhoneSource(notes){
+  const m = (notes||"").match(/\[phonesrc:([a-z0-9_]+)\]/i)
+  return m ? m[1].toLowerCase() : null
+}
+const PHONE_SRC_META = {
+  apollo_mobile: { label:"📱 Apollo direct mobile", color:"#69f6b8" },
+  apollo_work:   { label:"☎️ Apollo work line",     color:"#69b4f6" },
+}
+function phoneSourceMeta(notes){
+  const src = parsePhoneSource(notes)
+  if(!src) return null
+  return PHONE_SRC_META[src] || { label:`📞 Apollo (${src.replace(/^apollo_/,"")})`, color:"#a3aac4" }
 }
 // Last reported health-inspection date for a lead — from the [inspected:DATE]
 // token, or parsed from the note text for leads scraped before the token.
@@ -1933,6 +1959,13 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
             )}
             <div style={{display:"flex",gap:12,fontSize:12,color:"#a3aac4",flexWrap:"wrap",alignItems:"center"}}>
               {lead.phone&&<span>📞 {lead.phone}</span>}
+              {lead.phone&&(()=>{                        /* no hooks — safe inline */
+                const ps=phoneSourceMeta(lead.notes)
+                return ps?<span style={{fontSize:10,fontWeight:700,color:ps.color,border:`1px solid ${ps.color}44`,
+                  background:`${ps.color}14`,borderRadius:5,padding:"2px 6px"}}
+                  title="Where this number came from — a direct mobile reaches the decision maker, a main line reaches a front desk">
+                  {ps.label}</span>:null
+              })()}
               {lead.email&&<span>✉ {lead.email}</span>}
               {!lead.firstName&&(
                 <button onClick={findDecisionMaker} disabled={findingDM}
@@ -3101,7 +3134,7 @@ function MyWeek({user, leads, onCall, onReload, notify, reloadSignal}){
   useEffect(()=>{ load(weekOffset) },[weekOffset, reloadSignal]) // eslint-disable-line
 
   // Her due/overdue follow-ups (the worklist) for the top strip.
-  const myDue=leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted"&&(!l.assignedTo||l.assignedTo===user))
+  const myDue=leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&isCallable(l)&&(!l.assignedTo||l.assignedTo===user))
     .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
 
   function openAction(leadId,m){ setExpand(expand===leadId?null:leadId); setMode(m); setNoteText(""); setFuDate(today); setAiSent("") }
@@ -3239,8 +3272,22 @@ const APPT_STAGE_META = {
   confirmed: { label:"📅 Confirmed",                  color:"#69b4f6" },
   won:       { label:"🏆 Won",                        color:"#69f6b8" },
   lost:      { label:"❌ Lost",                       color:"#ff6e84" },
+  no_show:   { label:"👻 No-show",                    color:"#ffa869" },
 }
-const APPT_STAGES = ["pending","approved","confirmed","won","lost"]
+const APPT_STAGES = ["pending","approved","confirmed","won","lost","no_show"]
+
+// Won needs a number. Backend rejects a won transition without one, so ask
+// here rather than letting the click fail — and keep the ask identical on the
+// Appointments board and the Walkthroughs panel.
+// Returns the parsed monthly value, or null if the user cancelled / typed junk.
+function promptContractValue(company){
+  const raw = window.prompt(
+    `🏆 Marking ${company||"this deal"} as WON.\n\nMonthly contract value in dollars?`, "")
+  if(raw===null) return null                        // cancelled
+  const n = parseFloat(String(raw).replace(/[$,\s]/g,""))
+  if(!isFinite(n)||n<=0){ window.alert("Enter a monthly dollar amount greater than 0 — nothing was saved."); return null }
+  return n
+}
 function AppointmentsBoard(){
   const [appts,setAppts]=useState([])
   const [loading,setLoading]=useState(true)
@@ -3250,8 +3297,14 @@ function AppointmentsBoard(){
   function load(){ setLoading(true); api("/api/appointments").then(r=>setAppts(r.appointments||[])).catch(()=>setAppts([])).finally(()=>setLoading(false)) }
   useEffect(()=>{ load() },[]) // eslint-disable-line
   async function transition(a,stage,extra){
+    let body={stage,...(extra||{})}
+    if(stage==="won"&&body.contract_value==null){
+      const v=promptContractValue(a.company)
+      if(v===null) return                                    // cancelled → no call
+      body.contract_value=v
+    }
     setBusy(a.leadId+stage)
-    try{ await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage,...(extra||{})})}); load() }
+    try{ await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify(body)}); load() }
     catch{} finally{ setBusy("") }
   }
   async function addNote(a){
@@ -3261,8 +3314,11 @@ function AppointmentsBoard(){
   }
   const nextActions=a=>{
     if(a.stage==="pending")   return [["approved","✅ Approve & send to Angelo"]]
-    if(a.stage==="approved")  return [["confirmed","📅 Mark confirmed"]]
-    if(a.stage==="confirmed") return [["won","🏆 Won"],["lost","❌ Lost"]]
+    // A booked walkthrough can fall through at either stage, so "Didn't happen"
+    // is offered from approved onward — not only after it was confirmed.
+    if(a.stage==="approved")  return [["confirmed","📅 Mark confirmed"],["no_show","👻 Didn't happen"]]
+    if(a.stage==="confirmed") return [["won","🏆 Won"],["lost","❌ Lost"],["no_show","👻 Didn't happen"]]
+    if(a.stage==="no_show")   return [["confirmed","📅 Rebooked — confirm"],["lost","❌ Lost"]]
     return []
   }
   const byStage={}; APPT_STAGES.forEach(s=>byStage[s]=[]); appts.forEach(a=>{(byStage[a.stage]||byStage.pending).push(a)})
@@ -3343,11 +3399,22 @@ function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
   })
   const daysAgo=d=>{try{return Math.max(0,Math.round((new Date(today+"T12:00:00")-new Date(d+"T12:00:00"))/864e5))}catch{return 0}}
   async function decide(a,stage){
-    if(!window.confirm(`Mark ${a.company||"this deal"} as ${stage.toUpperCase()}?`)) return
+    const body={stage}
+    if(stage==="won"){
+      // The value prompt IS the confirmation for a win — no second dialog.
+      const v=promptContractValue(a.company)
+      if(v===null) return
+      body.contract_value=v
+    }else if(!window.confirm(
+      stage==="no_show"
+        ? `Mark the ${a.company||"this"} walkthrough as never happened?\n\nThe lead stays live and goes back in today's callback queue.`
+        : `Mark ${a.company||"this deal"} as ${stage.toUpperCase()}?`)) return
     setBusy(a.leadId+stage)
     try{
-      await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage})})
-      notify(stage==="won"?"🏆 Won — update sent to your chat":"Marked lost — update sent to your chat");load()
+      await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify(body)})
+      notify(stage==="won"?"🏆 Won — update sent to your chat"
+            :stage==="no_show"?"👻 Logged as no-show — back in the callback queue"
+            :"Marked lost — update sent to your chat");load()
     }catch{ notify("Couldn't update — try again","error") }
     finally{ setBusy("") }
   }
@@ -3435,6 +3502,11 @@ function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
                           style={{fontSize:11,padding:"7px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
                             border:"1px solid #ff6e8466",background:"#ff6e8418",color:"#ff6e84"}}>
                           {busy===a.leadId+"lost"?"…":"❌ Lost"}</button>
+                        <button disabled={busy===a.leadId+"no_show"} onClick={()=>decide(a,"no_show")}
+                          title="The walkthrough never happened — keeps the lead live instead of counting it as a loss"
+                          style={{fontSize:11,padding:"7px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                            border:"1px solid #ffa86966",background:"#ffa86918",color:"#ffa869"}}>
+                          {busy===a.leadId+"no_show"?"…":"👻 Didn't happen"}</button>
                         <button onClick={()=>{setNoteFor(noteFor===a.leadId?null:a.leadId);setNoteText("")}}
                           style={{fontSize:11,padding:"7px 10px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
                             border:"1px solid #40485d40",background:"transparent",color:"#a3aac4"}}>📝 Note</button>
@@ -3741,7 +3813,7 @@ export default function App(){
     const walk=pool.filter(l=>wt.has(String(l.id))&&l.status!=="converted"&&mine(l))
       .sort((a,b)=>(wt.get(String(a.id)).date||"").localeCompare(wt.get(String(b.id)).date||""))
     // 3 · ⏰ Callbacks due, not yet tried today.
-    const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l)
+    const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&isCallable(l)&&mine(l)
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
       .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
     // 4 · 🚨 Complaint list: violation/review-flagged, still fresh (<4 tries),
@@ -3792,7 +3864,7 @@ export default function App(){
     const check=()=>{
       const t=localDate()
       const pool=(allLeads.length?allLeads:leads)
-      const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"
+      const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&isCallable(l)
         &&(!l.assignedTo||l.assignedTo===user)
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
       const wtN=apptFollowups.length
@@ -4025,7 +4097,7 @@ export default function App(){
   const notifiedOnRef = useRef("")
   useEffect(()=>{
     if(!user||!leads.length || notifiedOnRef.current===today) return
-    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&isCallable(l))
     if(overdue.length>0&&"Notification" in window){
       if(Notification.permission==="granted"){
         notifiedOnRef.current=today
@@ -4077,7 +4149,7 @@ export default function App(){
   const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return localDate(d)})()
 
   // Notification items
-  const notifItems=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.status!=="converted").map(l=>{
+  const notifItems=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&isCallable(l)).map(l=>{
     const d=l.callbackDate
     if(d<today) return{...l,urgency:"overdue",label:"Overdue",color:"#ff6e84"}
     if(d===today) return{...l,urgency:"today",label:"Due today",color:"#ffe083"}
@@ -4427,7 +4499,7 @@ export default function App(){
                   "called but still carrying an old date" so overdue reads as
                   a caller-accountability signal, not a data-staleness one. */}
               {(()=>{
-                const overdue=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                const overdue=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<today&&isCallable(l))
                 if(!overdue.length) return null
                 const attempted=overdue.filter(l=>l.last_called_at&&tsLocalDate(l.last_called_at)>=l.callbackDate).length
                 const untouched=overdue.length-attempted
@@ -4448,12 +4520,12 @@ export default function App(){
                 )
               })()}
 
-              {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length>0&&(
+              {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&isCallable(l)).length>0&&(
                 <div style={{marginTop:32}}>
                   <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",
                     textTransform:"uppercase",marginBottom:14}}>🔔 Callbacks Due</div>
                   <div style={{display:"flex",flexDirection:"column",gap:8}}>
-                    {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").slice(0,5).map(lead=>{
+                    {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&isCallable(l)).slice(0,5).map(lead=>{
                       const ac=avatarColor(lead.company||lead.firstName||"?")
                       return(
                         <div key={lead.id} style={{background:"#1a1030",borderRadius:10,padding:"14px 18px",
@@ -4759,7 +4831,7 @@ export default function App(){
                   // Single per-row renderer reused for both segments below.
                   const renderRow = (lead) => {
                     const info=si(lead.status)
-                    const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
+                    const isCb=lead.callbackDate&&lead.callbackDate<=today&&isCallable(lead)
                     const score=lead.score||scoreLead(lead)||0
                     const ac=avatarColor(lead.company||lead.firstName||"?")
                     const isMine=!lead.assignedTo||lead.assignedTo===user
@@ -5238,7 +5310,7 @@ export default function App(){
                   <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
                   Focused calling mode — only showing unclaimed leads
                   {(()=>{
-                    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&isCallable(l))
                     return overdue.length>0?(
                       <span style={{marginLeft:12,background:"#ff6e8430",color:"#ff6e84",padding:"3px 10px",
                         borderRadius:20,fontSize:12,fontWeight:700}}>
@@ -5800,7 +5872,7 @@ export default function App(){
           {/* ── FOLLOW-UPS (overdue + today + week + month + later + future) ── */}
           {activeNav==="followups"&&(()=>{
             const allFollowups = (allLeads.length?allLeads:leads)
-              .filter(l=>l.callbackDate&&l.status!=="converted")
+              .filter(l=>l.callbackDate&&isCallable(l))
               .sort((a,b)=>a.callbackDate.localeCompare(b.callbackDate))
 
             const d7  = addDays(7)
