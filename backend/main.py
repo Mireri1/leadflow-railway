@@ -218,6 +218,12 @@ NON_ADMIN_DAILY_SCRAPE_CAP = int(os.getenv("NON_ADMIN_DAILY_SCRAPE_CAP", "3"))
 # lead is parked as status='retired' — out of the dialer queue and every
 # recycle path. A number that never picks up in 4 tries is dead or useless;
 # re-dialing it is what rotted the Aug 2026 queue (78% re-dials at 5.5% connect).
+# A claimed conversation with no notes, no qual and a timer under this many
+# seconds is recorded as `unsubstantiated_contact`. 10s: no real "not
+# interested" exchange fits in it, and at 0s the flag catches almost nothing
+# (the timer always ticks at least 1s). Tunable because it depends on whether
+# the team dials inside the modal or logs after the fact.
+UNSUBSTANTIATED_MAX_SEC = int(os.getenv("UNSUBSTANTIATED_MAX_SEC", "10"))
 RETIRE_AFTER_DIALS = int(os.getenv("RETIRE_AFTER_DIALS", "4"))
 
 # Non-admin daily Apollo-pull cap. Apollo burns ~1 credit per qualified contact
@@ -6936,11 +6942,31 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         send_email_followup = bool(call.pop("send_email_followup", False))
         flags = []
 
-        # Anti-gaming: empty form — no notes and no qual data filled out
+        # ── Substantiation flags ────────────────────────────────────────────
+        # The old empty_form rule fired whenever notes AND qual were both blank,
+        # regardless of outcome — so it fired on every ordinary no-answer, where
+        # blank IS the correct state. Measured over the 14,127-call history it
+        # fired on 55% of all calls and 92% of one caller's, which makes it
+        # wallpaper: nobody reads a flag that fires on half the table, so the
+        # ~997 genuinely unverifiable rows hid inside the noise.
+        #
+        # An empty form is only anomalous when the caller CLAIMED a conversation.
+        # "Reached a human" + nothing written + no qual + a timer that never
+        # moved = there is no evidence the conversation happened. Same history:
+        # 77% of one caller's claimed contacts vs 6% of the other's — a 14x
+        # separation on ~7% of rows. That is a signal worth acting on.
         has_notes = bool((call.get("notes") or "").strip())
         has_qual = any(call.get(f) for f in ["budgetfocus", "vendorstatus", "decisionmaker", "timeline", "qualified"])
-        if not has_notes and not has_qual:
-            flags.append("empty_form")
+        no_evidence = not has_notes and not has_qual
+        if no_evidence and outcome in CONTACT_OUTCOMES:
+            # Note: `duration` is modal-open time, not carrier talk time, so a
+            # caller who dials separately and logs afterwards reads near-zero
+            # too. The flag therefore means "unverifiable", not "fabricated" —
+            # keep the name honest, Eric decides what it means for his team.
+            if (call.get("duration") or 0) <= UNSUBSTANTIATED_MAX_SEC:
+                flags.append("unsubstantiated_contact")
+            else:
+                flags.append("empty_form")
 
         # Anti-gaming: duplicate cooldown — same lead within 5 minutes
         if lead_id:
@@ -10586,7 +10612,7 @@ def get_flagged_calls(user: str = Depends(verify_admin)):
         if not isinstance(calls, list):
             return []
         # Only return calls that have our gaming flags
-        gaming_flags = {"empty_form", "duplicate_cooldown", "rapid_cadence"}
+        gaming_flags = {"unsubstantiated_contact", "empty_form", "duplicate_cooldown", "rapid_cadence"}
         flagged = [c for c in calls if any(f in (c.get("follow_up_outcome") or "") for f in gaming_flags)]
         return flagged
     except Exception as e:
@@ -11872,7 +11898,8 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
         # which silently truncated leaderboard totals once the team crossed
         # 1000 lifetime calls (or 1000 in any window). Same root cause as
         # the /api/leads + /api/stats fix in commit 6142f2c.
-        calls_url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration"
+        calls_url = (f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                     f"?select=outcome,calledBy,calledAt,duration,follow_up_outcome")
         if since:
             since_ts = local_day_start_utc() if since == today else f"{since}T00:00:00"
             calls_url += f"&calledAt=gte.{since_ts}"
@@ -11923,6 +11950,15 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             outcome = c.get("outcome", "")
             if outcome in CONTACT_OUTCOMES:
                 u["contacted"] += 1
+                # Talk time on CLAIMED CONTACTS only — the trust signal. A
+                # no-answer's 1s duration is meaningless; a "not interested"
+                # that lasted 2s means no conversation happened. Over the
+                # 14k-call history this read 2s for one caller and 32s for
+                # another, which is the clearest integrity signal in the data
+                # and costs nothing extra: `duration` is already selected.
+                u.setdefault("_contact_durs", []).append(c.get("duration") or 0)
+            if "unsubstantiated_contact" in (c.get("follow_up_outcome") or ""):
+                u["unsubstantiated"] = u.get("unsubstantiated", 0) + 1
             if outcome == "converted":
                 u["conversions"] += 1
             elif outcome == "interested": u["interested"]  += 1
@@ -11956,6 +11992,18 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             u["conv_rate"] = f"{(u['conversions']/tc*100):.1f}" if tc else "0.0"
             u["contact_rate"] = f"{(u['contacted']/tc*100):.1f}" if tc else "0.0"
             u["avg_talk_time"] = round(u["talk_time"] / tc) if tc else 0
+            # Median, not mean: one 10-minute call cannot mask a hundred 2s ones.
+            durs = sorted(u.pop("_contact_durs", []) or [])
+            u["contact_talk_median"] = (durs[len(durs)//2] if len(durs) % 2
+                                        else (durs[len(durs)//2 - 1] + durs[len(durs)//2]) // 2) if durs else 0
+            # Share of claimed contacts with SOME evidence behind them. Only
+            # counts calls logged since the unsubstantiated_contact flag
+            # shipped — historical rows carry no flag, so read this alongside
+            # contact_talk_median, which works retroactively.
+            uns = u.get("unsubstantiated", 0)
+            u["unsubstantiated"] = uns
+            u["substantiated_rate"] = (f"{((u['contacted'] - uns) / u['contacted'] * 100):.1f}"
+                                       if u["contacted"] else "0.0")
             u["leads_assigned"] = u.get("leads_assigned", 0)
             u["leads_populated"] = u.get("leads_populated", 0)
             result.append(u)
@@ -11971,6 +12019,13 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             contact = float(u["contact_rate"]) if u["total_calls"] >= 10 else 0
             if conv > 50: u["flags"].append("high_conv_rate")
             if contact > 95 and u["total_calls"] >= 20: u["flags"].append("perfect_contact")
+            # The one that would have caught the pre-Jun-8 data: a caller
+            # claiming conversations whose median length is a couple of seconds.
+            if (u["contacted"] >= 20
+                    and u["contact_talk_median"] <= UNSUBSTANTIATED_MAX_SEC):
+                u["flags"].append("low_contact_talk_time")
+            if u["contacted"] >= 20 and float(u["substantiated_rate"]) < 50:
+                u["flags"].append("mostly_unsubstantiated")
 
         # Sort by calls today desc, then total calls
         result.sort(key=lambda x: (-x["calls_today"], -x["total_calls"]))

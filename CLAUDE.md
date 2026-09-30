@@ -62,12 +62,14 @@ Supabase columns: `budgetfocus`, `vendorstatus`, `decisionmaker`, `timeline`, `q
 - Recycle Stale button (unassign leads untouched 7+ days)
 - Per-caller quotas via `PUT /api/quota` with `caller` field
 
-### Anti-Gaming
-- Empty form flag (no notes + no qual data)
-- Duplicate cooldown (same lead + same rep within 5 minutes)
-- Rapid cadence (5+ calls in 5 minutes)
-- Leaderboard flags: >50% conv rate, >95% contact rate (admin-visible only)
-- Flags stored in `follow_up_outcome` field on call_outcomes
+### Anti-Gaming / caller-data integrity (2026-09 rework)
+- **`unsubstantiated_contact`** — a CONTACT outcome with no notes, no qual AND `duration <= UNSUBSTANTIATED_MAX_SEC` (10s). This is the real signal: measured over the 14,127-call history it hits 80% of one caller's claimed contacts vs 7% of another's.
+- **`empty_form`** now fires ONLY on a contact outcome (no notes + no qual but a plausible duration). It used to fire regardless of outcome, so it hit every ordinary no-answer — **55% of all calls, 92% of one caller's**. A flag that fires on half the table is wallpaper; that is precisely why ~1,000 unverifiable rows went unnoticed for months. **Never widen it back to no_answer/voicemail** — blank notes on an unanswered ring is the CORRECT state. New rule fires on 8% of calls and never on a plain no-answer.
+- Duplicate cooldown (same lead + same rep within 5 minutes); rapid cadence (5+ calls in 5 minutes).
+- Leaderboard (admin-visible only): `contact_talk_median` = median duration over that caller's **claimed contacts** — 2s vs 32s across the Jun-8 switch, the single clearest integrity signal, and free because `duration` is already selected. Median not mean (mean was 11.3s vs 2s median — 4x more forgiving). Plus `substantiated_rate` / `unsubstantiated`, which only count calls logged since the flag shipped, so read them alongside `contact_talk_median`, which works retroactively. Flags: `high_conv_rate` (>50%), `perfect_contact` (>95%), `low_contact_talk_time`, `mostly_unsubstantiated` (both need ≥20 contacts).
+- **Capture-time prompt** in CallModal: claiming a conversation with no note, no qual and ≤10s on the timer asks for one line before saving. A `confirm`, never a block — a genuine instant hangup is real, and blocking would push callers to mislabel it `no_answer`, recreating the exact data loss this branch removed.
+- `duration` is MODAL-OPEN time, not carrier talk time, so a caller who dials separately and logs afterwards also reads near-zero. The flag therefore means **unverifiable**, not fabricated — keep the name honest.
+- Flags stored in `follow_up_outcome` field on call_outcomes.
 
 ### Follow-Up Sequences
 - Hot Lead: 24h → 48h → 5 days

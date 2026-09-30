@@ -1804,6 +1804,31 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     if(secondary==="callback"&&!cbDate){ setModalError("Please select a callback date."); return }
     if(primary==="gatekeeper"&&!cbDate){ setModalError("Please pick a follow-up date."); return }
     if(primary==="gatekeeper"&&!confirmFarDate(cbDate,"Follow-up")) return
+    // Substantiation prompt. A flag Eric reads next week is worth far less than
+    // the caller adding one line now, while they still remember the call. This
+    // fires only when a CONVERSATION is claimed with nothing at all behind it —
+    // no note, no qual, and a timer that never moved. An ordinary no-answer
+    // never trips it. Deliberately a confirm, not a block: a genuine instant
+    // hangup is real, and blocking the save would push people to mislabel it as
+    // no_answer, which is exactly the data loss we just spent this branch
+    // undoing.
+    {
+      // Mirror of the server rule (UNSUBSTANTIATED_MAX_SEC). Computed here
+      // rather than reusing finalDuration below, which is declared inside the
+      // try block after this guard.
+      const secs = duration ? parseInt(duration)*60 : timerSeconds
+      const claimsTalk = outcome!=="no_answer" && outcome!=="voicemail" && outcome!=="gatekeeper"
+      const noEvidence = !notes.trim() && !hasQualData
+      if(claimsTalk && noEvidence && secs<=10){
+        const label=(SECONDARY_OUTCOMES.find(o=>o.value===outcome)||{}).label||outcome
+        if(!window.confirm(
+          `You marked this "${label}" — a conversation — but the call lasted `+
+          `${secs}s with no notes and no qualification.\n\n`+
+          `Add a line about what they said (even "wrong number" or "hung up") so `+
+          `this counts as a real contact.\n\n`+
+          `Save it as-is anyway?`)) return
+      }
+    }
     if(secondary==="callback"&&!confirmFarDate(cbDate,"Callback")) return
     if(apptDate&&!confirmFarDate(apptDate,"Walkthrough date")) return
 
