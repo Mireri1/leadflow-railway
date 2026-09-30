@@ -1032,6 +1032,12 @@ INTENT_BOOSTS = {
     "rfp":         32,   # active solicitation for janitorial services
     "contract":    28,   # holds an expiring janitorial contract (recompete soon)
     "newbuild":    22,   # new construction / just opened = need being born
+    # A tenant-improvement permit is a business FITTING OUT LEASED SPACE — it
+    # is moving in now, not opening in eighteen months, and a new occupant has
+    # no incumbent cleaner and no loyalty to one. That is a live need with a
+    # date on it, so it outranks newbuild. 34% of permit leads already matched
+    # this and were all being pitched as "new construction".
+    "tenant_improvement": 30,
     "competitor":  26,   # unhappy with their current cleaner (poach)
     "lookalike":   12,   # resembles a lead we've already converted
 }
@@ -2887,6 +2893,13 @@ def _bg_maintenance_loop():
             run_weekly_review_scan_if_due()
         except Exception as e:
             print(f"[WEEKLY-SCAN] loop exception: {e}")
+        # Weekly refresh of FRESH failed health inspections. Its own try/except
+        # so a Socrata outage cannot take down the digests or the job queue
+        # that run after it in this loop.
+        try:
+            run_health_refresh_if_due()
+        except Exception as e:
+            print(f"[HEALTH-REFRESH] loop exception: {e}")
         # Transcription/analysis queue. Drains a few jobs per cycle rather than
         # everything: this thread also drives digests, refills and the email
         # sequencer, and a 200-call backlog must not starve them.
@@ -4562,8 +4575,25 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
 # 2026-08 audit: dropped Hospital/General Acute Care/Nursing/Skilled Nursing
 # (in-house EVS, 5.8% connect, 0.4% engagement), Home Health (no facility to
 # clean), Pharmacy + Laboratory (chains). Kept the outsourcing-friendly types.
-NPI_STATEWIDE_TAXONOMIES = ["Clinic/Center", "Assisted Living", "Dental", "Rehabilitation",
-    "Urgent Care", "Surgical", "Dialysis"]
+# Measured over 8,147 Cristine-era dials, not assumed. The budget is split
+# EVENLY across this list, so a taxonomy here is a claim on ~1/N of every NPI
+# pull. "Clinic/Center" led the list and is the NPPES bucket that produced
+# `Clinic/Center` (564 dials, 6.7% contact / 0.5% engaged) plus its mental
+# health variants (633 dials, ~5% / ~0.2%) — roughly a fifth of all dials, at
+# a third of the engagement of the tiers we actually want. "Assisted Living"
+# and "Rehabilitation" feed the same Nursing Facility pool the 2026-08 audit
+# already demoted (1,144 dials, 7.7% / 1.3%).
+#
+# What is left is what earns its slot: Dialysis (558 dials, 10.4% / 2.5% —
+# the best-performing healthcare vertical and well above the 8.4% / 1.5%
+# overall), Urgent Care and Surgical (priority tiers per the 2026-08
+# recalibration), Dental (small but clean). Dropping four names does not just
+# cut bad volume, it doubles the share of every pull going to the good ones.
+#
+# Env-overridable now: this was a hardcoded list, which made it the one part
+# of the sourcing mix that needed a deploy to retune.
+NPI_STATEWIDE_TAXONOMIES = [t.strip() for t in os.getenv(
+    "NPI_STATEWIDE_TAXONOMIES", "Dialysis,Urgent Care,Surgical,Dental").split(",") if t.strip()]
 
 # NPPES caps `skip`; stay under it so a rotating offset can never send an
 # invalid request. 200 is also the hard per-request `limit` on their side.
@@ -4798,6 +4828,29 @@ SOCRATA_PERMIT_SOURCES = [
     ("MA", "Cambridge",    "data.cambridgema.gov",       "9qm7-wbdc"),
 ]
 
+# A commercial permit is two different signals wearing one label. Ground-up
+# construction is a need being BORN (call in a year). A tenant improvement is a
+# tenant fitting out leased space — moving in, no incumbent cleaner, needs one
+# within weeks. Same dataset, opposite timing and opposite opener, and
+# everything was being stamped [INTENT:newbuild] and pitched as a new build.
+#
+# NEW wins over TI when both appear: "new construction — tenant improvement
+# shell" is a ground-up build, and calling that one as a move-in is the more
+# embarrassing error of the two.
+_TI_RE = re.compile(
+    r"(\btenant\b|\bbuild[\s-]?out\b|\bfit[\s-]?out\b|\bt\.?i\.?\b|\bwhite[\s-]?box\b"
+    r"|\binterior (?:remodel|renovation|finish|only|alteration)\b|\bremodel of existing\b"
+    r"|\bsuite\b|\bcertificate of occupancy\b)", re.I)
+_NEWBUILD_RE = re.compile(
+    r"(\bnew construction\b|\bground[\s-]?up\b|\bnew commercial\b|\bnew building\b|\bshell\b)", re.I)
+
+def permit_intent(text: str) -> str:
+    """'newbuild' or 'tenant_improvement' for a permit description."""
+    t = text if isinstance(text, str) else ""
+    if _NEWBUILD_RE.search(t):
+        return "newbuild"
+    return "tenant_improvement" if _TI_RE.search(t) else "newbuild"
+
 def _permit_industry(desc: str) -> str:
     d = (desc or "").lower()
     for label, kws in [("Medical", ["medical", "clinic", "hospital", "dental", "health"]),
@@ -4941,6 +4994,9 @@ def fetch_permits(state_abbrev: str, days: int = 30) -> list:
             klass = _permit_val(row, f["klass"])
             if not _permit_is_commercial(klass, f"{desc} {ptype}"):
                 continue
+            _pintent = permit_intent(f"{desc} {ptype}")
+            _plabel = ("Tenant fit-out permit — new occupant moving in"
+                       if _pintent == "tenant_improvement" else "Commercial permit")
             company = _permit_val(row, f["company"])
             addr = _permit_val(row, f["addr"])
             if not addr and f["house"] and f["street"]:
@@ -4957,8 +5013,8 @@ def fetch_permits(state_abbrev: str, days: int = 30) -> list:
                 "phone": _permit_val(row, f["phone"]), "firstName": fn, "lastName": ln,
                 "address": addr, "city": _permit_val(row, f["city"]),
                 "state": _permit_val(row, f["state"]) or state_abbrev.upper(),
-                "notes": f"[INTENT:newbuild] Commercial permit ({name}): "
-                         f"{(desc or ptype)[:120]} @ {addr}".strip(),
+                "notes": (f"[INTENT:{_pintent}] {_plabel} ({name}): "
+                          f"{(desc or ptype)[:120]} @ {addr}").strip(),
             })
     return leads
 
@@ -5278,6 +5334,11 @@ def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
             viol = clean(row.get(s["viol"], ""))[:160]
             result = clean(row.get(s["result"], ""))
             ftype = clean(row.get(s["ftype"], "")) if s.get("ftype") else ""
+            # Refuse stale violations outright. The Socrata $where already asks
+            # for a window, but not every source honours it on every column,
+            # and this is the last point where the date is still in hand.
+            if age_days is not None and age_days > HEALTH_MAX_AGE_DAYS:
+                continue
             age_tag = f" [hvage:{age_days}]" if age_days is not None else ""
             insp_tag = f" [inspected:{date}]" if re.match(r"\d{4}-\d{2}-\d{2}", date) else ""
             lead_city = clean(row.get(s["city"], "")) if s.get("city") else s.get("city_const", "")
@@ -5483,6 +5544,27 @@ COMPLAINT_RUNG_MAX_CALLS = 4
 # most 5 reviews, so "the most recent complaint" can easily be years old — and a
 # 2023 gripe opens the call cold and burns the lead. Fails OPEN when Google gives
 # no timestamp (age_days=None) rather than silently dropping the hit.
+# ── Health-inspection freshness ─────────────────────────────────────────────
+# A failed inspection is a DATED event with a compliance deadline attached —
+# that timing is the whole reason the signal beats a generic lead list. It was
+# not behaving that way in production:
+#
+#   * every Health Inspection lead was created in ONE pull on 2026-06-26, and
+#     the source had not run in the 96 days since. POST /api/sources/health is
+#     manual and was never scheduled, so "recent violation" aged into "some
+#     place that failed an inspection a year and a half ago".
+#   * median inspection age across the ingested stock was 582 days (max 2,423).
+#   * the feed that actually carries a date (fetch_health_inspections, with its
+#     `$where date > cutoff`) was opt-in behind `restaurants=true` and off by
+#     default, so the DEFAULT path was CMS star ratings, which carry no date.
+#
+# HEALTH_MAX_AGE_DAYS refuses stale violations at ingest rather than letting
+# score_lead quietly rank them behind fresher ones — a two-year-old violation
+# is not a weak lead, it is a wrong one.
+HEALTH_MAX_AGE_DAYS      = int(os.getenv("HEALTH_MAX_AGE_DAYS", "120"))
+HEALTH_REFRESH_ENABLED   = os.getenv("HEALTH_REFRESH_ENABLED", "1") == "1"
+HEALTH_REFRESH_STATES    = [x.strip().upper() for x in os.getenv(
+    "HEALTH_REFRESH_STATES", "NV,OH,MO").split(",") if x.strip()]
 COMPLAINT_MAX_AGE_DAYS = int(os.getenv("COMPLAINT_MAX_AGE_DAYS", "540"))
 
 class ReviewScanRequest(BaseModel):
@@ -7013,9 +7095,30 @@ async def twilio_recording_status(request: Request, lead_id: str = ""):
 DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
 DEEPGRAM_MODEL        = os.getenv("DEEPGRAM_MODEL", "nova-3")
 DEEPGRAM_RATE_PER_MIN = float(os.getenv("DEEPGRAM_RATE_PER_MIN", "0.0077"))  # cost tracking only
-# Haiku-class per the spec: this is high-volume single-pass extraction, not
-# synthesis. INSIGHTS_MODEL stays on the weekly aggregate.
-ANALYSIS_MODEL        = os.getenv("ANALYSIS_MODEL", "claude-haiku-4-5")
+# Opus-class, deliberately — the spec called this Haiku-class "high-volume
+# single-pass extraction", which is only half true. Extraction (disposition,
+# objections, callback date, DM reached) is schema-enforced and Haiku handles
+# it. The COACHING block is judgment: scoring hedging language against
+# verbatim evidence, and deciding whether a buying signal was actually there.
+#
+# `close_opportunity.existed` is the reason for the upgrade. It is the
+# DENOMINATOR of close_rate_pct, and passed_on_buying_signal is derived from
+# it server-side. Errors in a denominator do not average out — they bias the
+# headline coaching number in one direction, and that number is used to judge
+# a person's performance.
+#
+# Volume makes this cheap: ~15 qualifying calls/day is ~450/month, so the
+# Haiku→Opus difference is roughly $3 → $20 a month. Set ANALYSIS_MODEL back
+# to claude-haiku-4-5 if a real comparison shows the coaching holds up.
+ANALYSIS_MODEL        = os.getenv("ANALYSIS_MODEL", "claude-opus-5-5")
+# Thinking is always on for Opus 5.5 and CANNOT be disabled, and thinking
+# tokens count against max_tokens. 2000 was sized for a Haiku response with no
+# thinking; on Opus that budget gets eaten before the JSON is emitted and the
+# response truncates. Same failure the weekly digest already hit once (rich
+# JSON truncating at 1600). Effort is set explicitly rather than inheriting
+# Opus 5.5's `medium` default, so tuning it is a visible decision.
+ANALYSIS_MAX_TOKENS   = int(os.getenv("ANALYSIS_MAX_TOKENS", "8000"))
+ANALYSIS_EFFORT       = os.getenv("ANALYSIS_EFFORT", "medium")   # low|medium|high|xhigh|max
 TRANSCRIBE_MIN_SEC    = int(os.getenv("TRANSCRIBE_MIN_SEC", "45"))
 TRANSCRIBE_ENABLED    = os.getenv("TRANSCRIBE_ENABLED", "0") == "1"   # off until 008 has run
 ANALYZE_ENABLED       = os.getenv("ANALYZE_ENABLED", "0") == "1"
@@ -7582,11 +7685,20 @@ def analyze_call(payload: dict):
     # block is schema-valid JSON, so this never regex-scrapes a blob out of
     # prose the way the weekly coach has to.
     resp = client.messages.create(
-        model=ANALYSIS_MODEL, max_tokens=2000,
+        model=ANALYSIS_MODEL, max_tokens=ANALYSIS_MAX_TOKENS,
         system=_ANALYSIS_SYSTEM,
         messages=[{"role": "user", "content": f"Transcript:\n\n{text[:20000]}"}],
-        output_config={"format": {"type": "json_schema", "schema": _ANALYSIS_SCHEMA}},
+        # `effort` lives inside output_config alongside `format`, not at the
+        # top level. Both are the same object.
+        output_config={"format": {"type": "json_schema", "schema": _ANALYSIS_SCHEMA},
+                       "effort": ANALYSIS_EFFORT},
     )
+    # A truncated response is a schema-invalid one, and json_lib.loads below
+    # raises on it — which the job queue retries. Say so loudly first, because
+    # "raise max_tokens" is not what a bare JSONDecodeError looks like.
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        print(f"[ANALYZE] hit max_tokens ({ANALYSIS_MAX_TOKENS}) on {ANALYSIS_MODEL} — "
+              f"raise ANALYSIS_MAX_TOKENS or lower ANALYSIS_EFFORT")
     body = next((b.text for b in resp.content if b.type == "text"), "")
     data = json_lib.loads(body)      # schema-enforced; a raise here is a real retry
     cost = _analysis_cost(getattr(resp, "usage", None))
@@ -9614,6 +9726,51 @@ def rescore_all(user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Demoted verticals ───────────────────────────────────────────────────────
+# The 2026-08 audit demoted hospitals / nursing / in-house-custodial
+# healthcare, but it only changed what gets INGESTED — it never retired the
+# stock already in the pipe. Four months later those verticals were still
+# ~29% of all dials. Measured over the last 120 days:
+#
+#   Nursing Facility              1,144 dials   7.7% contact  1.3% engaged
+#   Clinic/Center                   564          6.7%         0.5%
+#   Clinic/Center, Mental Health    470          5.1%         0.4%
+#   Clinic/Center, Adult Mental     163          4.9%         0.0%
+#   Hospital                         62          4.8%         0.0%
+#   -- for contrast --
+#   Dialysis Center                 558         10.4%         2.5%
+#   OVERALL                       8,147          8.4%         1.5%
+#
+# KEEP wins over DEMOTE, deliberately. A real, specific industry label beats a
+# generic one: "Dialysis Center" is a proven 2.5%-engaged vertical and must
+# never be swept just because it contains "Center". Same for urgent care,
+# dental and surgical. This mirrors is_complaint_excluded_vertical()'s rule
+# that a real industry label wins.
+#
+# Every pattern is \b-anchored. `hospitality` (hotels, clubs, venues — a real
+# vertical) must never be caught by `hospital`, which a prefix match would do.
+# Schools are deliberately ABSENT: only PUBLIC schools were demoted, and
+# private schools measure 10.6% / 1.6%, above the overall average.
+_DEMOTED_VERTICAL_RE = re.compile(
+    r"(\bnursing\b|\bskilled nursing\b|\bassisted living\b|\bhospital\b"
+    r"|\brehabilitation\b|^\s*clinic/center\b)", re.I)
+_DEMOTED_KEEP_RE = re.compile(
+    r"(\bdialysis\b|\burgent care\b|\bdental\b|\bsurgical\b|\bhospitality\b)", re.I)
+
+def is_demoted_vertical(industry) -> bool:
+    """True when a lead's industry is one the 2026-08 audit ruled out.
+
+    Reads the INDUSTRY label only, never the company name. A name-based test
+    would sweep "CHILDRESS REGIONAL MEDICAL CENTER DIALYSIS" — a Dialysis
+    Center, and one of the best verticals in the book.
+    """
+    label = (industry if isinstance(industry, str) else "").strip()
+    if not label:
+        return False                      # unlabelled is not evidence of anything
+    if _DEMOTED_KEEP_RE.search(label):
+        return False
+    return bool(_DEMOTED_VERTICAL_RE.search(label))
+
 @app.post("/api/admin/retire-exhausted")
 def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
     """One-time (re-runnable) sweep: retire every lead already sitting at
@@ -9651,6 +9808,84 @@ def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
         audit_log(user, "retire_exhausted", "lead", None,
                   {"retired": done, "skipped_had_contact": len(contacted)})
         return {"retired": done, "skipped_had_contact": len(contacted), "candidates": len(cand_ids)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/retire-demoted-verticals")
+def retire_demoted_verticals(dry_run: int = 1, limit: int = 5000,
+                             user: str = Depends(verify_admin)):
+    """Park leads whose INDUSTRY is a vertical the 2026-08 audit demoted.
+
+    The audit stopped ingesting hospitals / nursing / generic NPI clinics but
+    never retired what was already loaded, so ~29% of dials kept going there
+    at roughly a third of the engagement of the tiers we want.
+
+    dry_run DEFAULTS TO 1 — unlike retire-exhausted, which sweeps a handful of
+    genuinely exhausted leads. This one can touch thousands of rows on an
+    industry-label match, so the default has to be "show me first".
+
+    Safety, in order:
+      - never touches a lead that EVER reached a human (same guard as
+        retire-exhausted): a worked lead is not stock, whatever its vertical
+      - never touches an engaged status, so an interested/callback/converted
+        lead cannot be swept out from under the caller
+      - KEEP beats DEMOTE in is_demoted_vertical(), so dialysis / urgent care
+        / dental / surgical survive a "Center" or "Clinic" in their label
+    Reversible: the leads are set to `retired`, which a manual status edit
+    un-retires, exactly like the dial-count retirement.
+    """
+    try:
+        rows = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,industry,status,company"
+            f"&status=not.in.({','.join(sorted(ENGAGED_STATUSES | {'retired'}))})")
+        by_industry = {}
+        cands = []
+        for l in rows:
+            if is_demoted_vertical(l.get("industry")):
+                cands.append(l)
+                k = (l.get("industry") or "").strip()[:40]
+                by_industry[k] = by_industry.get(k, 0) + 1
+        cand_ids = [l["id"] for l in cands][:max(1, limit)]
+
+        # Exclude anything that ever reached a human.
+        contacted = set()
+        CONTACT_SET = ",".join(sorted(CONTACT_OUTCOMES))
+        for i in range(0, len(cand_ids), 150):
+            chunk = ",".join(str(x) for x in cand_ids[i:i+150])
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=in.({chunk})"
+                f"&outcome=in.({CONTACT_SET})&select=leadId",
+                headers=SB_HEADERS, timeout=20)
+            if r.status_code == 200:
+                contacted.update(row["leadId"] for row in r.json())
+        to_retire = [i for i in cand_ids if i not in contacted]
+
+        top = sorted(by_industry.items(), key=lambda kv: -kv[1])[:12]
+        summary = {"matched": len(cands), "considered": len(cand_ids),
+                   "skipped_had_contact": len(contacted),
+                   "would_retire" if dry_run else "retired": len(to_retire),
+                   "by_industry": dict(top), "dry_run": bool(dry_run)}
+        if dry_run:
+            # A couple of real rows so the caller can eyeball that the matcher
+            # is hitting what they think it is before anything moves.
+            summary["sample"] = [{"id": l["id"], "industry": l.get("industry"),
+                                  "company": l.get("company")}
+                                 for l in cands[:5]]
+            return summary
+
+        now = datetime.utcnow().isoformat()
+        done = 0
+        for i in range(0, len(to_retire), 100):
+            chunk = ",".join(str(x) for x in to_retire[i:i+100])
+            rr = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})",
+                headers=SB_HEADERS, json={"status": "retired", "updatedAt": now}, timeout=30)
+            if rr.status_code in (200, 204):
+                done += min(100, len(to_retire) - i)
+        summary["retired"] = done
+        audit_log(user, "retire_demoted_verticals", "lead", None,
+                  {"retired": done, "skipped_had_contact": len(contacted),
+                   "by_industry": dict(top)})
+        return summary
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -11483,6 +11718,47 @@ def run_weekly_review_scan_if_due():
                        fields=[{"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
     except Exception as e:
         print(f"[WEEKLY-SCAN] failed: {e}")
+
+def run_health_refresh_if_due():
+    """Weekly pull of FRESH failed health inspections.
+
+    This is the piece that was missing. POST /api/sources/health exists and
+    works, but nothing ever called it: the whole Health Inspection corpus came
+    from a single manual pull on 2026-06-26 and then aged for three months. A
+    dated compliance signal that is not refreshed is just an old list — by the
+    time it was measured, the median ingested violation was 582 days old.
+
+    Deliberately runs the DATED feed (restaurants=True reaches
+    fetch_health_inspections, the only path carrying an inspection date), not
+    just the CMS star-rating path that runs by default on the endpoint. The
+    HEALTH_MAX_AGE_DAYS gate inside the fetcher is what keeps it honest.
+
+    Record-before-work, same as the other weekly jobs: a crash mid-pull must
+    not re-fire the scrape on the next 10-minute tick.
+    """
+    if not HEALTH_REFRESH_ENABLED:
+        return
+    if not _iso_week_due("last_health_refresh"):
+        return
+    _record_weekly_run("last_health_refresh")
+    total_new, by_state = 0, {}
+    for st in HEALTH_REFRESH_STATES:
+        try:
+            res = source_health(FreeSourceRequest(state=st, limit=HEALTH_MAX_AGE_DAYS,
+                                                  restaurants=True), user="eric")
+            n = (res or {}).get("saved", 0) if isinstance(res, dict) else 0
+            by_state[st] = n
+            total_new += n
+        except Exception as e:
+            print(f"[HEALTH-REFRESH] {st} failed: {e}")
+            by_state[st] = f"error: {str(e)[:60]}"
+    print(f"[HEALTH-REFRESH] states={by_state} new={total_new}")
+    if total_new:
+        send_slack("🚨 Fresh health-inspection leads",
+                   f"*{total_new}* businesses failed an inspection in the last "
+                   f"{HEALTH_MAX_AGE_DAYS} days and are now on the Day Plan complaint list.",
+                   fields=[{"label": "By state", "value": ", ".join(f"{k}: {v}" for k, v in by_state.items())},
+                           {"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
 
 def run_call_coach_if_due():
     """Weekly Claude coaching report over the week's recorded calls — no-ops

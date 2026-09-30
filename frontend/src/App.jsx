@@ -255,6 +255,10 @@ const INTENT_META = {
   rfp:         { label: "📋 Active RFP",            color: "#ffb347", pitch: "Actively soliciting janitorial bids." },
   contract:    { label: "⏳ Contract expiring",     color: "#ffb347", pitch: "Time the recompete." },
   newbuild:    { label: "🏗️ New construction",       color: "#69b4f6", pitch: "Future cleaning need — time it to opening." },
+  // Distinct from newbuild on purpose: a fit-out means they are moving IN,
+  // with no incumbent cleaner and no loyalty to one. Opposite timing, so the
+  // opener has to be opposite too.
+  tenant_improvement: { label: "🔑 New tenant fit-out", color: "#ffc95c", pitch: "Moving into leased space — no cleaner yet. Ask who is covering it after they open." },
   competitor:  { label: "↔️ Unhappy w/ cleaner",     color: "#ff6e84", pitch: "Poach — they're unhappy now." },
   lookalike:   { label: "🎯 Lookalike (you convert these)", color: "#ffe083", pitch: "Resembles accounts you've won." },
 }
