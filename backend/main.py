@@ -6575,7 +6575,112 @@ async def twilio_bridge(request: Request, to: str = "", lead_id: str = "", rec: 
     rec_attrs = (f' record="record-from-answer-dual" '
                  f'recordingStatusCallback="{app_url}/twilio/recording-status?lead_id={url_quote(str(lead_id), safe="")}"'
                  if rec == "1" else "")
-    return _twiml(f'<Dial callerId="{cid}"{rec_attrs} timeout="25"><Number>{to}</Number></Dial>')
+    # `action` fires when the dialed leg ends — for EVERY call, recorded or not,
+    # in every state, because it is pure metadata (how long, not what was said).
+    # DialCallDuration is the LEAD leg, i.e. actual conversation length; the
+    # parent call's CallDuration would also include the ring time while the
+    # lead's phone was still ringing.
+    action = (f' action="{app_url}/twilio/dial-status?lead_id={url_quote(str(lead_id), safe="")}"'
+              f' method="POST"')
+    return _twiml(f'<Dial callerId="{cid}"{rec_attrs}{action} timeout="25"><Number>{to}</Number></Dial>')
+
+# Carrier-true talk time, keyed by lead, written by the Twilio <Dial action>.
+# Kept in app_settings (no DDL, same pattern as appt_*) because the webhook and
+# the caller's modal race: she usually hangs up and THEN logs, but she can also
+# save while still connected.
+TWILIO_DUR_TTL_MIN = int(os.getenv("TWILIO_DUR_TTL_MIN", "20"))
+
+def _twilio_dur_key(lead_id) -> str:
+    return f"twilio_dur_{lead_id}"
+
+def take_twilio_duration(lead_id):
+    """Consume a carrier-reported duration for this lead, if one landed recently.
+    Returns seconds or None. Consuming it prevents one real call's duration from
+    being reused by the next log on the same lead."""
+    if not lead_id:
+        return None
+    try:
+        rec = _settings_get_json(_twilio_dur_key(lead_id))
+        if not isinstance(rec, dict):
+            return None
+        ts = _parse_iso(rec.get("at") or "")
+        if not ts or (datetime.utcnow() - ts) > timedelta(minutes=TWILIO_DUR_TTL_MIN):
+            return None
+        secs = int(rec.get("seconds") or 0)
+        if secs <= 0:
+            return None
+        _settings_set_json(_twilio_dur_key(lead_id), {})   # consume
+        return secs
+    except Exception as e:
+        print(f"[TWILIO-DUR] read failed for lead {lead_id}: {e}")
+        return None
+
+@app.post("/twilio/dial-status")
+async def twilio_dial_status(request: Request, lead_id: str = ""):
+    """Twilio <Dial action>. DialCallDuration is the carrier's measurement of the
+    conversation with the lead — the only trustworthy talk time we can get.
+    `call_outcomes.duration` otherwise holds MODAL-OPEN time, which reads ~2s for
+    anyone who dials elsewhere and logs afterwards, and is therefore useless as
+    an integrity signal.
+
+    Returns empty TwiML: the conversation is over, so the parent call ends."""
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    status = (form.get("DialCallStatus") or "").lower()
+    try:
+        secs = int(form.get("DialCallDuration") or 0)
+    except ValueError:
+        secs = 0
+    audit_log("twilio", "call_duration", "lead", lead_id or None,
+              {"dial_status": status, "seconds": secs,
+               "dial_call_sid": form.get("DialCallSid") or "",
+               "call_sid": form.get("CallSid") or ""})
+    if lead_id and status == "completed" and secs > 0:
+        # Path A — she already logged the call (saved while connected): correct
+        # the row in place. Path B — she has not logged yet (the common case):
+        # park it for log_call to consume.
+        patched = False
+        try:
+            since = (datetime.utcnow() - timedelta(minutes=TWILIO_DUR_TTL_MIN)).isoformat()
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                f"?leadId=eq.{url_quote(str(lead_id), safe='')}&calledAt=gte.{since}"
+                f"&select=id,duration,follow_up_outcome&order=calledAt.desc&limit=1",
+                headers=SB_HEADERS, timeout=10)
+            rows = r.json() if r.status_code == 200 else []
+            if isinstance(rows, list) and rows:
+                row = rows[0]
+                fo = (row.get("follow_up_outcome") or "")
+                if "twilio_verified" not in fo:
+                    # Reconcile the flag too. The row was flagged against MODAL
+                    # time; if the carrier says the conversation really lasted
+                    # longer than the threshold, the row is substantiated after
+                    # all and must not keep accusing the caller.
+                    toks = [t for t in fo.split(",") if t]
+                    if secs > UNSUBSTANTIATED_MAX_SEC and "unsubstantiated_contact" in toks:
+                        toks = [t for t in toks if t != "unsubstantiated_contact"]
+                        print(f"[TWILIO-DUR] lead {lead_id}: clearing "
+                              f"unsubstantiated_contact — carrier says {secs}s")
+                    toks.append("twilio_verified")
+                    req_lib.patch(
+                        f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{row['id']}",
+                        headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                        json={"duration": secs, "follow_up_outcome": ",".join(toks)},
+                        timeout=10)
+                    patched = True
+                    print(f"[TWILIO-DUR] lead {lead_id}: corrected call {row['id']} "
+                          f"{row.get('duration')}s -> {secs}s (carrier)")
+        except Exception as e:
+            print(f"[TWILIO-DUR] patch attempt failed for lead {lead_id}: {e}")
+        if not patched:
+            try:
+                _settings_set_json(_twilio_dur_key(lead_id),
+                                   {"seconds": secs, "at": datetime.utcnow().isoformat(),
+                                    "call_sid": form.get("CallSid") or ""})
+            except Exception as e:
+                print(f"[TWILIO-DUR] park failed for lead {lead_id}: {e}")
+    return _twiml("")
 
 @app.post("/twilio/recording-status")
 async def twilio_recording_status(request: Request, lead_id: str = ""):
@@ -6941,6 +7046,21 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         # have a column for it; we use the local var only for the trigger logic.
         send_email_followup = bool(call.pop("send_email_followup", False))
         flags = []
+
+        # Prefer the CARRIER's talk time over the modal timer. This is what
+        # makes the substantiation flag below mean something: `duration` from
+        # the client is how long the modal was open, so anyone who dials on
+        # their phone and logs afterwards reads ~2s no matter how long they
+        # actually talked. When Twilio click-to-call was used, DialCallDuration
+        # is the real conversation length, and the flag then measures reality.
+        if lead_id:
+            _carrier = take_twilio_duration(lead_id)
+            if _carrier:
+                _client_dur = call.get("duration") or 0
+                call["duration"] = _carrier
+                flags.append("twilio_verified")
+                print(f"[TWILIO-DUR] lead {lead_id}: using carrier {_carrier}s "
+                      f"(modal reported {_client_dur}s)")
 
         # ── Substantiation flags ────────────────────────────────────────────
         # The old empty_form rule fired whenever notes AND qual were both blank,
