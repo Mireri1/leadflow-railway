@@ -6504,7 +6504,7 @@ async def twilio_transcription(request: Request):
 # ── Twilio click-to-call + recording + Claude call coach ─────────────────────
 # POST /api/call/start bridges: Twilio rings the CALLER's phone first, then
 # dials the lead with a market-matched local caller ID (TWILIO_NUMBERS).
-# Recording only when the lead's state is one-party-consent (RECORD_STATES);
+# Recording everywhere except all-party-consent states (RECORD_EXCLUDE_STATES);
 # recordings flow into LeadFlow's OWN pipeline (recording-status → jobs queue →
 # Deepgram → Claude) — see "Owned call transcription" below. Twilio
 # Conversational Intelligence has been removed.
@@ -6519,12 +6519,28 @@ def _twilio_numbers():
         num, _, st = part.partition(":")
         out.append((num.strip(), st.strip().upper()))
     return out
-# One-party-consent states (conservative list) — recording is silently skipped
-# for leads anywhere else. Override with RECORD_STATES env if your counsel
-# says otherwise.
-RECORD_STATES = set(s.strip().upper() for s in os.getenv("RECORD_STATES",
-    "NV,OH,MO,KS,ID,NC,TN,AL,GA,NY,NJ,TX,AZ,CO,VA,SC,LA,OK,IA,IN,KY,ME,MN,MS,ND,NE,NM,SD,UT,WI,WY,AR,HI,RI,DC,WV,AK"
-    ).split(",") if s.strip())
+# ── Recording eligibility: DENY-list, not allow-list ────────────────────────
+# Was an allow-list of 37 states, which silently dropped recording for any
+# state not enumerated (a typo or a new market = no recording, no signal).
+# Now: record everywhere EXCEPT states that require all-party consent for a
+# TELEPHONE call, with the spoken notice always playing when we record.
+#
+# ⚠️ NEVADA IS ON THIS LIST AND NEVADA IS A PRIMARY MARKET (the 702 number in
+# TWILIO_NUMBERS). NRS 200.620 requires the consent of all parties to record a
+# telephone call, and the Nevada Supreme Court read it that way in Lane v.
+# Allstate — so NV is conventionally grouped with CA/FL/WA, not with OH/MO.
+# The previous allow-list had NV as recordable, which is the opposite call.
+# This is a question for counsel, not for this file: the spoken notice may well
+# satisfy all-party consent (notice + continuing the call), and if counsel says
+# it does, drop NV from RECORD_EXCLUDE_STATES via env and nothing else changes.
+# Until then NV calls record no audio — and with no NV audio there are no NV
+# transcripts, so transcription coverage will read low for the biggest market.
+#
+# Not on the list, deliberately: OREGON (ORS 165.540 is all-party for in-person
+# conversations but ONE-party for telephone) and VERMONT (no statute).
+RECORD_EXCLUDE_STATES = set(s.strip().upper() for s in os.getenv(
+    "RECORD_EXCLUDE_STATES",
+    "CA,CT,DE,FL,IL,MD,MA,MI,MT,NV,NH,PA,WA").split(",") if s.strip())
 
 # Spoken notice played to the PROSPECT (not the caller) the moment they answer,
 # before the two legs are bridged, whenever the call is being recorded. Short on
@@ -6540,8 +6556,21 @@ RECORDING_ANNOUNCEMENT = os.getenv("RECORDING_ANNOUNCEMENT",
 RECORD_ALL_STATES_WITH_NOTICE = os.getenv("RECORD_ALL_STATES_WITH_NOTICE", "0") == "1"
 
 def _should_record(state_abbrev: str) -> bool:
-    """Whether to record a call to a lead in this state."""
-    return RECORD_ALL_STATES_WITH_NOTICE or (state_abbrev or "").strip().upper() in RECORD_STATES
+    """Record unless the lead's state requires all-party consent.
+
+    A blank/unknown state does NOT record: we cannot establish which law
+    applies, and the deny-list only protects states we can identify. That is
+    the one place this stays fail-closed.
+
+    RECORD_ALL_STATES_WITH_NOTICE=1 overrides the deny-list entirely — the
+    escape hatch for after counsel rules on whether the spoken notice satisfies
+    all-party consent. It is not a substitute for that ruling."""
+    st = (state_abbrev or "").strip().upper()
+    if RECORD_ALL_STATES_WITH_NOTICE:
+        return True
+    if len(st) != 2:
+        return False
+    return st not in RECORD_EXCLUDE_STATES
 
 def _twilio_ready():
     return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN")
@@ -6557,7 +6586,8 @@ def _e164(num: str) -> str:
 def call_config(user: str = Depends(verify_token)):
     return {"ready": _twilio_ready(),
             "numbers": [{"number": n, "state": st} for n, st in _twilio_numbers()],
-            "recording_states": sorted(RECORD_STATES) if _twilio_ready() else [],
+            "recording_excluded_states": sorted(RECORD_EXCLUDE_STATES),
+            "recording_all_states": RECORD_ALL_STATES_WITH_NOTICE,
             "transcription": bool(DEEPGRAM_API_KEY and TRANSCRIBE_ENABLED)}
 
 @app.post("/api/call/start")
@@ -6831,7 +6861,12 @@ CALL_DISPOSITIONS = ["appointment_set", "interested_callback", "send_info",
                      "already_has_vendor", "dnc", "voicemail",
                      "no_decision_maker", "other"]
 QA_FLAGS = ["no_close_attempt", "dnc_request", "profanity", "misrepresentation",
-            "talked_over_prospect", "hot_lead"]
+            "talked_over_prospect", "hot_lead",
+            # Added 2026-09: the "she had an opening and didn't take it" case.
+            # Distinct from no_close_attempt — that one means she never asked at
+            # all; this one means the prospect gave her a signal and she let it
+            # pass, which is the more coachable failure.
+            "passed_on_buying_signal", "over_hedged"]
 
 # ── jobs queue ──────────────────────────────────────────────────────────────
 def enqueue_job(kind: str, payload: dict, dedupe_key: str = "", delay_sec: int = 0) -> bool:
@@ -7245,10 +7280,28 @@ _ANALYSIS_SCHEMA = {
             "required": ["score", "opener", "pitch", "objection_handling", "close", "flags"],
             "additionalProperties": False},
         "flags": {"type": "array", "items": {"type": "string", "enum": QA_FLAGS}},
+        "coaching": {"type": "object", "properties": {
+            "approach": {"type": "string"},
+            "assertiveness": {"type": "object", "properties": {
+                "score": {"type": "integer"},
+                "note": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}}},
+                "required": ["score", "note", "evidence"], "additionalProperties": False},
+            "close_opportunity": {"type": "object", "properties": {
+                "existed": {"type": "boolean"},
+                "taken": {"type": "boolean"},
+                "prospect_signal": {"type": ["string", "null"]},
+                "missed_moment": {"type": ["string", "null"]},
+                "say_instead": {"type": ["string", "null"]}},
+                "required": ["existed", "taken", "prospect_signal",
+                             "missed_moment", "say_instead"],
+                "additionalProperties": False}},
+            "required": ["approach", "assertiveness", "close_opportunity"],
+            "additionalProperties": False},
     },
     "required": ["summary", "disposition", "disposition_confidence", "next_step",
                  "callback_at", "objections", "prospect_sentiment",
-                 "decision_maker_reached", "qa", "flags"],
+                 "decision_maker_reached", "qa", "flags", "coaching"],
     "additionalProperties": False,
 }
 
@@ -7273,7 +7326,32 @@ _ANALYSIS_SYSTEM = (
     "(5) attempts a close or a concrete next step. If no objection arose, award (4) if the "
     "rep kept control of the conversation.\n"
     "- Set the `dnc_request` flag only if the prospect asked not to be called again.\n"
-    "- Be specific. A QA comment that would apply to any call is useless."
+    "- Be specific. A QA comment that would apply to any call is useless.\n\n"
+    "COACHING BLOCK — the part a human reviewer actually reads:\n"
+    "- `approach`: one sentence on HOW she ran the call (e.g. consultative, "
+    "straight into the pitch, permission-seeking, rapport-first).\n"
+    "- `assertiveness`: this is about LANGUAGE, not tone. You are reading a "
+    "transcript — you cannot hear confidence, pace or volume, so do NOT guess at "
+    "them. Score only what the words show: hedging and minimisers (\"just\", "
+    "\"I was wondering if maybe\", \"sorry to bother you\", \"I don't know if "
+    "you'd be interested\"), apologising for calling, asking permission to ask a "
+    "question, trailing off, or accepting the first brush-off without a follow-up "
+    "question. 10 = direct and specific throughout with no hedging. Put the actual "
+    "hedging phrases in `evidence`, verbatim; if there are none, `evidence` is "
+    "empty and the score is high. An empty `evidence` list with a low score is a "
+    "contradiction — do not produce one.\n"
+    "- `close_opportunity`: the most useful field. `existed` is true if at ANY "
+    "point the prospect gave something to build on — a question about pricing or "
+    "service, naming the decision maker, admitting a problem with their current "
+    "cleaner, or any softening from an initial no. `prospect_signal` is that "
+    "moment quoted verbatim. `taken` is true only if she then asked for the "
+    "walkthrough, the appointment, or a concrete next step. If `existed` is true "
+    "and `taken` is false, quote where she should have asked in `missed_moment` "
+    "and write the exact words she should have used in `say_instead` — one "
+    "sentence she could read off a card next time.\n"
+    "- Flags: `passed_on_buying_signal` when existed && !taken. `over_hedged` "
+    "when hedging materially weakened the ask. `no_close_attempt` when she never "
+    "asked for anything at all, whether or not a signal appeared."
 )
 
 def _analysis_cost(usage) -> float:
@@ -7345,7 +7423,13 @@ def analyze_call(payload: dict):
         except Exception:
             pass
 
-    flags = sorted(set((data.get("flags") or []) + ((data.get("qa") or {}).get("flags") or [])))
+    flags = set((data.get("flags") or []) + ((data.get("qa") or {}).get("flags") or []))
+    # Derive the close flag from the structured fields rather than trusting the
+    # model to remember to set it — `existed && !taken` IS the definition.
+    _co = ((data.get("coaching") or {}).get("close_opportunity") or {})
+    if _co.get("existed") and not _co.get("taken"):
+        flags.add("passed_on_buying_signal")
+    flags = sorted(flags)
     row = {"call_id": call_id, "transcript_id": tid,
            "lead_id": int(lead_id) if str(lead_id or "").isdigit() else None,
            "model": ANALYSIS_MODEL, "summary": data.get("summary") or "",
@@ -7356,14 +7440,18 @@ def analyze_call(payload: dict):
            "objections": data.get("objections") or [],
            "prospect_sentiment": data.get("prospect_sentiment"),
            "decision_maker_reached": data.get("decision_maker_reached"),
-           "qa": data.get("qa") or {}, "flags": flags, "cost_usd": cost}
+           "qa": data.get("qa") or {}, "coaching": data.get("coaching") or {},
+           "flags": flags, "cost_usd": cost}
     ir = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_analyses",
                       headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
                       json=row, timeout=30)
     if ir.status_code not in (200, 201, 204):
         raise RuntimeError(f"analysis insert HTTP {ir.status_code}: {ir.text[:200]}")
+    _co = ((row.get("coaching") or {}).get("close_opportunity") or {})
     print(f"[ANALYZE] transcript {tid}: {row['disposition']} "
-          f"qa={(row['qa'] or {}).get('score')} flags={flags} ${cost}")
+          f"qa={(row['qa'] or {}).get('score')} "
+          f"close={'missed' if (_co.get('existed') and not _co.get('taken')) else 'ok'} "
+          f"flags={flags} ${cost}")
     _apply_analysis(call_id, lead_id, row, caller_disp)
 
 def _apply_analysis(call_id, lead_id, row: dict, caller_disp: str):
@@ -7478,6 +7566,191 @@ def run_transcription_cost_rollup_if_due():
                        f"skip distribution in /api/admin/transcription-stats.")
     except Exception as e:
         print(f"[TRANSCRIBE-COST] rollup failed: {e}")
+
+def _intel_rows(table: str, filt: str, select: str, limit: int = 200):
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/{table}?{filt}&select={select}&limit={limit}",
+                        headers=SB_ADMIN_HEADERS, timeout=20)
+        rows = r.json() if r.status_code == 200 else []
+        if r.status_code != 200:
+            print(f"[INTEL-API] {table} HTTP {r.status_code}: {r.text[:160]} "
+                  f"— has migration 008 run?")
+        return rows if isinstance(rows, list) else []
+    except Exception as e:
+        print(f"[INTEL-API] {table} failed: {e}")
+        return []
+
+@app.get("/api/calls/{call_id}/intelligence")
+def call_intelligence(call_id: int, user: str = Depends(verify_token)):
+    """Transcript + analysis for one call. Callers may read their OWN calls
+    (they should be able to re-read what they said); the QA scores are stripped
+    for non-admins — per spec, v1 does not show reps their scores."""
+    calls = _intel_rows("call_outcomes", f"id=eq.{call_id}",
+                        "id,leadId,outcome,calledBy,calledAt,duration,notes,"
+                        "recording_sid,recording_duration_sec,transcription_status,"
+                        "transcription_skip_reason,answered_by,disposition_mismatch", 1)
+    if not calls:
+        raise HTTPException(status_code=404, detail="Call not found")
+    call = calls[0]
+    admin = is_admin(user)
+    if not admin and (call.get("calledBy") or "") != user:
+        raise HTTPException(status_code=403, detail="Not your call")
+    tr = _intel_rows("call_transcripts", f"call_id=eq.{call_id}&order=created_at.desc",
+                     "id,full_text,utterances,duration_sec,model,cost_usd,created_at", 1)
+    an = _intel_rows("call_analyses", f"call_id=eq.{call_id}&order=created_at.desc",
+                     "id,summary,disposition,disposition_confidence,caller_disposition,"
+                     "next_step,callback_at,objections,prospect_sentiment,"
+                     "decision_maker_reached,qa,coaching,flags,model,cost_usd,created_at", 1)
+    analysis = an[0] if an else None
+    if analysis and not admin:
+        # Reps see the substance (what was said, what to do next) but not the
+        # score. Showing a number without a conversation about it is how QA
+        # becomes something people game instead of something they learn from.
+        analysis = {k: v for k, v in analysis.items() if k not in ("qa", "coaching")}
+    # Recording playback URL: Twilio-hosted, so hand back the SID and let the
+    # admin UI build the authenticated link rather than proxying audio.
+    return {"call": call, "transcript": tr[0] if tr else None, "analysis": analysis,
+            "recording_sid": call.get("recording_sid"), "is_admin": admin}
+
+@app.get("/api/admin/transcripts/search")
+def transcripts_search(q: str = "", caller: str = "", since: str = "",
+                       disposition: str = "", flag: str = "", limit: int = 50,
+                       user: str = Depends(verify_admin)):
+    """Full-text over transcripts, with caller / date / disposition / flag
+    filters. Uses the GIN tsvector index from 008 via PostgREST's `fts`."""
+    limit = max(1, min(limit, 200))
+    filt = ["order=created_at.desc"]
+    if q.strip():
+        # plfts = plainto_tsquery — treats the input as words, not an operator
+        # expression, so a caller can paste "take us off your list" safely.
+        filt.append(f"full_text=plfts(english).{url_quote(q.strip(), safe='')}")
+    if since.strip():
+        filt.append(f"created_at=gte.{url_quote(since.strip(), safe='')}")
+    rows = _intel_rows("call_transcripts", "&".join(filt),
+                       "id,call_id,lead_id,full_text,duration_sec,created_at", limit * 3)
+    if not rows:
+        return {"results": [], "total": 0, "query": q}
+    # Join analyses + the call row in bulk, then filter. PostgREST cannot join,
+    # and the result set is already capped, so this is two extra round trips.
+    call_ids = [str(r["call_id"]) for r in rows if r.get("call_id")]
+    an_by_call, call_by_id = {}, {}
+    for i in range(0, len(call_ids), 100):
+        chunk = ",".join(call_ids[i:i+100])
+        for a in _intel_rows("call_analyses", f"call_id=in.({chunk})",
+                             "call_id,disposition,flags,qa,coaching,summary", 300):
+            an_by_call[str(a.get("call_id"))] = a
+        for c in _intel_rows("call_outcomes", f"id=in.({chunk})",
+                             "id,calledBy,calledAt,outcome,leadId", 300):
+            call_by_id[str(c.get("id"))] = c
+    out = []
+    for r in rows:
+        cid = str(r.get("call_id"))
+        c, a = call_by_id.get(cid, {}), an_by_call.get(cid, {})
+        if caller and (c.get("calledBy") or "") != caller:
+            continue
+        if disposition and (a.get("disposition") or "") != disposition:
+            continue
+        if flag and flag not in (a.get("flags") or []):
+            continue
+        snippet = (r.get("full_text") or "")[:400]
+        out.append({"transcript_id": r["id"], "call_id": r.get("call_id"),
+                    "lead_id": r.get("lead_id"), "created_at": r.get("created_at"),
+                    "duration_sec": r.get("duration_sec"),
+                    "caller": c.get("calledBy"), "outcome": c.get("outcome"),
+                    "disposition": a.get("disposition"), "flags": a.get("flags") or [],
+                    "qa_score": (a.get("qa") or {}).get("score"),
+                    "summary": a.get("summary"), "snippet": snippet})
+        if len(out) >= limit:
+            break
+    return {"results": out, "total": len(out), "query": q}
+
+@app.get("/api/admin/caller-qa")
+def caller_qa(days: int = 30, caller: str = "", user: str = Depends(verify_admin)):
+    """Per-caller coaching rollup — the view that answers "is this caller
+    improving, and on what". Every rate is reported with its denominator so a
+    3-call sample can't read like a trend."""
+    days = max(1, min(days, 180))
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    an = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_analyses?created_at=gte.{since}"
+                        f"&select=call_id,disposition,flags,qa,coaching,objections,"
+                        f"decision_maker_reached,created_at", headers=SB_ADMIN_HEADERS)
+    if not an:
+        return {"window_days": days, "callers": [],
+                "detail": "No analyses yet — needs migration 008, DEEPGRAM_API_KEY, "
+                          "TRANSCRIBE_ENABLED=1 and ANALYZE_ENABLED=1."}
+    ids = [str(a["call_id"]) for a in an if a.get("call_id")]
+    who = {}
+    for i in range(0, len(ids), 100):
+        for c in _intel_rows("call_outcomes", f"id=in.({','.join(ids[i:i+100])})",
+                             "id,calledBy", 300):
+            who[str(c.get("id"))] = c.get("calledBy") or "Unknown"
+    # Transcription coverage: analysed calls vs calls that REACHED A HUMAN.
+    # Coverage against all dials would read ~15% by design and mean nothing.
+    contacted = {}
+    for c in _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?calledAt=gte.{since}"
+                            f"&select=calledBy,outcome", headers=SB_ADMIN_HEADERS):
+        if (c.get("outcome") or "") in CONTACT_OUTCOMES:
+            contacted[c.get("calledBy") or "Unknown"] = contacted.get(c.get("calledBy") or "Unknown", 0) + 1
+    from collections import Counter, defaultdict
+    by = defaultdict(lambda: {"n": 0, "qa": [], "assert": [], "flags": Counter(),
+                              "objections": Counter(), "dm": 0,
+                              "close_existed": 0, "close_taken": 0, "recent": []})
+    for a in an:
+        name = who.get(str(a.get("call_id")), "Unknown")
+        if caller and name != caller:
+            continue
+        b = by[name]
+        b["n"] += 1
+        qa = a.get("qa") or {}
+        co = (a.get("coaching") or {}).get("close_opportunity") or {}
+        asrt = (a.get("coaching") or {}).get("assertiveness") or {}
+        if isinstance(qa.get("score"), (int, float)):
+            b["qa"].append(float(qa["score"]))
+        if isinstance(asrt.get("score"), (int, float)):
+            b["assert"].append(float(asrt["score"]))
+        for f in (a.get("flags") or []):
+            b["flags"][f] += 1
+        for o in (a.get("objections") or []):
+            b["objections"][(o or {}).get("type") or "other"] += 1
+        if a.get("decision_maker_reached"):
+            b["dm"] += 1
+        if co.get("existed"):
+            b["close_existed"] += 1
+            if co.get("taken"):
+                b["close_taken"] += 1
+        if co.get("existed") and not co.get("taken") and co.get("say_instead"):
+            b["recent"].append({"date": (a.get("created_at") or "")[:10],
+                                "call_id": a.get("call_id"),
+                                "signal": co.get("prospect_signal"),
+                                "missed": co.get("missed_moment"),
+                                "say_instead": co.get("say_instead")})
+    def avg(xs):
+        return round(sum(xs) / len(xs), 2) if xs else None
+    out = []
+    for name, b in by.items():
+        n = b["n"]
+        out.append({
+            "caller": name, "analyzed_calls": n,
+            "human_contacts": contacted.get(name, 0),
+            # % of this caller's human contacts that produced an analysis.
+            "coverage_pct": round(n / contacted[name] * 100, 1) if contacted.get(name) else None,
+            "avg_qa_score": avg(b["qa"]),
+            "avg_assertiveness": avg(b["assert"]),
+            "decision_maker_rate": round(b["dm"] / n * 100, 1) if n else 0,
+            "close_opportunities": b["close_existed"],
+            "closes_attempted": b["close_taken"],
+            # The headline coaching number: when she had an opening, how often
+            # did she actually ask? Denominator is opportunities, not calls.
+            "close_rate_pct": round(b["close_taken"] / b["close_existed"] * 100, 1) if b["close_existed"] else None,
+            "flags": dict(b["flags"]),
+            "objections": dict(b["objections"]),
+            "missed_closes": sorted(b["recent"], key=lambda x: x["date"], reverse=True)[:8],
+        })
+    out.sort(key=lambda x: -x["analyzed_calls"])
+    return {"window_days": days, "callers": out,
+            "note": "Rates carry their denominators on purpose — a 3-call sample "
+                    "is not a trend. avg_assertiveness reads LANGUAGE (hedging), "
+                    "not tone: a transcript cannot show vocal confidence."}
 
 @app.get("/api/admin/transcription-stats")
 def transcription_stats(days: int = 7, user: str = Depends(verify_admin)):

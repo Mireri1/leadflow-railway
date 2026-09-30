@@ -89,6 +89,9 @@ create table if not exists call_analyses (
   prospect_sentiment     text,                          -- positive | neutral | negative
   decision_maker_reached boolean,
   qa                     jsonb   not null default '{}'::jsonb,
+  coaching               jsonb   not null default '{}'::jsonb,
+    -- {approach, assertiveness:{score,evidence[],note},
+    --  close_opportunity:{existed,taken,prospect_signal,missed_moment,say_instead}}
   flags                  text[]  default '{}',
   cost_usd               numeric(8,5),
   created_at             timestamptz not null default now()

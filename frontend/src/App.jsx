@@ -6567,6 +6567,7 @@ export default function App(){
               {isAdmin()&&<AuditLogPanel/>}
 
               {/* ── Connectivity Heatmap (admin only) ── */}
+              {isAdmin()&&<CallIntelligencePanel/>}
               {isAdmin()&&<ConnectivityPanel/>}
 
               {/* ── Insights: Apollo ROI + Touch-count + Stale callbacks (admin only) ── */}
@@ -8297,6 +8298,404 @@ function ConnectivityPanel(){
               </div>
             </>
           )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── CallIntelligencePanel (admin) — transcripts, QA, coaching ───────────────
+// The post-call review surface. Three things in one card because they answer
+// one question in sequence: how is this caller doing (QA rollup) → which calls
+// need looking at (search + flag chips) → what actually happened (transcript +
+// analysis, expanded inline).
+//
+// Deliberately honest about what the analysis can and cannot know: it reads a
+// TRANSCRIPT, so "assertiveness" is measured from hedging language, never from
+// tone of voice. The UI says so rather than letting a number imply more than it
+// has behind it.
+const FLAG_META = {
+  hot_lead:              {label:"🔥 Hot lead",           color:"#69f6b8"},
+  passed_on_buying_signal:{label:"🚪 Passed on a signal", color:"#ffa44a"},
+  no_close_attempt:      {label:"🤐 Never asked",        color:"#ffa44a"},
+  over_hedged:           {label:"😶 Over-hedged",        color:"#ffe083"},
+  talked_over_prospect:  {label:"🗣 Talked over",         color:"#ffe083"},
+  dnc_request:           {label:"⛔ DNC request",         color:"#ff6e84"},
+  profanity:             {label:"⚠ Profanity",           color:"#ff6e84"},
+  misrepresentation:     {label:"⚠ Misrepresentation",    color:"#ff6e84"},
+}
+const flagMeta = f => FLAG_META[f] || {label:f, color:"#a3aac4"}
+
+function QaBar({score, max=10, label}){
+  const v = typeof score==="number" ? score : null
+  const col = v===null?"#40485d":v>=8?"#69f6b8":v>=6?"#ffe083":v>=4?"#ffa44a":"#ff6e84"
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:8}}>
+      {label&&<span style={{fontSize:10,color:"#a3aac4",minWidth:76}}>{label}</span>}
+      <div style={{flex:1,height:6,background:"#192540",borderRadius:3,overflow:"hidden"}}>
+        <div style={{width:`${v===null?0:(v/max)*100}%`,height:"100%",background:col}}/>
+      </div>
+      <span style={{fontSize:11,color:col,fontWeight:700,minWidth:34,textAlign:"right"}}>
+        {v===null?"—":`${v}/${max}`}
+      </span>
+    </div>
+  )
+}
+
+function TranscriptView({t}){
+  if(!t) return <div style={{fontSize:11,color:"#40485d"}}>No transcript stored for this call.</div>
+  const utts = Array.isArray(t.utterances)?t.utterances:[]
+  if(!utts.length) return <pre style={{fontSize:11,color:"#dee5ff",whiteSpace:"pre-wrap",
+    maxHeight:300,overflowY:"auto",margin:0}}>{t.full_text}</pre>
+  return (
+    <div style={{maxHeight:320,overflowY:"auto",display:"flex",flexDirection:"column",gap:4}}>
+      {utts.map((u,i)=>{
+        const agent = u.speaker==="AGENT"
+        const mm=String(Math.floor((u.start||0)/60)).padStart(2,"0")
+        const ss=String(Math.floor((u.start||0)%60)).padStart(2,"0")
+        return (
+          <div key={i} style={{display:"flex",gap:8,fontSize:12,lineHeight:1.45}}>
+            <span style={{color:"#40485d",fontSize:10,minWidth:38,paddingTop:2,
+              fontVariantNumeric:"tabular-nums"}}>{mm}:{ss}</span>
+            <span style={{color:agent?"#a3a6ff":"#69f6b8",fontWeight:700,minWidth:64,fontSize:10,
+              paddingTop:2,textTransform:"uppercase",letterSpacing:".04em"}}>
+              {agent?"Caller":"Prospect"}
+            </span>
+            <span style={{color:"#dee5ff",flex:1}}>{u.text}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function CallIntelDetail({callId}){
+  const [d,setD]   = useState(null)
+  const [err,setErr]= useState("")
+  useEffect(()=>{
+    let live=true
+    api(`/api/calls/${callId}/intelligence`)
+      .then(r=>{ if(live) setD(r) })
+      .catch(e=>{ if(live) setErr(e.message||"Could not load") })
+    return ()=>{ live=false }
+  },[callId])
+  if(err) return <div style={{fontSize:11,color:"#ff6e84",padding:"8px 0"}}>⚠ {err}</div>
+  if(!d)  return <div style={{fontSize:11,color:"#40485d",padding:"8px 0"}}>Loading transcript…</div>
+  const a = d.analysis
+  const co = (a?.coaching?.close_opportunity)||{}
+  const asrt = (a?.coaching?.assertiveness)||{}
+  const qa = a?.qa||{}
+  const mismatch = a && a.caller_disposition && a.disposition &&
+                   d.call?.disposition_mismatch
+  return (
+    <div style={{padding:"12px 0 4px",display:"flex",flexDirection:"column",gap:14}}>
+      {/* Summary + dispositions side by side — the rep's call vs the transcript's */}
+      {a&&(
+        <div style={{background:"#060e20",borderRadius:8,padding:12,border:"1px solid #40485d20"}}>
+          <div style={{fontSize:12,color:"#dee5ff",lineHeight:1.5,marginBottom:10}}>{a.summary}</div>
+          <div style={{display:"flex",gap:16,flexWrap:"wrap",fontSize:11}}>
+            <span style={{color:"#a3aac4"}}>Rep logged:{" "}
+              <b style={{color:"#dee5ff"}}>{a.caller_disposition||"—"}</b></span>
+            <span style={{color:"#a3aac4"}}>Transcript reads:{" "}
+              <b style={{color:mismatch?"#ffa44a":"#dee5ff"}}>{a.disposition}</b>
+              {typeof a.disposition_confidence==="number"&&
+                <span style={{color:"#40485d"}}> ({Math.round(a.disposition_confidence*100)}%)</span>}
+            </span>
+            {a.decision_maker_reached!=null&&
+              <span style={{color:"#a3aac4"}}>DM reached:{" "}
+                <b style={{color:a.decision_maker_reached?"#69f6b8":"#a3aac4"}}>
+                  {a.decision_maker_reached?"yes":"no"}</b></span>}
+            {a.prospect_sentiment&&
+              <span style={{color:"#a3aac4"}}>Sentiment: <b style={{color:"#dee5ff"}}>{a.prospect_sentiment}</b></span>}
+          </div>
+          {mismatch&&(
+            <div style={{marginTop:10,fontSize:11,color:"#ffa44a",background:"#ffa44a12",
+              border:"1px solid #ffa44a30",borderRadius:6,padding:"7px 10px"}}>
+              ⚠ The transcript disagrees with what was logged. Flagged for review only —
+              the rep's entry is never overwritten.
+            </div>
+          )}
+          {a.next_step&&<div style={{marginTop:10,fontSize:11,color:"#a3aac4"}}>
+            <b style={{color:"#69f6b8"}}>Next step:</b> {a.next_step}
+            {a.callback_at&&<span style={{color:"#40485d"}}> · {String(a.callback_at).slice(0,10)}</span>}
+          </div>}
+        </div>
+      )}
+
+      {/* The coaching block — what the reviewer is actually here for */}
+      {a&&d.is_admin&&(
+        <div style={{background:"#060e20",borderRadius:8,padding:12,border:"1px solid #a3a6ff25"}}>
+          <div style={{fontSize:10,color:"#a3a6ff",fontWeight:700,letterSpacing:".08em",
+            textTransform:"uppercase",marginBottom:10}}>Coaching</div>
+          {a.coaching?.approach&&<div style={{fontSize:12,color:"#dee5ff",marginBottom:10}}>
+            <b style={{color:"#a3aac4",fontWeight:600}}>Approach:</b> {a.coaching.approach}</div>}
+          <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:12}}>
+            <QaBar label="Overall" score={qa.score}/>
+            <QaBar label="Directness" score={asrt.score}/>
+          </div>
+          {asrt.note&&<div style={{fontSize:11,color:"#a3aac4",marginBottom:6}}>{asrt.note}</div>}
+          {Array.isArray(asrt.evidence)&&asrt.evidence.length>0&&(
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:10,color:"#ffe083",marginBottom:4}}>Hedging, verbatim:</div>
+              {asrt.evidence.map((e,i)=>(
+                <div key={i} style={{fontSize:11,color:"#dee5ff",fontStyle:"italic",
+                  borderLeft:"2px solid #ffe083",paddingLeft:8,marginBottom:3}}>"{e}"</div>
+              ))}
+            </div>
+          )}
+          {/* The missed-close story. This is the single most actionable field. */}
+          {co.existed!=null&&(
+            <div style={{background:co.existed&&!co.taken?"#ffa44a10":"#69f6b810",
+              border:`1px solid ${co.existed&&!co.taken?"#ffa44a30":"#69f6b830"}`,
+              borderRadius:7,padding:10}}>
+              <div style={{fontSize:11,fontWeight:700,marginBottom:6,
+                color:co.existed&&!co.taken?"#ffa44a":"#69f6b8"}}>
+                {!co.existed ? "No opening to close on this call"
+                  : co.taken ? "✓ Had an opening and asked for the walkthrough"
+                  : "⚠ Had an opening and did not ask"}
+              </div>
+              {co.prospect_signal&&<div style={{fontSize:11,color:"#dee5ff",marginBottom:5}}>
+                <b style={{color:"#a3aac4",fontWeight:600}}>Their signal:</b>{" "}
+                <span style={{fontStyle:"italic"}}>"{co.prospect_signal}"</span></div>}
+              {co.missed_moment&&<div style={{fontSize:11,color:"#dee5ff",marginBottom:5}}>
+                <b style={{color:"#a3aac4",fontWeight:600}}>Moment:</b> {co.missed_moment}</div>}
+              {co.say_instead&&<div style={{fontSize:11,color:"#69f6b8",marginTop:7,
+                background:"#060e20",borderRadius:5,padding:"7px 9px"}}>
+                <b>Say next time:</b> "{co.say_instead}"</div>}
+            </div>
+          )}
+          {Array.isArray(a.objections)&&a.objections.length>0&&(
+            <div style={{marginTop:12}}>
+              <div style={{fontSize:10,color:"#a3aac4",marginBottom:4}}>Objections raised:</div>
+              {a.objections.map((o,i)=>(
+                <div key={i} style={{fontSize:11,color:"#dee5ff",marginBottom:3}}>
+                  <span style={{color:"#ffe083"}}>{o.type}</span>{" — "}
+                  <span style={{fontStyle:"italic"}}>"{o.quote}"</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{marginTop:10,fontSize:9,color:"#40485d",lineHeight:1.5}}>
+            Scored from the transcript text. "Directness" reads hedging language —
+            a transcript cannot show tone of voice, pace or volume, so it is not
+            scored on those.
+          </div>
+        </div>
+      )}
+      {a&&!d.is_admin&&(
+        <div style={{fontSize:10,color:"#40485d"}}>QA scoring is admin-only.</div>
+      )}
+
+      {/* Transcript last: the evidence for everything above it */}
+      <div>
+        <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,letterSpacing:".08em",
+          textTransform:"uppercase",marginBottom:8}}>
+          Transcript
+          {d.transcript?.duration_sec&&<span style={{color:"#40485d",fontWeight:400,
+            textTransform:"none",letterSpacing:0}}> · {Math.round(d.transcript.duration_sec)}s</span>}
+        </div>
+        <TranscriptView t={d.transcript}/>
+      </div>
+
+      {!a&&d.transcript&&<div style={{fontSize:11,color:"#40485d"}}>
+        Transcript stored, analysis pending (ANALYZE_ENABLED).</div>}
+      {!d.transcript&&d.call?.transcription_skip_reason&&
+        <div style={{fontSize:11,color:"#40485d"}}>
+          Not transcribed — <b>{d.call.transcription_skip_reason}</b>
+          {d.call.recording_duration_sec!=null&&` (${d.call.recording_duration_sec}s recorded)`}.
+        </div>}
+    </div>
+  )
+}
+
+function CallIntelligencePanel(){
+  const [open,setOpen]   = useState(false)
+  const [q,setQ]         = useState("")
+  const [flag,setFlag]   = useState("")
+  const [caller,setCaller]= useState("")
+  const [days,setDays]   = useState(30)
+  const [res,setRes]     = useState(null)
+  const [qa,setQa]       = useState(null)
+  const [busy,setBusy]   = useState(false)
+  const [expanded,setExp]= useState(null)
+  const [stats,setStats] = useState(null)
+
+  function load(){
+    setBusy(true)
+    const since = new Date(Date.now()-days*864e5).toISOString().slice(0,10)
+    const qs = new URLSearchParams({q, flag, caller, since, limit:"50"})
+    Promise.all([
+      api(`/api/admin/transcripts/search?${qs}`).catch(()=>({results:[]})),
+      api(`/api/admin/caller-qa?days=${days}`).catch(()=>({callers:[]})),
+      api(`/api/admin/transcription-stats?days=${days}`).catch(()=>null),
+    ]).then(([r,c,st])=>{ setRes(r); setQa(c); setStats(st) })
+     .finally(()=>setBusy(false))
+  }
+  useEffect(()=>{ if(open&&!res) load() },[open])
+
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24}}>
+      <div onClick={()=>setOpen(o=>!o)}
+        style={{padding:"18px 24px",cursor:"pointer",display:"flex",alignItems:"center",
+          justifyContent:"space-between"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+            textTransform:"uppercase"}}>
+            🎧 Call Intelligence <span style={{color:"#ff6e84",fontSize:9,marginLeft:6}}>ADMIN</span>
+          </div>
+          {stats&&<span style={{fontSize:11,color:"#a3a6ff",background:"#a3a6ff18",
+            padding:"2px 8px",borderRadius:4,fontWeight:700}}>
+            {stats.transcribed} transcribed · {stats.analyzed} analysed
+            {stats.avg_qa_score?` · QA ${stats.avg_qa_score}`:""}
+          </span>}
+        </div>
+        <span style={{color:"#a3aac4",fontSize:14}}>{open?"▾":"▸"}</span>
+      </div>
+      {open&&(
+        <div style={{padding:"0 24px 20px",borderTop:"1px solid #40485d20"}}>
+          {/* Pipeline health first — an empty panel is usually config, not "no calls" */}
+          {stats&&!stats.enabled?.transcribe&&(
+            <div style={{marginTop:14,padding:"10px 12px",fontSize:11,borderRadius:7,
+              background:"#ffa44a12",border:"1px solid #ffa44a30",color:"#ffa44a"}}>
+              ⚠ Transcription is off. Run <code>backend/migrations/008_call_transcription.sql</code>,
+              set <code>DEEPGRAM_API_KEY</code>, then <code>TRANSCRIBE_ENABLED=1</code>
+              {!stats.enabled?.analyze&&<> and <code>ANALYZE_ENABLED=1</code></>}.
+            </div>
+          )}
+          {stats?.gate&&stats.gate.skipped_total>0&&(
+            <div style={{marginTop:14,fontSize:10,color:"#40485d"}}>
+              Gate (last {days}d): {Object.entries(stats.gate.skipped).map(([k,v])=>`${k} ${v}`).join(" · ")}
+              {" · "}transcribed {stats.transcribed}
+              {stats.cost_usd&&` · $${(stats.cost_usd.deepgram+stats.cost_usd.claude).toFixed(2)}`}
+            </div>
+          )}
+
+          {/* Per-caller rollup */}
+          {(qa?.callers||[]).length>0&&(
+            <div style={{marginTop:16,display:"grid",
+              gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:12}}>
+              {qa.callers.map(c=>(
+                <div key={c.caller} style={{background:"#060e20",borderRadius:9,padding:13,
+                  border:"1px solid #40485d20"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",
+                    marginBottom:10}}>
+                    <b style={{fontSize:13,color:"#dee5ff"}}>{c.caller}</b>
+                    <span style={{fontSize:10,color:"#40485d"}}>
+                      {c.analyzed_calls} analysed
+                      {c.coverage_pct!=null&&` · ${c.coverage_pct}% of contacts`}
+                    </span>
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:10}}>
+                    <QaBar label="Overall QA" score={c.avg_qa_score}/>
+                    <QaBar label="Directness" score={c.avg_assertiveness}/>
+                  </div>
+                  <div style={{fontSize:11,color:"#a3aac4",lineHeight:1.7}}>
+                    <div>Asked for the walkthrough:{" "}
+                      <b style={{color:c.close_rate_pct==null?"#40485d"
+                        :c.close_rate_pct>=70?"#69f6b8":c.close_rate_pct>=40?"#ffe083":"#ff6e84"}}>
+                        {c.close_rate_pct==null?"—":`${c.close_rate_pct}%`}
+                      </b>
+                      <span style={{color:"#40485d"}}>
+                        {" "}({c.closes_attempted}/{c.close_opportunities} openings)
+                      </span>
+                    </div>
+                    <div>Reached the decision maker:{" "}
+                      <b style={{color:"#dee5ff"}}>{c.decision_maker_rate}%</b></div>
+                  </div>
+                  {Object.keys(c.objections||{}).length>0&&(
+                    <div style={{marginTop:8,fontSize:10,color:"#40485d"}}>
+                      Objections: {Object.entries(c.objections)
+                        .sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join(" · ")}
+                    </div>
+                  )}
+                  {(c.missed_closes||[]).length>0&&(
+                    <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid #40485d20"}}>
+                      <div style={{fontSize:10,color:"#ffa44a",marginBottom:5}}>
+                        Openings not taken ({c.missed_closes.length})
+                      </div>
+                      {c.missed_closes.slice(0,3).map((m,i)=>(
+                        <div key={i} style={{fontSize:10,color:"#a3aac4",marginBottom:6}}>
+                          <span style={{color:"#40485d"}}>{m.date}</span>{" "}
+                          {m.signal&&<span style={{fontStyle:"italic"}}>"{String(m.signal).slice(0,70)}"</span>}
+                          {m.say_instead&&<div style={{color:"#69f6b8",marginTop:2}}>
+                            → "{String(m.say_instead).slice(0,110)}"</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {qa?.detail&&<div style={{marginTop:14,fontSize:11,color:"#40485d"}}>{qa.detail}</div>}
+
+          {/* Search + flag chips */}
+          <div style={{marginTop:18,display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+            <input value={q} onChange={e=>setQ(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter") load() }}
+              placeholder='Search transcripts — e.g. "already have someone"'
+              style={{flex:"2 1 240px",background:"#060e20",border:"1px solid #40485d40",
+                borderRadius:7,color:"#dee5ff",padding:"8px 11px",fontSize:12,fontFamily:"inherit"}}/>
+            {[7,30,90].map(d=>(
+              <button key={d} className="btn" onClick={()=>{setDays(d);setTimeout(load,0)}}
+                style={{fontSize:11,padding:"5px 10px",
+                  background:days===d?"#a3a6ff":"transparent",
+                  color:days===d?"#000011":"#a3aac4",
+                  border:`1px solid ${days===d?"#a3a6ff":"#40485d40"}`}}>{d}d</button>
+            ))}
+            <button className="btn btn-p" onClick={load} disabled={busy}
+              style={{fontSize:11,padding:"6px 14px"}}>{busy?"…":"Search"}</button>
+          </div>
+          <div style={{marginTop:9,display:"flex",gap:6,flexWrap:"wrap"}}>
+            {Object.keys(FLAG_META).map(f=>{
+              const m=flagMeta(f), on=flag===f
+              return (
+                <button key={f} onClick={()=>{setFlag(on?"":f);setTimeout(load,0)}}
+                  style={{padding:"4px 9px",borderRadius:5,fontSize:10,cursor:"pointer",
+                    fontFamily:"inherit",background:on?m.color+"25":"transparent",
+                    color:on?m.color:"#a3aac4",
+                    border:`1px solid ${on?m.color:"#40485d30"}`}}>{m.label}</button>
+              )
+            })}
+          </div>
+
+          {/* Results */}
+          <div style={{marginTop:14}}>
+            {!res?null:res.results.length===0?(
+              <div style={{fontSize:11,color:"#40485d",padding:"14px 0"}}>
+                No transcripts match. {q&&"Try a broader phrase, "}or widen the window.
+              </div>
+            ):res.results.map(r=>(
+              <div key={r.transcript_id} style={{borderTop:"1px solid #40485d18",padding:"10px 0"}}>
+                <div onClick={()=>setExp(expanded===r.call_id?null:r.call_id)}
+                  style={{cursor:"pointer",display:"flex",gap:10,alignItems:"baseline",
+                    flexWrap:"wrap"}}>
+                  <span style={{fontSize:10,color:"#40485d",minWidth:70}}>
+                    {(r.created_at||"").slice(0,10)}</span>
+                  <b style={{fontSize:12,color:"#dee5ff"}}>{r.caller||"—"}</b>
+                  {r.disposition&&<span style={{fontSize:10,color:"#a3a6ff",
+                    background:"#a3a6ff18",padding:"1px 6px",borderRadius:4}}>{r.disposition}</span>}
+                  {typeof r.qa_score==="number"&&<span style={{fontSize:10,fontWeight:700,
+                    color:r.qa_score>=8?"#69f6b8":r.qa_score>=6?"#ffe083":r.qa_score>=4?"#ffa44a":"#ff6e84"}}>
+                    QA {r.qa_score}/10</span>}
+                  {(r.flags||[]).map(f=>{
+                    const m=flagMeta(f)
+                    return <span key={f} style={{fontSize:9,color:m.color,
+                      background:m.color+"18",padding:"1px 5px",borderRadius:3}}>{m.label}</span>
+                  })}
+                  {r.duration_sec&&<span style={{fontSize:10,color:"#40485d"}}>
+                    {Math.round(r.duration_sec)}s</span>}
+                  <span style={{marginLeft:"auto",color:"#40485d",fontSize:11}}>
+                    {expanded===r.call_id?"▾":"▸"}</span>
+                </div>
+                {r.summary&&expanded!==r.call_id&&(
+                  <div style={{fontSize:11,color:"#a3aac4",marginTop:4,paddingLeft:80}}>
+                    {String(r.summary).slice(0,150)}…</div>
+                )}
+                {expanded===r.call_id&&<CallIntelDetail callId={r.call_id}/>}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
