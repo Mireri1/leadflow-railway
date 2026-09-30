@@ -2794,6 +2794,19 @@ def _bg_maintenance_loop():
             run_weekly_review_scan_if_due()
         except Exception as e:
             print(f"[WEEKLY-SCAN] loop exception: {e}")
+        # Transcription/analysis queue. Drains a few jobs per cycle rather than
+        # everything: this thread also drives digests, refills and the email
+        # sequencer, and a 200-call backlog must not starve them.
+        try:
+            n = run_jobs_once(limit=int(os.getenv("JOBS_PER_CYCLE", "5")))
+            if n:
+                print(f"[JOBS] processed {n} job(s) this cycle")
+        except Exception as e:
+            print(f"[JOBS] loop exception: {e}")
+        try:
+            run_transcription_cost_rollup_if_due()
+        except Exception as e:
+            print(f"[TRANSCRIBE-COST] loop exception: {e}")
         # Monthly macro snapshot — banks one FRED reading per calendar month so a
         # paired macro × receptivity history builds up. No-op once banked.
         try:
@@ -6492,8 +6505,9 @@ async def twilio_transcription(request: Request):
 # POST /api/call/start bridges: Twilio rings the CALLER's phone first, then
 # dials the lead with a market-matched local caller ID (TWILIO_NUMBERS).
 # Recording only when the lead's state is one-party-consent (RECORD_STATES);
-# recordings flow → Voice Intelligence transcription (TWILIO_INTELLIGENCE_SID)
-# → audit_log 'call_transcript' rows → weekly Claude coaching report.
+# recordings flow into LeadFlow's OWN pipeline (recording-status → jobs queue →
+# Deepgram → Claude) — see "Owned call transcription" below. Twilio
+# Conversational Intelligence has been removed.
 # TWILIO_NUMBERS format: "+17025550100:NV,+16145550100:OH,+18165550100:MO"
 # (first entry is the default caller ID for unmatched states).
 TWILIO_NUMBERS_RAW = os.getenv("TWILIO_NUMBERS", "")
@@ -6511,13 +6525,6 @@ def _twilio_numbers():
 RECORD_STATES = set(s.strip().upper() for s in os.getenv("RECORD_STATES",
     "NV,OH,MO,KS,ID,NC,TN,AL,GA,NY,NJ,TX,AZ,CO,VA,SC,LA,OK,IA,IN,KY,ME,MN,MS,ND,NE,NM,SD,UT,WI,WY,AR,HI,RI,DC,WV,AK"
     ).split(",") if s.strip())
-TWILIO_INTELLIGENCE_SID = os.getenv("TWILIO_INTELLIGENCE_SID", "")
-# Recordings shorter than this are not worth a transcription call — they are
-# hellos and hangups, not coachable conversations.
-INTEL_MIN_SECONDS = int(os.getenv("INTEL_MIN_SECONDS", "20"))
-# media_channel -> who is talking. record-from-answer-dual puts the parent leg
-# (our caller) on 1 and the dialled leg (the prospect) on 2.
-_INTEL_SPEAKER = {"1": "AGENT", "2": "PROSPECT"}
 
 # Spoken notice played to the PROSPECT (not the caller) the moment they answer,
 # before the two legs are bridged, whenever the call is being recorded. Short on
@@ -6551,7 +6558,7 @@ def call_config(user: str = Depends(verify_token)):
     return {"ready": _twilio_ready(),
             "numbers": [{"number": n, "state": st} for n, st in _twilio_numbers()],
             "recording_states": sorted(RECORD_STATES) if _twilio_ready() else [],
-            "transcription": bool(TWILIO_INTELLIGENCE_SID)}
+            "transcription": bool(DEEPGRAM_API_KEY and TRANSCRIBE_ENABLED)}
 
 @app.post("/api/call/start")
 def call_start(body: dict, user: str = Depends(verify_token)):
@@ -6602,8 +6609,10 @@ async def twilio_bridge(request: Request, to: str = "", lead_id: str = "", rec: 
     if not _twilio_sig_ok(request, form):
         raise HTTPException(status_code=403, detail="Bad Twilio signature")
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
-    rec_attrs = (f' record="record-from-answer-dual" '
-                 f'recordingStatusCallback="{app_url}/twilio/recording-status?lead_id={url_quote(str(lead_id), safe="")}"'
+    rec_attrs = (f' record="record-from-answer-dual"'
+                 f' recordingStatusCallback="{app_url}/twilio/recording-status?lead_id={url_quote(str(lead_id), safe="")}"'
+                 f' recordingStatusCallbackEvent="completed"'
+                 f' recordingStatusCallbackMethod="POST"'
                  if rec == "1" else "")
     # `action` fires when the dialed leg ends — for EVERY call, recorded or not,
     # in every state, because it is pure metadata (how long, not what was said).
@@ -6616,6 +6625,14 @@ async def twilio_bridge(request: Request, to: str = "", lead_id: str = "", rec: 
     # only when we are actually recording — announcing a recording we are not
     # making would be both pointless and off-putting on a cold open.
     num_attrs = f' url="{app_url}/twilio/announce" method="POST"' if rec == "1" else ""
+    # AMD belongs on the PROSPECT's leg. Putting machineDetection on the REST
+    # call (as the spec's table suggests) would run it against CALLER_PHONE —
+    # our own rep's handset — because /api/call/start rings the rep first and
+    # bridges from here. asyncAmd so detection never delays the connect.
+    if TWILIO_AMD_ENABLED:
+        num_attrs += (f' machineDetection="Enable" amdStatusCallback='
+                      f'"{app_url}/twilio/amd-status?lead_id={url_quote(str(lead_id), safe="")}"'
+                      f' amdStatusCallbackMethod="POST"')
     return _twiml(f'<Dial callerId="{cid}"{rec_attrs}{action} timeout="25">'
                   f'<Number{num_attrs}>{to}</Number></Dial>')
 
@@ -6624,6 +6641,11 @@ async def twilio_bridge(request: Request, to: str = "", lead_id: str = "", rec: 
 # the caller's modal race: she usually hangs up and THEN logs, but she can also
 # save while still connected.
 TWILIO_DUR_TTL_MIN = int(os.getenv("TWILIO_DUR_TTL_MIN", "20"))
+# AMD (answering-machine detection) on the prospect's leg. Off by default: it
+# adds a Twilio per-call charge and the transcription gate is designed to fail
+# open without it (the duration floor does the real cost protection), so this is
+# an accuracy upgrade to switch on deliberately, not a dependency.
+TWILIO_AMD_ENABLED = os.getenv("TWILIO_AMD_ENABLED", "0") == "1"
 
 def _twilio_dur_key(lead_id) -> str:
     return f"twilio_dur_{lead_id}"
@@ -6744,108 +6766,752 @@ async def twilio_recording_status(request: Request, lead_id: str = ""):
     rec_sid = form.get("RecordingSid") or ""
     call_sid = form.get("CallSid") or ""
     dur = form.get("RecordingDuration") or "0"
+    # Twilio can send in-progress/absent events; only the terminal one carries a
+    # usable duration and a fetchable recording.
+    rec_status = (form.get("RecordingStatus") or "completed").strip().lower()
+    if rec_status != "completed":
+        print(f"[TRANSCRIBE] ignoring RecordingStatus={rec_status} for {rec_sid}")
+        return {"ok": True, "ignored": rec_status}
     audit_log("twilio", "call_recording", "lead", lead_id or None,
               {"recording_url": rec_url, "recording_sid": rec_sid, "call_sid": call_sid, "duration": dur})
-    # int() was in the `if` condition, OUTSIDE the try — a malformed
-    # RecordingDuration would 500 back at Twilio instead of being ignored.
+    # Recording metadata only. Transcription is owned by LeadFlow now
+    # (Deepgram → Claude, see the transcription pipeline below); Twilio
+    # Conversational Intelligence has been removed.
     try:
         dur_s = int(float(dur or 0))
     except (TypeError, ValueError):
         dur_s = 0
-    # Kick Voice Intelligence transcription when configured
-    if TWILIO_INTELLIGENCE_SID and rec_sid and dur_s >= INTEL_MIN_SECONDS:
-        try:
-            ir = req_lib.post(
-                "https://intelligence.twilio.com/v2/Transcripts",
-                auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")),
-                data={"ServiceSid": TWILIO_INTELLIGENCE_SID,
-                      "Channel": json_lib.dumps({"media_properties": {"source_sid": rec_sid}})},
-                timeout=15)
-            t_sid = (ir.json() or {}).get("sid", "") if ir.status_code in (200, 201) else ""
-            print(f"[INTEL] transcript requested for {rec_sid}: HTTP {ir.status_code} sid={t_sid or '-'}")
-            if ir.status_code not in (200, 201):
-                print(f"[INTEL] create rejected: {ir.text[:200]}")
-            # Remember which lead this transcript belongs to, NOW, while we
-            # still know. The webhook used to reverse-look-it-up with
-            # `audit_log?details=ilike.*<sid>*` — the only ilike-on-details
-            # query in the file, and `details` is stored as a JSON *string*, so
-            # on a jsonb column that filter matches nothing and every
-            # transcript silently lands with lead_id=None, unattributable.
-            if t_sid and lead_id:
-                try:
-                    _settings_set_json(f"intel_lead_{t_sid}",
-                                       {"lead_id": str(lead_id),
-                                        "at": datetime.utcnow().isoformat()})
-                except Exception as e:
-                    print(f"[INTEL] lead-link store failed for {t_sid}: {e}")
-        except Exception as e:
-            print(f"[INTEL] transcript request failed: {e}")
+    _on_recording_completed(form, lead_id, rec_sid, dur_s)
     return {"ok": True}
 
-@app.post("/twilio/intelligence")
-async def twilio_intelligence_webhook(request: Request):
-    """Voice Intelligence completion webhook (set on the Intelligence Service):
-    fetch sentences, store the full transcript for the Claude coach."""
+# ════════════════════════════════════════════════════════════════════════════
+# OWNED CALL TRANSCRIPTION + CALL INTELLIGENCE  (Twilio → Deepgram → Claude)
+# ════════════════════════════════════════════════════════════════════════════
+# LeadFlow owns this pipeline end to end; Twilio Conversational Intelligence is
+# gone. Flow:
+#
+#   Twilio call ends
+#     └─ POST /twilio/recording-status  (signature-validated, returns fast)
+#          └─ record metadata on call_outcomes, enqueue transcribe_call
+#               └─ worker: gate → download wav → Deepgram → call_transcripts
+#                    └─ worker: Claude → call_analyses → disposition/flags/DNC
+#
+# Both workers run on the existing _bg_maintenance_loop thread via a `jobs`
+# table (migration 008) — no new infra, per spec.
+#
+# COST GATING is the whole design. At ~175 dials/day only the 15-25% that reach
+# a human are worth transcribing, so the gate drops everything else BEFORE a
+# byte of audio is fetched, and every drop records why (so a broken gate is
+# visible as a shifted skip distribution rather than a surprise invoice).
+DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL        = os.getenv("DEEPGRAM_MODEL", "nova-3")
+DEEPGRAM_RATE_PER_MIN = float(os.getenv("DEEPGRAM_RATE_PER_MIN", "0.0077"))  # cost tracking only
+# Haiku-class per the spec: this is high-volume single-pass extraction, not
+# synthesis. INSIGHTS_MODEL stays on the weekly aggregate.
+ANALYSIS_MODEL        = os.getenv("ANALYSIS_MODEL", "claude-haiku-4-5")
+TRANSCRIBE_MIN_SEC    = int(os.getenv("TRANSCRIBE_MIN_SEC", "45"))
+TRANSCRIBE_ENABLED    = os.getenv("TRANSCRIBE_ENABLED", "0") == "1"   # off until 008 has run
+ANALYZE_ENABLED       = os.getenv("ANALYZE_ENABLED", "0") == "1"
+TRANSCRIBE_DAILY_COST_ALERT = float(os.getenv("TRANSCRIBE_DAILY_COST_ALERT", "5"))
+TRANSCRIBE_DAILY_COUNT_ALERT = int(os.getenv("TRANSCRIBE_DAILY_COUNT_ALERT", "60"))
+# Which Deepgram channel is our caller. record-from-answer-dual puts the parent
+# leg (the rep, whose phone Twilio rings first) on Twilio channel 1, which is
+# Deepgram's 0-indexed channel 0. Flip via env after checking the first real
+# recording rather than editing code — the spec lists this as a verify-once.
+DEEPGRAM_AGENT_CHANNEL = int(os.getenv("DEEPGRAM_AGENT_CHANNEL", "0"))
+
+# Twilio AMD values that mean "no human on the line".
+_AMD_MACHINE = {"machine_start", "machine_end_beep", "machine_end_silence",
+                "machine_end_other", "fax"}
+# Caller-logged outcomes that mean the same thing.
+_NO_HUMAN_OUTCOMES = {"voicemail", "no_answer", "busy"}
+# Keep in step with the DB comment in migration 008 and the analysis schema.
+CALL_DISPOSITIONS = ["appointment_set", "interested_callback", "send_info",
+                     "not_interested", "wrong_number", "gatekeeper_blocked",
+                     "already_has_vendor", "dnc", "voicemail",
+                     "no_decision_maker", "other"]
+QA_FLAGS = ["no_close_attempt", "dnc_request", "profanity", "misrepresentation",
+            "talked_over_prospect", "hot_lead"]
+
+# ── jobs queue ──────────────────────────────────────────────────────────────
+def enqueue_job(kind: str, payload: dict, dedupe_key: str = "", delay_sec: int = 0) -> bool:
+    """Insert a job. The partial unique index in 008 makes this idempotent per
+    (kind, dedupe_key) while a job is queued/running, so Twilio redelivering a
+    recording-status webhook cannot buy us a second transcription. A 409 from
+    that index is the SUCCESS case, not an error."""
+    run_after = (datetime.utcnow() + timedelta(seconds=delay_sec)).isoformat()
     try:
-        payload = await request.json()
-    except Exception:
-        form = await request.form()
-        payload = dict(form)
-    # This was the only Twilio webhook in the file with no signature check at
-    # all. Validated when the header is present; when it is absent we log and
-    # continue rather than hard-fail, because this endpoint has never run in
-    # production and silently rejecting every callback would be a worse first
-    # experience than an unsigned one. The blast radius is small either way:
-    # the body only carries a transcript SID that is then fetched from our own
-    # Twilio account.
-    if request.headers.get("X-Twilio-Signature"):
-        if not _twilio_sig_ok(request, payload):
-            raise HTTPException(status_code=403, detail="Bad Twilio signature")
-    else:
-        print("[INTEL] webhook arrived unsigned (no X-Twilio-Signature header)")
-    t_sid = payload.get("transcript_sid") or payload.get("TranscriptSid") or ""
-    if not t_sid:
-        return {"ok": False}
-    try:
-        sr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}/Sentences?PageSize=500",
-                         auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=20)
-        sents = (sr.json() or {}).get("sentences", []) if sr.status_code == 200 else []
-        # Name the speakers instead of emitting bare channel numbers. With
-        # record-from-answer-dual on <Dial>, channel 1 is the parent leg (our
-        # caller) and channel 2 the dialled leg (the prospect). Labelling them
-        # here means the coach prompt no longer has to explain a numbering
-        # convention, and a transcript is readable on its own in the audit row.
-        text = " ".join(f"[{_INTEL_SPEAKER.get(str(x.get('media_channel')), 'SPEAKER?')}] "
-                        f"{x.get('transcript','')}" for x in sents)[:8000]
-        # Lead linkage: prefer the mapping recorded when the transcript was
-        # REQUESTED (see /twilio/recording-status). The audit-row reverse lookup
-        # below is kept only as a fallback for transcripts created before this.
-        lead_id = None
-        try:
-            link = _settings_get_json(f"intel_lead_{t_sid}")
-            if isinstance(link, dict) and link.get("lead_id"):
-                lead_id = link["lead_id"]
-                _settings_set_json(f"intel_lead_{t_sid}", {})   # consume
-        except Exception as e:
-            print(f"[INTEL] lead-link read failed for {t_sid}: {e}")
-        if not lead_id:
-            tr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}",
-                             auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=15)
-            src_sid = ((tr.json() or {}).get("channel") or {}).get("media_properties", {}).get("source_sid", "") if tr.status_code == 200 else ""
-            if src_sid:
-                ar = req_lib.get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
-                                 f"&details=ilike.*{src_sid}*&select=resource_id&limit=1",
-                                 headers=SB_ADMIN_HEADERS, timeout=10)
-                if ar.status_code == 200 and ar.json():
-                    lead_id = ar.json()[0].get("resource_id")
-                if not lead_id:
-                    print(f"[INTEL] no lead link for {t_sid} (src {src_sid}) — "
-                          f"transcript stored unattributed")
-        audit_log("twilio", "call_transcript", "lead", lead_id, {"transcript_sid": t_sid, "text": text})
-        print(f"[INTEL] transcript stored ({len(text)} chars, lead {lead_id})")
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/jobs",
+                         headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                         json={"kind": kind, "payload": payload,
+                               "dedupe_key": dedupe_key or None,
+                               "run_after": run_after},
+                         timeout=10)
+        if r.status_code in (200, 201, 204):
+            return True
+        if r.status_code == 409:
+            print(f"[JOBS] {kind} {dedupe_key} already queued — not duplicating")
+            return True
+        print(f"[JOBS] enqueue {kind} failed: HTTP {r.status_code} {r.text[:160]}")
     except Exception as e:
-        print(f"[INTEL] webhook processing failed: {e}")
-    return {"ok": True}
+        print(f"[JOBS] enqueue {kind} failed: {e}")
+    return False
+
+_JOB_BACKOFF_SEC = [60, 300, 1800]   # spec: 1m, 5m, 30m
+JOB_MAX_ATTEMPTS = len(_JOB_BACKOFF_SEC)
+
+def _claim_job(job: dict) -> bool:
+    """Move queued→running only if it is still queued. The conditional filter is
+    the lock: two workers racing the same row, only one PATCH matches."""
+    try:
+        r = req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/jobs?id=eq.{job['id']}&status=eq.queued",
+            headers={**SB_ADMIN_HEADERS, "Prefer": "return=representation"},
+            json={"status": "running", "attempts": (job.get("attempts") or 0) + 1,
+                  "updated_at": datetime.utcnow().isoformat()},
+            timeout=10)
+        return r.status_code in (200, 206) and bool(r.json())
+    except Exception as e:
+        print(f"[JOBS] claim {job.get('id')} failed: {e}")
+        return False
+
+def _finish_job(job_id, status: str, error: str = ""):
+    try:
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/jobs?id=eq.{job_id}",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                      json={"status": status, "last_error": (error or "")[:500] or None,
+                            "updated_at": datetime.utcnow().isoformat()},
+                      timeout=10)
+    except Exception as e:
+        print(f"[JOBS] finish {job_id} failed: {e}")
+
+def _retry_job(job: dict, error: str):
+    """Back off, or give up after JOB_MAX_ATTEMPTS."""
+    attempts = (job.get("attempts") or 0)
+    if attempts >= JOB_MAX_ATTEMPTS:
+        print(f"[JOBS] {job.get('kind')} {job.get('id')} failed permanently: {error[:200]}")
+        _finish_job(job["id"], "failed", error)
+        return
+    delay = _JOB_BACKOFF_SEC[min(attempts - 1, len(_JOB_BACKOFF_SEC) - 1)] if attempts else _JOB_BACKOFF_SEC[0]
+    try:
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/jobs?id=eq.{job['id']}",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                      json={"status": "queued", "last_error": error[:500],
+                            "run_after": (datetime.utcnow() + timedelta(seconds=delay)).isoformat(),
+                            "updated_at": datetime.utcnow().isoformat()},
+                      timeout=10)
+        print(f"[JOBS] {job.get('kind')} {job.get('id')} retry in {delay}s: {error[:120]}")
+    except Exception as e:
+        print(f"[JOBS] retry {job.get('id')} failed: {e}")
+
+_JOB_HANDLERS = {}     # kind -> fn(payload) ; populated below
+
+def run_jobs_once(limit: int = 5) -> int:
+    """Drain up to `limit` due jobs. Called from _bg_maintenance_loop. Every
+    handler exception becomes a retry, never a thrown exception — a poisoned
+    job must not kill the maintenance thread that also drives digests, refills
+    and the email sequencer."""
+    if not (TRANSCRIBE_ENABLED or ANALYZE_ENABLED):
+        return 0
+    now = datetime.utcnow().isoformat()
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/jobs?status=eq.queued"
+                        f"&run_after=lte.{now}&order=run_after.asc&limit={limit}",
+                        headers=SB_ADMIN_HEADERS, timeout=15)
+        jobs = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"[JOBS] poll failed: {e}")
+        return 0
+    if not isinstance(jobs, list):
+        return 0
+    done = 0
+    for job in jobs:
+        handler = _JOB_HANDLERS.get(job.get("kind"))
+        if not handler:
+            _finish_job(job["id"], "failed", f"no handler for kind={job.get('kind')}")
+            continue
+        if not _claim_job(job):
+            continue                      # another worker got it
+        try:
+            handler(job.get("payload") or {})
+            _finish_job(job["id"], "done")
+            done += 1
+        except Exception as e:
+            _retry_job(job, f"{type(e).__name__}: {e}")
+    return done
+
+# ── call_outcomes helpers ───────────────────────────────────────────────────
+def _patch_call(call_id, fields: dict):
+    """Patch a call_outcomes row. Wrapped: every column here is added by
+    migration 008, and Supabase rejects an entire request naming an unknown
+    column — so before the migration has run this must degrade, not 500."""
+    try:
+        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}",
+                          headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                          json=fields, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[TRANSCRIBE] call {call_id} patch rejected "
+                  f"(HTTP {r.status_code}) — has migration 008 run? {r.text[:160]}")
+    except Exception as e:
+        print(f"[TRANSCRIBE] call {call_id} patch failed: {e}")
+
+def _find_call_for_recording(call_sid: str, lead_id) -> dict:
+    """Locate the call_outcomes row this recording belongs to.
+
+    Twilio's CallSid is not stored on call_outcomes (no column for it), so we
+    match on lead + recency: the rep logs the outcome within minutes of hanging
+    up, and the same lead is not dialled twice in that window (the
+    duplicate_cooldown flag exists precisely because that would be anomalous).
+    Returns {} when the rep has not logged yet — the caller then parks the
+    metadata for log_call to pick up, the same shape as take_twilio_duration."""
+    if not lead_id:
+        return {}
+    since = (datetime.utcnow() - timedelta(minutes=TWILIO_DUR_TTL_MIN)).isoformat()
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                        f"?leadId=eq.{url_quote(str(lead_id), safe='')}"
+                        f"&calledAt=gte.{since}&select=id,outcome,calledBy,calledAt"
+                        f"&order=calledAt.desc&limit=1",
+                        headers=SB_HEADERS, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        return rows[0] if isinstance(rows, list) and rows else {}
+    except Exception as e:
+        print(f"[TRANSCRIBE] call lookup failed for lead {lead_id}: {e}")
+        return {}
+
+def _on_recording_completed(form, lead_id, rec_sid: str, dur_s: int):
+    """Called from /twilio/recording-status. Records metadata and enqueues —
+    never transcribes inline; the webhook must return fast."""
+    audit_log("twilio", "call_recording", "lead", lead_id or None,
+              {"recording_url": form.get("RecordingUrl") or "", "recording_sid": rec_sid,
+               "call_sid": form.get("CallSid") or "", "duration": dur_s,
+               "channels": form.get("RecordingChannels") or ""})
+    if not rec_sid:
+        return
+    call = _find_call_for_recording(form.get("CallSid") or "", lead_id)
+    payload = {"recording_sid": rec_sid,
+               "recording_url": form.get("RecordingUrl") or "",
+               "recording_duration_sec": dur_s,
+               "channels": int(form.get("RecordingChannels") or 2),
+               "lead_id": str(lead_id) if lead_id else None,
+               "call_id": call.get("id")}
+    if call.get("id"):
+        _patch_call(call["id"], {"recording_sid": rec_sid,
+                                 "recording_duration_sec": dur_s,
+                                 "transcription_status": "queued"})
+    else:
+        # Rep has not saved the outcome yet. Park it; log_call attaches it.
+        try:
+            _settings_set_json(f"twilio_rec_{lead_id}",
+                               {**payload, "at": datetime.utcnow().isoformat()})
+        except Exception as e:
+            print(f"[TRANSCRIBE] park recording meta failed: {e}")
+    if not TRANSCRIBE_ENABLED:
+        print(f"[TRANSCRIBE] disabled — recorded {rec_sid} ({dur_s}s) metadata only")
+        return
+    enqueue_job("transcribe_call", payload, dedupe_key=rec_sid)
+
+@app.post("/twilio/amd-status")
+async def twilio_amd_status(request: Request, lead_id: str = ""):
+    """Async AMD result. `AnsweredBy` is the strongest human/machine signal we
+    get, and it lets the gate skip voicemail before spending anything.
+
+    CAVEAT worth knowing: /api/call/start rings OUR rep's phone first and
+    bridges to the prospect from TwiML, so AMD on the parent call would be
+    measuring the rep, not the prospect. This endpoint therefore only records
+    what Twilio sends for the leg it was configured on, and the gate FAILS OPEN
+    on unknown/absent AMD — the duration floor is what actually protects cost."""
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    answered_by = (form.get("AnsweredBy") or "").strip().lower() or "unknown"
+    audit_log("twilio", "call_amd", "lead", lead_id or None,
+              {"answered_by": answered_by, "call_sid": form.get("CallSid") or ""})
+    call = _find_call_for_recording(form.get("CallSid") or "", lead_id)
+    if call.get("id"):
+        _patch_call(call["id"], {"answered_by": answered_by})
+    elif lead_id:
+        try:
+            _settings_set_json(f"twilio_amd_{lead_id}",
+                               {"answered_by": answered_by,
+                                "at": datetime.utcnow().isoformat()})
+        except Exception as e:
+            print(f"[AMD] park failed: {e}")
+    return _twiml("")
+
+# ── worker: transcribe_call ─────────────────────────────────────────────────
+def transcription_gate(call: dict, payload: dict) -> str:
+    """Return a skip reason, or "" to transcribe. First hit wins.
+
+    Pure function of its inputs so the cost policy is unit-testable without
+    Twilio, Deepgram or Supabase."""
+    dur = int(payload.get("recording_duration_sec") or 0)
+    if dur < TRANSCRIBE_MIN_SEC:
+        return "short"
+    if (call.get("answered_by") or "").strip().lower() in _AMD_MACHINE:
+        return "machine"
+    if (call.get("outcome") or "").strip().lower() in _NO_HUMAN_OUTCOMES:
+        return "disposition"
+    # answered_by unknown/null → transcribe (fail open). The duration floor
+    # already bounds the spend, and dropping real conversations because AMD was
+    # inconclusive is the more expensive mistake.
+    return ""
+
+def _deepgram_transcribe(audio: bytes, channels: int) -> dict:
+    """POST the wav to Deepgram. multichannel for dual-channel recordings gives
+    exact speaker attribution (each leg is its own channel — no diarisation
+    guesswork); mono falls back to diarize."""
+    params = [f"model={DEEPGRAM_MODEL}", "smart_format=true", "punctuate=true",
+              "utterances=true", "utt_split=1.0", "language=en-US"]
+    params.append("multichannel=true" if channels >= 2 else "diarize=true")
+    r = req_lib.post("https://api.deepgram.com/v1/listen?" + "&".join(params),
+                     headers={"Authorization": f"Token {DEEPGRAM_API_KEY}",
+                              "Content-Type": "audio/wav"},
+                     data=audio, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"deepgram HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+def _speaker_for(utt: dict, channels: int) -> str:
+    if channels >= 2:
+        return "AGENT" if int(utt.get("channel") or 0) == DEEPGRAM_AGENT_CHANNEL else "PROSPECT"
+    # Mono: no channels to key on. Whoever speaks first is our rep — we placed
+    # the call, so the greeting after connect is theirs.
+    return "AGENT" if int(utt.get("speaker") or 0) == 0 else "PROSPECT"
+
+def _build_transcript(dg: dict, channels: int):
+    """→ (full_text, utterances). Deepgram returns utterances at the top level
+    when utterances=true; fall back to per-channel alternatives otherwise."""
+    utts = (dg.get("results") or {}).get("utterances") or []
+    out = []
+    for u in utts:
+        text = (u.get("transcript") or "").strip()
+        if not text:
+            continue
+        out.append({"speaker": _speaker_for(u, channels),
+                    "start": round(float(u.get("start") or 0), 2),
+                    "end": round(float(u.get("end") or 0), 2),
+                    "confidence": round(float(u.get("confidence") or 0), 3),
+                    "text": text})
+    if not out:
+        for i, ch in enumerate((dg.get("results") or {}).get("channels") or []):
+            alt = (ch.get("alternatives") or [{}])[0]
+            text = (alt.get("transcript") or "").strip()
+            if text:
+                out.append({"speaker": "AGENT" if i == DEEPGRAM_AGENT_CHANNEL else "PROSPECT",
+                            "start": 0.0, "end": 0.0,
+                            "confidence": round(float(alt.get("confidence") or 0), 3),
+                            "text": text})
+    lines = []
+    for u in out:
+        m, sec = divmod(int(u["start"]), 60)
+        lines.append(f"[{m:02d}:{sec:02d}] {u['speaker'].lower()}: {u['text']}")
+    return "\n".join(lines), out
+
+def _trim_raw(dg: dict) -> dict:
+    """Drop per-word arrays before storing — they are the bulk of the payload
+    and we never read them."""
+    try:
+        slim = json_lib.loads(json_lib.dumps(dg))
+        for ch in (slim.get("results") or {}).get("channels") or []:
+            for alt in ch.get("alternatives") or []:
+                alt.pop("words", None)
+        for u in (slim.get("results") or {}).get("utterances") or []:
+            u.pop("words", None)
+        return slim
+    except Exception:
+        return {}
+
+def transcribe_call(payload: dict):
+    """Worker. Raises on a retryable failure (the job runner backs off)."""
+    rec_sid = payload.get("recording_sid") or ""
+    if not rec_sid:
+        return
+    if not (TRANSCRIBE_ENABLED and DEEPGRAM_API_KEY):
+        print("[TRANSCRIBE] disabled or DEEPGRAM_API_KEY unset — dropping job")
+        return
+    call_id = payload.get("call_id")
+    lead_id = payload.get("lead_id")
+
+    # Idempotency: the unique index on recording_sid is the real guard, but
+    # checking first avoids paying Deepgram for a duplicate delivery.
+    try:
+        ex = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_transcripts"
+                         f"?recording_sid=eq.{url_quote(rec_sid, safe='')}&select=id",
+                         headers=SB_ADMIN_HEADERS, timeout=10)
+        if ex.status_code == 200 and ex.json():
+            print(f"[TRANSCRIBE] {rec_sid} already transcribed — skip:duplicate")
+            return
+    except Exception as e:
+        print(f"[TRANSCRIBE] duplicate check failed (continuing): {e}")
+
+    call = {}
+    if call_id:
+        try:
+            cr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}"
+                             f"&select=id,outcome,answered_by,calledBy", headers=SB_HEADERS, timeout=10)
+            rows = cr.json() if cr.status_code == 200 else []
+            call = rows[0] if rows else {}
+        except Exception as e:
+            print(f"[TRANSCRIBE] call fetch failed: {e}")
+
+    skip = transcription_gate(call, payload)
+    if skip:
+        print(f"[TRANSCRIBE] {rec_sid} skip:{skip} "
+              f"(dur={payload.get('recording_duration_sec')}s "
+              f"amd={call.get('answered_by')} outcome={call.get('outcome')})")
+        if call_id:
+            _patch_call(call_id, {"transcription_status": "skipped",
+                                  "transcription_skip_reason": skip})
+        audit_log("system", "transcribe_skip", "lead", lead_id,
+                  {"recording_sid": rec_sid, "reason": skip,
+                   "duration": payload.get("recording_duration_sec")})
+        return
+
+    if call_id:
+        _patch_call(call_id, {"transcription_status": "processing"})
+
+    rec_url = payload.get("recording_url") or ""
+    if not rec_url:
+        raise RuntimeError("no recording_url in payload")
+    ar = req_lib.get(rec_url + ".wav",
+                     auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")),
+                     timeout=120)
+    if ar.status_code != 200:
+        raise RuntimeError(f"recording fetch HTTP {ar.status_code}")
+    audio = ar.content
+
+    channels = int(payload.get("channels") or 2)
+    dg = _deepgram_transcribe(audio, channels)
+    full_text, utterances = _build_transcript(dg, channels)
+    if not full_text.strip():
+        print(f"[TRANSCRIBE] {rec_sid} produced empty text — marking done, nothing to analyse")
+        if call_id:
+            _patch_call(call_id, {"transcription_status": "skipped",
+                                  "transcription_skip_reason": "empty_transcript"})
+        return
+    dur = float((dg.get("metadata") or {}).get("duration")
+                or payload.get("recording_duration_sec") or 0)
+    cost = round(dur / 60.0 * DEEPGRAM_RATE_PER_MIN, 5)
+
+    row = {"call_id": call_id, "lead_id": int(lead_id) if str(lead_id or "").isdigit() else None,
+           "recording_sid": rec_sid, "provider": "deepgram",
+           "model": (dg.get("metadata") or {}).get("model_info") and DEEPGRAM_MODEL or DEEPGRAM_MODEL,
+           "language": "en-US", "duration_sec": round(dur, 2),
+           "full_text": full_text, "utterances": utterances,
+           "raw": _trim_raw(dg), "cost_usd": cost}
+    ir = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_transcripts",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=representation"},
+                      json=row, timeout=30)
+    if ir.status_code == 409:
+        print(f"[TRANSCRIBE] {rec_sid} raced another worker — skip:duplicate")
+        return
+    if ir.status_code not in (200, 201):
+        raise RuntimeError(f"transcript insert HTTP {ir.status_code}: {ir.text[:200]}")
+    tid = (ir.json() or [{}])[0].get("id")
+    if call_id:
+        _patch_call(call_id, {"transcription_status": "done",
+                              "transcription_skip_reason": None})
+    print(f"[TRANSCRIBE] {rec_sid} → transcript {tid} "
+          f"({len(utterances)} utterances, {dur:.0f}s, ${cost})")
+    if ANALYZE_ENABLED and tid:
+        enqueue_job("analyze_call", {"transcript_id": tid, "call_id": call_id,
+                                     "lead_id": lead_id},
+                    dedupe_key=f"analyze:{tid}")
+
+# ── worker: analyze_call ────────────────────────────────────────────────────
+_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "disposition": {"type": "string", "enum": CALL_DISPOSITIONS},
+        "disposition_confidence": {"type": "number"},
+        "next_step": {"type": ["string", "null"]},
+        "callback_at": {"type": ["string", "null"]},
+        "objections": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["price", "has_vendor", "no_authority",
+                                                     "timing", "not_interested", "trust", "other"]},
+                "quote": {"type": "string"}},
+            "required": ["type", "quote"], "additionalProperties": False}},
+        "prospect_sentiment": {"type": "string", "enum": ["positive", "neutral", "negative"]},
+        "decision_maker_reached": {"type": "boolean"},
+        "qa": {"type": "object", "properties": {
+            "score": {"type": "integer"},
+            "opener": {"type": "string"}, "pitch": {"type": "string"},
+            "objection_handling": {"type": "string"}, "close": {"type": "string"},
+            "flags": {"type": "array", "items": {"type": "string", "enum": QA_FLAGS}}},
+            "required": ["score", "opener", "pitch", "objection_handling", "close", "flags"],
+            "additionalProperties": False},
+        "flags": {"type": "array", "items": {"type": "string", "enum": QA_FLAGS}},
+    },
+    "required": ["summary", "disposition", "disposition_confidence", "next_step",
+                 "callback_at", "objections", "prospect_sentiment",
+                 "decision_maker_reached", "qa", "flags"],
+    "additionalProperties": False,
+}
+
+_ANALYSIS_SYSTEM = (
+    "You analyse ONE outbound B2B cold call for Vision Cleaning Company, a commercial "
+    "janitorial contractor selling recurring cleaning contracts to offices, medical and "
+    "dialysis facilities, industrial/logistics sites, daycares and property managers. "
+    "The caller is a 1099 sales rep. The goal of the call is to book a walkthrough/quote "
+    "appointment, or failing that to get a qualified callback with a named decision maker.\n\n"
+    "The transcript is speaker-labelled: `agent:` is our rep, `prospect:` is the business "
+    "we rang. Lines are prefixed with [mm:ss].\n\n"
+    "Rules:\n"
+    "- Quote objections VERBATIM from the transcript. Never paraphrase a quote.\n"
+    "- Never invent a callback time. Set callback_at only if a specific date/time was "
+    "stated; otherwise null.\n"
+    "- disposition must be exactly one of the allowed values.\n"
+    "- decision_maker_reached is true only if the rep actually spoke to someone with "
+    "authority to buy — a receptionist who took a message is false.\n"
+    "- QA score is 0-10, two points each: (1) opener names the company AND the reason for "
+    "the call, (2) asks for or identifies the decision maker, (3) delivers the value "
+    "proposition clearly, (4) handles an objection with a QUESTION rather than folding, "
+    "(5) attempts a close or a concrete next step. If no objection arose, award (4) if the "
+    "rep kept control of the conversation.\n"
+    "- Set the `dnc_request` flag only if the prospect asked not to be called again.\n"
+    "- Be specific. A QA comment that would apply to any call is useless."
+)
+
+def _analysis_cost(usage) -> float:
+    """Haiku 4.5 list price: $1/MTok in, $5/MTok out."""
+    try:
+        return round((usage.input_tokens / 1e6) * 1.0 + (usage.output_tokens / 1e6) * 5.0, 5)
+    except Exception:
+        return 0.0
+
+def analyze_call(payload: dict):
+    """Worker. One Claude pass per transcript, JSON guaranteed by
+    output_config.format rather than regex-scraped out of prose."""
+    tid = payload.get("transcript_id")
+    if not tid:
+        return
+    if not (ANALYZE_ENABLED and ANTHROPIC_API_KEY):
+        print("[ANALYZE] disabled or ANTHROPIC_API_KEY unset — dropping job")
+        return
+    try:
+        tr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_transcripts?id=eq.{tid}"
+                         f"&select=id,call_id,lead_id,full_text", headers=SB_ADMIN_HEADERS, timeout=15)
+        rows = tr.json() if tr.status_code == 200 else []
+    except Exception as e:
+        raise RuntimeError(f"transcript fetch failed: {e}")
+    if not rows:
+        print(f"[ANALYZE] transcript {tid} vanished — nothing to do")
+        return
+    t = rows[0]
+    text = (t.get("full_text") or "").strip()
+    if len(text) < 200:
+        print(f"[ANALYZE] transcript {tid} too short ({len(text)} chars) — skipping")
+        return
+    call_id = t.get("call_id") or payload.get("call_id")
+    lead_id = t.get("lead_id") or payload.get("lead_id")
+
+    # Already analysed? (retry after a partial failure)
+    try:
+        ex = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_analyses?transcript_id=eq.{tid}&select=id",
+                         headers=SB_ADMIN_HEADERS, timeout=10)
+        if ex.status_code == 200 and ex.json():
+            print(f"[ANALYZE] transcript {tid} already analysed")
+            return
+    except Exception:
+        pass
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    # No `temperature`: the current SDK does not accept sampling parameters
+    # (the spec asked for temperature 0). Determinism comes from the JSON
+    # schema below instead — output_config.format guarantees the first text
+    # block is schema-valid JSON, so this never regex-scrapes a blob out of
+    # prose the way the weekly coach has to.
+    resp = client.messages.create(
+        model=ANALYSIS_MODEL, max_tokens=2000,
+        system=_ANALYSIS_SYSTEM,
+        messages=[{"role": "user", "content": f"Transcript:\n\n{text[:20000]}"}],
+        output_config={"format": {"type": "json_schema", "schema": _ANALYSIS_SCHEMA}},
+    )
+    body = next((b.text for b in resp.content if b.type == "text"), "")
+    data = json_lib.loads(body)      # schema-enforced; a raise here is a real retry
+    cost = _analysis_cost(getattr(resp, "usage", None))
+
+    caller_disp = ""
+    if call_id:
+        try:
+            cr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}&select=outcome",
+                             headers=SB_HEADERS, timeout=10)
+            caller_disp = ((cr.json() or [{}])[0] or {}).get("outcome") or "" if cr.status_code == 200 else ""
+        except Exception:
+            pass
+
+    flags = sorted(set((data.get("flags") or []) + ((data.get("qa") or {}).get("flags") or [])))
+    row = {"call_id": call_id, "transcript_id": tid,
+           "lead_id": int(lead_id) if str(lead_id or "").isdigit() else None,
+           "model": ANALYSIS_MODEL, "summary": data.get("summary") or "",
+           "disposition": data.get("disposition") or "other",
+           "disposition_confidence": data.get("disposition_confidence"),
+           "caller_disposition": caller_disp or None,
+           "next_step": data.get("next_step"), "callback_at": data.get("callback_at"),
+           "objections": data.get("objections") or [],
+           "prospect_sentiment": data.get("prospect_sentiment"),
+           "decision_maker_reached": data.get("decision_maker_reached"),
+           "qa": data.get("qa") or {}, "flags": flags, "cost_usd": cost}
+    ir = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_analyses",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                      json=row, timeout=30)
+    if ir.status_code not in (200, 201, 204):
+        raise RuntimeError(f"analysis insert HTTP {ir.status_code}: {ir.text[:200]}")
+    print(f"[ANALYZE] transcript {tid}: {row['disposition']} "
+          f"qa={(row['qa'] or {}).get('score')} flags={flags} ${cost}")
+    _apply_analysis(call_id, lead_id, row, caller_disp)
+
+def _apply_analysis(call_id, lead_id, row: dict, caller_disp: str):
+    """Act on the analysis. Each step is independently wrapped: a failure to
+    create a callback must not lose the stored analysis."""
+    flags = row.get("flags") or []
+    # DNC is the one flag with a hard consequence — honour it immediately.
+    if "dnc_request" in flags and lead_id:
+        try:
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                          headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                          json={"status": "do_not_contact", "callbackDate": "",
+                                "updatedAt": datetime.utcnow().isoformat()}, timeout=10)
+            audit_log("system", "dnc_from_transcript", "lead", lead_id,
+                      {"summary": (row.get("summary") or "")[:300]})
+            print(f"[ANALYZE] lead {lead_id} → do_not_contact (dnc_request in transcript)")
+        except Exception as e:
+            print(f"[ANALYZE] DNC apply failed for lead {lead_id}: {e}")
+    # Disposition disagreement: SURFACE it, never overwrite the rep's entry.
+    # That is an admin review, not an automated correction.
+    try:
+        conf = float(row.get("disposition_confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if call_id and caller_disp and conf >= 0.8:
+        if not _dispositions_agree(caller_disp, row.get("disposition") or ""):
+            _patch_call(call_id, {"disposition_mismatch": True})
+            print(f"[ANALYZE] call {call_id} mismatch: rep logged '{caller_disp}', "
+                  f"transcript reads '{row.get('disposition')}' (conf {conf})")
+    # A stated callback with nothing on the lead — book it.
+    cb = row.get("callback_at")
+    if cb and lead_id:
+        try:
+            lr = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}"
+                             f"&select=callbackDate", headers=SB_HEADERS, timeout=10)
+            existing = ((lr.json() or [{}])[0] or {}).get("callbackDate") if lr.status_code == 200 else None
+            if not existing:
+                req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                              headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                              json={"callbackDate": str(cb)[:10],
+                                    "updatedAt": datetime.utcnow().isoformat()}, timeout=10)
+                print(f"[ANALYZE] lead {lead_id} callbackDate ← {str(cb)[:10]} (from transcript)")
+        except Exception as e:
+            print(f"[ANALYZE] callback apply failed for lead {lead_id}: {e}")
+    # Hot lead / appointment → existing notification path.
+    if ("hot_lead" in flags or row.get("disposition") == "appointment_set") and SLACK_WEBHOOK_URL:
+        try:
+            send_slack("🔥 Call intelligence: hot call",
+                       (row.get("summary") or "")[:600],
+                       fields=[{"label": "Disposition", "value": row.get("disposition") or "?"},
+                               {"label": "Next step", "value": row.get("next_step") or "—"}])
+        except Exception as e:
+            print(f"[ANALYZE] slack failed: {e}")
+
+# The rep's outcome vocabulary and the analysis disposition enum are different
+# taxonomies; this maps one onto the other so "mismatch" means a real
+# disagreement about what happened, not a vocabulary difference.
+_DISP_EQUIV = {
+    "appointment_set":     {"converted", "interested"},
+    "interested_callback": {"callback", "interested", "interested_no_dm"},
+    "send_info":           {"interested", "callback", "answered", "interested_no_dm"},
+    "not_interested":      {"not_interested"},
+    "already_has_vendor":  {"not_interested"},
+    "wrong_number":        {"not_interested", "no_answer"},
+    "gatekeeper_blocked":  {"gatekeeper", "interested_no_dm", "no_answer"},
+    "no_decision_maker":   {"gatekeeper", "interested_no_dm", "answered"},
+    "dnc":                 {"not_interested"},
+    "voicemail":           {"voicemail", "no_answer"},
+    "other":               set(CALL_DISPOSITIONS) | {"answered"},
+}
+
+def _dispositions_agree(caller_outcome: str, analysis_disposition: str) -> bool:
+    if not caller_outcome or not analysis_disposition:
+        return True                      # nothing to compare
+    allowed = _DISP_EQUIV.get(analysis_disposition)
+    if allowed is None:
+        return True                      # unknown disposition — don't cry wolf
+    return caller_outcome.strip().lower() in allowed
+
+_JOB_HANDLERS["transcribe_call"] = transcribe_call
+_JOB_HANDLERS["analyze_call"] = analyze_call
+
+# ── cost guardrail ──────────────────────────────────────────────────────────
+def run_transcription_cost_rollup_if_due():
+    """Once per UTC day: sum yesterday's spend and alert if the gate is leaking.
+    A transcribed-call count well above the human-answered rate means the gate
+    is broken, which shows up as cost before it shows up anywhere else."""
+    if not (TRANSCRIBE_ENABLED and SLACK_WEBHOOK_URL):
+        return
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if (_settings_get_json("last_transcribe_rollup") or {}).get("day") == today:
+        return
+    try:
+        _settings_set_json("last_transcribe_rollup", {"day": today})
+        since = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        tr = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts"
+                            f"?created_at=gte.{since}&select=cost_usd", headers=SB_ADMIN_HEADERS)
+        an = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_analyses"
+                            f"?created_at=gte.{since}&select=cost_usd", headers=SB_ADMIN_HEADERS)
+        t_cost = sum(float(x.get("cost_usd") or 0) for x in tr)
+        a_cost = sum(float(x.get("cost_usd") or 0) for x in an)
+        total, n = t_cost + a_cost, len(tr)
+        print(f"[TRANSCRIBE-COST] 24h: {n} transcripts ${t_cost:.2f} + "
+              f"{len(an)} analyses ${a_cost:.2f} = ${total:.2f}")
+        if total > TRANSCRIBE_DAILY_COST_ALERT or n > TRANSCRIBE_DAILY_COUNT_ALERT:
+            send_slack("⚠️ Transcription spend above threshold",
+                       f"Last 24h: *{n} calls transcribed*, total *${total:.2f}* "
+                       f"(Deepgram ${t_cost:.2f} + Claude ${a_cost:.2f}).\n"
+                       f"Thresholds: ${TRANSCRIBE_DAILY_COST_ALERT:.2f}/day or "
+                       f"{TRANSCRIBE_DAILY_COUNT_ALERT} calls. A count far above the "
+                       f"human-answered rate means the gate is not working — check the "
+                       f"skip distribution in /api/admin/transcription-stats.")
+    except Exception as e:
+        print(f"[TRANSCRIBE-COST] rollup failed: {e}")
+
+@app.get("/api/admin/transcription-stats")
+def transcription_stats(days: int = 7, user: str = Depends(verify_admin)):
+    """Gate distribution + spend. The skip histogram is the operational view:
+    if `short` and `machine` stop dominating, the gate has regressed."""
+    since = (datetime.utcnow() - timedelta(days=max(1, min(days, 90)))).isoformat()
+    skips = _paginated_get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.transcribe_skip"
+                           f"&created_at=gte.{since}&select=details", headers=SB_ADMIN_HEADERS)
+    from collections import Counter
+    reasons = Counter()
+    for r in skips:
+        try:
+            reasons[json_lib.loads(r.get("details") or "{}").get("reason") or "?"] += 1
+        except Exception:
+            reasons["?"] += 1
+    tr = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts?created_at=gte.{since}"
+                        f"&select=cost_usd,duration_sec", headers=SB_ADMIN_HEADERS)
+    an = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_analyses?created_at=gte.{since}"
+                        f"&select=cost_usd,disposition,flags,qa", headers=SB_ADMIN_HEADERS)
+    return {
+        "window_days": days,
+        "enabled": {"transcribe": TRANSCRIBE_ENABLED, "analyze": ANALYZE_ENABLED,
+                    "deepgram_key": bool(DEEPGRAM_API_KEY)},
+        "gate": {"min_seconds": TRANSCRIBE_MIN_SEC, "skipped": dict(reasons),
+                 "skipped_total": sum(reasons.values())},
+        "transcribed": len(tr),
+        "analyzed": len(an),
+        "cost_usd": {"deepgram": round(sum(float(x.get("cost_usd") or 0) for x in tr), 4),
+                     "claude": round(sum(float(x.get("cost_usd") or 0) for x in an), 4)},
+        "avg_duration_sec": round(sum(float(x.get("duration_sec") or 0) for x in tr) / len(tr), 1) if tr else 0,
+        "dispositions": dict(Counter(x.get("disposition") or "?" for x in an)),
+        "flags": dict(Counter(f for x in an for f in (x.get("flags") or []))),
+        "avg_qa_score": round(sum(float((x.get("qa") or {}).get("score") or 0) for x in an) / len(an), 2) if an else 0,
+    }
 
 # ── Claude call coach: rate the week's recorded calls, propose script moves ──
 @app.post("/api/coach/run")
@@ -6856,19 +7522,17 @@ def coach_run(days: int = 7, preview: int = 1, user: str = Depends(verify_admin)
     if not ANTHROPIC_API_KEY:
         return {"error": "ANTHROPIC_API_KEY not set"}
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_transcript"
-                          f"&created_at=gte.{since}&select=details,created_at&order=created_at.desc",
-                          headers=SB_ADMIN_HEADERS)
-    transcripts = []
-    for row in rows[:20]:
-        try:
-            d = json_lib.loads(row.get("details") or "{}")
-            if len(d.get("text") or "") > 200:
-                transcripts.append({"date": row.get("created_at", "")[:10], "text": d["text"][:4000]})
-        except Exception:
-            pass
+    # Reads the owned call_transcripts table. Used to walk audit_log rows
+    # written by the (now removed) Twilio Intelligence webhook.
+    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts"
+                          f"?created_at=gte.{since}&select=full_text,created_at"
+                          f"&order=created_at.desc", headers=SB_ADMIN_HEADERS)
+    transcripts = [{"date": (r.get("created_at") or "")[:10], "text": (r.get("full_text") or "")[:4000]}
+                   for r in rows[:20] if len(r.get("full_text") or "") > 200]
     if not transcripts:
-        return {"analyzed": 0, "detail": "No transcripts yet — they accumulate once TWILIO_INTELLIGENCE_SID is configured and calls are recorded."}
+        return {"analyzed": 0,
+                "detail": "No transcripts yet — set DEEPGRAM_API_KEY + TRANSCRIBE_ENABLED=true "
+                          "and run migration 008; they accumulate as recorded calls land."}
     system = (
         "You are a cold-call coach for Vision Cleaning Company (commercial janitorial). "
         "You get transcripts of the caller's recorded outbound calls. Each line is "
@@ -7169,6 +7833,28 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                 print(f"[TWILIO-DUR] lead {lead_id}: using carrier {_carrier}s "
                       f"(modal reported {_client_dur}s)")
 
+        # A recording may have completed BEFORE the rep saved the outcome (the
+        # common ordering). /twilio/recording-status parked the metadata under
+        # the lead; attach it to this row and enqueue now that a call_id exists.
+        _pending_rec, _pending_amd = None, ""
+        if lead_id:
+            try:
+                _rec = _settings_get_json(f"twilio_rec_{lead_id}")
+                if isinstance(_rec, dict) and _rec.get("recording_sid"):
+                    _ts = _parse_iso(_rec.get("at") or "")
+                    if _ts and (datetime.utcnow() - _ts) <= timedelta(minutes=TWILIO_DUR_TTL_MIN):
+                        _pending_rec = _rec
+                    _settings_set_json(f"twilio_rec_{lead_id}", {})   # consume either way
+            except Exception as e:
+                print(f"[TRANSCRIBE] pending-recording read failed: {e}")
+            try:
+                _amd = _settings_get_json(f"twilio_amd_{lead_id}")
+                if isinstance(_amd, dict) and _amd.get("answered_by"):
+                    _pending_amd = _amd["answered_by"]
+                    _settings_set_json(f"twilio_amd_{lead_id}", {})
+            except Exception:
+                pass
+
         # ── Substantiation flags ────────────────────────────────────────────
         # The old empty_form rule fired whenever notes AND qual were both blank,
         # regardless of outcome — so it fired on every ordinary no-answer, where
@@ -7226,12 +7912,34 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         call["calledBy"] = caller
 
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_outcomes",
-                        headers=SB_HEADERS, json=call, timeout=30)
+                        headers={**SB_HEADERS, "Prefer": "return=representation"},
+                        json=call, timeout=30)
         # A PostgREST 400 (e.g. unexpected column) used to return the error
         # body with HTTP 200 and still bump the lead — the call was silently
         # lost while the UI thought it saved.
         if r.status_code not in (200, 201):
             raise HTTPException(status_code=500, detail=f"Call insert failed: {r.text[:200]}")
+        try:
+            _new_call_id = ((r.json() or [{}])[0] or {}).get("id")
+        except Exception:
+            _new_call_id = None
+        # Transcription columns land via PATCH, never on the insert above: they
+        # come from migration 008, and _patch_call degrades with a warning
+        # instead of failing the save if 008 has not been run yet.
+        if _new_call_id and (_pending_rec or _pending_amd):
+            _fields = {}
+            if _pending_amd:
+                _fields["answered_by"] = _pending_amd
+            if _pending_rec:
+                _fields["recording_sid"] = _pending_rec.get("recording_sid")
+                _fields["recording_duration_sec"] = _pending_rec.get("recording_duration_sec")
+                _fields["transcription_status"] = "queued" if TRANSCRIBE_ENABLED else "none"
+            _patch_call(_new_call_id, _fields)
+        if _new_call_id and _pending_rec and TRANSCRIBE_ENABLED:
+            enqueue_job("transcribe_call",
+                        {**{k: v for k, v in _pending_rec.items() if k != "at"},
+                         "call_id": _new_call_id, "lead_id": str(lead_id)},
+                        dedupe_key=_pending_rec.get("recording_sid") or "")
         if lead_id:
             lr = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=*",
@@ -10228,7 +10936,7 @@ def run_weekly_review_scan_if_due():
 def run_call_coach_if_due():
     """Weekly Claude coaching report over the week's recorded calls — no-ops
     until transcription is configured and transcripts exist."""
-    if not TWILIO_INTELLIGENCE_SID or not ANTHROPIC_API_KEY or not SLACK_WEBHOOK_URL:
+    if not (DEEPGRAM_API_KEY and ANTHROPIC_API_KEY and SLACK_WEBHOOK_URL):
         return
     if not _iso_week_due("last_call_coach"):
         return
