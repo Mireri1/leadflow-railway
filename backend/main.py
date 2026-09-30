@@ -2909,6 +2909,10 @@ def _bg_maintenance_loop():
             run_jobs_refresh_if_due()
         except Exception as e:
             print(f"[JOBS-REFRESH] loop exception: {e}")
+        try:
+            run_demoted_retirement_if_due()
+        except Exception as e:
+            print(f"[DEMOTED-RETIRE] loop exception: {e}")
         # Transcription/analysis queue. Drains a few jobs per cycle rather than
         # everything: this thread also drives digests, refills and the email
         # sequencer, and a 200-call backlog must not starve them.
@@ -11797,22 +11801,82 @@ def _record_weekly_run(cooldown_key: str):
                  headers={**SB_ADMIN_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"},
                  json={"key": cooldown_key, "value": datetime.utcnow().isoformat() + "Z"}, timeout=10)
 
+def _metro_state(metro: str) -> str:
+    """'Las Vegas, NV' -> 'NV'. Blank when there is no state suffix."""
+    parts = [x.strip() for x in (metro or "").split(",")]
+    return parts[-1].upper() if len(parts) >= 2 and len(parts[-1].strip()) == 2 else ""
+
+def _recent_pickup_by_state(days: int = None) -> dict:
+    """{ST: (dials, pickup_pct)} over the last `days`. FAILS OPEN: any error
+    returns {}, which the rotation gate reads as "nothing is cold" — a broken
+    analytics query must never stop the refill."""
+    days = int(days or REFILL_PICKUP_WINDOW_DAYS)
+    try:
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        calls = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                               f"?select=outcome,leadId&calledAt=gte.{since}")
+        ids = list({c.get("leadId") for c in calls if c.get("leadId")})
+        state_of = {}
+        for i in range(0, len(ids), 200):
+            chunk = ",".join(str(x) for x in ids[i:i+200])
+            r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})&select=id,state",
+                            headers=SB_HEADERS, timeout=30)
+            if r.status_code == 200:
+                for row in r.json():
+                    state_of[row["id"]] = (row.get("state") or "").strip().upper()
+        agg = {}
+        for c in calls:
+            st = state_of.get(c.get("leadId"), "")
+            if len(st) != 2:
+                continue
+            d, p = agg.get(st, (0, 0))
+            agg[st] = (d + 1, p + (1 if (c.get("outcome") or "") in CONTACT_OUTCOMES else 0))
+        return {st: (d, round(100.0 * p / d, 1) if d else 0.0) for st, (d, p) in agg.items()}
+    except Exception as e:
+        print(f"[REFILL] pickup-by-state failed (failing open): {e}")
+        return {}
+
+def _pick_refill_metros(idx: int, pickup: dict):
+    """Next 2 metros from the rotation, skipping ones whose state is cold.
+    Returns (metros, new_idx, skipped) where skipped is [(metro, dials, pct)].
+    Walks at most one full lap; if that yields fewer than 2 warm metros, the
+    plain next-2 pair is used so a refill always happens."""
+    n = len(WEEKLY_REFILL_METROS)
+    chosen, skipped, i, steps = [], [], idx, 0
+    while len(chosen) < 2 and steps < n:
+        m = WEEKLY_REFILL_METROS[i % n]
+        d, pct = pickup.get(_metro_state(m), (0, 100.0))
+        if d >= REFILL_MIN_PICKUP_DIALS and pct < REFILL_MIN_PICKUP_PCT:
+            skipped.append((m, d, pct))
+        else:
+            chosen.append(m)
+        i += 1; steps += 1
+    if len(chosen) < 2:
+        return ([WEEKLY_REFILL_METROS[idx % n], WEEKLY_REFILL_METROS[(idx + 1) % n]],
+                (idx + 2) % n, skipped)
+    return chosen, i % n, skipped
+
 def _do_refill_scrape(trigger: str):
     """Shared core for the weekly AND the low-inventory refill: scrape the next
     2 metros in the rotation across the target verticals, Slack the result."""
     idx = int(_settings_get_json("refill_rotation_idx") or 0)
-    metros = [WEEKLY_REFILL_METROS[idx % len(WEEKLY_REFILL_METROS)],
-              WEEKLY_REFILL_METROS[(idx + 1) % len(WEEKLY_REFILL_METROS)]]
-    _settings_set_json("refill_rotation_idx", (idx + 2) % len(WEEKLY_REFILL_METROS))
+    metros, new_idx, skipped = _pick_refill_metros(idx, _recent_pickup_by_state())
+    _settings_set_json("refill_rotation_idx", new_idx)
+    if skipped:
+        print(f"[REFILL:{trigger}] skipped cold metros: "
+              + ", ".join(f"{m} ({pct}% on {d})" for m, d, pct in skipped))
     res = run_scrape(ScrapeRequest(industry="Manufacturing",
                                    industries=WEEKLY_REFILL_INDUSTRIES,
                                    locations=metros, limit=30), user="eric")
     saved = res.get("saved", 0) if isinstance(res, dict) else 0
     dupes = res.get("alreadyInDb", 0) if isinstance(res, dict) else 0
     print(f"[REFILL:{trigger}] {metros}: saved={saved} dupes={dupes}")
+    skip_note = ("\n_Skipped as cold: " + ", ".join(f"{m} ({pct}% pickup on {d} dials)"
+                 for m, d, pct in skipped) + "_") if skipped else ""
     send_slack(f"🔄 Lead refill ({trigger})",
                f"Scraped *{', '.join(metros)}* across {WEEKLY_REFILL_INDUSTRIES}: "
-               f"*{saved} fresh leads* saved ({dupes} already in DB). Live in the dialer now.")
+               f"*{saved} fresh leads* saved ({dupes} already in DB). Live in the dialer now."
+               + skip_note)
     return saved
 
 def run_weekly_refill_if_due():
@@ -11830,6 +11894,28 @@ def run_weekly_refill_if_due():
 # Low-inventory refill: when the undialed pool drops below REFILL_MIN_FRESH,
 # scrape the next rotation immediately — cristine never runs dry mid-week.
 # 20h cooldown so a broken scrape can't loop-spend the Places budget.
+# ── Weekly retirement of demoted-vertical stock ─────────────────────────────
+# The one-off sweep clears the backlog; this keeps it clear. Ingestion is
+# gated now, but Places and Apollo can still hand us a nursing home under a
+# different label, and a week of that is a week of dials wasted. Capped per
+# run so a matcher regression cannot quietly park thousands — the cap is
+# sized so the FIRST run clears the ~1,800 backlog, then it's a trickle.
+DEMOTED_RETIRE_ENABLED    = os.getenv("DEMOTED_RETIRE_ENABLED", "1") == "1"
+DEMOTED_RETIRE_WEEKLY_CAP = int(os.getenv("DEMOTED_RETIRE_WEEKLY_CAP", "2000"))
+
+# ── Data-driven metro rotation ──────────────────────────────────────────────
+# The 2026-08 rule ("≥12% first-dial connect keeps a metro; <9% drops it")
+# lived in a comment and nothing enforced it. Now a metro whose STATE has
+# pulled at least REFILL_MIN_PICKUP_DIALS recent dials at under
+# REFILL_MIN_PICKUP_PCT pickup is skipped for the cycle and the rotation
+# advances past it. It is a skip, never a removal: if every metro is cold
+# the original pair is scraped anyway, because an empty refill is a worse
+# outcome than a cold one, and a metro with too few dials to judge is
+# treated as warm. The window is short on purpose — it has to react to a
+# state going stale, which a lifetime rate hides.
+REFILL_MIN_PICKUP_PCT     = float(os.getenv("REFILL_MIN_PICKUP_PCT", "9"))
+REFILL_MIN_PICKUP_DIALS   = int(os.getenv("REFILL_MIN_PICKUP_DIALS", "100"))
+REFILL_PICKUP_WINDOW_DAYS = int(os.getenv("REFILL_PICKUP_WINDOW_DAYS", "45"))
 REFILL_MIN_FRESH = int(os.getenv("REFILL_MIN_FRESH", "250"))
 
 def run_inventory_refill_if_due():
@@ -11949,6 +12035,30 @@ def run_jobs_refresh_if_due():
                        fields=[{"label": "Opener", "value": "Saw you're hiring for cleaning — while that role is open, want a quote for covering it?"}])
     except Exception as e:
         print(f"[JOBS-REFRESH] failed: {e}")
+
+def run_demoted_retirement_if_due():
+    """Weekly sweep of demoted-vertical stock. The manual endpoint defaults
+    to dry_run=1; this is the one caller that runs it for real, capped and
+    Slacked so it is never silent."""
+    if not DEMOTED_RETIRE_ENABLED:
+        return
+    if not _iso_week_due("last_demoted_retire"):
+        return
+    _record_weekly_run("last_demoted_retire")
+    try:
+        res = retire_demoted_verticals(dry_run=0, limit=DEMOTED_RETIRE_WEEKLY_CAP, user="eric")
+        n = (res or {}).get("retired", 0) if isinstance(res, dict) else 0
+        by = (res or {}).get("by_industry", {}) if isinstance(res, dict) else {}
+        print(f"[DEMOTED-RETIRE] retired={n} by_industry={by}")
+        if n:
+            top = ", ".join(f"{k}: {v}" for k, v in sorted(by.items(), key=lambda kv: -kv[1])[:5])
+            send_slack("🗄️ Weekly retirement of demoted verticals",
+                       f"Parked *{n}* leads in verticals the 2026-08 audit ruled out "
+                       f"(nursing, hospitals, generic/mental-health clinics). "
+                       f"{res.get('skipped_had_contact', 0)} protected for having reached a human.",
+                       fields=[{"label": "Top", "value": top or "—"}])
+    except Exception as e:
+        print(f"[DEMOTED-RETIRE] failed: {e}")
 
 def run_call_coach_if_due():
     """Weekly Claude coaching report over the week's recorded calls — no-ops
