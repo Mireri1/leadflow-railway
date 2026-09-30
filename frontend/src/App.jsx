@@ -45,6 +45,13 @@ const DIALER_SNOOZE_HOURS_DEFAULT = 4
 // Statuses callers should NEVER auto-dial — used to filter the dialer queue
 // and to show a "don't call" warning in the call modal.
 const NO_DIAL_STATUSES = new Set(["awaiting_email_reply","do_not_contact","retired"])
+// Is this lead worth surfacing in a "call this" list? Closed deals are out, and
+// so is anything in NO_DIAL_STATUSES. Every callback surface (bell, dashboard
+// banners, Follow-Ups tab, Day Plan, My Week, dialer chip) filtered only on
+// status!=="converted", so a number the Twilio lookup sweep had just marked
+// do_not_contact kept its callbackDate and surfaced in the bell as due — a
+// caller sent at a disconnected line. One predicate so the surfaces can't drift.
+function isCallable(l){ return l.status!=="converted" && !NO_DIAL_STATUSES.has(l.status) }
 
 const CALL_OUTCOMES = [
   { value:"answered",       label:"Answered" },
@@ -3127,7 +3134,7 @@ function MyWeek({user, leads, onCall, onReload, notify, reloadSignal}){
   useEffect(()=>{ load(weekOffset) },[weekOffset, reloadSignal]) // eslint-disable-line
 
   // Her due/overdue follow-ups (the worklist) for the top strip.
-  const myDue=leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted"&&(!l.assignedTo||l.assignedTo===user))
+  const myDue=leads.filter(l=>l.callbackDate&&l.callbackDate<=today&&isCallable(l)&&(!l.assignedTo||l.assignedTo===user))
     .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
 
   function openAction(leadId,m){ setExpand(expand===leadId?null:leadId); setMode(m); setNoteText(""); setFuDate(today); setAiSent("") }
@@ -3806,7 +3813,7 @@ export default function App(){
     const walk=pool.filter(l=>wt.has(String(l.id))&&l.status!=="converted"&&mine(l))
       .sort((a,b)=>(wt.get(String(a.id)).date||"").localeCompare(wt.get(String(b.id)).date||""))
     // 3 · ⏰ Callbacks due, not yet tried today.
-    const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l)
+    const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&isCallable(l)&&mine(l)
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
       .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
     // 4 · 🚨 Complaint list: violation/review-flagged, still fresh (<4 tries),
@@ -3857,7 +3864,7 @@ export default function App(){
     const check=()=>{
       const t=localDate()
       const pool=(allLeads.length?allLeads:leads)
-      const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"
+      const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&isCallable(l)
         &&(!l.assignedTo||l.assignedTo===user)
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
       const wtN=apptFollowups.length
@@ -4090,7 +4097,7 @@ export default function App(){
   const notifiedOnRef = useRef("")
   useEffect(()=>{
     if(!user||!leads.length || notifiedOnRef.current===today) return
-    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&isCallable(l))
     if(overdue.length>0&&"Notification" in window){
       if(Notification.permission==="granted"){
         notifiedOnRef.current=today
@@ -4142,7 +4149,7 @@ export default function App(){
   const threeDays=(()=>{const d=new Date();d.setDate(d.getDate()+3);return localDate(d)})()
 
   // Notification items
-  const notifItems=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.status!=="converted").map(l=>{
+  const notifItems=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&isCallable(l)).map(l=>{
     const d=l.callbackDate
     if(d<today) return{...l,urgency:"overdue",label:"Overdue",color:"#ff6e84"}
     if(d===today) return{...l,urgency:"today",label:"Due today",color:"#ffe083"}
@@ -4492,7 +4499,7 @@ export default function App(){
                   "called but still carrying an old date" so overdue reads as
                   a caller-accountability signal, not a data-staleness one. */}
               {(()=>{
-                const overdue=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                const overdue=(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<today&&isCallable(l))
                 if(!overdue.length) return null
                 const attempted=overdue.filter(l=>l.last_called_at&&tsLocalDate(l.last_called_at)>=l.callbackDate).length
                 const untouched=overdue.length-attempted
@@ -4513,12 +4520,12 @@ export default function App(){
                 )
               })()}
 
-              {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").length>0&&(
+              {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&isCallable(l)).length>0&&(
                 <div style={{marginTop:32}}>
                   <div style={{fontSize:"0.6rem",color:"#ffe083",fontWeight:700,letterSpacing:".1em",
                     textTransform:"uppercase",marginBottom:14}}>🔔 Callbacks Due</div>
                   <div style={{display:"flex",flexDirection:"column",gap:8}}>
-                    {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&l.status!=="converted").slice(0,5).map(lead=>{
+                    {(allLeads.length?allLeads:leads).filter(l=>l.callbackDate&&l.callbackDate<=today&&isCallable(l)).slice(0,5).map(lead=>{
                       const ac=avatarColor(lead.company||lead.firstName||"?")
                       return(
                         <div key={lead.id} style={{background:"#1a1030",borderRadius:10,padding:"14px 18px",
@@ -4824,7 +4831,7 @@ export default function App(){
                   // Single per-row renderer reused for both segments below.
                   const renderRow = (lead) => {
                     const info=si(lead.status)
-                    const isCb=lead.callbackDate&&lead.callbackDate<=today&&lead.status!=="converted"
+                    const isCb=lead.callbackDate&&lead.callbackDate<=today&&isCallable(lead)
                     const score=lead.score||scoreLead(lead)||0
                     const ac=avatarColor(lead.company||lead.firstName||"?")
                     const isMine=!lead.assignedTo||lead.assignedTo===user
@@ -5303,7 +5310,7 @@ export default function App(){
                   <p style={{color:"#a3aac4",fontSize:14,marginTop:4}}>
                   Focused calling mode — only showing unclaimed leads
                   {(()=>{
-                    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&l.status!=="converted")
+                    const overdue=leads.filter(l=>l.callbackDate&&l.callbackDate<today&&isCallable(l))
                     return overdue.length>0?(
                       <span style={{marginLeft:12,background:"#ff6e8430",color:"#ff6e84",padding:"3px 10px",
                         borderRadius:20,fontSize:12,fontWeight:700}}>
@@ -5865,7 +5872,7 @@ export default function App(){
           {/* ── FOLLOW-UPS (overdue + today + week + month + later + future) ── */}
           {activeNav==="followups"&&(()=>{
             const allFollowups = (allLeads.length?allLeads:leads)
-              .filter(l=>l.callbackDate&&l.status!=="converted")
+              .filter(l=>l.callbackDate&&isCallable(l))
               .sort((a,b)=>a.callbackDate.localeCompare(b.callbackDate))
 
             const d7  = addDays(7)
