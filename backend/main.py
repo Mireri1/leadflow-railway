@@ -2791,7 +2791,33 @@ def _fetch_all_leads_for_dedupe() -> list:
 
 # Statuses we never auto-delete a duplicate of — the row carries real
 # engagement value (or compliance signal) that mustn't be discarded.
-ENGAGED_STATUSES = {"interested", "interested_no_dm", "converted", "callback", "awaiting_email_reply", "do_not_contact"}
+# Dedup-protection set, NOT an engagement metric: "this row has history worth
+# keeping." Decides which duplicate survives and which are safe to delete.
+# gatekeeper belongs here (a logged contact + a scheduled follow-up) even though
+# it is deliberately excluded from ENGAGED_OUTCOMES below, which IS a metric.
+ENGAGED_STATUSES = {"interested", "interested_no_dm", "gatekeeper", "converted",
+                    "callback", "awaiting_email_reply", "do_not_contact"}
+
+# ── Canonical outcome sets ──────────────────────────────────────────────────
+# "A human picked up." Defined ONCE here because six copies of this literal had
+# drifted apart: two of them (the connectivity heatmap and the best-hour ranker)
+# were silently missing interested_no_dm, so the same calls counted as contact
+# on the leaderboard and as no-contact on the heatmap.
+#
+# not_interested counts: it is only reachable after "Answered" in the two-step
+# flow, so the rep did reach a person.
+#
+# gatekeeper counts too, and is the reason this set changed: a receptionist who
+# says "the manager stepped out, I'll pass your message" IS a pickup. Callers
+# were logging those as no_answer because they hadn't reached the DM, which
+# understated the true reach rate by ~6.5pt over 14k dials AND left the lead
+# with no callback date, so it fell out of the pipeline entirely.
+CONTACT_OUTCOMES = {"answered", "gatekeeper", "interested", "interested_no_dm",
+                    "not_interested", "callback", "converted"}
+# A real positive. gatekeeper is deliberately NOT here — reaching the front desk
+# is contact, not interest, and folding it in would inflate the engagement rate
+# that the receptivity index is built on.
+ENGAGED_OUTCOMES = {"interested", "interested_no_dm", "callback", "converted"}
 
 def find_phone_dupe_groups(leads: list) -> list:
     """Group by exact phone match. For each group, pick the row to keep
@@ -4163,7 +4189,18 @@ OSM_CATEGORY_SELECTORS = {
     "Entertainment": ['["amenity"="theatre"]', '["amenity"="cinema"]', '["amenity"="conference_centre"]',
                       '["amenity"="events_venue"]', '["leisure"="sports_centre"]', '["leisure"="fitness_centre"]',
                       '["leisure"="bowling_alley"]'],
-    "Offices":       ['["office"]'],
+    # 2026-09: ['["office"]'] was a catch-all. office=* includes government,
+    # diplomatic, political_party, religion and charity — public buildings with
+    # in-house custodial staff and switchboards nobody at a desk answers. The
+    # caller's own notes carry "wrong number government building". Curated down
+    # to private, multi-employee tenants that lease space and buy cleaning.
+    "Offices":       ['["office"="company"]', '["office"="coworking"]', '["office"="insurance"]',
+                      '["office"="lawyer"]', '["office"="accountant"]', '["office"="estate_agent"]',
+                      '["office"="financial"]', '["office"="it"]', '["office"="engineer"]',
+                      '["office"="architect"]', '["office"="logistics"]', '["office"="research"]',
+                      '["office"="employment_agency"]', '["office"="advertising_agency"]',
+                      '["office"="property_management"]', '["office"="telecommunication"]',
+                      '["office"="construction_company"]'],
     "Hospitality":   ['["tourism"="hotel"]', '["amenity"="events_venue"]', '["leisure"="resort"]'],
 }
 # Map a category to the industry label stored on the lead (drives fit scoring).
@@ -4241,11 +4278,25 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
                 elements.append(el)
 
     st_up = state_abbrev.upper()
+    # OSM never deletes a closed business, it re-prefixes the tag —
+    # disused:amenity=clinic, abandoned:office=company, was:shop=*, plus
+    # office=vacant and the explicit closed/demolished lifecycle keys. Those
+    # rows are guaranteed dead numbers, and the "dead" tag is on the element we
+    # already fetched, so filtering them costs nothing and they were previously
+    # ingested as ordinary leads.
+    DEAD_TAG_PREFIXES = ("disused:", "abandoned:", "was:", "removed:", "demolished:", "razed:")
     leads = []
+    skipped_dead = 0
     for el in elements:
         t = el.get("tags", {})
         name = t.get("name", "")
         if not name:
+            continue
+        if (any(k.startswith(DEAD_TAG_PREFIXES) for k in t)
+                or t.get("office") == "vacant"
+                or t.get("disused") == "yes"
+                or (t.get("operational_status") or "").lower() in ("closed", "abandoned")):
+            skipped_dead += 1
             continue
         el_city = t.get("addr:city", "")
         # City-scoped query already limits to the city's boundary, so we DON'T
@@ -4272,6 +4323,8 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
             "state": t.get("addr:state") or state_abbrev.upper(),
             "notes": "Source: OpenStreetMap",
         })
+    if skipped_dead:
+        print(f"[OSM] skipped {skipped_dead} closed/disused features")
     return leads
 
 # NPPES rejects a state-only query ("requires additional search criteria"), so a
@@ -4283,11 +4336,16 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
 NPI_STATEWIDE_TAXONOMIES = ["Clinic/Center", "Assisted Living", "Dental", "Rehabilitation",
     "Urgent Care", "Surgical", "Dialysis"]
 
-def _npi_query(state_abbrev: str, city: str, taxonomy: str, limit: int) -> list:
+# NPPES caps `skip`; stay under it so a rotating offset can never send an
+# invalid request. 200 is also the hard per-request `limit` on their side.
+NPI_SKIP_CEILING = int(os.getenv("NPI_SKIP_CEILING", "800"))
+
+def _npi_query(state_abbrev: str, city: str, taxonomy: str, limit: int, skip: int = 0) -> list:
     params = {"version": "2.1", "enumeration_type": "NPI-2",
               "state": state_abbrev.upper(), "limit": min(max(limit, 1), 200)}
     if city:     params["city"] = city
     if taxonomy: params["taxonomy_description"] = taxonomy
+    if skip:     params["skip"] = min(max(int(skip), 0), NPI_SKIP_CEILING)
     try:
         r = req_lib.get(NPI_API_URL, params=params, timeout=30)
         if r.status_code != 200:
@@ -4305,21 +4363,62 @@ def fetch_npi(state_abbrev: str, city: str = "", taxonomy: str = "", limit: int 
     if city or taxonomy:
         results = _npi_query(state_abbrev, city, taxonomy, limit)
     else:
+        # 2026-09 fix. This loop used to request 200 rows (the API maximum, and
+        # also FREE_SOURCE_MAX_ROWS) for NPI_STATEWIDE_TAXONOMIES[0] and then
+        # break on the row budget — so a statewide pull only ever queried
+        # "Clinic/Center" and the other six taxonomies were unreachable. With no
+        # skip offset it also re-fetched the SAME 200 records on every run, which
+        # then all deduped away, so a weekly refill added ~nothing.
+        #
+        # Now: split the budget evenly across every taxonomy, and advance a
+        # persisted per-state offset each run so successive pulls go DEEPER
+        # instead of re-reading page one.
+        taxos   = NPI_STATEWIDE_TAXONOMIES
+        per_tax = max(20, FREE_SOURCE_MAX_ROWS // max(1, len(taxos)))
+        okey    = f"npi_skip_{state_abbrev.upper()}"
+        try:
+            skip = int(_settings_get_json(okey) or 0)
+        except Exception:
+            skip = 0
         results, seen = [], set()
-        for tx in NPI_STATEWIDE_TAXONOMIES:
-            for res in _npi_query(state_abbrev, "", tx, 200):
+        def _collect(tx, lim, sk):
+            added = 0
+            for res in _npi_query(state_abbrev, "", tx, lim, skip=sk):
                 npi = res.get("number")
                 if npi and npi not in seen:
                     seen.add(npi)
                     results.append(res)
+                    added += 1
+            return added
+        for tx in taxos:
+            _collect(tx, per_tax, skip)
             if len(results) >= FREE_SOURCE_MAX_ROWS:
                 break
+        # Small states exhaust a taxonomy before per_tax is filled. One top-up
+        # pass spends the leftover budget rather than returning a short page.
+        if len(results) < FREE_SOURCE_MAX_ROWS:
+            for tx in taxos:
+                room = FREE_SOURCE_MAX_ROWS - len(results)
+                if room <= 0:
+                    break
+                _collect(tx, min(room, 200), skip + per_tax)
+        try:
+            _settings_set_json(okey, (skip + per_tax) % max(per_tax, NPI_SKIP_CEILING))
+        except Exception as e:
+            print(f"[NPI] skip-offset persist failed (harmless, next run repeats page): {e}")
 
     leads = []
     for res in results:
         basic = res.get("basic", {})
         name = basic.get("organization_name") or basic.get("name") or ""
         if not name:
+            continue
+        # NPPES marks a deactivated (surrendered / closed) provider with a status
+        # other than "A". Those numbers are dead by definition. Deliberately
+        # fails OPEN: an absent or renamed field keeps the lead rather than
+        # silently emptying the pull.
+        st_flag = (basic.get("status") or "").strip().upper()
+        if st_flag and st_flag != "A":
             continue
         # Prefer the LOCATION address (not mailing). NPPES marks it purpose=LOCATION.
         addrs = res.get("addresses", []) or []
@@ -4343,6 +4442,7 @@ class FreeSourceRequest(BaseModel):
     categories: Optional[object] = None   # OSM only: list of vertical names
     taxonomy:   Optional[str] = ""        # NPI only: e.g. "Nursing", "Dentist"
     limit:      Optional[int] = 200
+    days:       Optional[int] = 30        # permits only: recency floor on the permit date
     enrich:     Optional[bool] = False    # OSM only: Apollo-enrich phoneless leads (admin)
     restaurants: Optional[bool] = False   # health only: ALSO pull restaurant inspections (low-budget)
 
@@ -4526,7 +4626,13 @@ def _detect_permit_fields(k: list) -> dict:
 def fetch_permits(state_abbrev: str, days: int = 30) -> list:
     """Pull recent commercial permits for every configured metro in a state.
     Heuristically maps each dataset's schema. Returns raw lead dicts tagged
-    [INTENT:newbuild]. Free, no key. (days kept for signature compat.)"""
+    [INTENT:newbuild]. Free, no key.
+
+    `days` is a real recency floor. It used to be accepted and then ignored, so a
+    portal that had not refreshed in two years handed us permits for buildings
+    that are long finished and already under a cleaning contract — the worst
+    possible newbuild lead. Dropped automatically for datasets that store the
+    date as text (the request 400s and we retry without the filter)."""
     sources = [s for s in SOCRATA_PERMIT_SOURCES if s[0] == state_abbrev.upper()]
     leads = []
     for st, name, domain, rid in sources:
@@ -4546,10 +4652,24 @@ def fetch_permits(state_abbrev: str, days: int = 30) -> list:
             print(f"[PERMITS] {name}: sample failed {e}")
             continue
         params = {"$limit": FREE_SOURCE_MAX_ROWS}
-        if f["date"]:
-            params["$order"] = f"{f['date']} DESC"   # newest first
+        # _pick_field returns a LIST of candidate column names (Socrata omits
+        # null fields per row, so the mapper tries each). $order/$where need ONE
+        # real column: previously this interpolated the whole list and sent
+        # "['issue_date'] DESC", which Socrata 400s — so EVERY permit pull fell
+        # through to the unordered retry below and we were reading the dataset in
+        # arbitrary order, not newest-first. Candidates come from the sampled
+        # rows, so [0] is a column that actually exists.
+        date_col = f["date"][0] if f["date"] else ""
+        if date_col:
+            params["$order"] = f"{date_col} DESC"   # newest first
+            cutoff = (datetime.utcnow() - timedelta(days=max(1, int(days or 30)))).strftime("%Y-%m-%dT00:00:00")
+            params["$where"] = f"{date_col} >= '{cutoff}'"
         try:
             r = req_lib.get(base, params=params, headers=hdr, timeout=45)
+            if r.status_code != 200 and "$where" in params:  # date stored as text → drop the floor
+                print(f"[PERMITS] {name}: date filter rejected (HTTP {r.status_code}) — retrying unfiltered")
+                r = req_lib.get(base, params={k: v for k, v in params.items() if k != "$where"},
+                                headers=hdr, timeout=45)
             if r.status_code != 200 and "$order" in params:  # bad date type → retry unordered
                 r = req_lib.get(base, params={"$limit": FREE_SOURCE_MAX_ROWS}, headers=hdr, timeout=45)
             rows = r.json() if r.status_code == 200 else []
@@ -4595,7 +4715,7 @@ def source_permits(body: FreeSourceRequest, user: str = Depends(verify_token)):
         return {"found": 0, "saved": 0, "alreadyInDb": 0, "droppedUncallable": 0,
                 "summary": f"No permit feed configured for {body.state} yet. Covered states: "
                            f"{', '.join(sorted(configured))}. (Permit portals are per-metro; ask to add yours.)"}
-    raw = fetch_permits(body.state, body.limit if (body.limit and body.limit < 121) else 30)
+    raw = fetch_permits(body.state, body.days or 30)
     res = ingest_leads(raw, "Permit (new construction)", user)
     audit_log(user, "source_permits", "lead", None, {"state": body.state, **res})
     res["summary"] = (f"Permits: {res['found']} commercial builds found · {res['alreadyInDb']} already in DB · "
@@ -5093,6 +5213,19 @@ COMPLAINT_CALL_GUIDANCE = (
     "a walkthrough."
 )
 
+# Only spend a Google call on a lead that can actually REACH the complaint rung.
+# Day Plan rung 4 (dayPlanRungs() in App.jsx) requires status new/no_answer/called
+# and fewer than 4 dials, so scanning a converted customer, a retired lead, a
+# do_not_contact row or a phoneless row costs ~$0.05 and can never surface. Keep
+# these in step with that filter.
+COMPLAINT_RUNG_STATUSES  = {"", "new", "no_answer", "called"}
+COMPLAINT_RUNG_MAX_CALLS = 4
+# A cleanliness complaint is only intent while it is recent. Google returns at
+# most 5 reviews, so "the most recent complaint" can easily be years old — and a
+# 2023 gripe opens the call cold and burns the lead. Fails OPEN when Google gives
+# no timestamp (age_days=None) rather than silently dropping the hit.
+COMPLAINT_MAX_AGE_DAYS = int(os.getenv("COMPLAINT_MAX_AGE_DAYS", "540"))
+
 class ReviewScanRequest(BaseModel):
     state:      Optional[str] = ""
     cities:     Optional[str] = ""
@@ -5119,8 +5252,9 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
     # response near 1000 rows, so a client-side filter over "newest 1000" would
     # miss older target leads (e.g. gyms pulled before today's healthcare sweep).
     params = {
-        "select": "id,company,city,state,notes,score,phone,firstName,email,industry,title",
+        "select": "id,company,city,state,notes,score,phone,firstName,email,industry,title,status,total_calls",
         "company": "not.is.null",
+        "phone": "neq.",
         "order": "createdAt.desc",
         "limit": str(scan_n * (40 if want_inds else 3)),
     }
@@ -5137,12 +5271,20 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
         raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
 
     flagged, scanned, samples = 0, 0, []
+    skipped_ineligible = skipped_stale = 0
     for lead in candidates:
         if scanned >= scan_n:
             break
         if "[INTENT:cleanliness]" in (lead.get("notes") or ""):
             continue
         if is_complaint_excluded_vertical(lead):   # hospitals: never scanned, never reported
+            continue
+        # Cheap eligibility checks first — every one of these saves ~$0.05.
+        if (lead.get("status") or "") not in COMPLAINT_RUNG_STATUSES:
+            skipped_ineligible += 1
+            continue
+        if (lead.get("total_calls") or 0) >= COMPLAINT_RUNG_MAX_CALLS:
+            skipped_ineligible += 1
             continue
         if want_inds:
             ind = (lead.get("industry") or "").lower()
@@ -5160,6 +5302,9 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
         reviews, rating, _ = google_place_reviews(pid)
         hit, snippet, age_days, rel = scan_cleanliness(reviews)
         if not hit:
+            continue
+        if age_days is not None and age_days > COMPLAINT_MAX_AGE_DAYS:
+            skipped_stale += 1
             continue
         # Stamp a parseable age token so score_lead can decay older complaints.
         age_tag = f" [clnage:{age_days}]" if age_days is not None else ""
@@ -5189,7 +5334,15 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
                    fields=[{"label": f"{s['company']} · {s['posted']}", "value": s["snippet"]} for s in samples[:5]]
                           + [{"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
     return {"scanned": scanned, "flagged": flagged,
-            "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (freshest = hottest)",
+            # Observability on the two new gates: ineligible rows are Google
+            # calls NOT spent, stale hits are cold opens NOT put in front of the
+            # caller. Both used to be invisible.
+            "skipped_ineligible": skipped_ineligible,
+            "skipped_stale_complaint": skipped_stale,
+            "max_complaint_age_days": COMPLAINT_MAX_AGE_DAYS,
+            "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (freshest = hottest)"
+                       + (f" · skipped {skipped_ineligible} ineligible (saved ~${skipped_ineligible*0.05:.2f})" if skipped_ineligible else "")
+                       + (f" · dropped {skipped_stale} stale (>{COMPLAINT_MAX_AGE_DAYS}d)" if skipped_stale else ""),
             "samples": samples}
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -6704,9 +6857,16 @@ def log_call(call: dict, user: str = Depends(verify_token)):
             # Status new/no_answer means no human was ever reached (any contact
             # outcome rewrites status), so count>=N ⇒ N failures. Manual
             # status edit un-retires if a caller wants another shot.
+            #
+            # 'gatekeeper' is retire-eligible but at DOUBLE the threshold: we
+            # know a human answers that number, so it is not the dead-number
+            # case retirement exists for — but it must not become immortal
+            # either, or every front-desk block accumulates in the queue forever.
+            cur_status = (lead_full.get("status") or "new")
+            retire_at = RETIRE_AFTER_DIALS * (2 if cur_status == "gatekeeper" else 1)
             if (outcome in ("no_answer", "voicemail")
-                    and new_count is not None and new_count >= RETIRE_AFTER_DIALS
-                    and (lead_full.get("status") or "new") in ("new", "no_answer")):
+                    and new_count is not None and new_count >= retire_at
+                    and cur_status in ("new", "no_answer", "gatekeeper")):
                 patch_payload["status"] = "retired"
             # Only update total_calls when we have a trustworthy count.
             # Skipping (vs. writing a wrong value) is the safe failure mode —
@@ -7012,7 +7172,7 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
         # Build summary stats. "not_interested" counts as contacted: it's only
         # reachable after "Answered" in the two-step flow, so the rep DID reach a
         # person — excluding it undercounted contact rate.
-        contacted = ["answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"]
+        contacted = CONTACT_OUTCOMES
         summary = {"total": len(calls), "converted": 0, "interested": 0,
                    "no_answer": 0, "callback": 0, "voicemail": 0, "answered": 0,
                    "total_talk_time": 0, "first_calls": 0, "follow_ups": 0}
@@ -7494,7 +7654,7 @@ def insights_best_call_time(industry: str = "", days: int = 60,
     Without an industry filter, returns a global ranking across all calls."""
     days = max(1, min(int(days or 60), 365))
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    contacted_set = {"answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"}
+    contacted_set = CONTACT_OUTCOMES
 
     # If filtering by industry, first resolve leadIds matching that industry,
     # then pull their calls. PostgREST can't join directly.
@@ -7588,7 +7748,7 @@ def guidance_best_region(days: int = 30, min_sample: int = 20,
         except Exception:
             pass
 
-    PICKUP = {"answered", "interested", "not_interested", "callback", "converted"}
+    PICKUP = CONTACT_OUTCOMES
     tz_cache = {}
     def gtz(tz_str):
         if tz_str not in tz_cache:
@@ -7792,7 +7952,7 @@ def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
         cand_ids = [l["id"] for l in cands]
         # exclude anything that EVER reached a human
         contacted = set()
-        CONTACT_SET = "answered,interested,interested_no_dm,converted,callback,not_interested"
+        CONTACT_SET = ",".join(sorted(CONTACT_OUTCOMES))
         for i in range(0, len(cand_ids), 150):
             chunk = ",".join(str(x) for x in cand_ids[i:i+150])
             r = req_lib.get(
@@ -8025,8 +8185,7 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
             print(f"[CONNECTIVITY] lead-state batch {i} fetch failed: {e}")
 
     DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    PICKUP_OUTCOMES    = {"answered", "interested", "interested_no_dm",
-                          "not_interested", "callback", "converted"}
+    PICKUP_OUTCOMES    = CONTACT_OUTCOMES
     VOICEMAIL_OUTCOMES = {"voicemail"}
 
     # Cache ZoneInfo objects per tz string (cheap, but no need to re-build per call)
@@ -11229,8 +11388,6 @@ def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_to
 #   engaged   = interested / callback / converted (a real positive)
 # Index = 100 * (0.35*contact_rate + 0.65*engagement_rate). Hundreds of points
 # a day instead of one win per 500 calls → readable in weeks, not years.
-CONTACT_OUTCOMES = {"answered", "interested", "interested_no_dm", "not_interested", "callback", "converted"}
-ENGAGED_OUTCOMES = {"interested", "interested_no_dm", "callback", "converted"}
 _DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 RECEPTIVITY_MIN_SLICE = int(os.getenv("RECEPTIVITY_MIN_SLICE", "15"))   # below this = low confidence
@@ -11601,7 +11758,7 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             if (c.get("calledAt") or "") >= local_day_start_utc():
                 u["calls_today"] += 1
             outcome = c.get("outcome", "")
-            if outcome in ("answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"):
+            if outcome in CONTACT_OUTCOMES:
                 u["contacted"] += 1
             if outcome == "converted":
                 u["conversions"] += 1

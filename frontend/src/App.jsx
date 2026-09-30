@@ -29,6 +29,7 @@ const STATUS_OPTIONS = [
   { value:"no_answer",             label:"No Answer",             color:"#a3aac4" },
   { value:"interested",            label:"Interested",            color:"#69f6b8" },
   { value:"interested_no_dm",      label:"Interested · No DM",    color:"#5ec8ff" },
+  { value:"gatekeeper",            label:"Gatekeeper · No DM",    color:"#7dd3fc" },
   { value:"not_interested",        label:"Not Interested",        color:"#ff6e84" },
   { value:"callback",              label:"Callback",              color:"#8b5cf6" },
   { value:"converted",             label:"Converted",             color:"#06d6a0" },
@@ -53,6 +54,7 @@ const CALL_OUTCOMES = [
   { value:"callback",       label:"Requested Callback" },
   { value:"interested",     label:"Interested" },
   { value:"interested_no_dm", label:"Interested · No DM" },
+  { value:"gatekeeper",     label:"Gatekeeper · No DM" },
   { value:"not_interested", label:"Not Interested" },
   { value:"converted",      label:"Converted!" },
 ]
@@ -61,6 +63,12 @@ const PRIMARY_OUTCOMES = [
   { value:"no_answer", label:"No Answer", color:"#40485d", icon:"📵" },
   { value:"voicemail", label:"Voicemail", color:"#a3aac4", icon:"📨" },
   { value:"answered",  label:"Answered",  color:"#69f6b8", icon:"📞" },
+  // A person picked up but you never got to the decision-maker — receptionist
+  // took a message, didn't know who handles cleaning, said to email. This used
+  // to get logged as "No Answer", which threw away the fact that the number is
+  // live AND left the lead with no follow-up date, so it dropped out entirely.
+  { value:"gatekeeper", label:"Gatekeeper", color:"#7dd3fc", icon:"🚪",
+    hint:"A person answered but you couldn't reach the decision-maker. Counts as a real contact and books a follow-up." },
 ]
 
 const SECONDARY_OUTCOMES = [
@@ -1719,11 +1727,18 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [apptDate,setApptDate]    = useState("")       // walkthrough appointment (optional)
   const [apptArea,setApptArea]    = useState("")
 
+  // Gatekeeper defaults to a 3-day retry: long enough that the message has
+  // been passed on, short enough that the conversation is still remembered.
+  function pickGatekeeper(){
+    setPrimary("gatekeeper"); setSecondary(""); setCbReason("")
+    setCbDate(d=>d||addDays(3))
+  }
+
   // Smart-fill: map Haiku's note read onto the outcome chips + callback date.
   function applyAi(r){
     if(r.sentiment) setAiSent(r.sentiment)
     const o=r.outcome
-    if(o==="no_answer"||o==="voicemail"){ setPrimary(o); setSecondary("") }
+    if(o==="no_answer"||o==="voicemail"||o==="gatekeeper"){ setPrimary(o); setSecondary("") }
     else if(o==="not_interested"||o==="callback"||o==="interested"||o==="converted"){ setPrimary("answered"); setSecondary(o) }
     if(r.callbackDate){
       setCbDate(r.callbackDate)
@@ -1740,7 +1755,9 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   },[lead.id])
 
   // Keyboard shortcuts for the 100-dials/day loop: 1=No Answer, 2=Voicemail,
-  // 3=Answered, Enter=Log Call (same guards as the button). Ignored while
+  // 3=Answered, 4=Gatekeeper, Enter=Log Call (same guards as the button).
+  // Gatekeeper is 4, not 3, so 1/2/3 stay where the caller's fingers expect.
+  // Ignored while
   // typing in an input/textarea/select.
   useEffect(()=>{
     const h=e=>{
@@ -1749,10 +1766,12 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       if(e.key==="1"){ setPrimary("no_answer"); setSecondary(""); setCbReason("") }
       else if(e.key==="2"){ setPrimary("voicemail"); setSecondary(""); setCbReason("") }
       else if(e.key==="3"){ setPrimary("answered") }
+      else if(e.key==="4"){ pickGatekeeper() }
       else if(e.key==="Enter"&&primary&&!saving
         &&!(primary==="answered"&&!secondary)
         &&!(needsQual&&!hasQualData)
-        &&!(secondary==="callback"&&!cbDate)){ e.preventDefault(); log() }
+        &&!(secondary==="callback"&&!cbDate)
+        &&!(primary==="gatekeeper"&&!cbDate)){ e.preventDefault(); log() }
     }
     window.addEventListener("keydown",h)
     return()=>window.removeEventListener("keydown",h)
@@ -1783,6 +1802,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     if(primary==="answered"&&!secondary){ setModalError("Select the call result."); return }
     if(needsQual&&!hasQualData){ setModalError("Fill out at least one qualification field below."); return }
     if(secondary==="callback"&&!cbDate){ setModalError("Please select a callback date."); return }
+    if(primary==="gatekeeper"&&!cbDate){ setModalError("Please pick a follow-up date."); return }
+    if(primary==="gatekeeper"&&!confirmFarDate(cbDate,"Follow-up")) return
     if(secondary==="callback"&&!confirmFarDate(cbDate,"Callback")) return
     if(apptDate&&!confirmFarDate(apptDate,"Walkthrough date")) return
 
@@ -1799,7 +1820,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       const callPayload = {
         leadId:lead.id, outcome, notes:fullNotes,
         duration:finalDuration,
-        callbackDate:secondary==="callback"?cbDate:"",
+        callbackDate:(secondary==="callback"||primary==="gatekeeper")?cbDate:"",
         calledBy:getUser(), calledAt:new Date().toISOString(),
         budgetfocus: budgetFocus||null, vendorstatus: vendorStatus||null,
         decisionmaker: decisionMaker||null, timeline: timeline||null,
@@ -1817,15 +1838,17 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         api(`/api/scripts/${scriptId}/use`,{method:"POST",body:JSON.stringify({})}).catch(()=>{})
       }
       const statusMap={answered:"called",no_answer:"no_answer",voicemail:"no_answer",
+        gatekeeper:"gatekeeper",
         callback:"callback",interested:"interested",interested_no_dm:"interested_no_dm",
         not_interested:"not_interested",converted:"converted"}
       const fuDays = FOLLOW_UP_DAYS[followUpSeq]
-      const nextFollowUp = fuDays ? addDays(fuDays[0]) : (secondary==="callback"?cbDate:"")
+      const nextFollowUp = fuDays ? addDays(fuDays[0])
+        : ((secondary==="callback"||primary==="gatekeeper")?cbDate:"")
       // callbackDate rules: set it when this call produced a new date; CLEAR it
       // only when the deal is dead (not interested / converted). A plain
       // no-answer/voicemail on a lead with a scheduled callback must NOT wipe
       // the date — that silently dropped leads out of Follow-Ups and the bell.
-      const newCb = secondary==="callback" ? cbDate : (nextFollowUp||"")
+      const newCb = (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||"")
       const cbPatch = newCb ? {callbackDate:newCb}
         : (["not_interested","converted"].includes(outcome) ? {callbackDate:""} : {})
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
@@ -2063,7 +2086,11 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           </div>
           <div style={{display:"flex",gap:8}}>
             {PRIMARY_OUTCOMES.map(p=>(
-              <button key={p.value} onClick={()=>{setPrimary(p.value);if(p.value!=="answered"){setSecondary("");setCbReason("")}}}
+              <button key={p.value} title={p.hint||""}
+                onClick={()=>{
+                  if(p.value==="gatekeeper"){ pickGatekeeper(); return }
+                  setPrimary(p.value);if(p.value!=="answered"){setSecondary("");setCbReason("")}
+                }}
                 style={{flex:1,padding:"14px 12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",
                   textAlign:"center",fontSize:13,fontWeight:600,transition:"all .15s",
                   background:primary===p.value?p.color+"25":"#060e20",
@@ -2215,6 +2242,27 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           </div>
         )}
 
+        {/* Gatekeeper follow-up. The date is the whole point of this outcome:
+            a receptionist who took a message is a live lead, and logging it as
+            "No Answer" left no date, so it never came back around. Prefilled so
+            the fast path is one tap. */}
+        {primary==="gatekeeper"&&(
+          <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
+            border:"1px solid #7dd3fc25"}}>
+            <div style={{fontSize:10,color:"#7dd3fc",letterSpacing:".1em",fontWeight:700,marginBottom:4}}>
+              TRY AGAIN ON
+            </div>
+            <div style={{fontSize:11,color:"#a3aac4",marginBottom:10}}>
+              Counts as a real contact. Note who you spoke to and what they said —
+              next time you can ask for the decision-maker by name.
+            </div>
+            <div className="ff">
+              <label>Follow-up Date</label>
+              <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+            </div>
+          </div>
+        )}
+
         {/* Qualification — shown when needed */}
         {needsQual&&(
           <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
@@ -2303,7 +2351,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
             <button className="btn btn-p" onClick={log} disabled={saving||
               (primary==="answered"&&!secondary)||
               (needsQual&&!hasQualData)||
-              (secondary==="callback"&&!cbDate)}
+              (secondary==="callback"&&!cbDate)||
+              (primary==="gatekeeper"&&!cbDate)}
               style={{width:"100%",padding:"14px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700}}>
               {saving?"Saving...":"Log Call"}
             </button>
@@ -3142,7 +3191,7 @@ function MyWeek({user, leads, onCall, onReload, notify, reloadSignal}){
 
   const byDay={}; calls.forEach(c=>{ const d=(c.calledAt||"").slice(0,10); if(d){(byDay[d]=byDay[d]||[]).push(c)} })
   const dayKeys=Object.keys(byDay).sort().reverse()
-  const oc={converted:"#69f6b8",interested:"#69f6b8",interested_no_dm:"#69f6b8",callback:"#8b5cf6",not_interested:"#ff6e84",no_answer:"#a3aac4",voicemail:"#ffe083",answered:"#a3a6ff"}
+  const oc={converted:"#69f6b8",interested:"#69f6b8",interested_no_dm:"#69f6b8",callback:"#8b5cf6",not_interested:"#ff6e84",no_answer:"#a3aac4",voicemail:"#ffe083",answered:"#a3a6ff",gatekeeper:"#7dd3fc"}
   return (
     <div>
       <div style={{display:"flex",alignItems:"flex-end",justifyContent:"space-between",gap:20,flexWrap:"wrap",marginBottom:24}}>
@@ -7269,7 +7318,8 @@ function CallNotesPanel(){
     api(`/api/analytics/call-notes?days=${d||days}`).then(r=>{setData(r);setLoading(false)}).catch(()=>setLoading(false))
   }
   const oc={converted:"#69f6b8",interested:"#69f6b8",interested_no_dm:"#69f6b8",callback:"#8b5cf6",
-    not_interested:"#ff6e84",no_answer:"#a3aac4",voicemail:"#ffe083",answered:"#a3a6ff"}
+    not_interested:"#ff6e84",no_answer:"#a3aac4",voicemail:"#ffe083",answered:"#a3a6ff",
+    gatekeeper:"#7dd3fc"}
   const Bars=({title,rows,total})=>rows&&rows.length>0?(
     <div style={{marginBottom:10}}>
       <div style={{fontSize:10,color:"#40485d",textTransform:"uppercase",letterSpacing:".07em",marginBottom:4}}>{title}</div>
