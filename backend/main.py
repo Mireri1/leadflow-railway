@@ -2887,6 +2887,13 @@ def _bg_maintenance_loop():
             run_weekly_review_scan_if_due()
         except Exception as e:
             print(f"[WEEKLY-SCAN] loop exception: {e}")
+        # Weekly refresh of FRESH failed health inspections. Its own try/except
+        # so a Socrata outage cannot take down the digests or the job queue
+        # that run after it in this loop.
+        try:
+            run_health_refresh_if_due()
+        except Exception as e:
+            print(f"[HEALTH-REFRESH] loop exception: {e}")
         # Transcription/analysis queue. Drains a few jobs per cycle rather than
         # everything: this thread also drives digests, refills and the email
         # sequencer, and a 200-call backlog must not starve them.
@@ -5295,6 +5302,11 @@ def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
             viol = clean(row.get(s["viol"], ""))[:160]
             result = clean(row.get(s["result"], ""))
             ftype = clean(row.get(s["ftype"], "")) if s.get("ftype") else ""
+            # Refuse stale violations outright. The Socrata $where already asks
+            # for a window, but not every source honours it on every column,
+            # and this is the last point where the date is still in hand.
+            if age_days is not None and age_days > HEALTH_MAX_AGE_DAYS:
+                continue
             age_tag = f" [hvage:{age_days}]" if age_days is not None else ""
             insp_tag = f" [inspected:{date}]" if re.match(r"\d{4}-\d{2}-\d{2}", date) else ""
             lead_city = clean(row.get(s["city"], "")) if s.get("city") else s.get("city_const", "")
@@ -5500,6 +5512,27 @@ COMPLAINT_RUNG_MAX_CALLS = 4
 # most 5 reviews, so "the most recent complaint" can easily be years old — and a
 # 2023 gripe opens the call cold and burns the lead. Fails OPEN when Google gives
 # no timestamp (age_days=None) rather than silently dropping the hit.
+# ── Health-inspection freshness ─────────────────────────────────────────────
+# A failed inspection is a DATED event with a compliance deadline attached —
+# that timing is the whole reason the signal beats a generic lead list. It was
+# not behaving that way in production:
+#
+#   * every Health Inspection lead was created in ONE pull on 2026-06-26, and
+#     the source had not run in the 96 days since. POST /api/sources/health is
+#     manual and was never scheduled, so "recent violation" aged into "some
+#     place that failed an inspection a year and a half ago".
+#   * median inspection age across the ingested stock was 582 days (max 2,423).
+#   * the feed that actually carries a date (fetch_health_inspections, with its
+#     `$where date > cutoff`) was opt-in behind `restaurants=true` and off by
+#     default, so the DEFAULT path was CMS star ratings, which carry no date.
+#
+# HEALTH_MAX_AGE_DAYS refuses stale violations at ingest rather than letting
+# score_lead quietly rank them behind fresher ones — a two-year-old violation
+# is not a weak lead, it is a wrong one.
+HEALTH_MAX_AGE_DAYS      = int(os.getenv("HEALTH_MAX_AGE_DAYS", "120"))
+HEALTH_REFRESH_ENABLED   = os.getenv("HEALTH_REFRESH_ENABLED", "1") == "1"
+HEALTH_REFRESH_STATES    = [x.strip().upper() for x in os.getenv(
+    "HEALTH_REFRESH_STATES", "NV,OH,MO").split(",") if x.strip()]
 COMPLAINT_MAX_AGE_DAYS = int(os.getenv("COMPLAINT_MAX_AGE_DAYS", "540"))
 
 class ReviewScanRequest(BaseModel):
@@ -11653,6 +11686,47 @@ def run_weekly_review_scan_if_due():
                        fields=[{"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
     except Exception as e:
         print(f"[WEEKLY-SCAN] failed: {e}")
+
+def run_health_refresh_if_due():
+    """Weekly pull of FRESH failed health inspections.
+
+    This is the piece that was missing. POST /api/sources/health exists and
+    works, but nothing ever called it: the whole Health Inspection corpus came
+    from a single manual pull on 2026-06-26 and then aged for three months. A
+    dated compliance signal that is not refreshed is just an old list — by the
+    time it was measured, the median ingested violation was 582 days old.
+
+    Deliberately runs the DATED feed (restaurants=True reaches
+    fetch_health_inspections, the only path carrying an inspection date), not
+    just the CMS star-rating path that runs by default on the endpoint. The
+    HEALTH_MAX_AGE_DAYS gate inside the fetcher is what keeps it honest.
+
+    Record-before-work, same as the other weekly jobs: a crash mid-pull must
+    not re-fire the scrape on the next 10-minute tick.
+    """
+    if not HEALTH_REFRESH_ENABLED:
+        return
+    if not _iso_week_due("last_health_refresh"):
+        return
+    _record_weekly_run("last_health_refresh")
+    total_new, by_state = 0, {}
+    for st in HEALTH_REFRESH_STATES:
+        try:
+            res = source_health(FreeSourceRequest(state=st, limit=HEALTH_MAX_AGE_DAYS,
+                                                  restaurants=True), user="eric")
+            n = (res or {}).get("saved", 0) if isinstance(res, dict) else 0
+            by_state[st] = n
+            total_new += n
+        except Exception as e:
+            print(f"[HEALTH-REFRESH] {st} failed: {e}")
+            by_state[st] = f"error: {str(e)[:60]}"
+    print(f"[HEALTH-REFRESH] states={by_state} new={total_new}")
+    if total_new:
+        send_slack("🚨 Fresh health-inspection leads",
+                   f"*{total_new}* businesses failed an inspection in the last "
+                   f"{HEALTH_MAX_AGE_DAYS} days and are now on the Day Plan complaint list.",
+                   fields=[{"label": "By state", "value": ", ".join(f"{k}: {v}" for k, v in by_state.items())},
+                           {"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
 
 def run_call_coach_if_due():
     """Weekly Claude coaching report over the week's recorded calls — no-ops
