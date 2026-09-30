@@ -1032,6 +1032,12 @@ INTENT_BOOSTS = {
     "rfp":         32,   # active solicitation for janitorial services
     "contract":    28,   # holds an expiring janitorial contract (recompete soon)
     "newbuild":    22,   # new construction / just opened = need being born
+    # A tenant-improvement permit is a business FITTING OUT LEASED SPACE — it
+    # is moving in now, not opening in eighteen months, and a new occupant has
+    # no incumbent cleaner and no loyalty to one. That is a live need with a
+    # date on it, so it outranks newbuild. 34% of permit leads already matched
+    # this and were all being pitched as "new construction".
+    "tenant_improvement": 30,
     "competitor":  26,   # unhappy with their current cleaner (poach)
     "lookalike":   12,   # resembles a lead we've already converted
 }
@@ -4822,6 +4828,29 @@ SOCRATA_PERMIT_SOURCES = [
     ("MA", "Cambridge",    "data.cambridgema.gov",       "9qm7-wbdc"),
 ]
 
+# A commercial permit is two different signals wearing one label. Ground-up
+# construction is a need being BORN (call in a year). A tenant improvement is a
+# tenant fitting out leased space — moving in, no incumbent cleaner, needs one
+# within weeks. Same dataset, opposite timing and opposite opener, and
+# everything was being stamped [INTENT:newbuild] and pitched as a new build.
+#
+# NEW wins over TI when both appear: "new construction — tenant improvement
+# shell" is a ground-up build, and calling that one as a move-in is the more
+# embarrassing error of the two.
+_TI_RE = re.compile(
+    r"(\btenant\b|\bbuild[\s-]?out\b|\bfit[\s-]?out\b|\bt\.?i\.?\b|\bwhite[\s-]?box\b"
+    r"|\binterior (?:remodel|renovation|finish|only|alteration)\b|\bremodel of existing\b"
+    r"|\bsuite\b|\bcertificate of occupancy\b)", re.I)
+_NEWBUILD_RE = re.compile(
+    r"(\bnew construction\b|\bground[\s-]?up\b|\bnew commercial\b|\bnew building\b|\bshell\b)", re.I)
+
+def permit_intent(text: str) -> str:
+    """'newbuild' or 'tenant_improvement' for a permit description."""
+    t = text if isinstance(text, str) else ""
+    if _NEWBUILD_RE.search(t):
+        return "newbuild"
+    return "tenant_improvement" if _TI_RE.search(t) else "newbuild"
+
 def _permit_industry(desc: str) -> str:
     d = (desc or "").lower()
     for label, kws in [("Medical", ["medical", "clinic", "hospital", "dental", "health"]),
@@ -4965,6 +4994,9 @@ def fetch_permits(state_abbrev: str, days: int = 30) -> list:
             klass = _permit_val(row, f["klass"])
             if not _permit_is_commercial(klass, f"{desc} {ptype}"):
                 continue
+            _pintent = permit_intent(f"{desc} {ptype}")
+            _plabel = ("Tenant fit-out permit — new occupant moving in"
+                       if _pintent == "tenant_improvement" else "Commercial permit")
             company = _permit_val(row, f["company"])
             addr = _permit_val(row, f["addr"])
             if not addr and f["house"] and f["street"]:
@@ -4981,8 +5013,8 @@ def fetch_permits(state_abbrev: str, days: int = 30) -> list:
                 "phone": _permit_val(row, f["phone"]), "firstName": fn, "lastName": ln,
                 "address": addr, "city": _permit_val(row, f["city"]),
                 "state": _permit_val(row, f["state"]) or state_abbrev.upper(),
-                "notes": f"[INTENT:newbuild] Commercial permit ({name}): "
-                         f"{(desc or ptype)[:120]} @ {addr}".strip(),
+                "notes": (f"[INTENT:{_pintent}] {_plabel} ({name}): "
+                          f"{(desc or ptype)[:120]} @ {addr}").strip(),
             })
     return leads
 
