@@ -7,13 +7,86 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt, os, re, time, json as json_lib, requests as req_lib
+import jwt, os, re, time, json as json_lib, requests as _requests
 import imaplib, email as email_lib, threading
 from email.header import decode_header
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pydantic import BaseModel
 from urllib.parse import quote as url_quote
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except ImportError:                                    # pragma: no cover
+    Retry = None
+
+# ── Retrying HTTP transport (req_lib) ───────────────────────────────────────
+# Every outbound call in this file goes through req_lib. It used to be the bare
+# `requests` module, which means: a new TCP connection and a fresh DNS lookup
+# per call, and ZERO retries. A transient resolver blip therefore killed whole
+# background jobs — production logged
+#   [INV-REFILL] failed: ... Failed to resolve 'ucpwpjokyconwzwqvdad.supabase.co'
+# every ~10 minutes for 7 hours straight, so the low-inventory refill (the thing
+# that stops the caller running dry) simply never ran. Nothing was broken; one
+# DNS lookup failed and there was no second attempt.
+#
+# SAFETY — the retry policy is deliberately asymmetric:
+#   connect errors (DNS / TCP)  -> retried for EVERY method. The request never
+#                                  reached the server, so a replay cannot
+#                                  duplicate anything.
+#   read errors / 5xx statuses  -> retried ONLY for idempotent methods, which is
+#                                  urllib3's default allowed_methods. A POST
+#                                  that already reached Supabase must NEVER be
+#                                  replayed: retrying POST /call_outcomes would
+#                                  double-log a call and corrupt total_calls.
+# raise_on_status stays False because every caller here inspects
+# r.status_code — raising instead would change behaviour at ~250 call sites.
+HTTP_RETRY_TOTAL    = int(os.getenv("HTTP_RETRY_TOTAL", "4"))     # 0 disables
+HTTP_RETRY_CONNECT  = int(os.getenv("HTTP_RETRY_CONNECT", "3"))
+HTTP_RETRY_BACKOFF  = float(os.getenv("HTTP_RETRY_BACKOFF", "0.5"))  # 0s,1s,2s…
+
+def _build_retry():
+    if Retry is None or HTTP_RETRY_TOTAL <= 0:
+        return None
+    kw = dict(total=HTTP_RETRY_TOTAL, connect=HTTP_RETRY_CONNECT, read=2, status=2,
+              backoff_factor=HTTP_RETRY_BACKOFF,
+              status_forcelist=(429, 502, 503, 504), raise_on_status=False)
+    try:
+        return Retry(**kw)                             # urllib3 >= 1.26 / 2.x
+    except TypeError:                                  # pragma: no cover
+        kw.pop("raise_on_status", None)
+        return Retry(**kw)
+
+_HTTP_RETRY = _build_retry()
+
+class _RetryingHTTP:
+    """Drop-in for the `requests` module (get/post/patch/delete) backed by a
+    per-thread Session. Per-thread because requests.Session is not documented
+    as thread-safe and this process runs a background maintenance thread
+    alongside the request handlers; urllib3's connection pool underneath each
+    Session is. Also gives us connection reuse, which cuts the DNS lookups that
+    were failing in the first place."""
+    def __init__(self):
+        self._local = threading.local()
+
+    @property
+    def session(self):
+        sess = getattr(self._local, "sess", None)
+        if sess is None:
+            sess = _requests.Session()
+            adapter = HTTPAdapter(max_retries=_HTTP_RETRY, pool_connections=10,
+                                  pool_maxsize=20) if _HTTP_RETRY else HTTPAdapter()
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            self._local.sess = sess
+        return sess
+
+    def get(self, *a, **kw):    return self.session.get(*a, **kw)
+    def post(self, *a, **kw):   return self.session.post(*a, **kw)
+    def patch(self, *a, **kw):  return self.session.patch(*a, **kw)
+    def delete(self, *a, **kw): return self.session.delete(*a, **kw)
+
+req_lib = _RetryingHTTP()
 
 SECRET_KEY      = os.getenv("SECRET_KEY",      "leadflow-secret")
 TEAM_PASSWORD   = os.getenv("TEAM_PASSWORD",   "LeadFlow2024")
@@ -145,6 +218,12 @@ NON_ADMIN_DAILY_SCRAPE_CAP = int(os.getenv("NON_ADMIN_DAILY_SCRAPE_CAP", "3"))
 # lead is parked as status='retired' — out of the dialer queue and every
 # recycle path. A number that never picks up in 4 tries is dead or useless;
 # re-dialing it is what rotted the Aug 2026 queue (78% re-dials at 5.5% connect).
+# A claimed conversation with no notes, no qual and a timer under this many
+# seconds is recorded as `unsubstantiated_contact`. 10s: no real "not
+# interested" exchange fits in it, and at 0s the flag catches almost nothing
+# (the timer always ticks at least 1s). Tunable because it depends on whether
+# the team dials inside the modal or logs after the fact.
+UNSUBSTANTIATED_MAX_SEC = int(os.getenv("UNSUBSTANTIATED_MAX_SEC", "10"))
 RETIRE_AFTER_DIALS = int(os.getenv("RETIRE_AFTER_DIALS", "4"))
 
 # Non-admin daily Apollo-pull cap. Apollo burns ~1 credit per qualified contact
@@ -167,10 +246,21 @@ AUTOCOMPLETE_CACHE_TTL_SECONDS = int(os.getenv("AUTOCOMPLETE_CACHE_TTL_SECONDS",
 # fetch ceiling so a runaway query can't hammer a public API or flood the DB.
 # One switch halts all free sources; mirrors PLACES_KILL_SWITCH ergonomics.
 FREE_SOURCES_KILL_SWITCH = os.getenv("FREE_SOURCES_KILL_SWITCH", "0") == "1"
-# Overpass mirrors, tried in order — public instances 504 under load, so we
-# fall through to the next. kumi is usually fastest; .de is the canonical one.
+# Overpass mirrors. Public instances 504 and time out under load — production
+# logged BOTH of the original two failing on the same pull (kumi read-timeout,
+# .de HTTP 504), which returned found=0 and looked exactly like "no leads
+# matched". More mirrors = more chances one is healthy; they are tried in a
+# ROTATING order (see _overpass_order) so a persistently slow instance does not
+# eat the time budget on every single run.
 OVERPASS_MIRRORS = [m.strip() for m in os.getenv("OVERPASS_MIRRORS",
-    "https://overpass.kumi.systems/api/interpreter,https://overpass-api.de/api/interpreter").split(",") if m.strip()]
+    "https://overpass.kumi.systems/api/interpreter,"
+    "https://overpass-api.de/api/interpreter,"
+    "https://overpass.private.coffee/api/interpreter,"
+    "https://overpass.osm.jp/api/interpreter,"
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter").split(",") if m.strip()]
+# Per-request ceiling. The budget below is the real limit; this just stops one
+# hung mirror from blocking longer than any single attempt is ever worth.
+OVERPASS_ATTEMPT_TIMEOUT = int(os.getenv("OVERPASS_ATTEMPT_TIMEOUT", "20"))
 # Public Overpass blocks requests with no User-Agent (returns 406). Identify us.
 OVERPASS_HEADERS = {"User-Agent": "LeadFlow/1.0 (Vision Cleaning lead sourcing)"}
 # NPPES / NPI registry — free US healthcare-provider directory.
@@ -186,7 +276,10 @@ OSM_ENRICH_CAP = int(os.getenv("OSM_ENRICH_CAP", "50"))
 # Wall-clock budgets so a big-state pull (6 Overpass queries + 50 sequential
 # Apollo calls) can't blow the HTTP gateway timeout and hang. Each phase returns
 # whatever it gathered so far — partial coverage beats a dead request.
-OSM_FETCH_BUDGET_SEC  = int(os.getenv("OSM_FETCH_BUDGET_SEC", "35"))
+# 35s was not enough to try even one category against two mirrors at the old
+# 40s-per-attempt timeout, so the budget tripped after the first failure and the
+# rest of the verticals were skipped ("fetch budget hit — stopping at Education").
+OSM_FETCH_BUDGET_SEC  = int(os.getenv("OSM_FETCH_BUDGET_SEC", "90"))
 OSM_ENRICH_BUDGET_SEC = int(os.getenv("OSM_ENRICH_BUDGET_SEC", "40"))
 
 # Google Places pricing (May 2025) — used for usage_events cost tracking
@@ -2701,6 +2794,19 @@ def _bg_maintenance_loop():
             run_weekly_review_scan_if_due()
         except Exception as e:
             print(f"[WEEKLY-SCAN] loop exception: {e}")
+        # Transcription/analysis queue. Drains a few jobs per cycle rather than
+        # everything: this thread also drives digests, refills and the email
+        # sequencer, and a 200-call backlog must not starve them.
+        try:
+            n = run_jobs_once(limit=int(os.getenv("JOBS_PER_CYCLE", "5")))
+            if n:
+                print(f"[JOBS] processed {n} job(s) this cycle")
+        except Exception as e:
+            print(f"[JOBS] loop exception: {e}")
+        try:
+            run_transcription_cost_rollup_if_due()
+        except Exception as e:
+            print(f"[TRANSCRIBE-COST] loop exception: {e}")
         # Monthly macro snapshot — banks one FRED reading per calendar month so a
         # paired macro × receptivity history builds up. No-op once banked.
         try:
@@ -2791,7 +2897,33 @@ def _fetch_all_leads_for_dedupe() -> list:
 
 # Statuses we never auto-delete a duplicate of — the row carries real
 # engagement value (or compliance signal) that mustn't be discarded.
-ENGAGED_STATUSES = {"interested", "interested_no_dm", "converted", "callback", "awaiting_email_reply", "do_not_contact"}
+# Dedup-protection set, NOT an engagement metric: "this row has history worth
+# keeping." Decides which duplicate survives and which are safe to delete.
+# gatekeeper belongs here (a logged contact + a scheduled follow-up) even though
+# it is deliberately excluded from ENGAGED_OUTCOMES below, which IS a metric.
+ENGAGED_STATUSES = {"interested", "interested_no_dm", "gatekeeper", "converted",
+                    "callback", "awaiting_email_reply", "do_not_contact"}
+
+# ── Canonical outcome sets ──────────────────────────────────────────────────
+# "A human picked up." Defined ONCE here because six copies of this literal had
+# drifted apart: two of them (the connectivity heatmap and the best-hour ranker)
+# were silently missing interested_no_dm, so the same calls counted as contact
+# on the leaderboard and as no-contact on the heatmap.
+#
+# not_interested counts: it is only reachable after "Answered" in the two-step
+# flow, so the rep did reach a person.
+#
+# gatekeeper counts too, and is the reason this set changed: a receptionist who
+# says "the manager stepped out, I'll pass your message" IS a pickup. Callers
+# were logging those as no_answer because they hadn't reached the DM, which
+# understated the true reach rate by ~6.5pt over 14k dials AND left the lead
+# with no callback date, so it fell out of the pipeline entirely.
+CONTACT_OUTCOMES = {"answered", "gatekeeper", "interested", "interested_no_dm",
+                    "not_interested", "callback", "converted"}
+# A real positive. gatekeeper is deliberately NOT here — reaching the front desk
+# is contact, not interest, and folding it in would inflate the engagement rate
+# that the receptivity index is built on.
+ENGAGED_OUTCOMES = {"interested", "interested_no_dm", "callback", "converted"}
 
 def find_phone_dupe_groups(leads: list) -> list:
     """Group by exact phone match. For each group, pick the row to keep
@@ -4163,7 +4295,18 @@ OSM_CATEGORY_SELECTORS = {
     "Entertainment": ['["amenity"="theatre"]', '["amenity"="cinema"]', '["amenity"="conference_centre"]',
                       '["amenity"="events_venue"]', '["leisure"="sports_centre"]', '["leisure"="fitness_centre"]',
                       '["leisure"="bowling_alley"]'],
-    "Offices":       ['["office"]'],
+    # 2026-09: ['["office"]'] was a catch-all. office=* includes government,
+    # diplomatic, political_party, religion and charity — public buildings with
+    # in-house custodial staff and switchboards nobody at a desk answers. The
+    # caller's own notes carry "wrong number government building". Curated down
+    # to private, multi-employee tenants that lease space and buy cleaning.
+    "Offices":       ['["office"="company"]', '["office"="coworking"]', '["office"="insurance"]',
+                      '["office"="lawyer"]', '["office"="accountant"]', '["office"="estate_agent"]',
+                      '["office"="financial"]', '["office"="it"]', '["office"="engineer"]',
+                      '["office"="architect"]', '["office"="logistics"]', '["office"="research"]',
+                      '["office"="employment_agency"]', '["office"="advertising_agency"]',
+                      '["office"="property_management"]', '["office"="telecommunication"]',
+                      '["office"="construction_company"]'],
     "Hospitality":   ['["tourism"="hotel"]', '["amenity"="events_venue"]', '["leisure"="resort"]'],
 }
 # Map a category to the industry label stored on the lead (drives fit scoring).
@@ -4171,6 +4314,17 @@ OSM_CATEGORY_INDUSTRY = {
     "Healthcare": "Healthcare", "Education": "Education", "Industrial": "Industrial",
     "Entertainment": "Entertainment", "Offices": "Office", "Hospitality": "Hotel",
 }
+
+_overpass_rotation = {"i": 0}
+
+def _overpass_order():
+    """Mirrors, rotated one step per call. Spreads load and guarantees that a
+    mirror which is slow-but-not-dead cannot be the first attempt every time."""
+    if not OVERPASS_MIRRORS:
+        return []
+    i = _overpass_rotation["i"] % len(OVERPASS_MIRRORS)
+    _overpass_rotation["i"] = (i + 1) % len(OVERPASS_MIRRORS)
+    return OVERPASS_MIRRORS[i:] + OVERPASS_MIRRORS[:i]
 
 def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
     """Query Overpass for businesses by cleaning-vertical. Free, no key. When a
@@ -4205,18 +4359,29 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
     # One Overpass call PER category — a whole-state query across all 6 verticals
     # 504s on big states (TX/CA/GA). Per-category queries are small + reliable;
     # we merge + dedup the elements. Free, so the extra calls cost nothing.
-    def _overpass(ql):
-        # Tight HTTP timeout so a single slow query can't blow past the fetch
-        # budget (which is only checked between categories). A slow mirror is
-        # abandoned fast and we move on — partial coverage beats a hung request.
-        for ep in OVERPASS_MIRRORS:
+    mirror_errors = []
+
+    def _overpass(ql, deadline):
+        # Per-attempt timeout is clamped to the time actually LEFT in the
+        # budget. Previously it was a flat 40s while the budget was 35s and only
+        # checked between categories, so one slow mirror could overrun the whole
+        # budget before the check ever ran.
+        for ep in _overpass_order():
+            left = deadline - time.time()
+            if left <= 2:
+                mirror_errors.append("budget exhausted before all mirrors tried")
+                break
+            host = ep.split("/")[2]
             try:
-                r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS, timeout=40)
+                r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS,
+                                 timeout=min(OVERPASS_ATTEMPT_TIMEOUT, max(3, int(left))))
                 if r.status_code == 200:
                     return r.json().get("elements", [])
-                print(f"[OSM] {ep.split('/')[2]} HTTP {r.status_code} — next mirror")
+                mirror_errors.append(f"{host} HTTP {r.status_code}")
+                print(f"[OSM] {host} HTTP {r.status_code} — next mirror")
             except Exception as e:
-                print(f"[OSM] {ep.split('/')[2]} failed ({e}) — next mirror")
+                mirror_errors.append(f"{host} {type(e).__name__}")
+                print(f"[OSM] {host} failed ({e}) — next mirror")
         return None
 
     seen_ids, elements = set(), []
@@ -4229,8 +4394,9 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
             print(f"[OSM] fetch budget ({OSM_FETCH_BUDGET_SEC}s) hit — stopping at {cat}, partial result")
             break
         body = "\n".join(f"  nwr{sel}(area.a);" for sel in sels)
-        ql = (f"[out:json][timeout:40];\n" + area_def + "\n(" + body + "\n);\nout center 250;")
-        els = _overpass(ql)
+        ql = (f"[out:json][timeout:{OVERPASS_ATTEMPT_TIMEOUT}];\n"
+              + area_def + "\n(" + body + "\n);\nout center 250;")
+        els = _overpass(ql, fetch_deadline)
         if els is None:
             print(f"[OSM] {cat}: all mirrors failed — skipping")
             continue
@@ -4241,11 +4407,25 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
                 elements.append(el)
 
     st_up = state_abbrev.upper()
+    # OSM never deletes a closed business, it re-prefixes the tag —
+    # disused:amenity=clinic, abandoned:office=company, was:shop=*, plus
+    # office=vacant and the explicit closed/demolished lifecycle keys. Those
+    # rows are guaranteed dead numbers, and the "dead" tag is on the element we
+    # already fetched, so filtering them costs nothing and they were previously
+    # ingested as ordinary leads.
+    DEAD_TAG_PREFIXES = ("disused:", "abandoned:", "was:", "removed:", "demolished:", "razed:")
     leads = []
+    skipped_dead = 0
     for el in elements:
         t = el.get("tags", {})
         name = t.get("name", "")
         if not name:
+            continue
+        if (any(k.startswith(DEAD_TAG_PREFIXES) for k in t)
+                or t.get("office") == "vacant"
+                or t.get("disused") == "yes"
+                or (t.get("operational_status") or "").lower() in ("closed", "abandoned")):
+            skipped_dead += 1
             continue
         el_city = t.get("addr:city", "")
         # City-scoped query already limits to the city's boundary, so we DON'T
@@ -4272,6 +4452,15 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
             "state": t.get("addr:state") or state_abbrev.upper(),
             "notes": "Source: OpenStreetMap",
         })
+    if skipped_dead:
+        print(f"[OSM] skipped {skipped_dead} closed/disused features")
+    # A pull that found nothing because every mirror was down must NOT look
+    # identical to a pull that found nothing because nothing matched. The caller
+    # reads this off the returned list, so stash it where source_osm can see it.
+    fetch_osm.last_errors = mirror_errors
+    fetch_osm.last_elements = len(elements)
+    if not elements and mirror_errors:
+        print(f"[OSM] NO DATA — every mirror failed: {'; '.join(mirror_errors[:6])}")
     return leads
 
 # NPPES rejects a state-only query ("requires additional search criteria"), so a
@@ -4283,11 +4472,16 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
 NPI_STATEWIDE_TAXONOMIES = ["Clinic/Center", "Assisted Living", "Dental", "Rehabilitation",
     "Urgent Care", "Surgical", "Dialysis"]
 
-def _npi_query(state_abbrev: str, city: str, taxonomy: str, limit: int) -> list:
+# NPPES caps `skip`; stay under it so a rotating offset can never send an
+# invalid request. 200 is also the hard per-request `limit` on their side.
+NPI_SKIP_CEILING = int(os.getenv("NPI_SKIP_CEILING", "800"))
+
+def _npi_query(state_abbrev: str, city: str, taxonomy: str, limit: int, skip: int = 0) -> list:
     params = {"version": "2.1", "enumeration_type": "NPI-2",
               "state": state_abbrev.upper(), "limit": min(max(limit, 1), 200)}
     if city:     params["city"] = city
     if taxonomy: params["taxonomy_description"] = taxonomy
+    if skip:     params["skip"] = min(max(int(skip), 0), NPI_SKIP_CEILING)
     try:
         r = req_lib.get(NPI_API_URL, params=params, timeout=30)
         if r.status_code != 200:
@@ -4305,21 +4499,77 @@ def fetch_npi(state_abbrev: str, city: str = "", taxonomy: str = "", limit: int 
     if city or taxonomy:
         results = _npi_query(state_abbrev, city, taxonomy, limit)
     else:
+        # 2026-09 fix. This loop used to request 200 rows (the API maximum, and
+        # also FREE_SOURCE_MAX_ROWS) for NPI_STATEWIDE_TAXONOMIES[0] and then
+        # break on the row budget — so a statewide pull only ever queried
+        # "Clinic/Center" and the other six taxonomies were unreachable. With no
+        # skip offset it also re-fetched the SAME 200 records on every run, which
+        # then all deduped away, so a weekly refill added ~nothing.
+        #
+        # Now: split the budget evenly across every taxonomy, and advance a
+        # persisted per-state offset each run so successive pulls go DEEPER
+        # instead of re-reading page one.
+        taxos   = NPI_STATEWIDE_TAXONOMIES
+        per_tax = max(20, FREE_SOURCE_MAX_ROWS // max(1, len(taxos)))
+        okey    = f"npi_skip_{state_abbrev.upper()}"
+        try:
+            skip = int(_settings_get_json(okey) or 0)
+        except Exception:
+            skip = 0
         results, seen = [], set()
-        for tx in NPI_STATEWIDE_TAXONOMIES:
-            for res in _npi_query(state_abbrev, "", tx, 200):
+        def _collect(tx, lim, sk):
+            added = 0
+            for res in _npi_query(state_abbrev, "", tx, lim, skip=sk):
                 npi = res.get("number")
                 if npi and npi not in seen:
                     seen.add(npi)
                     results.append(res)
+                    added += 1
+            return added
+        for tx in taxos:
+            _collect(tx, per_tax, skip)
             if len(results) >= FREE_SOURCE_MAX_ROWS:
                 break
+        # SELF-HEAL. After the first run `skip` is always > 0, and _npi_query
+        # swallows errors and returns []. So if NPPES ever rejects or ignores
+        # `skip`, or a small state's offset simply runs past the end of the
+        # result set, EVERY later pull would come back empty and silent — the
+        # deep-paging fix would have turned a partly-working source into a dead
+        # one. A zero-row pass at a non-zero offset therefore rewinds to page one
+        # and resets the stored offset, so the source can never get stuck.
+        if skip and not results:
+            print(f"[NPI] 0 rows at skip={skip} for {state_abbrev.upper()} — "
+                  f"rewinding to page 1 (offset past end, or skip unsupported)")
+            for tx in taxos:
+                _collect(tx, per_tax, 0)
+                if len(results) >= FREE_SOURCE_MAX_ROWS:
+                    break
+            skip = 0
+        # Small states exhaust a taxonomy before per_tax is filled. One top-up
+        # pass spends the leftover budget rather than returning a short page.
+        if len(results) < FREE_SOURCE_MAX_ROWS:
+            for tx in taxos:
+                room = FREE_SOURCE_MAX_ROWS - len(results)
+                if room <= 0:
+                    break
+                _collect(tx, min(room, 200), skip + per_tax)
+        try:
+            _settings_set_json(okey, (skip + per_tax) % max(per_tax, NPI_SKIP_CEILING))
+        except Exception as e:
+            print(f"[NPI] skip-offset persist failed (harmless, next run repeats page): {e}")
 
     leads = []
     for res in results:
         basic = res.get("basic", {})
         name = basic.get("organization_name") or basic.get("name") or ""
         if not name:
+            continue
+        # NPPES marks a deactivated (surrendered / closed) provider with a status
+        # other than "A". Those numbers are dead by definition. Deliberately
+        # fails OPEN: an absent or renamed field keeps the lead rather than
+        # silently emptying the pull.
+        st_flag = (basic.get("status") or "").strip().upper()
+        if st_flag and st_flag != "A":
             continue
         # Prefer the LOCATION address (not mailing). NPPES marks it purpose=LOCATION.
         addrs = res.get("addresses", []) or []
@@ -4343,6 +4593,7 @@ class FreeSourceRequest(BaseModel):
     categories: Optional[object] = None   # OSM only: list of vertical names
     taxonomy:   Optional[str] = ""        # NPI only: e.g. "Nursing", "Dentist"
     limit:      Optional[int] = 200
+    days:       Optional[int] = 30        # permits only: recency floor on the permit date
     enrich:     Optional[bool] = False    # OSM only: Apollo-enrich phoneless leads (admin)
     restaurants: Optional[bool] = False   # health only: ALSO pull restaurant inspections (low-budget)
 
@@ -4367,8 +4618,11 @@ def source_osm(body: FreeSourceRequest, user: str = Depends(verify_token)):
            else list(OSM_CATEGORY_SELECTORS.keys())
     cities = [c.strip() for c in (body.cities or "").split(",") if c.strip()] or [""]
     all_raw = []
+    mirror_errors, elements_seen = [], 0
     for city in cities:
         all_raw += fetch_osm(body.state, cats, city)
+        mirror_errors += getattr(fetch_osm, "last_errors", []) or []
+        elements_seen += getattr(fetch_osm, "last_elements", 0) or 0
 
     # OSM is phone-sparse. Optionally Apollo-enrich the phoneless rows (up to a
     # cap) so the wide net becomes callable instead of getting dropped. Admin
@@ -4388,8 +4642,20 @@ def source_osm(body: FreeSourceRequest, user: str = Depends(verify_token)):
     audit_log(user, "source_osm", "lead", None,
               {"state": body.state, "categories": cats, "enriched": enriched, **res})
     enrich_note = f" · {enriched} Apollo-enriched" if enriched else ""
-    res["summary"] = (f"OSM: {res['found']} found · {res['alreadyInDb']} already in DB · "
-                      f"{res['droppedUncallable']} uncallable{enrich_note} · {res['saved']} new saved")
+    res["mirrorErrors"] = mirror_errors[:8]
+    # Zero elements + every mirror erroring is an OUTAGE, not an empty result
+    # set. These looked the same before ("found=0 saved=0", HTTP 200), so a week
+    # of dead Overpass mirrors read as "OSM just has no leads for us".
+    res["sourceUnavailable"] = bool(elements_seen == 0 and mirror_errors)
+    if res["sourceUnavailable"]:
+        res["summary"] = ("⚠️ OSM unavailable — every Overpass mirror failed, so this is a "
+                          "SOURCE OUTAGE, not an empty result. Nothing was saved. Tried: "
+                          + "; ".join(mirror_errors[:4])
+                          + ". Retry later, or set OVERPASS_MIRRORS to a working instance.")
+    else:
+        res["summary"] = (f"OSM: {res['found']} found · {res['alreadyInDb']} already in DB · "
+                          f"{res['droppedUncallable']} uncallable{enrich_note} · {res['saved']} new saved"
+                          + (f" · {len(mirror_errors)} mirror error(s) — partial coverage" if mirror_errors else ""))
     return res
 
 @app.post("/api/sources/npi")
@@ -4526,7 +4792,13 @@ def _detect_permit_fields(k: list) -> dict:
 def fetch_permits(state_abbrev: str, days: int = 30) -> list:
     """Pull recent commercial permits for every configured metro in a state.
     Heuristically maps each dataset's schema. Returns raw lead dicts tagged
-    [INTENT:newbuild]. Free, no key. (days kept for signature compat.)"""
+    [INTENT:newbuild]. Free, no key.
+
+    `days` is a real recency floor. It used to be accepted and then ignored, so a
+    portal that had not refreshed in two years handed us permits for buildings
+    that are long finished and already under a cleaning contract — the worst
+    possible newbuild lead. Dropped automatically for datasets that store the
+    date as text (the request 400s and we retry without the filter)."""
     sources = [s for s in SOCRATA_PERMIT_SOURCES if s[0] == state_abbrev.upper()]
     leads = []
     for st, name, domain, rid in sources:
@@ -4546,10 +4818,24 @@ def fetch_permits(state_abbrev: str, days: int = 30) -> list:
             print(f"[PERMITS] {name}: sample failed {e}")
             continue
         params = {"$limit": FREE_SOURCE_MAX_ROWS}
-        if f["date"]:
-            params["$order"] = f"{f['date']} DESC"   # newest first
+        # _pick_field returns a LIST of candidate column names (Socrata omits
+        # null fields per row, so the mapper tries each). $order/$where need ONE
+        # real column: previously this interpolated the whole list and sent
+        # "['issue_date'] DESC", which Socrata 400s — so EVERY permit pull fell
+        # through to the unordered retry below and we were reading the dataset in
+        # arbitrary order, not newest-first. Candidates come from the sampled
+        # rows, so [0] is a column that actually exists.
+        date_col = f["date"][0] if f["date"] else ""
+        if date_col:
+            params["$order"] = f"{date_col} DESC"   # newest first
+            cutoff = (datetime.utcnow() - timedelta(days=max(1, int(days or 30)))).strftime("%Y-%m-%dT00:00:00")
+            params["$where"] = f"{date_col} >= '{cutoff}'"
         try:
             r = req_lib.get(base, params=params, headers=hdr, timeout=45)
+            if r.status_code != 200 and "$where" in params:  # date stored as text → drop the floor
+                print(f"[PERMITS] {name}: date filter rejected (HTTP {r.status_code}) — retrying unfiltered")
+                r = req_lib.get(base, params={k: v for k, v in params.items() if k != "$where"},
+                                headers=hdr, timeout=45)
             if r.status_code != 200 and "$order" in params:  # bad date type → retry unordered
                 r = req_lib.get(base, params={"$limit": FREE_SOURCE_MAX_ROWS}, headers=hdr, timeout=45)
             rows = r.json() if r.status_code == 200 else []
@@ -4595,7 +4881,7 @@ def source_permits(body: FreeSourceRequest, user: str = Depends(verify_token)):
         return {"found": 0, "saved": 0, "alreadyInDb": 0, "droppedUncallable": 0,
                 "summary": f"No permit feed configured for {body.state} yet. Covered states: "
                            f"{', '.join(sorted(configured))}. (Permit portals are per-metro; ask to add yours.)"}
-    raw = fetch_permits(body.state, body.limit if (body.limit and body.limit < 121) else 30)
+    raw = fetch_permits(body.state, body.days or 30)
     res = ingest_leads(raw, "Permit (new construction)", user)
     audit_log(user, "source_permits", "lead", None, {"state": body.state, **res})
     res["summary"] = (f"Permits: {res['found']} commercial builds found · {res['alreadyInDb']} already in DB · "
@@ -5093,6 +5379,19 @@ COMPLAINT_CALL_GUIDANCE = (
     "a walkthrough."
 )
 
+# Only spend a Google call on a lead that can actually REACH the complaint rung.
+# Day Plan rung 4 (dayPlanRungs() in App.jsx) requires status new/no_answer/called
+# and fewer than 4 dials, so scanning a converted customer, a retired lead, a
+# do_not_contact row or a phoneless row costs ~$0.05 and can never surface. Keep
+# these in step with that filter.
+COMPLAINT_RUNG_STATUSES  = {"", "new", "no_answer", "called"}
+COMPLAINT_RUNG_MAX_CALLS = 4
+# A cleanliness complaint is only intent while it is recent. Google returns at
+# most 5 reviews, so "the most recent complaint" can easily be years old — and a
+# 2023 gripe opens the call cold and burns the lead. Fails OPEN when Google gives
+# no timestamp (age_days=None) rather than silently dropping the hit.
+COMPLAINT_MAX_AGE_DAYS = int(os.getenv("COMPLAINT_MAX_AGE_DAYS", "540"))
+
 class ReviewScanRequest(BaseModel):
     state:      Optional[str] = ""
     cities:     Optional[str] = ""
@@ -5119,8 +5418,9 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
     # response near 1000 rows, so a client-side filter over "newest 1000" would
     # miss older target leads (e.g. gyms pulled before today's healthcare sweep).
     params = {
-        "select": "id,company,city,state,notes,score,phone,firstName,email,industry,title",
+        "select": "id,company,city,state,notes,score,phone,firstName,email,industry,title,status,total_calls",
         "company": "not.is.null",
+        "phone": "neq.",
         "order": "createdAt.desc",
         "limit": str(scan_n * (40 if want_inds else 3)),
     }
@@ -5137,12 +5437,20 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
         raise HTTPException(status_code=502, detail=f"Lead fetch failed: {e}")
 
     flagged, scanned, samples = 0, 0, []
+    skipped_ineligible = skipped_stale = 0
     for lead in candidates:
         if scanned >= scan_n:
             break
         if "[INTENT:cleanliness]" in (lead.get("notes") or ""):
             continue
         if is_complaint_excluded_vertical(lead):   # hospitals: never scanned, never reported
+            continue
+        # Cheap eligibility checks first — every one of these saves ~$0.05.
+        if (lead.get("status") or "") not in COMPLAINT_RUNG_STATUSES:
+            skipped_ineligible += 1
+            continue
+        if (lead.get("total_calls") or 0) >= COMPLAINT_RUNG_MAX_CALLS:
+            skipped_ineligible += 1
             continue
         if want_inds:
             ind = (lead.get("industry") or "").lower()
@@ -5160,6 +5468,9 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
         reviews, rating, _ = google_place_reviews(pid)
         hit, snippet, age_days, rel = scan_cleanliness(reviews)
         if not hit:
+            continue
+        if age_days is not None and age_days > COMPLAINT_MAX_AGE_DAYS:
+            skipped_stale += 1
             continue
         # Stamp a parseable age token so score_lead can decay older complaints.
         age_tag = f" [clnage:{age_days}]" if age_days is not None else ""
@@ -5189,7 +5500,15 @@ def enrich_reviews(body: ReviewScanRequest, user: str = Depends(verify_admin)):
                    fields=[{"label": f"{s['company']} · {s['posted']}", "value": s["snippet"]} for s in samples[:5]]
                           + [{"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
     return {"scanned": scanned, "flagged": flagged,
-            "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (freshest = hottest)",
+            # Observability on the two new gates: ineligible rows are Google
+            # calls NOT spent, stale hits are cold opens NOT put in front of the
+            # caller. Both used to be invisible.
+            "skipped_ineligible": skipped_ineligible,
+            "skipped_stale_complaint": skipped_stale,
+            "max_complaint_age_days": COMPLAINT_MAX_AGE_DAYS,
+            "summary": f"Scanned {scanned} leads · {flagged} have cleanliness complaints (freshest = hottest)"
+                       + (f" · skipped {skipped_ineligible} ineligible (saved ~${skipped_ineligible*0.05:.2f})" if skipped_ineligible else "")
+                       + (f" · dropped {skipped_stale} stale (>{COMPLAINT_MAX_AGE_DAYS}d)" if skipped_stale else ""),
             "samples": samples}
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -5489,15 +5808,31 @@ def _paginated_get(url: str, headers: dict = None, page_size: int = 1000, max_pa
         end   = start + page_size - 1
         try:
             r = req_lib.get(url, headers={**base_headers, "Range": f"{start}-{end}"}, timeout=30)
-            batch = r.json() if r.status_code in (200, 206) else []
+            # A mid-walk error truncates the result, and a truncated list is
+            # INDISTINGUISHABLE from "end of data" to every caller — so stats,
+            # analytics and lead lists would quietly under-report instead of
+            # failing. Retries (see req_lib) now absorb the transient cases;
+            # anything that still gets here is logged loudly with the page
+            # offset and the body so it is diagnosable from the Railway logs
+            # rather than showing up as a number that is merely too low.
+            if r.status_code not in (200, 206):
+                print(f"[PAGINATED-GET] TRUNCATED at rows {start}-{end}: HTTP "
+                      f"{r.status_code} {r.text[:200]} — returning {len(rows)} partial rows "
+                      f"for {url.split('?')[0]}")
+                break
+            batch = r.json()
             if not isinstance(batch, list) or len(batch) == 0:
                 break
             rows.extend(batch)
             if len(batch) < page_size:
                 break
         except Exception as e:
-            print(f"[PAGINATED-GET] page {page} failed: {e}")
+            print(f"[PAGINATED-GET] TRUNCATED at rows {start}-{end}: {type(e).__name__}: {e} "
+                  f"— returning {len(rows)} partial rows for {url.split('?')[0]}")
             break
+    else:
+        print(f"[PAGINATED-GET] hit the {max_pages}-page ceiling ({len(rows)} rows) — "
+              f"result may be incomplete for {url.split('?')[0]}")
     return rows
 
 @app.get("/api/leads/lookup")
@@ -6055,6 +6390,13 @@ def _twilio_sig_ok(request: Request, form) -> bool:
     mac = _b64.b64encode(_hmac.new(token.encode(), data.encode(), _hashlib.sha1).digest()).decode()
     return _hmac.compare_digest(mac, request.headers.get("X-Twilio-Signature", ""))
 
+def _xml_escape(t: str) -> str:
+    """Escape operator-supplied text before it goes into TwiML. An ampersand in
+    something like RECORDING_ANNOUNCEMENT would otherwise produce invalid XML
+    and Twilio would drop the whole verb."""
+    return (str(t or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
 def _twiml(body: str):
     return HTMLResponse(f'<?xml version="1.0" encoding="UTF-8"?><Response>{body}</Response>',
                         media_type="application/xml")
@@ -6162,9 +6504,10 @@ async def twilio_transcription(request: Request):
 # ── Twilio click-to-call + recording + Claude call coach ─────────────────────
 # POST /api/call/start bridges: Twilio rings the CALLER's phone first, then
 # dials the lead with a market-matched local caller ID (TWILIO_NUMBERS).
-# Recording only when the lead's state is one-party-consent (RECORD_STATES);
-# recordings flow → Voice Intelligence transcription (TWILIO_INTELLIGENCE_SID)
-# → audit_log 'call_transcript' rows → weekly Claude coaching report.
+# Recording everywhere except all-party-consent states (RECORD_EXCLUDE_STATES);
+# recordings flow into LeadFlow's OWN pipeline (recording-status → jobs queue →
+# Deepgram → Claude) — see "Owned call transcription" below. Twilio
+# Conversational Intelligence has been removed.
 # TWILIO_NUMBERS format: "+17025550100:NV,+16145550100:OH,+18165550100:MO"
 # (first entry is the default caller ID for unmatched states).
 TWILIO_NUMBERS_RAW = os.getenv("TWILIO_NUMBERS", "")
@@ -6176,13 +6519,73 @@ def _twilio_numbers():
         num, _, st = part.partition(":")
         out.append((num.strip(), st.strip().upper()))
     return out
-# One-party-consent states (conservative list) — recording is silently skipped
-# for leads anywhere else. Override with RECORD_STATES env if your counsel
-# says otherwise.
-RECORD_STATES = set(s.strip().upper() for s in os.getenv("RECORD_STATES",
-    "NV,OH,MO,KS,ID,NC,TN,AL,GA,NY,NJ,TX,AZ,CO,VA,SC,LA,OK,IA,IN,KY,ME,MN,MS,ND,NE,NM,SD,UT,WI,WY,AR,HI,RI,DC,WV,AK"
-    ).split(",") if s.strip())
-TWILIO_INTELLIGENCE_SID = os.getenv("TWILIO_INTELLIGENCE_SID", "")
+# ── Recording eligibility: DENY-list, not allow-list ────────────────────────
+# Was an allow-list of 37 states, which silently dropped recording for any
+# state not enumerated (a typo or a new market = no recording, no signal).
+# Now: record everywhere EXCEPT states that require all-party consent for a
+# TELEPHONE call, with the spoken notice always playing when we record.
+#
+# ⚠️ NEVADA IS ON THIS LIST AND NEVADA IS A PRIMARY MARKET (the 702 number in
+# TWILIO_NUMBERS). NRS 200.620 requires the consent of all parties to record a
+# telephone call, and the Nevada Supreme Court read it that way in Lane v.
+# Allstate — so NV is conventionally grouped with CA/FL/WA, not with OH/MO.
+# The previous allow-list had NV as recordable, which is the opposite call.
+# This is a question for counsel, not for this file: the spoken notice may well
+# satisfy all-party consent (notice + continuing the call), and if counsel says
+# it does, drop NV from RECORD_EXCLUDE_STATES via env and nothing else changes.
+# Until then NV calls record no audio — and with no NV audio there are no NV
+# transcripts, so transcription coverage will read low for the biggest market.
+#
+# Not on the list, deliberately: OREGON (ORS 165.540 is all-party for in-person
+# conversations but ONE-party for telephone) and VERMONT (no statute).
+RECORD_EXCLUDE_STATES = set(s.strip().upper() for s in os.getenv(
+    "RECORD_EXCLUDE_STATES",
+    "CA,CT,DE,FL,IL,MD,MA,MI,MT,NV,NH,PA,WA").split(",") if s.strip())
+
+# Spoken notice played to the PROSPECT (not the caller) the moment they answer,
+# before the two legs are bridged, whenever the call is being recorded. Short on
+# purpose: this lands in the first seconds of a cold call, and a long
+# disclaimer kills the opener.
+# "is being recorded", not "may be". The notice only ever plays when we ARE
+# recording, and since notice-plus-continuing is now the consent basis in
+# all-party states, hedging with "may be" weakens the very thing it exists to
+# establish. Unambiguous notice is the point.
+RECORDING_ANNOUNCEMENT = os.getenv("RECORDING_ANNOUNCEMENT",
+    "This call is being recorded for quality and training purposes.")
+# ON as of 2026-09, by explicit owner decision, reaffirmed: the prospect hears
+# an unambiguous notice before any conversation happens and can decline by
+# hanging up, which is the standard implied-consent basis for recording into
+# all-party-consent states. RECORD_EXCLUDE_STATES is kept as the lever for
+# carving a state back out if that ever changes.
+#
+# THE INVARIANT THIS RELIES ON: we never record without delivering the notice.
+# See _should_record — an empty RECORDING_ANNOUNCEMENT disables recording
+# entirely rather than recording silently. Consent-by-notice with no notice is
+# just recording without consent, and a blanked-out env var must not be able to
+# produce that quietly.
+RECORD_ALL_STATES_WITH_NOTICE = os.getenv("RECORD_ALL_STATES_WITH_NOTICE", "1") == "1"
+
+def _should_record(state_abbrev: str) -> bool:
+    """Whether to record a call to a lead in this state.
+
+    Order matters:
+      1. No notice text  -> NEVER record, anywhere. The consent basis is the
+         spoken notice; without it there is nothing to consent to. This makes a
+         blanked-out RECORDING_ANNOUNCEMENT fail safe instead of silently
+         recording every call with no disclosure.
+      2. RECORD_ALL_STATES_WITH_NOTICE (default on) -> record everywhere,
+         including all-party-consent states, on the implied-consent basis that
+         the prospect hears the notice before the conversation and may hang up.
+      3. Otherwise -> deny-list: record unless the state requires all-party
+         consent, and not at all for an unidentifiable state."""
+    if not (RECORDING_ANNOUNCEMENT or "").strip():
+        return False
+    st = (state_abbrev or "").strip().upper()
+    if RECORD_ALL_STATES_WITH_NOTICE:
+        return True
+    if len(st) != 2:
+        return False
+    return st not in RECORD_EXCLUDE_STATES
 
 def _twilio_ready():
     return bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN")
@@ -6198,8 +6601,11 @@ def _e164(num: str) -> str:
 def call_config(user: str = Depends(verify_token)):
     return {"ready": _twilio_ready(),
             "numbers": [{"number": n, "state": st} for n, st in _twilio_numbers()],
-            "recording_states": sorted(RECORD_STATES) if _twilio_ready() else [],
-            "transcription": bool(TWILIO_INTELLIGENCE_SID)}
+            "recording_excluded_states": ([] if RECORD_ALL_STATES_WITH_NOTICE
+                                          else sorted(RECORD_EXCLUDE_STATES)),
+            "recording_all_states": RECORD_ALL_STATES_WITH_NOTICE,
+            "recording_notice": RECORDING_ANNOUNCEMENT,
+            "transcription": bool(DEEPGRAM_API_KEY and TRANSCRIBE_ENABLED)}
 
 @app.post("/api/call/start")
 def call_start(body: dict, user: str = Depends(verify_token)):
@@ -6221,7 +6627,7 @@ def call_start(body: dict, user: str = Depends(verify_token)):
     from_num = next((n for n, ns in nums if ns == st), nums[0][0])
     to_num = _e164(lead["phone"])
     caller_phone = _e164(os.getenv("CALLER_PHONE") or INBOUND_FORWARD_NUMBER)
-    record = st in RECORD_STATES
+    record = _should_record(st)
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
     twiml_url = (f"{app_url}/twilio/bridge?to={url_quote(to_num, safe='')}"
                  f"&lead_id={url_quote(str(lead_id), safe='')}&rec={'1' if record else '0'}"
@@ -6250,10 +6656,153 @@ async def twilio_bridge(request: Request, to: str = "", lead_id: str = "", rec: 
     if not _twilio_sig_ok(request, form):
         raise HTTPException(status_code=403, detail="Bad Twilio signature")
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
-    rec_attrs = (f' record="record-from-answer-dual" '
-                 f'recordingStatusCallback="{app_url}/twilio/recording-status?lead_id={url_quote(str(lead_id), safe="")}"'
+    rec_attrs = (f' record="record-from-answer-dual"'
+                 f' recordingStatusCallback="{app_url}/twilio/recording-status?lead_id={url_quote(str(lead_id), safe="")}"'
+                 f' recordingStatusCallbackEvent="completed"'
+                 f' recordingStatusCallbackMethod="POST"'
                  if rec == "1" else "")
-    return _twiml(f'<Dial callerId="{cid}"{rec_attrs} timeout="25"><Number>{to}</Number></Dial>')
+    # `action` fires when the dialed leg ends — for EVERY call, recorded or not,
+    # in every state, because it is pure metadata (how long, not what was said).
+    # DialCallDuration is the LEAD leg, i.e. actual conversation length; the
+    # parent call's CallDuration would also include the ring time while the
+    # lead's phone was still ringing.
+    action = (f' action="{app_url}/twilio/dial-status?lead_id={url_quote(str(lead_id), safe="")}"'
+              f' method="POST"')
+    # The notice rides on <Number url>, so it plays to the PROSPECT only, and
+    # only when we are actually recording — announcing a recording we are not
+    # making would be both pointless and off-putting on a cold open.
+    num_attrs = f' url="{app_url}/twilio/announce" method="POST"' if rec == "1" else ""
+    # AMD belongs on the PROSPECT's leg. Putting machineDetection on the REST
+    # call (as the spec's table suggests) would run it against CALLER_PHONE —
+    # our own rep's handset — because /api/call/start rings the rep first and
+    # bridges from here. asyncAmd so detection never delays the connect.
+    if TWILIO_AMD_ENABLED:
+        num_attrs += (f' machineDetection="Enable" amdStatusCallback='
+                      f'"{app_url}/twilio/amd-status?lead_id={url_quote(str(lead_id), safe="")}"'
+                      f' amdStatusCallbackMethod="POST"')
+    return _twiml(f'<Dial callerId="{cid}"{rec_attrs}{action} timeout="25">'
+                  f'<Number{num_attrs}>{to}</Number></Dial>')
+
+# Carrier-true talk time, keyed by lead, written by the Twilio <Dial action>.
+# Kept in app_settings (no DDL, same pattern as appt_*) because the webhook and
+# the caller's modal race: she usually hangs up and THEN logs, but she can also
+# save while still connected.
+TWILIO_DUR_TTL_MIN = int(os.getenv("TWILIO_DUR_TTL_MIN", "20"))
+# AMD (answering-machine detection) on the prospect's leg. Off by default: it
+# adds a Twilio per-call charge and the transcription gate is designed to fail
+# open without it (the duration floor does the real cost protection), so this is
+# an accuracy upgrade to switch on deliberately, not a dependency.
+TWILIO_AMD_ENABLED = os.getenv("TWILIO_AMD_ENABLED", "0") == "1"
+
+def _twilio_dur_key(lead_id) -> str:
+    return f"twilio_dur_{lead_id}"
+
+def take_twilio_duration(lead_id):
+    """Consume a carrier-reported duration for this lead, if one landed recently.
+    Returns seconds or None. Consuming it prevents one real call's duration from
+    being reused by the next log on the same lead."""
+    if not lead_id:
+        return None
+    try:
+        rec = _settings_get_json(_twilio_dur_key(lead_id))
+        if not isinstance(rec, dict):
+            return None
+        ts = _parse_iso(rec.get("at") or "")
+        if not ts or (datetime.utcnow() - ts) > timedelta(minutes=TWILIO_DUR_TTL_MIN):
+            return None
+        secs = int(rec.get("seconds") or 0)
+        if secs <= 0:
+            return None
+        _settings_set_json(_twilio_dur_key(lead_id), {})   # consume
+        return secs
+    except Exception as e:
+        print(f"[TWILIO-DUR] read failed for lead {lead_id}: {e}")
+        return None
+
+@app.post("/twilio/announce")
+async def twilio_announce(request: Request):
+    """TwiML run on the PROSPECT's leg after they answer and before the two legs
+    are bridged (the `url` attribute on <Number>). It has to be their leg —
+    a <Say> before <Dial> would only be heard by our own caller, who already
+    knows.
+
+    Note on what this does and does not achieve: recording starts when the
+    prospect answers, so the notice itself is captured (useful — it evidences
+    that notice was given), but their "hello" precedes it. Whether that is
+    sufficient consent in an all-party-consent state is a question for counsel,
+    which is why RECORD_ALL_STATES_WITH_NOTICE defaults to off."""
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    notice = _xml_escape(RECORDING_ANNOUNCEMENT)
+    return _twiml(f'<Say voice="Polly.Joanna">{notice}</Say><Pause length="1"/>')
+
+@app.post("/twilio/dial-status")
+async def twilio_dial_status(request: Request, lead_id: str = ""):
+    """Twilio <Dial action>. DialCallDuration is the carrier's measurement of the
+    conversation with the lead — the only trustworthy talk time we can get.
+    `call_outcomes.duration` otherwise holds MODAL-OPEN time, which reads ~2s for
+    anyone who dials elsewhere and logs afterwards, and is therefore useless as
+    an integrity signal.
+
+    Returns empty TwiML: the conversation is over, so the parent call ends."""
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    status = (form.get("DialCallStatus") or "").lower()
+    try:
+        secs = int(form.get("DialCallDuration") or 0)
+    except ValueError:
+        secs = 0
+    audit_log("twilio", "call_duration", "lead", lead_id or None,
+              {"dial_status": status, "seconds": secs,
+               "dial_call_sid": form.get("DialCallSid") or "",
+               "call_sid": form.get("CallSid") or ""})
+    if lead_id and status == "completed" and secs > 0:
+        # Path A — she already logged the call (saved while connected): correct
+        # the row in place. Path B — she has not logged yet (the common case):
+        # park it for log_call to consume.
+        patched = False
+        try:
+            since = (datetime.utcnow() - timedelta(minutes=TWILIO_DUR_TTL_MIN)).isoformat()
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                f"?leadId=eq.{url_quote(str(lead_id), safe='')}&calledAt=gte.{since}"
+                f"&select=id,duration,follow_up_outcome&order=calledAt.desc&limit=1",
+                headers=SB_HEADERS, timeout=10)
+            rows = r.json() if r.status_code == 200 else []
+            if isinstance(rows, list) and rows:
+                row = rows[0]
+                fo = (row.get("follow_up_outcome") or "")
+                if "twilio_verified" not in fo:
+                    # Reconcile the flag too. The row was flagged against MODAL
+                    # time; if the carrier says the conversation really lasted
+                    # longer than the threshold, the row is substantiated after
+                    # all and must not keep accusing the caller.
+                    toks = [t for t in fo.split(",") if t]
+                    if secs > UNSUBSTANTIATED_MAX_SEC and "unsubstantiated_contact" in toks:
+                        toks = [t for t in toks if t != "unsubstantiated_contact"]
+                        print(f"[TWILIO-DUR] lead {lead_id}: clearing "
+                              f"unsubstantiated_contact — carrier says {secs}s")
+                    toks.append("twilio_verified")
+                    req_lib.patch(
+                        f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{row['id']}",
+                        headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                        json={"duration": secs, "follow_up_outcome": ",".join(toks)},
+                        timeout=10)
+                    patched = True
+                    print(f"[TWILIO-DUR] lead {lead_id}: corrected call {row['id']} "
+                          f"{row.get('duration')}s -> {secs}s (carrier)")
+        except Exception as e:
+            print(f"[TWILIO-DUR] patch attempt failed for lead {lead_id}: {e}")
+        if not patched:
+            try:
+                _settings_set_json(_twilio_dur_key(lead_id),
+                                   {"seconds": secs, "at": datetime.utcnow().isoformat(),
+                                    "call_sid": form.get("CallSid") or ""})
+            except Exception as e:
+                print(f"[TWILIO-DUR] park failed for lead {lead_id}: {e}")
+    return _twiml("")
 
 @app.post("/twilio/recording-status")
 async def twilio_recording_status(request: Request, lead_id: str = ""):
@@ -6264,55 +6813,1096 @@ async def twilio_recording_status(request: Request, lead_id: str = ""):
     rec_sid = form.get("RecordingSid") or ""
     call_sid = form.get("CallSid") or ""
     dur = form.get("RecordingDuration") or "0"
+    # Twilio can send in-progress/absent events; only the terminal one carries a
+    # usable duration and a fetchable recording.
+    rec_status = (form.get("RecordingStatus") or "completed").strip().lower()
+    if rec_status != "completed":
+        print(f"[TRANSCRIBE] ignoring RecordingStatus={rec_status} for {rec_sid}")
+        return {"ok": True, "ignored": rec_status}
     audit_log("twilio", "call_recording", "lead", lead_id or None,
               {"recording_url": rec_url, "recording_sid": rec_sid, "call_sid": call_sid, "duration": dur})
-    # Kick Voice Intelligence transcription when configured
-    if TWILIO_INTELLIGENCE_SID and rec_sid and int(dur or 0) >= 20:
-        try:
-            ir = req_lib.post(
-                "https://intelligence.twilio.com/v2/Transcripts",
-                auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")),
-                data={"ServiceSid": TWILIO_INTELLIGENCE_SID,
-                      "Channel": json_lib.dumps({"media_properties": {"source_sid": rec_sid}})},
-                timeout=15)
-            print(f"[INTEL] transcript requested for {rec_sid}: HTTP {ir.status_code}")
-        except Exception as e:
-            print(f"[INTEL] transcript request failed: {e}")
+    # Recording metadata only. Transcription is owned by LeadFlow now
+    # (Deepgram → Claude, see the transcription pipeline below); Twilio
+    # Conversational Intelligence has been removed.
+    try:
+        dur_s = int(float(dur or 0))
+    except (TypeError, ValueError):
+        dur_s = 0
+    _on_recording_completed(form, lead_id, rec_sid, dur_s)
     return {"ok": True}
 
-@app.post("/twilio/intelligence")
-async def twilio_intelligence_webhook(request: Request):
-    """Voice Intelligence completion webhook (set on the Intelligence Service):
-    fetch sentences, store the full transcript for the Claude coach."""
+# ════════════════════════════════════════════════════════════════════════════
+# OWNED CALL TRANSCRIPTION + CALL INTELLIGENCE  (Twilio → Deepgram → Claude)
+# ════════════════════════════════════════════════════════════════════════════
+# LeadFlow owns this pipeline end to end; Twilio Conversational Intelligence is
+# gone. Flow:
+#
+#   Twilio call ends
+#     └─ POST /twilio/recording-status  (signature-validated, returns fast)
+#          └─ record metadata on call_outcomes, enqueue transcribe_call
+#               └─ worker: gate → download wav → Deepgram → call_transcripts
+#                    └─ worker: Claude → call_analyses → disposition/flags/DNC
+#
+# Both workers run on the existing _bg_maintenance_loop thread via a `jobs`
+# table (migration 008) — no new infra, per spec.
+#
+# COST GATING is the whole design. At ~175 dials/day only the 15-25% that reach
+# a human are worth transcribing, so the gate drops everything else BEFORE a
+# byte of audio is fetched, and every drop records why (so a broken gate is
+# visible as a shifted skip distribution rather than a surprise invoice).
+DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL        = os.getenv("DEEPGRAM_MODEL", "nova-3")
+DEEPGRAM_RATE_PER_MIN = float(os.getenv("DEEPGRAM_RATE_PER_MIN", "0.0077"))  # cost tracking only
+# Haiku-class per the spec: this is high-volume single-pass extraction, not
+# synthesis. INSIGHTS_MODEL stays on the weekly aggregate.
+ANALYSIS_MODEL        = os.getenv("ANALYSIS_MODEL", "claude-haiku-4-5")
+TRANSCRIBE_MIN_SEC    = int(os.getenv("TRANSCRIBE_MIN_SEC", "45"))
+TRANSCRIBE_ENABLED    = os.getenv("TRANSCRIBE_ENABLED", "0") == "1"   # off until 008 has run
+ANALYZE_ENABLED       = os.getenv("ANALYZE_ENABLED", "0") == "1"
+TRANSCRIBE_DAILY_COST_ALERT = float(os.getenv("TRANSCRIBE_DAILY_COST_ALERT", "5"))
+TRANSCRIBE_DAILY_COUNT_ALERT = int(os.getenv("TRANSCRIBE_DAILY_COUNT_ALERT", "60"))
+# Which Deepgram channel is our caller. record-from-answer-dual puts the parent
+# leg (the rep, whose phone Twilio rings first) on Twilio channel 1, which is
+# Deepgram's 0-indexed channel 0. Flip via env after checking the first real
+# recording rather than editing code — the spec lists this as a verify-once.
+DEEPGRAM_AGENT_CHANNEL = int(os.getenv("DEEPGRAM_AGENT_CHANNEL", "0"))
+
+# Twilio AMD values that mean "no human on the line".
+_AMD_MACHINE = {"machine_start", "machine_end_beep", "machine_end_silence",
+                "machine_end_other", "fax"}
+# Caller-logged outcomes that mean the same thing.
+_NO_HUMAN_OUTCOMES = {"voicemail", "no_answer", "busy"}
+# Keep in step with the DB comment in migration 008 and the analysis schema.
+CALL_DISPOSITIONS = ["appointment_set", "interested_callback", "send_info",
+                     "not_interested", "wrong_number", "gatekeeper_blocked",
+                     "already_has_vendor", "dnc", "voicemail",
+                     "no_decision_maker", "other"]
+QA_FLAGS = ["no_close_attempt", "dnc_request", "profanity", "misrepresentation",
+            "talked_over_prospect", "hot_lead",
+            # Added 2026-09: the "she had an opening and didn't take it" case.
+            # Distinct from no_close_attempt — that one means she never asked at
+            # all; this one means the prospect gave her a signal and she let it
+            # pass, which is the more coachable failure.
+            "passed_on_buying_signal", "over_hedged"]
+
+# ── jobs queue ──────────────────────────────────────────────────────────────
+def enqueue_job(kind: str, payload: dict, dedupe_key: str = "", delay_sec: int = 0) -> bool:
+    """Insert a job. The partial unique index in 008 makes this idempotent per
+    (kind, dedupe_key) while a job is queued/running, so Twilio redelivering a
+    recording-status webhook cannot buy us a second transcription. A 409 from
+    that index is the SUCCESS case, not an error."""
+    run_after = (datetime.utcnow() + timedelta(seconds=delay_sec)).isoformat()
     try:
-        payload = await request.json()
-    except Exception:
-        form = await request.form()
-        payload = dict(form)
-    t_sid = payload.get("transcript_sid") or payload.get("TranscriptSid") or ""
-    if not t_sid:
-        return {"ok": False}
-    try:
-        sr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}/Sentences?PageSize=500",
-                         auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=20)
-        sents = (sr.json() or {}).get("sentences", []) if sr.status_code == 200 else []
-        text = " ".join(f"[{x.get('media_channel','?')}] {x.get('transcript','')}" for x in sents)[:8000]
-        # link back to the lead via the recording audit row
-        lead_id = None
-        tr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}",
-                         auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=15)
-        src_sid = ((tr.json() or {}).get("channel") or {}).get("media_properties", {}).get("source_sid", "") if tr.status_code == 200 else ""
-        if src_sid:
-            ar = req_lib.get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
-                             f"&details=ilike.*{src_sid}*&select=resource_id&limit=1",
-                             headers=SB_ADMIN_HEADERS, timeout=10)
-            if ar.status_code == 200 and ar.json():
-                lead_id = ar.json()[0].get("resource_id")
-        audit_log("twilio", "call_transcript", "lead", lead_id, {"transcript_sid": t_sid, "text": text})
-        print(f"[INTEL] transcript stored ({len(text)} chars, lead {lead_id})")
+        r = req_lib.post(f"{SUPABASE_URL}/rest/v1/jobs",
+                         headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                         json={"kind": kind, "payload": payload,
+                               "dedupe_key": dedupe_key or None,
+                               "run_after": run_after},
+                         timeout=10)
+        if r.status_code in (200, 201, 204):
+            return True
+        if r.status_code == 409:
+            print(f"[JOBS] {kind} {dedupe_key} already queued — not duplicating")
+            return True
+        print(f"[JOBS] enqueue {kind} failed: HTTP {r.status_code} {r.text[:160]}")
     except Exception as e:
-        print(f"[INTEL] webhook processing failed: {e}")
-    return {"ok": True}
+        print(f"[JOBS] enqueue {kind} failed: {e}")
+    return False
+
+_JOB_BACKOFF_SEC = [60, 300, 1800]   # spec: 1m, 5m, 30m
+JOB_MAX_ATTEMPTS = len(_JOB_BACKOFF_SEC)
+
+def _claim_job(job: dict) -> bool:
+    """Move queued→running only if it is still queued. The conditional filter is
+    the lock: two workers racing the same row, only one PATCH matches."""
+    try:
+        r = req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/jobs?id=eq.{job['id']}&status=eq.queued",
+            headers={**SB_ADMIN_HEADERS, "Prefer": "return=representation"},
+            json={"status": "running", "attempts": (job.get("attempts") or 0) + 1,
+                  "updated_at": datetime.utcnow().isoformat()},
+            timeout=10)
+        return r.status_code in (200, 206) and bool(r.json())
+    except Exception as e:
+        print(f"[JOBS] claim {job.get('id')} failed: {e}")
+        return False
+
+def _finish_job(job_id, status: str, error: str = ""):
+    try:
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/jobs?id=eq.{job_id}",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                      json={"status": status, "last_error": (error or "")[:500] or None,
+                            "updated_at": datetime.utcnow().isoformat()},
+                      timeout=10)
+    except Exception as e:
+        print(f"[JOBS] finish {job_id} failed: {e}")
+
+def _retry_job(job: dict, error: str):
+    """Back off, or give up after JOB_MAX_ATTEMPTS."""
+    attempts = (job.get("attempts") or 0)
+    if attempts >= JOB_MAX_ATTEMPTS:
+        print(f"[JOBS] {job.get('kind')} {job.get('id')} failed permanently: {error[:200]}")
+        _finish_job(job["id"], "failed", error)
+        return
+    delay = _JOB_BACKOFF_SEC[min(attempts - 1, len(_JOB_BACKOFF_SEC) - 1)] if attempts else _JOB_BACKOFF_SEC[0]
+    try:
+        req_lib.patch(f"{SUPABASE_URL}/rest/v1/jobs?id=eq.{job['id']}",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                      json={"status": "queued", "last_error": error[:500],
+                            "run_after": (datetime.utcnow() + timedelta(seconds=delay)).isoformat(),
+                            "updated_at": datetime.utcnow().isoformat()},
+                      timeout=10)
+        print(f"[JOBS] {job.get('kind')} {job.get('id')} retry in {delay}s: {error[:120]}")
+    except Exception as e:
+        print(f"[JOBS] retry {job.get('id')} failed: {e}")
+
+_JOB_HANDLERS = {}     # kind -> fn(payload) ; populated below
+
+def run_jobs_once(limit: int = 5) -> int:
+    """Drain up to `limit` due jobs. Called from _bg_maintenance_loop. Every
+    handler exception becomes a retry, never a thrown exception — a poisoned
+    job must not kill the maintenance thread that also drives digests, refills
+    and the email sequencer."""
+    if not (TRANSCRIBE_ENABLED or ANALYZE_ENABLED):
+        return 0
+    now = datetime.utcnow().isoformat()
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/jobs?status=eq.queued"
+                        f"&run_after=lte.{now}&order=run_after.asc&limit={limit}",
+                        headers=SB_ADMIN_HEADERS, timeout=15)
+        jobs = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"[JOBS] poll failed: {e}")
+        return 0
+    if not isinstance(jobs, list):
+        return 0
+    done = 0
+    for job in jobs:
+        handler = _JOB_HANDLERS.get(job.get("kind"))
+        if not handler:
+            _finish_job(job["id"], "failed", f"no handler for kind={job.get('kind')}")
+            continue
+        if not _claim_job(job):
+            continue                      # another worker got it
+        try:
+            handler(job.get("payload") or {})
+            _finish_job(job["id"], "done")
+            done += 1
+        except Exception as e:
+            _retry_job(job, f"{type(e).__name__}: {e}")
+    return done
+
+# ── call_outcomes helpers ───────────────────────────────────────────────────
+def _patch_call(call_id, fields: dict):
+    """Patch a call_outcomes row. Wrapped: every column here is added by
+    migration 008, and Supabase rejects an entire request naming an unknown
+    column — so before the migration has run this must degrade, not 500."""
+    try:
+        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}",
+                          headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                          json=fields, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[TRANSCRIBE] call {call_id} patch rejected "
+                  f"(HTTP {r.status_code}) — has migration 008 run? {r.text[:160]}")
+    except Exception as e:
+        print(f"[TRANSCRIBE] call {call_id} patch failed: {e}")
+
+def _find_call_for_recording(call_sid: str, lead_id) -> dict:
+    """Locate the call_outcomes row this recording belongs to.
+
+    Twilio's CallSid is not stored on call_outcomes (no column for it), so we
+    match on lead + recency: the rep logs the outcome within minutes of hanging
+    up, and the same lead is not dialled twice in that window (the
+    duplicate_cooldown flag exists precisely because that would be anomalous).
+    Returns {} when the rep has not logged yet — the caller then parks the
+    metadata for log_call to pick up, the same shape as take_twilio_duration."""
+    if not lead_id:
+        return {}
+    since = (datetime.utcnow() - timedelta(minutes=TWILIO_DUR_TTL_MIN)).isoformat()
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                        f"?leadId=eq.{url_quote(str(lead_id), safe='')}"
+                        f"&calledAt=gte.{since}&select=id,outcome,calledBy,calledAt"
+                        f"&order=calledAt.desc&limit=1",
+                        headers=SB_HEADERS, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        return rows[0] if isinstance(rows, list) and rows else {}
+    except Exception as e:
+        print(f"[TRANSCRIBE] call lookup failed for lead {lead_id}: {e}")
+        return {}
+
+def _on_recording_completed(form, lead_id, rec_sid: str, dur_s: int):
+    """Called from /twilio/recording-status. Records metadata and enqueues —
+    never transcribes inline; the webhook must return fast."""
+    audit_log("twilio", "call_recording", "lead", lead_id or None,
+              {"recording_url": form.get("RecordingUrl") or "", "recording_sid": rec_sid,
+               "call_sid": form.get("CallSid") or "", "duration": dur_s,
+               "channels": form.get("RecordingChannels") or ""})
+    if not rec_sid:
+        return
+    call = _find_call_for_recording(form.get("CallSid") or "", lead_id)
+    payload = {"recording_sid": rec_sid,
+               "recording_url": form.get("RecordingUrl") or "",
+               "recording_duration_sec": dur_s,
+               "channels": int(form.get("RecordingChannels") or 2),
+               "lead_id": str(lead_id) if lead_id else None,
+               "call_id": call.get("id")}
+    if call.get("id"):
+        _patch_call(call["id"], {"recording_sid": rec_sid,
+                                 "recording_duration_sec": dur_s,
+                                 "transcription_status": "queued"})
+    else:
+        # Rep has not saved the outcome yet. Park it; log_call attaches it.
+        try:
+            _settings_set_json(f"twilio_rec_{lead_id}",
+                               {**payload, "at": datetime.utcnow().isoformat()})
+        except Exception as e:
+            print(f"[TRANSCRIBE] park recording meta failed: {e}")
+    if not TRANSCRIBE_ENABLED:
+        print(f"[TRANSCRIBE] disabled — recorded {rec_sid} ({dur_s}s) metadata only")
+        return
+    enqueue_job("transcribe_call", payload, dedupe_key=rec_sid)
+
+@app.post("/twilio/amd-status")
+async def twilio_amd_status(request: Request, lead_id: str = ""):
+    """Async AMD result. `AnsweredBy` is the strongest human/machine signal we
+    get, and it lets the gate skip voicemail before spending anything.
+
+    CAVEAT worth knowing: /api/call/start rings OUR rep's phone first and
+    bridges to the prospect from TwiML, so AMD on the parent call would be
+    measuring the rep, not the prospect. This endpoint therefore only records
+    what Twilio sends for the leg it was configured on, and the gate FAILS OPEN
+    on unknown/absent AMD — the duration floor is what actually protects cost."""
+    form = await request.form()
+    if not _twilio_sig_ok(request, form):
+        raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    answered_by = (form.get("AnsweredBy") or "").strip().lower() or "unknown"
+    audit_log("twilio", "call_amd", "lead", lead_id or None,
+              {"answered_by": answered_by, "call_sid": form.get("CallSid") or ""})
+    call = _find_call_for_recording(form.get("CallSid") or "", lead_id)
+    if call.get("id"):
+        _patch_call(call["id"], {"answered_by": answered_by})
+    elif lead_id:
+        try:
+            _settings_set_json(f"twilio_amd_{lead_id}",
+                               {"answered_by": answered_by,
+                                "at": datetime.utcnow().isoformat()})
+        except Exception as e:
+            print(f"[AMD] park failed: {e}")
+    return _twiml("")
+
+# ── worker: transcribe_call ─────────────────────────────────────────────────
+def transcription_gate(call: dict, payload: dict) -> str:
+    """Return a skip reason, or "" to transcribe. First hit wins.
+
+    Pure function of its inputs so the cost policy is unit-testable without
+    Twilio, Deepgram or Supabase."""
+    dur = int(payload.get("recording_duration_sec") or 0)
+    if dur < TRANSCRIBE_MIN_SEC:
+        return "short"
+    if (call.get("answered_by") or "").strip().lower() in _AMD_MACHINE:
+        return "machine"
+    if (call.get("outcome") or "").strip().lower() in _NO_HUMAN_OUTCOMES:
+        return "disposition"
+    # answered_by unknown/null → transcribe (fail open). The duration floor
+    # already bounds the spend, and dropping real conversations because AMD was
+    # inconclusive is the more expensive mistake.
+    return ""
+
+def _deepgram_transcribe(audio: bytes, channels: int) -> dict:
+    """POST the wav to Deepgram. multichannel for dual-channel recordings gives
+    exact speaker attribution (each leg is its own channel — no diarisation
+    guesswork); mono falls back to diarize."""
+    params = [f"model={DEEPGRAM_MODEL}", "smart_format=true", "punctuate=true",
+              "utterances=true", "utt_split=1.0", "language=en-US"]
+    params.append("multichannel=true" if channels >= 2 else "diarize=true")
+    r = req_lib.post("https://api.deepgram.com/v1/listen?" + "&".join(params),
+                     headers={"Authorization": f"Token {DEEPGRAM_API_KEY}",
+                              "Content-Type": "audio/wav"},
+                     data=audio, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"deepgram HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+def _speaker_for(utt: dict, channels: int) -> str:
+    if channels >= 2:
+        return "AGENT" if int(utt.get("channel") or 0) == DEEPGRAM_AGENT_CHANNEL else "PROSPECT"
+    # Mono: no channels to key on. Whoever speaks first is our rep — we placed
+    # the call, so the greeting after connect is theirs.
+    return "AGENT" if int(utt.get("speaker") or 0) == 0 else "PROSPECT"
+
+def _build_transcript(dg: dict, channels: int):
+    """→ (full_text, utterances). Deepgram returns utterances at the top level
+    when utterances=true; fall back to per-channel alternatives otherwise."""
+    utts = (dg.get("results") or {}).get("utterances") or []
+    out = []
+    for u in utts:
+        text = (u.get("transcript") or "").strip()
+        if not text:
+            continue
+        out.append({"speaker": _speaker_for(u, channels),
+                    "start": round(float(u.get("start") or 0), 2),
+                    "end": round(float(u.get("end") or 0), 2),
+                    "confidence": round(float(u.get("confidence") or 0), 3),
+                    "text": text})
+    if not out:
+        for i, ch in enumerate((dg.get("results") or {}).get("channels") or []):
+            alt = (ch.get("alternatives") or [{}])[0]
+            text = (alt.get("transcript") or "").strip()
+            if text:
+                out.append({"speaker": "AGENT" if i == DEEPGRAM_AGENT_CHANNEL else "PROSPECT",
+                            "start": 0.0, "end": 0.0,
+                            "confidence": round(float(alt.get("confidence") or 0), 3),
+                            "text": text})
+    lines = []
+    for u in out:
+        m, sec = divmod(int(u["start"]), 60)
+        lines.append(f"[{m:02d}:{sec:02d}] {u['speaker'].lower()}: {u['text']}")
+    return "\n".join(lines), out
+
+def _trim_raw(dg: dict) -> dict:
+    """Drop per-word arrays before storing — they are the bulk of the payload
+    and we never read them."""
+    try:
+        slim = json_lib.loads(json_lib.dumps(dg))
+        for ch in (slim.get("results") or {}).get("channels") or []:
+            for alt in ch.get("alternatives") or []:
+                alt.pop("words", None)
+        for u in (slim.get("results") or {}).get("utterances") or []:
+            u.pop("words", None)
+        return slim
+    except Exception:
+        return {}
+
+def transcribe_call(payload: dict):
+    """Worker. Raises on a retryable failure (the job runner backs off)."""
+    rec_sid = payload.get("recording_sid") or ""
+    if not rec_sid:
+        return
+    if not (TRANSCRIBE_ENABLED and DEEPGRAM_API_KEY):
+        print("[TRANSCRIBE] disabled or DEEPGRAM_API_KEY unset — dropping job")
+        return
+    call_id = payload.get("call_id")
+    lead_id = payload.get("lead_id")
+
+    # Idempotency: the unique index on recording_sid is the real guard, but
+    # checking first avoids paying Deepgram for a duplicate delivery.
+    try:
+        ex = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_transcripts"
+                         f"?recording_sid=eq.{url_quote(rec_sid, safe='')}&select=id",
+                         headers=SB_ADMIN_HEADERS, timeout=10)
+        if ex.status_code == 200 and ex.json():
+            print(f"[TRANSCRIBE] {rec_sid} already transcribed — skip:duplicate")
+            return
+    except Exception as e:
+        print(f"[TRANSCRIBE] duplicate check failed (continuing): {e}")
+
+    call = {}
+    if call_id:
+        try:
+            cr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}"
+                             f"&select=id,outcome,answered_by,calledBy", headers=SB_HEADERS, timeout=10)
+            rows = cr.json() if cr.status_code == 200 else []
+            call = rows[0] if rows else {}
+        except Exception as e:
+            print(f"[TRANSCRIBE] call fetch failed: {e}")
+
+    skip = transcription_gate(call, payload)
+    if skip:
+        print(f"[TRANSCRIBE] {rec_sid} skip:{skip} "
+              f"(dur={payload.get('recording_duration_sec')}s "
+              f"amd={call.get('answered_by')} outcome={call.get('outcome')})")
+        if call_id:
+            _patch_call(call_id, {"transcription_status": "skipped",
+                                  "transcription_skip_reason": skip})
+        audit_log("system", "transcribe_skip", "lead", lead_id,
+                  {"recording_sid": rec_sid, "reason": skip,
+                   "duration": payload.get("recording_duration_sec")})
+        return
+
+    if call_id:
+        _patch_call(call_id, {"transcription_status": "processing"})
+
+    rec_url = payload.get("recording_url") or ""
+    if not rec_url:
+        raise RuntimeError("no recording_url in payload")
+    ar = req_lib.get(rec_url + ".wav",
+                     auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")),
+                     timeout=120)
+    if ar.status_code != 200:
+        raise RuntimeError(f"recording fetch HTTP {ar.status_code}")
+    audio = ar.content
+
+    channels = int(payload.get("channels") or 2)
+    dg = _deepgram_transcribe(audio, channels)
+    full_text, utterances = _build_transcript(dg, channels)
+    if not full_text.strip():
+        print(f"[TRANSCRIBE] {rec_sid} produced empty text — marking done, nothing to analyse")
+        if call_id:
+            _patch_call(call_id, {"transcription_status": "skipped",
+                                  "transcription_skip_reason": "empty_transcript"})
+        return
+    dur = float((dg.get("metadata") or {}).get("duration")
+                or payload.get("recording_duration_sec") or 0)
+    cost = round(dur / 60.0 * DEEPGRAM_RATE_PER_MIN, 5)
+
+    row = {"call_id": call_id, "lead_id": int(lead_id) if str(lead_id or "").isdigit() else None,
+           "recording_sid": rec_sid, "provider": "deepgram",
+           "model": (dg.get("metadata") or {}).get("model_info") and DEEPGRAM_MODEL or DEEPGRAM_MODEL,
+           "language": "en-US", "duration_sec": round(dur, 2),
+           "full_text": full_text, "utterances": utterances,
+           "raw": _trim_raw(dg), "cost_usd": cost}
+    ir = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_transcripts",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=representation"},
+                      json=row, timeout=30)
+    if ir.status_code == 409:
+        print(f"[TRANSCRIBE] {rec_sid} raced another worker — skip:duplicate")
+        return
+    if ir.status_code not in (200, 201):
+        raise RuntimeError(f"transcript insert HTTP {ir.status_code}: {ir.text[:200]}")
+    tid = (ir.json() or [{}])[0].get("id")
+    if call_id:
+        _patch_call(call_id, {"transcription_status": "done",
+                              "transcription_skip_reason": None})
+    print(f"[TRANSCRIBE] {rec_sid} → transcript {tid} "
+          f"({len(utterances)} utterances, {dur:.0f}s, ${cost})")
+    if ANALYZE_ENABLED and tid:
+        enqueue_job("analyze_call", {"transcript_id": tid, "call_id": call_id,
+                                     "lead_id": lead_id},
+                    dedupe_key=f"analyze:{tid}")
+
+# ── worker: analyze_call ────────────────────────────────────────────────────
+_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "disposition": {"type": "string", "enum": CALL_DISPOSITIONS},
+        "disposition_confidence": {"type": "number"},
+        "next_step": {"type": ["string", "null"]},
+        "callback_at": {"type": ["string", "null"]},
+        "objections": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["price", "has_vendor", "no_authority",
+                                                     "timing", "not_interested", "trust", "other"]},
+                "quote": {"type": "string"}},
+            "required": ["type", "quote"], "additionalProperties": False}},
+        "prospect_sentiment": {"type": "string", "enum": ["positive", "neutral", "negative"]},
+        "decision_maker_reached": {"type": "boolean"},
+        "qa": {"type": "object", "properties": {
+            "score": {"type": "integer"},
+            "opener": {"type": "string"}, "pitch": {"type": "string"},
+            "objection_handling": {"type": "string"}, "close": {"type": "string"},
+            "flags": {"type": "array", "items": {"type": "string", "enum": QA_FLAGS}}},
+            "required": ["score", "opener", "pitch", "objection_handling", "close", "flags"],
+            "additionalProperties": False},
+        "flags": {"type": "array", "items": {"type": "string", "enum": QA_FLAGS}},
+        "coaching": {"type": "object", "properties": {
+            "approach": {"type": "string"},
+            "assertiveness": {"type": "object", "properties": {
+                "score": {"type": "integer"},
+                "note": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}}},
+                "required": ["score", "note", "evidence"], "additionalProperties": False},
+            "close_opportunity": {"type": "object", "properties": {
+                "existed": {"type": "boolean"},
+                "taken": {"type": "boolean"},
+                "prospect_signal": {"type": ["string", "null"]},
+                "missed_moment": {"type": ["string", "null"]},
+                "say_instead": {"type": ["string", "null"]}},
+                "required": ["existed", "taken", "prospect_signal",
+                             "missed_moment", "say_instead"],
+                "additionalProperties": False}},
+            "required": ["approach", "assertiveness", "close_opportunity"],
+            "additionalProperties": False},
+    },
+    "required": ["summary", "disposition", "disposition_confidence", "next_step",
+                 "callback_at", "objections", "prospect_sentiment",
+                 "decision_maker_reached", "qa", "flags", "coaching"],
+    "additionalProperties": False,
+}
+
+_ANALYSIS_SYSTEM = (
+    "You analyse ONE outbound B2B cold call for Vision Cleaning Company, a commercial "
+    "janitorial contractor selling recurring cleaning contracts to offices, medical and "
+    "dialysis facilities, industrial/logistics sites, daycares and property managers. "
+    "The caller is a 1099 sales rep. The goal of the call is to book a walkthrough/quote "
+    "appointment, or failing that to get a qualified callback with a named decision maker.\n\n"
+    "The transcript is speaker-labelled: `agent:` is our rep, `prospect:` is the business "
+    "we rang. Lines are prefixed with [mm:ss].\n\n"
+    "Rules:\n"
+    "- Quote objections VERBATIM from the transcript. Never paraphrase a quote.\n"
+    "- Never invent a callback time. Set callback_at only if a specific date/time was "
+    "stated; otherwise null.\n"
+    "- disposition must be exactly one of the allowed values.\n"
+    "- decision_maker_reached is true only if the rep actually spoke to someone with "
+    "authority to buy — a receptionist who took a message is false.\n"
+    "- QA score is 0-10, two points each: (1) opener names the company AND the reason for "
+    "the call, (2) asks for or identifies the decision maker, (3) delivers the value "
+    "proposition clearly, (4) handles an objection with a QUESTION rather than folding, "
+    "(5) attempts a close or a concrete next step. If no objection arose, award (4) if the "
+    "rep kept control of the conversation.\n"
+    "- Set the `dnc_request` flag only if the prospect asked not to be called again.\n"
+    "- Be specific. A QA comment that would apply to any call is useless.\n\n"
+    "COACHING BLOCK — the part a human reviewer actually reads:\n"
+    "- `approach`: one sentence on HOW she ran the call (e.g. consultative, "
+    "straight into the pitch, permission-seeking, rapport-first).\n"
+    "- `assertiveness`: this is about LANGUAGE, not tone. You are reading a "
+    "transcript — you cannot hear confidence, pace or volume, so do NOT guess at "
+    "them. Score only what the words show: hedging and minimisers (\"just\", "
+    "\"I was wondering if maybe\", \"sorry to bother you\", \"I don't know if "
+    "you'd be interested\"), apologising for calling, asking permission to ask a "
+    "question, trailing off, or accepting the first brush-off without a follow-up "
+    "question. 10 = direct and specific throughout with no hedging. Put the actual "
+    "hedging phrases in `evidence`, verbatim; if there are none, `evidence` is "
+    "empty and the score is high. An empty `evidence` list with a low score is a "
+    "contradiction — do not produce one.\n"
+    "- `close_opportunity`: the most useful field. `existed` is true if at ANY "
+    "point the prospect gave something to build on — a question about pricing or "
+    "service, naming the decision maker, admitting a problem with their current "
+    "cleaner, or any softening from an initial no. `prospect_signal` is that "
+    "moment quoted verbatim. `taken` is true only if she then asked for the "
+    "walkthrough, the appointment, or a concrete next step. If `existed` is true "
+    "and `taken` is false, quote where she should have asked in `missed_moment` "
+    "and write the exact words she should have used in `say_instead` — one "
+    "sentence she could read off a card next time.\n"
+    "- Flags: `passed_on_buying_signal` when existed && !taken. `over_hedged` "
+    "when hedging materially weakened the ask. `no_close_attempt` when she never "
+    "asked for anything at all, whether or not a signal appeared."
+)
+
+def _analysis_cost(usage) -> float:
+    """Haiku 4.5 list price: $1/MTok in, $5/MTok out."""
+    try:
+        return round((usage.input_tokens / 1e6) * 1.0 + (usage.output_tokens / 1e6) * 5.0, 5)
+    except Exception:
+        return 0.0
+
+def analyze_call(payload: dict):
+    """Worker. One Claude pass per transcript, JSON guaranteed by
+    output_config.format rather than regex-scraped out of prose."""
+    tid = payload.get("transcript_id")
+    if not tid:
+        return
+    if not (ANALYZE_ENABLED and ANTHROPIC_API_KEY):
+        print("[ANALYZE] disabled or ANTHROPIC_API_KEY unset — dropping job")
+        return
+    try:
+        tr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_transcripts?id=eq.{tid}"
+                         f"&select=id,call_id,lead_id,full_text", headers=SB_ADMIN_HEADERS, timeout=15)
+        rows = tr.json() if tr.status_code == 200 else []
+    except Exception as e:
+        raise RuntimeError(f"transcript fetch failed: {e}")
+    if not rows:
+        print(f"[ANALYZE] transcript {tid} vanished — nothing to do")
+        return
+    t = rows[0]
+    text = (t.get("full_text") or "").strip()
+    if len(text) < 200:
+        print(f"[ANALYZE] transcript {tid} too short ({len(text)} chars) — skipping")
+        return
+    call_id = t.get("call_id") or payload.get("call_id")
+    lead_id = t.get("lead_id") or payload.get("lead_id")
+
+    # Already analysed? (retry after a partial failure)
+    try:
+        ex = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_analyses?transcript_id=eq.{tid}&select=id",
+                         headers=SB_ADMIN_HEADERS, timeout=10)
+        if ex.status_code == 200 and ex.json():
+            print(f"[ANALYZE] transcript {tid} already analysed")
+            return
+    except Exception:
+        pass
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    # No `temperature`: the current SDK does not accept sampling parameters
+    # (the spec asked for temperature 0). Determinism comes from the JSON
+    # schema below instead — output_config.format guarantees the first text
+    # block is schema-valid JSON, so this never regex-scrapes a blob out of
+    # prose the way the weekly coach has to.
+    resp = client.messages.create(
+        model=ANALYSIS_MODEL, max_tokens=2000,
+        system=_ANALYSIS_SYSTEM,
+        messages=[{"role": "user", "content": f"Transcript:\n\n{text[:20000]}"}],
+        output_config={"format": {"type": "json_schema", "schema": _ANALYSIS_SCHEMA}},
+    )
+    body = next((b.text for b in resp.content if b.type == "text"), "")
+    data = json_lib.loads(body)      # schema-enforced; a raise here is a real retry
+    cost = _analysis_cost(getattr(resp, "usage", None))
+
+    caller_disp = ""
+    if call_id:
+        try:
+            cr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}&select=outcome",
+                             headers=SB_HEADERS, timeout=10)
+            caller_disp = ((cr.json() or [{}])[0] or {}).get("outcome") or "" if cr.status_code == 200 else ""
+        except Exception:
+            pass
+
+    flags = set((data.get("flags") or []) + ((data.get("qa") or {}).get("flags") or []))
+    # Derive the close flag from the structured fields rather than trusting the
+    # model to remember to set it — `existed && !taken` IS the definition.
+    _co = ((data.get("coaching") or {}).get("close_opportunity") or {})
+    if _co.get("existed") and not _co.get("taken"):
+        flags.add("passed_on_buying_signal")
+    flags = sorted(flags)
+    row = {"call_id": call_id, "transcript_id": tid,
+           "lead_id": int(lead_id) if str(lead_id or "").isdigit() else None,
+           "model": ANALYSIS_MODEL, "summary": data.get("summary") or "",
+           "disposition": data.get("disposition") or "other",
+           "disposition_confidence": data.get("disposition_confidence"),
+           "caller_disposition": caller_disp or None,
+           "next_step": data.get("next_step"), "callback_at": data.get("callback_at"),
+           "objections": data.get("objections") or [],
+           "prospect_sentiment": data.get("prospect_sentiment"),
+           "decision_maker_reached": data.get("decision_maker_reached"),
+           "qa": data.get("qa") or {}, "coaching": data.get("coaching") or {},
+           "flags": flags, "cost_usd": cost}
+    ir = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_analyses",
+                      headers={**SB_ADMIN_HEADERS, "Prefer": "return=minimal"},
+                      json=row, timeout=30)
+    if ir.status_code not in (200, 201, 204):
+        raise RuntimeError(f"analysis insert HTTP {ir.status_code}: {ir.text[:200]}")
+    _co = ((row.get("coaching") or {}).get("close_opportunity") or {})
+    print(f"[ANALYZE] transcript {tid}: {row['disposition']} "
+          f"qa={(row['qa'] or {}).get('score')} "
+          f"close={'missed' if (_co.get('existed') and not _co.get('taken')) else 'ok'} "
+          f"flags={flags} ${cost}")
+    _apply_analysis(call_id, lead_id, row, caller_disp)
+
+def _apply_analysis(call_id, lead_id, row: dict, caller_disp: str):
+    """Act on the analysis. Each step is independently wrapped: a failure to
+    create a callback must not lose the stored analysis."""
+    flags = row.get("flags") or []
+    # DNC is the one flag with a hard consequence — honour it immediately.
+    if "dnc_request" in flags and lead_id:
+        try:
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                          headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                          json={"status": "do_not_contact", "callbackDate": "",
+                                "updatedAt": datetime.utcnow().isoformat()}, timeout=10)
+            audit_log("system", "dnc_from_transcript", "lead", lead_id,
+                      {"summary": (row.get("summary") or "")[:300]})
+            print(f"[ANALYZE] lead {lead_id} → do_not_contact (dnc_request in transcript)")
+        except Exception as e:
+            print(f"[ANALYZE] DNC apply failed for lead {lead_id}: {e}")
+    # Disposition disagreement: SURFACE it, never overwrite the rep's entry.
+    # That is an admin review, not an automated correction.
+    try:
+        conf = float(row.get("disposition_confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if call_id and caller_disp and conf >= 0.8:
+        if not _dispositions_agree(caller_disp, row.get("disposition") or ""):
+            _patch_call(call_id, {"disposition_mismatch": True})
+            print(f"[ANALYZE] call {call_id} mismatch: rep logged '{caller_disp}', "
+                  f"transcript reads '{row.get('disposition')}' (conf {conf})")
+    # A stated callback with nothing on the lead — book it.
+    cb = row.get("callback_at")
+    if cb and lead_id:
+        try:
+            lr = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}"
+                             f"&select=callbackDate", headers=SB_HEADERS, timeout=10)
+            existing = ((lr.json() or [{}])[0] or {}).get("callbackDate") if lr.status_code == 200 else None
+            if not existing:
+                req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                              headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                              json={"callbackDate": str(cb)[:10],
+                                    "updatedAt": datetime.utcnow().isoformat()}, timeout=10)
+                print(f"[ANALYZE] lead {lead_id} callbackDate ← {str(cb)[:10]} (from transcript)")
+        except Exception as e:
+            print(f"[ANALYZE] callback apply failed for lead {lead_id}: {e}")
+    # Hot lead / appointment → existing notification path.
+    if ("hot_lead" in flags or row.get("disposition") == "appointment_set") and SLACK_WEBHOOK_URL:
+        try:
+            send_slack("🔥 Call intelligence: hot call",
+                       (row.get("summary") or "")[:600],
+                       fields=[{"label": "Disposition", "value": row.get("disposition") or "?"},
+                               {"label": "Next step", "value": row.get("next_step") or "—"}])
+        except Exception as e:
+            print(f"[ANALYZE] slack failed: {e}")
+
+# The rep's outcome vocabulary and the analysis disposition enum are different
+# taxonomies; this maps one onto the other so "mismatch" means a real
+# disagreement about what happened, not a vocabulary difference.
+_DISP_EQUIV = {
+    "appointment_set":     {"converted", "interested"},
+    "interested_callback": {"callback", "interested", "interested_no_dm"},
+    "send_info":           {"interested", "callback", "answered", "interested_no_dm"},
+    "not_interested":      {"not_interested"},
+    "already_has_vendor":  {"not_interested"},
+    "wrong_number":        {"not_interested", "no_answer"},
+    "gatekeeper_blocked":  {"gatekeeper", "interested_no_dm", "no_answer"},
+    "no_decision_maker":   {"gatekeeper", "interested_no_dm", "answered"},
+    "dnc":                 {"not_interested"},
+    "voicemail":           {"voicemail", "no_answer"},
+    "other":               set(CALL_DISPOSITIONS) | {"answered"},
+}
+
+def _dispositions_agree(caller_outcome: str, analysis_disposition: str) -> bool:
+    if not caller_outcome or not analysis_disposition:
+        return True                      # nothing to compare
+    allowed = _DISP_EQUIV.get(analysis_disposition)
+    if allowed is None:
+        return True                      # unknown disposition — don't cry wolf
+    return caller_outcome.strip().lower() in allowed
+
+_JOB_HANDLERS["transcribe_call"] = transcribe_call
+_JOB_HANDLERS["analyze_call"] = analyze_call
+
+# ── cost guardrail ──────────────────────────────────────────────────────────
+def run_transcription_cost_rollup_if_due():
+    """Once per UTC day: sum yesterday's spend and alert if the gate is leaking.
+    A transcribed-call count well above the human-answered rate means the gate
+    is broken, which shows up as cost before it shows up anywhere else."""
+    if not (TRANSCRIBE_ENABLED and SLACK_WEBHOOK_URL):
+        return
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if (_settings_get_json("last_transcribe_rollup") or {}).get("day") == today:
+        return
+    try:
+        _settings_set_json("last_transcribe_rollup", {"day": today})
+        since = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        tr = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts"
+                            f"?created_at=gte.{since}&select=cost_usd", headers=SB_ADMIN_HEADERS)
+        an = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_analyses"
+                            f"?created_at=gte.{since}&select=cost_usd", headers=SB_ADMIN_HEADERS)
+        t_cost = sum(float(x.get("cost_usd") or 0) for x in tr)
+        a_cost = sum(float(x.get("cost_usd") or 0) for x in an)
+        total, n = t_cost + a_cost, len(tr)
+        print(f"[TRANSCRIBE-COST] 24h: {n} transcripts ${t_cost:.2f} + "
+              f"{len(an)} analyses ${a_cost:.2f} = ${total:.2f}")
+        if total > TRANSCRIBE_DAILY_COST_ALERT or n > TRANSCRIBE_DAILY_COUNT_ALERT:
+            send_slack("⚠️ Transcription spend above threshold",
+                       f"Last 24h: *{n} calls transcribed*, total *${total:.2f}* "
+                       f"(Deepgram ${t_cost:.2f} + Claude ${a_cost:.2f}).\n"
+                       f"Thresholds: ${TRANSCRIBE_DAILY_COST_ALERT:.2f}/day or "
+                       f"{TRANSCRIBE_DAILY_COUNT_ALERT} calls. A count far above the "
+                       f"human-answered rate means the gate is not working — check the "
+                       f"skip distribution in /api/admin/transcription-stats.")
+    except Exception as e:
+        print(f"[TRANSCRIBE-COST] rollup failed: {e}")
+
+def _intel_rows(table: str, filt: str, select: str, limit: int = 200):
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/{table}?{filt}&select={select}&limit={limit}",
+                        headers=SB_ADMIN_HEADERS, timeout=20)
+        rows = r.json() if r.status_code == 200 else []
+        if r.status_code != 200:
+            print(f"[INTEL-API] {table} HTTP {r.status_code}: {r.text[:160]} "
+                  f"— has migration 008 run?")
+        return rows if isinstance(rows, list) else []
+    except Exception as e:
+        print(f"[INTEL-API] {table} failed: {e}")
+        return []
+
+@app.get("/api/calls/{call_id}/intelligence")
+def call_intelligence(call_id: int, user: str = Depends(verify_token)):
+    """Transcript + analysis for one call. Callers may read their OWN calls
+    (they should be able to re-read what they said); the QA scores are stripped
+    for non-admins — per spec, v1 does not show reps their scores."""
+    calls = _intel_rows("call_outcomes", f"id=eq.{call_id}",
+                        "id,leadId,outcome,calledBy,calledAt,duration,notes,"
+                        "recording_sid,recording_duration_sec,transcription_status,"
+                        "transcription_skip_reason,answered_by,disposition_mismatch", 1)
+    if not calls:
+        raise HTTPException(status_code=404, detail="Call not found")
+    call = calls[0]
+    admin = is_admin(user)
+    if not admin and (call.get("calledBy") or "") != user:
+        raise HTTPException(status_code=403, detail="Not your call")
+    tr = _intel_rows("call_transcripts", f"call_id=eq.{call_id}&order=created_at.desc",
+                     "id,full_text,utterances,duration_sec,model,cost_usd,created_at", 1)
+    an = _intel_rows("call_analyses", f"call_id=eq.{call_id}&order=created_at.desc",
+                     "id,summary,disposition,disposition_confidence,caller_disposition,"
+                     "next_step,callback_at,objections,prospect_sentiment,"
+                     "decision_maker_reached,qa,coaching,flags,model,cost_usd,created_at", 1)
+    analysis = an[0] if an else None
+    if analysis and not admin:
+        # Reps see the substance (what was said, what to do next) but not the
+        # score. Showing a number without a conversation about it is how QA
+        # becomes something people game instead of something they learn from.
+        analysis = {k: v for k, v in analysis.items() if k not in ("qa", "coaching")}
+    # Recording playback URL: Twilio-hosted, so hand back the SID and let the
+    # admin UI build the authenticated link rather than proxying audio.
+    return {"call": call, "transcript": tr[0] if tr else None, "analysis": analysis,
+            "recording_sid": call.get("recording_sid"), "is_admin": admin}
+
+@app.get("/api/admin/transcripts/search")
+def transcripts_search(q: str = "", caller: str = "", since: str = "",
+                       disposition: str = "", flag: str = "", limit: int = 50,
+                       user: str = Depends(verify_admin)):
+    """Full-text over transcripts, with caller / date / disposition / flag
+    filters. Uses the GIN tsvector index from 008 via PostgREST's `fts`."""
+    limit = max(1, min(limit, 200))
+    filt = ["order=created_at.desc"]
+    if q.strip():
+        # plfts = plainto_tsquery — treats the input as words, not an operator
+        # expression, so a caller can paste "take us off your list" safely.
+        filt.append(f"full_text=plfts(english).{url_quote(q.strip(), safe='')}")
+    if since.strip():
+        filt.append(f"created_at=gte.{url_quote(since.strip(), safe='')}")
+    rows = _intel_rows("call_transcripts", "&".join(filt),
+                       "id,call_id,lead_id,full_text,duration_sec,created_at", limit * 3)
+    if not rows:
+        return {"results": [], "total": 0, "query": q}
+    # Join analyses + the call row in bulk, then filter. PostgREST cannot join,
+    # and the result set is already capped, so this is two extra round trips.
+    call_ids = [str(r["call_id"]) for r in rows if r.get("call_id")]
+    an_by_call, call_by_id = {}, {}
+    for i in range(0, len(call_ids), 100):
+        chunk = ",".join(call_ids[i:i+100])
+        for a in _intel_rows("call_analyses", f"call_id=in.({chunk})",
+                             "call_id,disposition,flags,qa,coaching,summary", 300):
+            an_by_call[str(a.get("call_id"))] = a
+        for c in _intel_rows("call_outcomes", f"id=in.({chunk})",
+                             "id,calledBy,calledAt,outcome,leadId", 300):
+            call_by_id[str(c.get("id"))] = c
+    out = []
+    for r in rows:
+        cid = str(r.get("call_id"))
+        c, a = call_by_id.get(cid, {}), an_by_call.get(cid, {})
+        if caller and (c.get("calledBy") or "") != caller:
+            continue
+        if disposition and (a.get("disposition") or "") != disposition:
+            continue
+        if flag and flag not in (a.get("flags") or []):
+            continue
+        snippet = (r.get("full_text") or "")[:400]
+        out.append({"transcript_id": r["id"], "call_id": r.get("call_id"),
+                    "lead_id": r.get("lead_id"), "created_at": r.get("created_at"),
+                    "duration_sec": r.get("duration_sec"),
+                    "caller": c.get("calledBy"), "outcome": c.get("outcome"),
+                    "disposition": a.get("disposition"), "flags": a.get("flags") or [],
+                    "qa_score": (a.get("qa") or {}).get("score"),
+                    "summary": a.get("summary"), "snippet": snippet})
+        if len(out) >= limit:
+            break
+    return {"results": out, "total": len(out), "query": q}
+
+@app.get("/api/admin/caller-qa")
+def caller_qa(days: int = 30, caller: str = "", user: str = Depends(verify_admin)):
+    """Per-caller coaching rollup — the view that answers "is this caller
+    improving, and on what". Every rate is reported with its denominator so a
+    3-call sample can't read like a trend."""
+    days = max(1, min(days, 180))
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    an = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_analyses?created_at=gte.{since}"
+                        f"&select=call_id,disposition,flags,qa,coaching,objections,"
+                        f"decision_maker_reached,created_at", headers=SB_ADMIN_HEADERS)
+    if not an:
+        return {"window_days": days, "callers": [],
+                "detail": "No analyses yet — needs migration 008, DEEPGRAM_API_KEY, "
+                          "TRANSCRIBE_ENABLED=1 and ANALYZE_ENABLED=1."}
+    ids = [str(a["call_id"]) for a in an if a.get("call_id")]
+    who = {}
+    for i in range(0, len(ids), 100):
+        for c in _intel_rows("call_outcomes", f"id=in.({','.join(ids[i:i+100])})",
+                             "id,calledBy", 300):
+            who[str(c.get("id"))] = c.get("calledBy") or "Unknown"
+    # Transcription coverage: analysed calls vs calls that REACHED A HUMAN.
+    # Coverage against all dials would read ~15% by design and mean nothing.
+    contacted = {}
+    for c in _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?calledAt=gte.{since}"
+                            f"&select=calledBy,outcome", headers=SB_ADMIN_HEADERS):
+        if (c.get("outcome") or "") in CONTACT_OUTCOMES:
+            contacted[c.get("calledBy") or "Unknown"] = contacted.get(c.get("calledBy") or "Unknown", 0) + 1
+    from collections import Counter, defaultdict
+    by = defaultdict(lambda: {"n": 0, "qa": [], "assert": [], "flags": Counter(),
+                              "objections": Counter(), "dm": 0,
+                              "close_existed": 0, "close_taken": 0, "recent": []})
+    for a in an:
+        name = who.get(str(a.get("call_id")), "Unknown")
+        if caller and name != caller:
+            continue
+        b = by[name]
+        b["n"] += 1
+        qa = a.get("qa") or {}
+        co = (a.get("coaching") or {}).get("close_opportunity") or {}
+        asrt = (a.get("coaching") or {}).get("assertiveness") or {}
+        if isinstance(qa.get("score"), (int, float)):
+            b["qa"].append(float(qa["score"]))
+        if isinstance(asrt.get("score"), (int, float)):
+            b["assert"].append(float(asrt["score"]))
+        for f in (a.get("flags") or []):
+            b["flags"][f] += 1
+        for o in (a.get("objections") or []):
+            b["objections"][(o or {}).get("type") or "other"] += 1
+        if a.get("decision_maker_reached"):
+            b["dm"] += 1
+        if co.get("existed"):
+            b["close_existed"] += 1
+            if co.get("taken"):
+                b["close_taken"] += 1
+        if co.get("existed") and not co.get("taken") and co.get("say_instead"):
+            b["recent"].append({"date": (a.get("created_at") or "")[:10],
+                                "call_id": a.get("call_id"),
+                                "signal": co.get("prospect_signal"),
+                                "missed": co.get("missed_moment"),
+                                "say_instead": co.get("say_instead")})
+    def avg(xs):
+        return round(sum(xs) / len(xs), 2) if xs else None
+    out = []
+    for name, b in by.items():
+        n = b["n"]
+        out.append({
+            "caller": name, "analyzed_calls": n,
+            "human_contacts": contacted.get(name, 0),
+            # % of this caller's human contacts that produced an analysis.
+            "coverage_pct": round(n / contacted[name] * 100, 1) if contacted.get(name) else None,
+            "avg_qa_score": avg(b["qa"]),
+            "avg_assertiveness": avg(b["assert"]),
+            "decision_maker_rate": round(b["dm"] / n * 100, 1) if n else 0,
+            "close_opportunities": b["close_existed"],
+            "closes_attempted": b["close_taken"],
+            # The headline coaching number: when she had an opening, how often
+            # did she actually ask? Denominator is opportunities, not calls.
+            "close_rate_pct": round(b["close_taken"] / b["close_existed"] * 100, 1) if b["close_existed"] else None,
+            "flags": dict(b["flags"]),
+            "objections": dict(b["objections"]),
+            "missed_closes": sorted(b["recent"], key=lambda x: x["date"], reverse=True)[:8],
+        })
+    out.sort(key=lambda x: -x["analyzed_calls"])
+    return {"window_days": days, "callers": out,
+            "note": "Rates carry their denominators on purpose — a 3-call sample "
+                    "is not a trend. avg_assertiveness reads LANGUAGE (hedging), "
+                    "not tone: a transcript cannot show vocal confidence."}
+
+@app.post("/api/admin/transcribe-backfill")
+def transcribe_backfill(days: int = 30, max_spend_usd: float = 25.0,
+                        dry_run: int = 1, user: str = Depends(verify_admin)):
+    """Rollout step 5 — one-time sweep over recordings already sitting in
+    Twilio that would pass the gate.
+
+    dry_run=1 (the DEFAULT) enqueues nothing and returns the projected cost and
+    skip distribution. Run it that way first: this is the one operation here
+    that can spend real money in bulk, and the spec caps it at $25.
+
+    The cost ceiling is enforced while BUILDING the queue, not while draining
+    it — once a job is enqueued the worker will run it, so the only place a cap
+    can actually hold is before the insert."""
+    days = max(1, min(int(days), 90))
+    cap = max(0.0, min(float(max_spend_usd), 200.0))
+    if not DEEPGRAM_API_KEY:
+        return {"error": "DEEPGRAM_API_KEY not set"}
+    if not TRANSCRIBE_ENABLED and not dry_run:
+        return {"error": "TRANSCRIBE_ENABLED is off — flip it before a live backfill"}
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    # Recordings are recorded in audit_log by /twilio/recording-status, which is
+    # the only place we know the RecordingUrl. call_outcomes.recording_sid only
+    # exists for calls logged after 008, so the audit rows are the fuller
+    # history — they go back to whenever click-to-call recording started.
+    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
+                          f"&created_at=gte.{since}&select=resource_id,details,created_at"
+                          f"&order=created_at.desc", headers=SB_ADMIN_HEADERS)
+    # Already-transcribed recording_sids, so a re-run is idempotent and free.
+    done = set()
+    for t in _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts?select=recording_sid",
+                            headers=SB_ADMIN_HEADERS):
+        if t.get("recording_sid"):
+            done.add(t["recording_sid"])
+
+    from collections import Counter
+    skipped = Counter()
+    queued, projected = [], 0.0
+    for r in rows:
+        try:
+            d = json_lib.loads(r.get("details") or "{}")
+        except Exception:
+            skipped["unparseable_audit_row"] += 1
+            continue
+        rec_sid = d.get("recording_sid") or ""
+        rec_url = d.get("recording_url") or ""
+        try:
+            dur = int(float(d.get("duration") or 0))
+        except (TypeError, ValueError):
+            dur = 0
+        if not rec_sid or not rec_url:
+            skipped["no_recording_url"] += 1
+            continue
+        if rec_sid in done:
+            skipped["duplicate"] += 1
+            continue
+        lead_id = r.get("resource_id")
+        call = _find_call_for_recording("", lead_id) if lead_id else {}
+        # Same gate as the live path — one definition, so a backfill can never
+        # transcribe something the live pipeline would have skipped.
+        reason = transcription_gate(call, {"recording_duration_sec": dur})
+        if reason:
+            skipped[reason] += 1
+            continue
+        cost = dur / 60.0 * DEEPGRAM_RATE_PER_MIN
+        if projected + cost > cap:
+            skipped["over_budget"] += 1
+            continue
+        projected += cost
+        queued.append({"recording_sid": rec_sid, "recording_url": rec_url,
+                       "recording_duration_sec": dur, "channels": 2,
+                       "lead_id": str(lead_id) if lead_id else None,
+                       "call_id": call.get("id")})
+
+    enqueued = 0
+    if not dry_run:
+        for job in queued:
+            if enqueue_job("transcribe_call", job, dedupe_key=job["recording_sid"]):
+                enqueued += 1
+        audit_log(user, "transcribe_backfill", None, None,
+                  {"days": days, "enqueued": enqueued,
+                   "projected_usd": round(projected, 2)})
+    print(f"[BACKFILL] {days}d: {len(rows)} recordings, {len(queued)} eligible, "
+          f"${projected:.2f} projected, enqueued={enqueued} (dry_run={bool(dry_run)})")
+    return {
+        "dry_run": bool(dry_run),
+        "window_days": days, "max_spend_usd": cap,
+        "recordings_found": len(rows),
+        "eligible": len(queued),
+        "enqueued": enqueued,
+        "projected_deepgram_usd": round(projected, 2),
+        # Claude is billed per analysis; ~$0.004/call at Haiku rates on a
+        # 3-minute transcript. Rough, but enough to see the order of magnitude.
+        "projected_claude_usd": round(len(queued) * 0.004, 2),
+        "skipped": dict(skipped),
+        "note": ("Nothing was enqueued. Re-run with dry_run=0 to spend."
+                 if dry_run else
+                 f"{enqueued} job(s) queued; the bg loop drains "
+                 f"{os.getenv('JOBS_PER_CYCLE', '5')} per cycle."),
+    }
+
+@app.get("/api/admin/transcription-stats")
+def transcription_stats(days: int = 7, user: str = Depends(verify_admin)):
+    """Gate distribution + spend. The skip histogram is the operational view:
+    if `short` and `machine` stop dominating, the gate has regressed."""
+    since = (datetime.utcnow() - timedelta(days=max(1, min(days, 90)))).isoformat()
+    skips = _paginated_get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.transcribe_skip"
+                           f"&created_at=gte.{since}&select=details", headers=SB_ADMIN_HEADERS)
+    from collections import Counter
+    reasons = Counter()
+    for r in skips:
+        try:
+            reasons[json_lib.loads(r.get("details") or "{}").get("reason") or "?"] += 1
+        except Exception:
+            reasons["?"] += 1
+    tr = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts?created_at=gte.{since}"
+                        f"&select=cost_usd,duration_sec", headers=SB_ADMIN_HEADERS)
+    an = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_analyses?created_at=gte.{since}"
+                        f"&select=cost_usd,disposition,flags,qa", headers=SB_ADMIN_HEADERS)
+    return {
+        "window_days": days,
+        "enabled": {"transcribe": TRANSCRIBE_ENABLED, "analyze": ANALYZE_ENABLED,
+                    "deepgram_key": bool(DEEPGRAM_API_KEY)},
+        "gate": {"min_seconds": TRANSCRIBE_MIN_SEC, "skipped": dict(reasons),
+                 "skipped_total": sum(reasons.values())},
+        "transcribed": len(tr),
+        "analyzed": len(an),
+        "cost_usd": {"deepgram": round(sum(float(x.get("cost_usd") or 0) for x in tr), 4),
+                     "claude": round(sum(float(x.get("cost_usd") or 0) for x in an), 4)},
+        "avg_duration_sec": round(sum(float(x.get("duration_sec") or 0) for x in tr) / len(tr), 1) if tr else 0,
+        "dispositions": dict(Counter(x.get("disposition") or "?" for x in an)),
+        "flags": dict(Counter(f for x in an for f in (x.get("flags") or []))),
+        "avg_qa_score": round(sum(float((x.get("qa") or {}).get("score") or 0) for x in an) / len(an), 2) if an else 0,
+    }
 
 # ── Claude call coach: rate the week's recorded calls, propose script moves ──
 @app.post("/api/coach/run")
@@ -6323,22 +7913,21 @@ def coach_run(days: int = 7, preview: int = 1, user: str = Depends(verify_admin)
     if not ANTHROPIC_API_KEY:
         return {"error": "ANTHROPIC_API_KEY not set"}
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_transcript"
-                          f"&created_at=gte.{since}&select=details,created_at&order=created_at.desc",
-                          headers=SB_ADMIN_HEADERS)
-    transcripts = []
-    for row in rows[:20]:
-        try:
-            d = json_lib.loads(row.get("details") or "{}")
-            if len(d.get("text") or "") > 200:
-                transcripts.append({"date": row.get("created_at", "")[:10], "text": d["text"][:4000]})
-        except Exception:
-            pass
+    # Reads the owned call_transcripts table. Used to walk audit_log rows
+    # written by the (now removed) Twilio Intelligence webhook.
+    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_transcripts"
+                          f"?created_at=gte.{since}&select=full_text,created_at"
+                          f"&order=created_at.desc", headers=SB_ADMIN_HEADERS)
+    transcripts = [{"date": (r.get("created_at") or "")[:10], "text": (r.get("full_text") or "")[:4000]}
+                   for r in rows[:20] if len(r.get("full_text") or "") > 200]
     if not transcripts:
-        return {"analyzed": 0, "detail": "No transcripts yet — they accumulate once TWILIO_INTELLIGENCE_SID is configured and calls are recorded."}
+        return {"analyzed": 0,
+                "detail": "No transcripts yet — set DEEPGRAM_API_KEY + TRANSCRIBE_ENABLED=true "
+                          "and run migration 008; they accumulate as recorded calls land."}
     system = (
         "You are a cold-call coach for Vision Cleaning Company (commercial janitorial). "
-        "You get transcripts of the caller's recorded outbound calls ([1]=caller, [2]=prospect). "
+        "You get transcripts of the caller's recorded outbound calls. Each line is "
+        "prefixed [AGENT] (our caller) or [PROSPECT] (the business we rang). "
         "Return STRICT JSON: {\"calls\":[{\"date\",\"score\":1-10,\"strength\",\"fix\"}],"
         "\"patterns\":[str],\"script_changes\":[{\"situation\",\"say_this\"}],\"drill\":str}. "
         "Score on: opening hook, discovery questions, objection handling, asking for the walkthrough. "
@@ -6620,11 +8209,68 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         send_email_followup = bool(call.pop("send_email_followup", False))
         flags = []
 
-        # Anti-gaming: empty form — no notes and no qual data filled out
+        # Prefer the CARRIER's talk time over the modal timer. This is what
+        # makes the substantiation flag below mean something: `duration` from
+        # the client is how long the modal was open, so anyone who dials on
+        # their phone and logs afterwards reads ~2s no matter how long they
+        # actually talked. When Twilio click-to-call was used, DialCallDuration
+        # is the real conversation length, and the flag then measures reality.
+        if lead_id:
+            _carrier = take_twilio_duration(lead_id)
+            if _carrier:
+                _client_dur = call.get("duration") or 0
+                call["duration"] = _carrier
+                flags.append("twilio_verified")
+                print(f"[TWILIO-DUR] lead {lead_id}: using carrier {_carrier}s "
+                      f"(modal reported {_client_dur}s)")
+
+        # A recording may have completed BEFORE the rep saved the outcome (the
+        # common ordering). /twilio/recording-status parked the metadata under
+        # the lead; attach it to this row and enqueue now that a call_id exists.
+        _pending_rec, _pending_amd = None, ""
+        if lead_id:
+            try:
+                _rec = _settings_get_json(f"twilio_rec_{lead_id}")
+                if isinstance(_rec, dict) and _rec.get("recording_sid"):
+                    _ts = _parse_iso(_rec.get("at") or "")
+                    if _ts and (datetime.utcnow() - _ts) <= timedelta(minutes=TWILIO_DUR_TTL_MIN):
+                        _pending_rec = _rec
+                    _settings_set_json(f"twilio_rec_{lead_id}", {})   # consume either way
+            except Exception as e:
+                print(f"[TRANSCRIBE] pending-recording read failed: {e}")
+            try:
+                _amd = _settings_get_json(f"twilio_amd_{lead_id}")
+                if isinstance(_amd, dict) and _amd.get("answered_by"):
+                    _pending_amd = _amd["answered_by"]
+                    _settings_set_json(f"twilio_amd_{lead_id}", {})
+            except Exception:
+                pass
+
+        # ── Substantiation flags ────────────────────────────────────────────
+        # The old empty_form rule fired whenever notes AND qual were both blank,
+        # regardless of outcome — so it fired on every ordinary no-answer, where
+        # blank IS the correct state. Measured over the 14,127-call history it
+        # fired on 55% of all calls and 92% of one caller's, which makes it
+        # wallpaper: nobody reads a flag that fires on half the table, so the
+        # ~997 genuinely unverifiable rows hid inside the noise.
+        #
+        # An empty form is only anomalous when the caller CLAIMED a conversation.
+        # "Reached a human" + nothing written + no qual + a timer that never
+        # moved = there is no evidence the conversation happened. Same history:
+        # 77% of one caller's claimed contacts vs 6% of the other's — a 14x
+        # separation on ~7% of rows. That is a signal worth acting on.
         has_notes = bool((call.get("notes") or "").strip())
         has_qual = any(call.get(f) for f in ["budgetfocus", "vendorstatus", "decisionmaker", "timeline", "qualified"])
-        if not has_notes and not has_qual:
-            flags.append("empty_form")
+        no_evidence = not has_notes and not has_qual
+        if no_evidence and outcome in CONTACT_OUTCOMES:
+            # Note: `duration` is modal-open time, not carrier talk time, so a
+            # caller who dials separately and logs afterwards reads near-zero
+            # too. The flag therefore means "unverifiable", not "fabricated" —
+            # keep the name honest, Eric decides what it means for his team.
+            if (call.get("duration") or 0) <= UNSUBSTANTIATED_MAX_SEC:
+                flags.append("unsubstantiated_contact")
+            else:
+                flags.append("empty_form")
 
         # Anti-gaming: duplicate cooldown — same lead within 5 minutes
         if lead_id:
@@ -6657,12 +8303,34 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         call["calledBy"] = caller
 
         r = req_lib.post(f"{SUPABASE_URL}/rest/v1/call_outcomes",
-                        headers=SB_HEADERS, json=call, timeout=30)
+                        headers={**SB_HEADERS, "Prefer": "return=representation"},
+                        json=call, timeout=30)
         # A PostgREST 400 (e.g. unexpected column) used to return the error
         # body with HTTP 200 and still bump the lead — the call was silently
         # lost while the UI thought it saved.
         if r.status_code not in (200, 201):
             raise HTTPException(status_code=500, detail=f"Call insert failed: {r.text[:200]}")
+        try:
+            _new_call_id = ((r.json() or [{}])[0] or {}).get("id")
+        except Exception:
+            _new_call_id = None
+        # Transcription columns land via PATCH, never on the insert above: they
+        # come from migration 008, and _patch_call degrades with a warning
+        # instead of failing the save if 008 has not been run yet.
+        if _new_call_id and (_pending_rec or _pending_amd):
+            _fields = {}
+            if _pending_amd:
+                _fields["answered_by"] = _pending_amd
+            if _pending_rec:
+                _fields["recording_sid"] = _pending_rec.get("recording_sid")
+                _fields["recording_duration_sec"] = _pending_rec.get("recording_duration_sec")
+                _fields["transcription_status"] = "queued" if TRANSCRIBE_ENABLED else "none"
+            _patch_call(_new_call_id, _fields)
+        if _new_call_id and _pending_rec and TRANSCRIBE_ENABLED:
+            enqueue_job("transcribe_call",
+                        {**{k: v for k, v in _pending_rec.items() if k != "at"},
+                         "call_id": _new_call_id, "lead_id": str(lead_id)},
+                        dedupe_key=_pending_rec.get("recording_sid") or "")
         if lead_id:
             lr = req_lib.get(
                 f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}&select=*",
@@ -6704,9 +8372,16 @@ def log_call(call: dict, user: str = Depends(verify_token)):
             # Status new/no_answer means no human was ever reached (any contact
             # outcome rewrites status), so count>=N ⇒ N failures. Manual
             # status edit un-retires if a caller wants another shot.
+            #
+            # 'gatekeeper' is retire-eligible but at DOUBLE the threshold: we
+            # know a human answers that number, so it is not the dead-number
+            # case retirement exists for — but it must not become immortal
+            # either, or every front-desk block accumulates in the queue forever.
+            cur_status = (lead_full.get("status") or "new")
+            retire_at = RETIRE_AFTER_DIALS * (2 if cur_status == "gatekeeper" else 1)
             if (outcome in ("no_answer", "voicemail")
-                    and new_count is not None and new_count >= RETIRE_AFTER_DIALS
-                    and (lead_full.get("status") or "new") in ("new", "no_answer")):
+                    and new_count is not None and new_count >= retire_at
+                    and cur_status in ("new", "no_answer", "gatekeeper")):
                 patch_payload["status"] = "retired"
             # Only update total_calls when we have a trustworthy count.
             # Skipping (vs. writing a wrong value) is the safe failure mode —
@@ -7012,7 +8687,7 @@ def get_call_history(date_from: str = "", date_to: str = "", caller: str = "",
         # Build summary stats. "not_interested" counts as contacted: it's only
         # reachable after "Answered" in the two-step flow, so the rep DID reach a
         # person — excluding it undercounted contact rate.
-        contacted = ["answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"]
+        contacted = CONTACT_OUTCOMES
         summary = {"total": len(calls), "converted": 0, "interested": 0,
                    "no_answer": 0, "callback": 0, "voicemail": 0, "answered": 0,
                    "total_talk_time": 0, "first_calls": 0, "follow_ups": 0}
@@ -7494,7 +9169,7 @@ def insights_best_call_time(industry: str = "", days: int = 60,
     Without an industry filter, returns a global ranking across all calls."""
     days = max(1, min(int(days or 60), 365))
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-    contacted_set = {"answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"}
+    contacted_set = CONTACT_OUTCOMES
 
     # If filtering by industry, first resolve leadIds matching that industry,
     # then pull their calls. PostgREST can't join directly.
@@ -7588,7 +9263,7 @@ def guidance_best_region(days: int = 30, min_sample: int = 20,
         except Exception:
             pass
 
-    PICKUP = {"answered", "interested", "not_interested", "callback", "converted"}
+    PICKUP = CONTACT_OUTCOMES
     tz_cache = {}
     def gtz(tz_str):
         if tz_str not in tz_cache:
@@ -7792,7 +9467,7 @@ def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
         cand_ids = [l["id"] for l in cands]
         # exclude anything that EVER reached a human
         contacted = set()
-        CONTACT_SET = "answered,interested,interested_no_dm,converted,callback,not_interested"
+        CONTACT_SET = ",".join(sorted(CONTACT_OUTCOMES))
         for i in range(0, len(cand_ids), 150):
             chunk = ",".join(str(x) for x in cand_ids[i:i+150])
             r = req_lib.get(
@@ -7855,6 +9530,18 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
 # DST) since Vision is in AZ; override with LEADFLOW_TZ_OFFSET_HOURS for
 # other deployments. UTC offset in hours, can be negative.
 LEADFLOW_TZ_OFFSET_HOURS = int(os.getenv("LEADFLOW_TZ_OFFSET_HOURS", "-7"))
+
+# Free-text markers a caller types when the NUMBER ITSELF is bad (as opposed to
+# nobody picking up). The Twilio lookup (/api/admin/validate-phones) costs
+# ~$0.008/number and is env-gated; the caller already typed this answer for
+# free on every dial, so mine it. Feeds dead_rate in the per-source breakdown —
+# a source handing us disconnected numbers is the cheapest connectivity fix
+# there is, and it is invisible in pickup_rate alone (a dead number and a
+# ringing-but-unanswered number both log as no_answer).
+DEAD_NUMBER_RE = re.compile(
+    r"\b(disconnected|not in service|no longer in service|wrong number|"
+    r"out of business|permanently closed|number (?:is )?(?:invalid|not valid)|"
+    r"fax (?:line|machine|number))\b", re.I)
 
 @app.post("/api/admin/leads/backfill-last-contacted")
 def backfill_last_contacted(user: str = Depends(verify_admin)):
@@ -7986,20 +9673,21 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
     # touched. Both paginated to dodge the 1000-row Supabase cap.
     calls = _paginated_get(
         f"{SUPABASE_URL}/rest/v1/call_outcomes"
-        f"?select=outcome,calledAt,leadId&calledAt=gte.{since}&order=calledAt.desc"
+        f"?select=outcome,calledAt,leadId,notes&calledAt=gte.{since}&order=calledAt.desc"
     )
 
     # Lead-state lookup: only the leadIds we actually saw, batched to keep
     # the in.() filter URL under ~8KB. Builds {leadId: state} for tz lookup.
     lead_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
     lead_state = {}
+    lead_source = {}
     BATCH = 200
     for i in range(0, len(lead_ids), BATCH):
         chunk = lead_ids[i:i+BATCH]
         try:
             ids_filter = ",".join(str(x) for x in chunk)
             lr = req_lib.get(
-                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})&select=id,state",
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})&select=id,state,source",
                 headers=SB_HEADERS, timeout=30,
             )
             rows = lr.json() if lr.status_code == 200 else []
@@ -8007,11 +9695,12 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
                 for row in rows:
                     if row.get("id"):
                         lead_state[row["id"]] = (row.get("state") or "").strip()
+                        lead_source[row["id"]] = (row.get("source") or "").strip() or "(unset)"
         except Exception as e:
             print(f"[CONNECTIVITY] lead-state batch {i} fetch failed: {e}")
 
     DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    PICKUP_OUTCOMES    = {"answered", "interested", "not_interested", "callback", "converted"}
+    PICKUP_OUTCOMES    = CONTACT_OUTCOMES
     VOICEMAIL_OUTCOMES = {"voicemail"}
 
     # Cache ZoneInfo objects per tz string (cheap, but no need to re-build per call)
@@ -8033,6 +9722,12 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
     fallback_calls = 0  # calls bucketed via fixed offset (state unknown / pre-3.9 Python)
     state_counts = {}   # {state: bucketed_count} — observability
     state_buckets = {}  # {state: {total, pickup, voicemail, no_answer}} — per-state pickup rate
+    # {source: {...}} and {(source, "YYYY-MM"): {...}} — which data source hands
+    # us reachable phone numbers, and whether that is getting better or worse.
+    # The month trend is the point: a source whose stock degrades (or new stock
+    # that was never good) is invisible in a single blended lifetime number.
+    source_buckets = {}
+    source_month   = {}
     for c in calls:
         ts = c.get("calledAt") or ""
         try:
@@ -8065,16 +9760,34 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
         if state_key not in state_buckets:
             state_buckets[state_key] = {"total": 0, "pickup": 0, "voicemail": 0, "no_answer": 0}
         state_buckets[state_key]["total"] += 1
+
+        # Source rollups. Month key uses the UTC call date (not prospect-local) —
+        # a trend only needs stable month boundaries, and prospect-local would
+        # put one dial in two different months depending on the lead's state.
+        src_key = lead_source.get(lid, "(unset)") if lid else "(unset)"
+        ym = dt_utc.strftime("%Y-%m")
+        for store, k in ((source_buckets, src_key), (source_month, (src_key, ym))):
+            if k not in store:
+                store[k] = {"total": 0, "pickup": 0, "voicemail": 0, "no_answer": 0, "dead": 0}
+            store[k]["total"] += 1
+
         outcome = (c.get("outcome") or "").lower()
         if outcome in PICKUP_OUTCOMES:
-            buckets[key]["pickup"] += 1
-            state_buckets[state_key]["pickup"] += 1
+            field = "pickup"
         elif outcome in VOICEMAIL_OUTCOMES:
-            buckets[key]["voicemail"] += 1
-            state_buckets[state_key]["voicemail"] += 1
+            field = "voicemail"
         else:
-            buckets[key]["no_answer"] += 1
-            state_buckets[state_key]["no_answer"] += 1
+            field = "no_answer"
+        buckets[key][field] += 1
+        state_buckets[state_key][field] += 1
+        source_buckets[src_key][field] += 1
+        source_month[(src_key, ym)][field] += 1
+        # Dead number: the caller wrote "disconnected" / "wrong number" / etc.
+        # Counted on top of the outcome (it is a property of the NUMBER, not of
+        # the call result), so dead + pickup + vm + no_answer do not sum to total.
+        if DEAD_NUMBER_RE.search(c.get("notes") or ""):
+            source_buckets[src_key]["dead"] += 1
+            source_month[(src_key, ym)]["dead"] += 1
 
     windows = []
     for (day_idx, hour), counts in sorted(buckets.items()):
@@ -8114,6 +9827,45 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
         })
     state_rows.sort(key=lambda r: -r["total"])
 
+    # ── Per-SOURCE rollup ───────────────────────────────────────────────────
+    # The question the other analytics endpoints can't answer: which data source
+    # gives us phone numbers a human actually picks up? /analytics/conversions
+    # slices by source but measures conversions, and at a ~0.2% close rate that
+    # is noise — pickup is a dense signal that reads in days, not years.
+    SRC_MIN_SAMPLE = 30   # below this a source's rate is not worth ranking on
+    source_rows = []
+    for src, b in source_buckets.items():
+        t = b["total"]
+        source_rows.append({
+            "source":      src,
+            "total":       t,
+            "pickup":      b["pickup"],
+            "voicemail":   b["voicemail"],
+            "no_answer":   b["no_answer"],
+            "dead":        b["dead"],
+            "pickup_rate": round(b["pickup"] / t * 100, 1) if t else 0.0,
+            "dead_rate":   round(b["dead"]   / t * 100, 1) if t else 0.0,
+            "significant": t >= SRC_MIN_SAMPLE,
+        })
+    source_rows.sort(key=lambda r: -r["total"])
+
+    # Month trend per source, oldest→newest. A source is only worth trending
+    # once it has real volume, so thin sources don't fill the payload with noise.
+    trend_sources = {r["source"] for r in source_rows if r["significant"]}
+    trend = {}
+    for (src, ym), b in source_month.items():
+        if src not in trend_sources:
+            continue
+        t = b["total"]
+        trend.setdefault(src, []).append({
+            "month":       ym,
+            "total":       t,
+            "pickup_rate": round(b["pickup"] / t * 100, 1) if t else 0.0,
+            "dead_rate":   round(b["dead"]   / t * 100, 1) if t else 0.0,
+        })
+    for rowsx in trend.values():
+        rowsx.sort(key=lambda r: r["month"])
+
     return {
         "since":           since,
         "days_analyzed":   days,
@@ -8124,10 +9876,13 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
         "worst_windows":   worst,
         "state_counts":    state_counts,
         "state_breakdown": state_rows,
+        "source_breakdown": source_rows,
+        "source_trend":     trend,
         "summary": {
             "total_calls":          overall_total,
             "overall_pickup_rate":  round(overall_rate, 1),
             "min_sample_for_rank":  MIN_SAMPLE,
+            "min_sample_per_source": SRC_MIN_SAMPLE,
             "parse_failures":       parse_failures,
             "fallback_calls":       fallback_calls,
         },
@@ -9572,7 +11327,7 @@ def run_weekly_review_scan_if_due():
 def run_call_coach_if_due():
     """Weekly Claude coaching report over the week's recorded calls — no-ops
     until transcription is configured and transcripts exist."""
-    if not TWILIO_INTELLIGENCE_SID or not ANTHROPIC_API_KEY or not SLACK_WEBHOOK_URL:
+    if not (DEEPGRAM_API_KEY and ANTHROPIC_API_KEY and SLACK_WEBHOOK_URL):
         return
     if not _iso_week_due("last_call_coach"):
         return
@@ -10183,7 +11938,7 @@ def get_flagged_calls(user: str = Depends(verify_admin)):
         if not isinstance(calls, list):
             return []
         # Only return calls that have our gaming flags
-        gaming_flags = {"empty_form", "duplicate_cooldown", "rapid_cadence"}
+        gaming_flags = {"unsubstantiated_contact", "empty_form", "duplicate_cooldown", "rapid_cadence"}
         flagged = [c for c in calls if any(f in (c.get("follow_up_outcome") or "") for f in gaming_flags)]
         return flagged
     except Exception as e:
@@ -11148,8 +12903,6 @@ def note_insights(days: int = 7, refresh: int = 0, user: str = Depends(verify_to
 #   engaged   = interested / callback / converted (a real positive)
 # Index = 100 * (0.35*contact_rate + 0.65*engagement_rate). Hundreds of points
 # a day instead of one win per 500 calls → readable in weeks, not years.
-CONTACT_OUTCOMES = {"answered", "interested", "interested_no_dm", "not_interested", "callback", "converted"}
-ENGAGED_OUTCOMES = {"interested", "interested_no_dm", "callback", "converted"}
 _DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 RECEPTIVITY_MIN_SLICE = int(os.getenv("RECEPTIVITY_MIN_SLICE", "15"))   # below this = low confidence
@@ -11471,7 +13224,8 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
         # which silently truncated leaderboard totals once the team crossed
         # 1000 lifetime calls (or 1000 in any window). Same root cause as
         # the /api/leads + /api/stats fix in commit 6142f2c.
-        calls_url = f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome,calledBy,calledAt,duration"
+        calls_url = (f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                     f"?select=outcome,calledBy,calledAt,duration,follow_up_outcome")
         if since:
             since_ts = local_day_start_utc() if since == today else f"{since}T00:00:00"
             calls_url += f"&calledAt=gte.{since_ts}"
@@ -11520,8 +13274,17 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             if (c.get("calledAt") or "") >= local_day_start_utc():
                 u["calls_today"] += 1
             outcome = c.get("outcome", "")
-            if outcome in ("answered", "interested", "interested_no_dm", "converted", "callback", "not_interested"):
+            if outcome in CONTACT_OUTCOMES:
                 u["contacted"] += 1
+                # Talk time on CLAIMED CONTACTS only — the trust signal. A
+                # no-answer's 1s duration is meaningless; a "not interested"
+                # that lasted 2s means no conversation happened. Over the
+                # 14k-call history this read 2s for one caller and 32s for
+                # another, which is the clearest integrity signal in the data
+                # and costs nothing extra: `duration` is already selected.
+                u.setdefault("_contact_durs", []).append(c.get("duration") or 0)
+            if "unsubstantiated_contact" in (c.get("follow_up_outcome") or ""):
+                u["unsubstantiated"] = u.get("unsubstantiated", 0) + 1
             if outcome == "converted":
                 u["conversions"] += 1
             elif outcome == "interested": u["interested"]  += 1
@@ -11555,6 +13318,18 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             u["conv_rate"] = f"{(u['conversions']/tc*100):.1f}" if tc else "0.0"
             u["contact_rate"] = f"{(u['contacted']/tc*100):.1f}" if tc else "0.0"
             u["avg_talk_time"] = round(u["talk_time"] / tc) if tc else 0
+            # Median, not mean: one 10-minute call cannot mask a hundred 2s ones.
+            durs = sorted(u.pop("_contact_durs", []) or [])
+            u["contact_talk_median"] = (durs[len(durs)//2] if len(durs) % 2
+                                        else (durs[len(durs)//2 - 1] + durs[len(durs)//2]) // 2) if durs else 0
+            # Share of claimed contacts with SOME evidence behind them. Only
+            # counts calls logged since the unsubstantiated_contact flag
+            # shipped — historical rows carry no flag, so read this alongside
+            # contact_talk_median, which works retroactively.
+            uns = u.get("unsubstantiated", 0)
+            u["unsubstantiated"] = uns
+            u["substantiated_rate"] = (f"{((u['contacted'] - uns) / u['contacted'] * 100):.1f}"
+                                       if u["contacted"] else "0.0")
             u["leads_assigned"] = u.get("leads_assigned", 0)
             u["leads_populated"] = u.get("leads_populated", 0)
             result.append(u)
@@ -11570,6 +13345,13 @@ def get_leaderboard(range: str = "today", user: str = Depends(verify_token)):
             contact = float(u["contact_rate"]) if u["total_calls"] >= 10 else 0
             if conv > 50: u["flags"].append("high_conv_rate")
             if contact > 95 and u["total_calls"] >= 20: u["flags"].append("perfect_contact")
+            # The one that would have caught the pre-Jun-8 data: a caller
+            # claiming conversations whose median length is a couple of seconds.
+            if (u["contacted"] >= 20
+                    and u["contact_talk_median"] <= UNSUBSTANTIATED_MAX_SEC):
+                u["flags"].append("low_contact_talk_time")
+            if u["contacted"] >= 20 and float(u["substantiated_rate"]) < 50:
+                u["flags"].append("mostly_unsubstantiated")
 
         # Sort by calls today desc, then total calls
         result.sort(key=lambda x: (-x["calls_today"], -x["total_calls"]))
