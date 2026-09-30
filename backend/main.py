@@ -7013,9 +7013,30 @@ async def twilio_recording_status(request: Request, lead_id: str = ""):
 DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
 DEEPGRAM_MODEL        = os.getenv("DEEPGRAM_MODEL", "nova-3")
 DEEPGRAM_RATE_PER_MIN = float(os.getenv("DEEPGRAM_RATE_PER_MIN", "0.0077"))  # cost tracking only
-# Haiku-class per the spec: this is high-volume single-pass extraction, not
-# synthesis. INSIGHTS_MODEL stays on the weekly aggregate.
-ANALYSIS_MODEL        = os.getenv("ANALYSIS_MODEL", "claude-haiku-4-5")
+# Opus-class, deliberately — the spec called this Haiku-class "high-volume
+# single-pass extraction", which is only half true. Extraction (disposition,
+# objections, callback date, DM reached) is schema-enforced and Haiku handles
+# it. The COACHING block is judgment: scoring hedging language against
+# verbatim evidence, and deciding whether a buying signal was actually there.
+#
+# `close_opportunity.existed` is the reason for the upgrade. It is the
+# DENOMINATOR of close_rate_pct, and passed_on_buying_signal is derived from
+# it server-side. Errors in a denominator do not average out — they bias the
+# headline coaching number in one direction, and that number is used to judge
+# a person's performance.
+#
+# Volume makes this cheap: ~15 qualifying calls/day is ~450/month, so the
+# Haiku→Opus difference is roughly $3 → $20 a month. Set ANALYSIS_MODEL back
+# to claude-haiku-4-5 if a real comparison shows the coaching holds up.
+ANALYSIS_MODEL        = os.getenv("ANALYSIS_MODEL", "claude-opus-5-5")
+# Thinking is always on for Opus 5.5 and CANNOT be disabled, and thinking
+# tokens count against max_tokens. 2000 was sized for a Haiku response with no
+# thinking; on Opus that budget gets eaten before the JSON is emitted and the
+# response truncates. Same failure the weekly digest already hit once (rich
+# JSON truncating at 1600). Effort is set explicitly rather than inheriting
+# Opus 5.5's `medium` default, so tuning it is a visible decision.
+ANALYSIS_MAX_TOKENS   = int(os.getenv("ANALYSIS_MAX_TOKENS", "8000"))
+ANALYSIS_EFFORT       = os.getenv("ANALYSIS_EFFORT", "medium")   # low|medium|high|xhigh|max
 TRANSCRIBE_MIN_SEC    = int(os.getenv("TRANSCRIBE_MIN_SEC", "45"))
 TRANSCRIBE_ENABLED    = os.getenv("TRANSCRIBE_ENABLED", "0") == "1"   # off until 008 has run
 ANALYZE_ENABLED       = os.getenv("ANALYZE_ENABLED", "0") == "1"
@@ -7582,11 +7603,20 @@ def analyze_call(payload: dict):
     # block is schema-valid JSON, so this never regex-scrapes a blob out of
     # prose the way the weekly coach has to.
     resp = client.messages.create(
-        model=ANALYSIS_MODEL, max_tokens=2000,
+        model=ANALYSIS_MODEL, max_tokens=ANALYSIS_MAX_TOKENS,
         system=_ANALYSIS_SYSTEM,
         messages=[{"role": "user", "content": f"Transcript:\n\n{text[:20000]}"}],
-        output_config={"format": {"type": "json_schema", "schema": _ANALYSIS_SCHEMA}},
+        # `effort` lives inside output_config alongside `format`, not at the
+        # top level. Both are the same object.
+        output_config={"format": {"type": "json_schema", "schema": _ANALYSIS_SCHEMA},
+                       "effort": ANALYSIS_EFFORT},
     )
+    # A truncated response is a schema-invalid one, and json_lib.loads below
+    # raises on it — which the job queue retries. Say so loudly first, because
+    # "raise max_tokens" is not what a bare JSONDecodeError looks like.
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        print(f"[ANALYZE] hit max_tokens ({ANALYSIS_MAX_TOKENS}) on {ANALYSIS_MODEL} — "
+              f"raise ANALYSIS_MAX_TOKENS or lower ANALYSIS_EFFORT")
     body = next((b.text for b in resp.content if b.type == "text"), "")
     data = json_lib.loads(body)      # schema-enforced; a raise here is a real retry
     cost = _analysis_cost(getattr(resp, "usage", None))
