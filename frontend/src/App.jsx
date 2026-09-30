@@ -259,6 +259,10 @@ const INTENT_META = {
   // with no incumbent cleaner and no loyalty to one. Opposite timing, so the
   // opener has to be opposite too.
   tenant_improvement: { label: "🔑 New tenant fit-out", color: "#ffc95c", pitch: "Moving into leased space — no cleaner yet. Ask who is covering it after they open." },
+  // They are advertising for their OWN cleaner: in-house, and visibly unable
+  // to staff it. Inverts the usual rule — in-house is a bad target, in-house
+  // and hiring for it is one of the best.
+  hiring_custodial: { label: "🧹 Hiring own cleaner", color: "#f6a569", pitch: "They're trying to hire a janitor. While that role is open, offer to cover it — quote beats a hire." },
   competitor:  { label: "↔️ Unhappy w/ cleaner",     color: "#ff6e84", pitch: "Poach — they're unhappy now." },
   lookalike:   { label: "🎯 Lookalike (you convert these)", color: "#ffe083", pitch: "Resembles accounts you've won." },
 }
@@ -826,10 +830,12 @@ function FreeSourceFinder({onFound}){
       const path = src==="osm" ? "/api/sources/osm"
                  : src==="npi" ? "/api/sources/npi"
                  : src==="permits" ? "/api/sources/permits"
+                 : src==="jobs" ? "/api/sources/jobs"
                  : "/api/sources/health"
       const body = src==="osm" ? {state,cities,categories:cats,enrich}
                  : src==="npi" ? {state,cities,taxonomy,limit:200}
                  : src==="permits" ? {state,limit:30}
+                 : src==="jobs" ? {state,cities,days:30}
                  : {state,limit:90,restaurants,enrich:dmEnrich}
       const res = await api(path,{method:"POST",body:JSON.stringify(body)})
       setResult(res); if(res.saved>0) onFound&&onFound()
@@ -849,7 +855,7 @@ function FreeSourceFinder({onFound}){
 
       {/* Source toggle */}
       <div style={{display:"flex",gap:8,marginBottom:14}}>
-        {[["osm","🗺️ OpenStreetMap"],["npi","🏥 NPI Healthcare"],["permits","🏗️ New-Build Permits"],["health","🚨 Health Inspections"]].map(([v,label])=>(
+        {[["osm","🗺️ OpenStreetMap"],["npi","🏥 NPI Healthcare"],["permits","🏗️ New-Build Permits"],["health","🚨 Health Inspections"],["jobs","🧹 Hiring Own Cleaner"]].map(([v,label])=>(
           <button key={v} onClick={()=>setSrc(v)} type="button"
             style={{padding:"6px 14px",borderRadius:8,fontSize:12,fontFamily:"inherit",cursor:"pointer",
               background:src===v?"#69f6b8":"transparent",color:src===v?"#001b12":"#a3aac4",

@@ -1038,6 +1038,11 @@ INTENT_BOOSTS = {
     # date on it, so it outranks newbuild. 34% of permit leads already matched
     # this and were all being pitched as "new construction".
     "tenant_improvement": 30,
+    # A business advertising for its OWN janitor cleans in-house AND cannot
+    # staff it — the exact moment outsourcing becomes attractive. Inverts the
+    # 2026-08 finding: in-house custodial is a bad target, but in-house and
+    # visibly failing to hire for it is one of the best. Dated by the posting.
+    "hiring_custodial": 30,
     "competitor":  26,   # unhappy with their current cleaner (poach)
     "lookalike":   12,   # resembles a lead we've already converted
 }
@@ -2900,6 +2905,10 @@ def _bg_maintenance_loop():
             run_health_refresh_if_due()
         except Exception as e:
             print(f"[HEALTH-REFRESH] loop exception: {e}")
+        try:
+            run_jobs_refresh_if_due()
+        except Exception as e:
+            print(f"[JOBS-REFRESH] loop exception: {e}")
         # Transcription/analysis queue. Drains a few jobs per cycle rather than
         # everything: this thread also drives digests, refills and the email
         # sequencer, and a 200-call backlog must not starve them.
@@ -5018,6 +5027,44 @@ def fetch_permits(state_abbrev: str, days: int = 30) -> list:
             })
     return leads
 
+@app.post("/api/sources/jobs")
+def source_jobs(body: FreeSourceRequest, user: str = Depends(verify_token)):
+    """Businesses hiring their OWN janitor/custodian — in-house cleaning that
+    is visibly short-staffed. Adzuna-backed; needs ADZUNA_APP_ID + ADZUNA_APP_KEY.
+    `cities` is the metro list ("Las Vegas, NV|Columbus, OH"); `days` is the
+    max posting age. Adzuna carries no phones, so leads are Google-phoned
+    before ingest (same path and caps as restaurant inspections)."""
+    _free_source_guard(user)
+    if not (ADZUNA_APP_ID and ADZUNA_APP_KEY):
+        raise HTTPException(status_code=400, detail="Set ADZUNA_APP_ID and ADZUNA_APP_KEY to enable the job-posting source.")
+    metros = [m.strip() for m in (body.cities or "").replace("|", ",").split(",") if m.strip()]
+    if not metros and body.state:
+        metros = [m for m in JOBS_REFRESH_METROS if m.upper().endswith(body.state.upper())] or JOBS_REFRESH_METROS
+    if not metros:
+        raise HTTPException(status_code=400, detail="Pick a state or pass cities.")
+    raw = []
+    for m in metros:
+        raw += fetch_adzuna_jobs(m, max_days_old=body.days or JOBS_MAX_DAYS_OLD, limit=body.limit or FREE_SOURCE_MAX_ROWS)
+    found = len(raw)
+    phoned = 0
+    on, _src = is_kill_switch_on()
+    if GOOGLE_KEY and not on and raw:
+        deadline = time.time() + OSM_ENRICH_BUDGET_SEC
+        for lead in raw:
+            if phoned >= OSM_ENRICH_CAP or time.time() > deadline:
+                break
+            ph = google_place_phone(lead["company"], lead.get("city", ""), lead.get("state", ""))
+            if ph:
+                lead["phone"] = ph; phoned += 1
+                log_usage(user, "google_find_place", {"company": lead["company"]})
+                log_usage(user, "google_details", {"company": lead["company"]})
+    res = ingest_leads(raw, "Job posting (in-house custodial)", user)
+    res["phoned"] = phoned
+    audit_log(user, "source_jobs", "lead", None, {"metros": metros, "found": found, **res})
+    res["summary"] = (f"Jobs: {found} businesses hiring their own cleaners · {phoned} phoned · "
+                      f"{res['alreadyInDb']} already in DB · {res['droppedUncallable']} no phone · {res['saved']} new saved")
+    return res
+
 @app.post("/api/sources/permits")
 def source_permits(body: FreeSourceRequest, user: str = Depends(verify_token)):
     """Pull recent commercial new-construction permits (trigger leads). Free.
@@ -5295,6 +5342,96 @@ CMS_HEALTHCARE_FETCHERS = [t for t in _CMS_ALL_FETCHERS if t[0] in CMS_HEALTH_TY
 # of the complaint flow for good, so CMS_HEALTH_TYPES=hospital can no longer
 # pull them back in. The fetcher stays defined for reference only.
 
+# A cleaning company hiring cleaners is a competitor, not a prospect, and a
+# staffing agency hiring them is neither. Both post exactly the titles we
+# search for, so without this the pull is mostly noise. Matched on the
+# EMPLOYER name only — a hospital "hiring a janitor" is the lead we want.
+_JOBS_COMPETITOR_RE = re.compile(
+    r"(\bclean(?:ing|ers?)\b|\bjanitorial\b|\bcustodial services\b|\bmaintenance services\b"
+    r"|\bfacilit(?:y|ies) services\b|\bbuilding services\b|\bstaffing\b|\brecruit(?:ing|ers?)\b"
+    r"|\btemp(?:orary)? (?:agency|services)\b|\bservicemaster\b|\baramark\b|\bsodexo\b|\babm\b)",
+    re.I)
+
+def _jobs_state_abbrev(area) -> str:
+    """Adzuna's location.area is ["US", "Nevada", "Clark County", "Las Vegas"].
+    Index 1 is the full state name; US_STATES_REVERSE turns it into NV."""
+    try:
+        full = str((area or [None, ""])[1] or "").strip().lower()
+    except Exception:
+        return ""
+    return US_STATES_REVERSE.get(full, "")
+
+def fetch_adzuna_jobs(where: str, keywords=None, max_days_old: int = None, limit: int = None) -> list:
+    """Businesses advertising for their OWN cleaning staff, via Adzuna.
+
+    One request per keyword, deduped on employer + city, competitors and
+    staffing agencies removed, tagged [INTENT:hiring_custodial] with the title
+    and posting date as the pitch. Returns leads WITHOUT phones — Adzuna has
+    none — so the caller must enrich before ingest or every row is dropped as
+    uncallable.
+    """
+    if not (ADZUNA_APP_ID and ADZUNA_APP_KEY):
+        return []
+    keywords = keywords or JOBS_KEYWORDS
+    max_days_old = max(1, min(int(max_days_old or JOBS_MAX_DAYS_OLD), 90))
+    limit = int(limit or FREE_SOURCE_MAX_ROWS)
+    leads, seen, dropped_competitor = [], set(), 0
+    for kw in keywords:
+        try:
+            r = req_lib.get("https://api.adzuna.com/v1/api/jobs/us/search/1",
+                            params={"app_id": ADZUNA_APP_ID, "app_key": ADZUNA_APP_KEY,
+                                    "what": kw, "where": where, "results_per_page": 50,
+                                    "max_days_old": max_days_old, "content-type": "application/json"},
+                            timeout=30)
+            if r.status_code != 200:
+                print(f"[JOBS] {where!r} {kw!r} HTTP {r.status_code}: {r.text[:120]}")
+                continue
+            results = (r.json() or {}).get("results") or []
+        except Exception as e:
+            print(f"[JOBS] {where!r} {kw!r} failed: {e}")
+            continue
+        for j in results:
+            company = clean(((j.get("company") or {}).get("display_name")) or "")
+            if not company:
+                continue
+            if _JOBS_COMPETITOR_RE.search(company):
+                dropped_competitor += 1
+                continue
+            # A hospital or nursing home hiring EVS staff is not a distress
+            # signal — they run cleaning in-house structurally and hire for it
+            # constantly. That is the vertical the 2026-08 audit demoted.
+            # Adzuna's category is a JOB type, not a business type, so the
+            # name is the only signal here; industry is blanked deliberately
+            # so is_complaint_excluded_vertical() falls through to its
+            # careful name test (keeps dialysis, keeps hospitality).
+            if is_complaint_excluded_vertical({"company": company, "industry": ""}):
+                dropped_competitor += 1
+                continue
+            loc = j.get("location") or {}
+            area = loc.get("area") or []
+            city = clean(str(area[-1])) if area else clean(loc.get("display_name") or "")
+            st = _jobs_state_abbrev(area)
+            key = (company.lower(), city.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            title = clean(j.get("title") or "")[:80]
+            posted = str(j.get("created") or "")[:10]
+            leads.append({
+                "company": company, "industry": clean(((j.get("category") or {}).get("label")) or "") or "Unknown",
+                "phone": "", "city": city, "state": st,
+                "notes": (f"[INTENT:hiring_custodial] Hiring their own {title or 'cleaner'} "
+                          f"(posted {posted}) — cleans in-house and can't staff it"
+                          + (f" [posted:{posted}]" if re.match(r"\d{4}-\d{2}-\d{2}", posted) else "")),
+            })
+            if len(leads) >= limit:
+                break
+        if len(leads) >= limit:
+            break
+    if dropped_competitor:
+        print(f"[JOBS] {where!r}: dropped {dropped_competitor} competitor/staffing postings")
+    return leads
+
 def fetch_health_inspections(state_abbrev: str, days: int = 90) -> list:
     """Pull recent FAILED health inspections for configured metros in a state.
     Dedups multi-violation rows to one lead per facility, tagged
@@ -5563,6 +5700,25 @@ COMPLAINT_RUNG_MAX_CALLS = 4
 # is not a weak lead, it is a wrong one.
 HEALTH_MAX_AGE_DAYS      = int(os.getenv("HEALTH_MAX_AGE_DAYS", "120"))
 HEALTH_REFRESH_ENABLED   = os.getenv("HEALTH_REFRESH_ENABLED", "1") == "1"
+# ── Job-posting signal (Adzuna) ─────────────────────────────────────────────
+# Licensed aggregator, not a scraper. Indeed retired its public search API and
+# blocks scraping; ZipRecruiter's API is partner-gated; scraping either
+# directly is a ToS breach against mature anti-bot defences, so it would
+# break constantly AND carry legal exposure. Adzuna has done those deals and
+# exposes them through a keyed API. Both credentials are required by their
+# API — an app_id alone is rejected.
+ADZUNA_APP_ID          = os.getenv("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY         = os.getenv("ADZUNA_APP_KEY", "")
+# Titles for IN-HOUSE cleaning staff. The search is for the role, and the
+# competitor filter below removes cleaning companies hiring for it.
+JOBS_KEYWORDS          = [k.strip() for k in os.getenv("JOBS_KEYWORDS",
+    "janitor,custodian,environmental services technician,commercial housekeeper,porter"
+    ).split(",") if k.strip()]
+# A posting older than this is filled or abandoned either way.
+JOBS_MAX_DAYS_OLD      = int(os.getenv("JOBS_MAX_DAYS_OLD", "30"))
+JOBS_REFRESH_ENABLED   = os.getenv("JOBS_REFRESH_ENABLED", "1") == "1"
+JOBS_REFRESH_METROS    = [m.strip() for m in os.getenv("JOBS_REFRESH_METROS",
+    "Las Vegas, NV|Columbus, OH|Kansas City, MO").split("|") if m.strip()]
 HEALTH_REFRESH_STATES    = [x.strip().upper() for x in os.getenv(
     "HEALTH_REFRESH_STATES", "NV,OH,MO").split(",") if x.strip()]
 COMPLAINT_MAX_AGE_DAYS = int(os.getenv("COMPLAINT_MAX_AGE_DAYS", "540"))
@@ -11759,6 +11915,28 @@ def run_health_refresh_if_due():
                    f"{HEALTH_MAX_AGE_DAYS} days and are now on the Day Plan complaint list.",
                    fields=[{"label": "By state", "value": ", ".join(f"{k}: {v}" for k, v in by_state.items())},
                            {"label": "Guidance", "value": COMPLAINT_CALL_GUIDANCE}])
+
+def run_jobs_refresh_if_due():
+    """Weekly pull of businesses hiring their own cleaning staff. A posting is
+    a dated signal that goes stale in weeks, so like the health feed it is
+    worth nothing unless something actually refreshes it."""
+    if not (JOBS_REFRESH_ENABLED and ADZUNA_APP_ID and ADZUNA_APP_KEY):
+        return
+    if not _iso_week_due("last_jobs_refresh"):
+        return
+    _record_weekly_run("last_jobs_refresh")
+    try:
+        res = source_jobs(FreeSourceRequest(cities="|".join(JOBS_REFRESH_METROS),
+                                            days=JOBS_MAX_DAYS_OLD), user="eric")
+        n = (res or {}).get("saved", 0) if isinstance(res, dict) else 0
+        print(f"[JOBS-REFRESH] {res.get('summary') if isinstance(res, dict) else res}")
+        if n:
+            send_slack("🧹 Businesses hiring their own cleaners",
+                       f"*{n}* new leads are advertising for in-house janitorial staff in the last "
+                       f"{JOBS_MAX_DAYS_OLD} days — cleaning in-house and short-handed.",
+                       fields=[{"label": "Opener", "value": "Saw you're hiring for cleaning — while that role is open, want a quote for covering it?"}])
+    except Exception as e:
+        print(f"[JOBS-REFRESH] failed: {e}")
 
 def run_call_coach_if_due():
     """Weekly Claude coaching report over the week's recorded calls — no-ops
