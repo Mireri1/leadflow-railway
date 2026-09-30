@@ -4562,8 +4562,25 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
 # 2026-08 audit: dropped Hospital/General Acute Care/Nursing/Skilled Nursing
 # (in-house EVS, 5.8% connect, 0.4% engagement), Home Health (no facility to
 # clean), Pharmacy + Laboratory (chains). Kept the outsourcing-friendly types.
-NPI_STATEWIDE_TAXONOMIES = ["Clinic/Center", "Assisted Living", "Dental", "Rehabilitation",
-    "Urgent Care", "Surgical", "Dialysis"]
+# Measured over 8,147 Cristine-era dials, not assumed. The budget is split
+# EVENLY across this list, so a taxonomy here is a claim on ~1/N of every NPI
+# pull. "Clinic/Center" led the list and is the NPPES bucket that produced
+# `Clinic/Center` (564 dials, 6.7% contact / 0.5% engaged) plus its mental
+# health variants (633 dials, ~5% / ~0.2%) — roughly a fifth of all dials, at
+# a third of the engagement of the tiers we actually want. "Assisted Living"
+# and "Rehabilitation" feed the same Nursing Facility pool the 2026-08 audit
+# already demoted (1,144 dials, 7.7% / 1.3%).
+#
+# What is left is what earns its slot: Dialysis (558 dials, 10.4% / 2.5% —
+# the best-performing healthcare vertical and well above the 8.4% / 1.5%
+# overall), Urgent Care and Surgical (priority tiers per the 2026-08
+# recalibration), Dental (small but clean). Dropping four names does not just
+# cut bad volume, it doubles the share of every pull going to the good ones.
+#
+# Env-overridable now: this was a hardcoded list, which made it the one part
+# of the sourcing mix that needed a deploy to retune.
+NPI_STATEWIDE_TAXONOMIES = [t.strip() for t in os.getenv(
+    "NPI_STATEWIDE_TAXONOMIES", "Dialysis,Urgent Care,Surgical,Dental").split(",") if t.strip()]
 
 # NPPES caps `skip`; stay under it so a rotating offset can never send an
 # invalid request. 200 is also the hard per-request `limit` on their side.
@@ -9644,6 +9661,51 @@ def rescore_all(user: str = Depends(verify_admin)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Demoted verticals ───────────────────────────────────────────────────────
+# The 2026-08 audit demoted hospitals / nursing / in-house-custodial
+# healthcare, but it only changed what gets INGESTED — it never retired the
+# stock already in the pipe. Four months later those verticals were still
+# ~29% of all dials. Measured over the last 120 days:
+#
+#   Nursing Facility              1,144 dials   7.7% contact  1.3% engaged
+#   Clinic/Center                   564          6.7%         0.5%
+#   Clinic/Center, Mental Health    470          5.1%         0.4%
+#   Clinic/Center, Adult Mental     163          4.9%         0.0%
+#   Hospital                         62          4.8%         0.0%
+#   -- for contrast --
+#   Dialysis Center                 558         10.4%         2.5%
+#   OVERALL                       8,147          8.4%         1.5%
+#
+# KEEP wins over DEMOTE, deliberately. A real, specific industry label beats a
+# generic one: "Dialysis Center" is a proven 2.5%-engaged vertical and must
+# never be swept just because it contains "Center". Same for urgent care,
+# dental and surgical. This mirrors is_complaint_excluded_vertical()'s rule
+# that a real industry label wins.
+#
+# Every pattern is \b-anchored. `hospitality` (hotels, clubs, venues — a real
+# vertical) must never be caught by `hospital`, which a prefix match would do.
+# Schools are deliberately ABSENT: only PUBLIC schools were demoted, and
+# private schools measure 10.6% / 1.6%, above the overall average.
+_DEMOTED_VERTICAL_RE = re.compile(
+    r"(\bnursing\b|\bskilled nursing\b|\bassisted living\b|\bhospital\b"
+    r"|\brehabilitation\b|^\s*clinic/center\b)", re.I)
+_DEMOTED_KEEP_RE = re.compile(
+    r"(\bdialysis\b|\burgent care\b|\bdental\b|\bsurgical\b|\bhospitality\b)", re.I)
+
+def is_demoted_vertical(industry) -> bool:
+    """True when a lead's industry is one the 2026-08 audit ruled out.
+
+    Reads the INDUSTRY label only, never the company name. A name-based test
+    would sweep "CHILDRESS REGIONAL MEDICAL CENTER DIALYSIS" — a Dialysis
+    Center, and one of the best verticals in the book.
+    """
+    label = (industry if isinstance(industry, str) else "").strip()
+    if not label:
+        return False                      # unlabelled is not evidence of anything
+    if _DEMOTED_KEEP_RE.search(label):
+        return False
+    return bool(_DEMOTED_VERTICAL_RE.search(label))
+
 @app.post("/api/admin/retire-exhausted")
 def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
     """One-time (re-runnable) sweep: retire every lead already sitting at
@@ -9681,6 +9743,84 @@ def retire_exhausted(dry_run: int = 0, user: str = Depends(verify_admin)):
         audit_log(user, "retire_exhausted", "lead", None,
                   {"retired": done, "skipped_had_contact": len(contacted)})
         return {"retired": done, "skipped_had_contact": len(contacted), "candidates": len(cand_ids)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/retire-demoted-verticals")
+def retire_demoted_verticals(dry_run: int = 1, limit: int = 5000,
+                             user: str = Depends(verify_admin)):
+    """Park leads whose INDUSTRY is a vertical the 2026-08 audit demoted.
+
+    The audit stopped ingesting hospitals / nursing / generic NPI clinics but
+    never retired what was already loaded, so ~29% of dials kept going there
+    at roughly a third of the engagement of the tiers we want.
+
+    dry_run DEFAULTS TO 1 — unlike retire-exhausted, which sweeps a handful of
+    genuinely exhausted leads. This one can touch thousands of rows on an
+    industry-label match, so the default has to be "show me first".
+
+    Safety, in order:
+      - never touches a lead that EVER reached a human (same guard as
+        retire-exhausted): a worked lead is not stock, whatever its vertical
+      - never touches an engaged status, so an interested/callback/converted
+        lead cannot be swept out from under the caller
+      - KEEP beats DEMOTE in is_demoted_vertical(), so dialysis / urgent care
+        / dental / surgical survive a "Center" or "Clinic" in their label
+    Reversible: the leads are set to `retired`, which a manual status edit
+    un-retires, exactly like the dial-count retirement.
+    """
+    try:
+        rows = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,industry,status,company"
+            f"&status=not.in.({','.join(sorted(ENGAGED_STATUSES | {'retired'}))})")
+        by_industry = {}
+        cands = []
+        for l in rows:
+            if is_demoted_vertical(l.get("industry")):
+                cands.append(l)
+                k = (l.get("industry") or "").strip()[:40]
+                by_industry[k] = by_industry.get(k, 0) + 1
+        cand_ids = [l["id"] for l in cands][:max(1, limit)]
+
+        # Exclude anything that ever reached a human.
+        contacted = set()
+        CONTACT_SET = ",".join(sorted(CONTACT_OUTCOMES))
+        for i in range(0, len(cand_ids), 150):
+            chunk = ",".join(str(x) for x in cand_ids[i:i+150])
+            r = req_lib.get(
+                f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=in.({chunk})"
+                f"&outcome=in.({CONTACT_SET})&select=leadId",
+                headers=SB_HEADERS, timeout=20)
+            if r.status_code == 200:
+                contacted.update(row["leadId"] for row in r.json())
+        to_retire = [i for i in cand_ids if i not in contacted]
+
+        top = sorted(by_industry.items(), key=lambda kv: -kv[1])[:12]
+        summary = {"matched": len(cands), "considered": len(cand_ids),
+                   "skipped_had_contact": len(contacted),
+                   "would_retire" if dry_run else "retired": len(to_retire),
+                   "by_industry": dict(top), "dry_run": bool(dry_run)}
+        if dry_run:
+            # A couple of real rows so the caller can eyeball that the matcher
+            # is hitting what they think it is before anything moves.
+            summary["sample"] = [{"id": l["id"], "industry": l.get("industry"),
+                                  "company": l.get("company")}
+                                 for l in cands[:5]]
+            return summary
+
+        now = datetime.utcnow().isoformat()
+        done = 0
+        for i in range(0, len(to_retire), 100):
+            chunk = ",".join(str(x) for x in to_retire[i:i+100])
+            rr = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=in.({chunk})",
+                headers=SB_HEADERS, json={"status": "retired", "updatedAt": now}, timeout=30)
+            if rr.status_code in (200, 204):
+                done += min(100, len(to_retire) - i)
+        summary["retired"] = done
+        audit_log(user, "retire_demoted_verticals", "lead", None,
+                  {"retired": done, "skipped_had_contact": len(contacted),
+                   "by_industry": dict(top)})
+        return summary
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
