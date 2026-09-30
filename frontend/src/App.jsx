@@ -2306,7 +2306,15 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                 placeholder={secondary==="callback"?"What did they say? When should you call back?":"Dictate or type — then hit Smart-fill…"}/>
               <NoteAssist getNote={()=>notes} context={{company:lead.company,status:outcome}} onApply={applyAi}/>
             </div>
-            {(secondary==="interested"||secondary==="converted")&&(
+            {/* Callback is included deliberately. "I spoke to Trudy, she set the
+                walkthrough for Wednesday" reads as a callback to the caller —
+                there IS a future date to ring — so that is the button she
+                presses, and the appointment field never appeared. Audit of the
+                notes: 5 of 11 genuinely-booked walkthroughs were logged as
+                callback, so no appt_* record was created and the Appointments
+                board, the Angelo handoff, the walkthrough follow-up bucket and
+                the client-call relay all stayed silent on live deals. */}
+            {(secondary==="interested"||secondary==="converted"||secondary==="callback")&&(
               <div style={{marginBottom:12,padding:"12px 14px",background:"#69f6b80d",border:"1px solid #69f6b833",borderRadius:9}}>
                 <div style={{fontSize:12,fontWeight:700,color:"#69f6b8",marginBottom:8}}>📅 Booked a walkthrough? (sends to admin for approval)</div>
                 <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
