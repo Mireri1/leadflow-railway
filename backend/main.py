@@ -7856,6 +7856,18 @@ def recycle_stale_leads(user: str = Depends(verify_admin)):
 # other deployments. UTC offset in hours, can be negative.
 LEADFLOW_TZ_OFFSET_HOURS = int(os.getenv("LEADFLOW_TZ_OFFSET_HOURS", "-7"))
 
+# Free-text markers a caller types when the NUMBER ITSELF is bad (as opposed to
+# nobody picking up). The Twilio lookup (/api/admin/validate-phones) costs
+# ~$0.008/number and is env-gated; the caller already typed this answer for
+# free on every dial, so mine it. Feeds dead_rate in the per-source breakdown —
+# a source handing us disconnected numbers is the cheapest connectivity fix
+# there is, and it is invisible in pickup_rate alone (a dead number and a
+# ringing-but-unanswered number both log as no_answer).
+DEAD_NUMBER_RE = re.compile(
+    r"\b(disconnected|not in service|no longer in service|wrong number|"
+    r"out of business|permanently closed|number (?:is )?(?:invalid|not valid)|"
+    r"fax (?:line|machine|number))\b", re.I)
+
 @app.post("/api/admin/leads/backfill-last-contacted")
 def backfill_last_contacted(user: str = Depends(verify_admin)):
     """One-shot: walk call_outcomes, pin each lead's updatedAt to the most
@@ -7986,20 +7998,21 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
     # touched. Both paginated to dodge the 1000-row Supabase cap.
     calls = _paginated_get(
         f"{SUPABASE_URL}/rest/v1/call_outcomes"
-        f"?select=outcome,calledAt,leadId&calledAt=gte.{since}&order=calledAt.desc"
+        f"?select=outcome,calledAt,leadId,notes&calledAt=gte.{since}&order=calledAt.desc"
     )
 
     # Lead-state lookup: only the leadIds we actually saw, batched to keep
     # the in.() filter URL under ~8KB. Builds {leadId: state} for tz lookup.
     lead_ids = list({c.get("leadId") for c in calls if c.get("leadId")})
     lead_state = {}
+    lead_source = {}
     BATCH = 200
     for i in range(0, len(lead_ids), BATCH):
         chunk = lead_ids[i:i+BATCH]
         try:
             ids_filter = ",".join(str(x) for x in chunk)
             lr = req_lib.get(
-                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})&select=id,state",
+                f"{SUPABASE_URL}/rest/v1/leads?id=in.({ids_filter})&select=id,state,source",
                 headers=SB_HEADERS, timeout=30,
             )
             rows = lr.json() if lr.status_code == 200 else []
@@ -8007,11 +8020,13 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
                 for row in rows:
                     if row.get("id"):
                         lead_state[row["id"]] = (row.get("state") or "").strip()
+                        lead_source[row["id"]] = (row.get("source") or "").strip() or "(unset)"
         except Exception as e:
             print(f"[CONNECTIVITY] lead-state batch {i} fetch failed: {e}")
 
     DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    PICKUP_OUTCOMES    = {"answered", "interested", "not_interested", "callback", "converted"}
+    PICKUP_OUTCOMES    = {"answered", "interested", "interested_no_dm",
+                          "not_interested", "callback", "converted"}
     VOICEMAIL_OUTCOMES = {"voicemail"}
 
     # Cache ZoneInfo objects per tz string (cheap, but no need to re-build per call)
@@ -8033,6 +8048,12 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
     fallback_calls = 0  # calls bucketed via fixed offset (state unknown / pre-3.9 Python)
     state_counts = {}   # {state: bucketed_count} — observability
     state_buckets = {}  # {state: {total, pickup, voicemail, no_answer}} — per-state pickup rate
+    # {source: {...}} and {(source, "YYYY-MM"): {...}} — which data source hands
+    # us reachable phone numbers, and whether that is getting better or worse.
+    # The month trend is the point: a source whose stock degrades (or new stock
+    # that was never good) is invisible in a single blended lifetime number.
+    source_buckets = {}
+    source_month   = {}
     for c in calls:
         ts = c.get("calledAt") or ""
         try:
@@ -8065,16 +8086,34 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
         if state_key not in state_buckets:
             state_buckets[state_key] = {"total": 0, "pickup": 0, "voicemail": 0, "no_answer": 0}
         state_buckets[state_key]["total"] += 1
+
+        # Source rollups. Month key uses the UTC call date (not prospect-local) —
+        # a trend only needs stable month boundaries, and prospect-local would
+        # put one dial in two different months depending on the lead's state.
+        src_key = lead_source.get(lid, "(unset)") if lid else "(unset)"
+        ym = dt_utc.strftime("%Y-%m")
+        for store, k in ((source_buckets, src_key), (source_month, (src_key, ym))):
+            if k not in store:
+                store[k] = {"total": 0, "pickup": 0, "voicemail": 0, "no_answer": 0, "dead": 0}
+            store[k]["total"] += 1
+
         outcome = (c.get("outcome") or "").lower()
         if outcome in PICKUP_OUTCOMES:
-            buckets[key]["pickup"] += 1
-            state_buckets[state_key]["pickup"] += 1
+            field = "pickup"
         elif outcome in VOICEMAIL_OUTCOMES:
-            buckets[key]["voicemail"] += 1
-            state_buckets[state_key]["voicemail"] += 1
+            field = "voicemail"
         else:
-            buckets[key]["no_answer"] += 1
-            state_buckets[state_key]["no_answer"] += 1
+            field = "no_answer"
+        buckets[key][field] += 1
+        state_buckets[state_key][field] += 1
+        source_buckets[src_key][field] += 1
+        source_month[(src_key, ym)][field] += 1
+        # Dead number: the caller wrote "disconnected" / "wrong number" / etc.
+        # Counted on top of the outcome (it is a property of the NUMBER, not of
+        # the call result), so dead + pickup + vm + no_answer do not sum to total.
+        if DEAD_NUMBER_RE.search(c.get("notes") or ""):
+            source_buckets[src_key]["dead"] += 1
+            source_month[(src_key, ym)]["dead"] += 1
 
     windows = []
     for (day_idx, hour), counts in sorted(buckets.items()):
@@ -8114,6 +8153,45 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
         })
     state_rows.sort(key=lambda r: -r["total"])
 
+    # ── Per-SOURCE rollup ───────────────────────────────────────────────────
+    # The question the other analytics endpoints can't answer: which data source
+    # gives us phone numbers a human actually picks up? /analytics/conversions
+    # slices by source but measures conversions, and at a ~0.2% close rate that
+    # is noise — pickup is a dense signal that reads in days, not years.
+    SRC_MIN_SAMPLE = 30   # below this a source's rate is not worth ranking on
+    source_rows = []
+    for src, b in source_buckets.items():
+        t = b["total"]
+        source_rows.append({
+            "source":      src,
+            "total":       t,
+            "pickup":      b["pickup"],
+            "voicemail":   b["voicemail"],
+            "no_answer":   b["no_answer"],
+            "dead":        b["dead"],
+            "pickup_rate": round(b["pickup"] / t * 100, 1) if t else 0.0,
+            "dead_rate":   round(b["dead"]   / t * 100, 1) if t else 0.0,
+            "significant": t >= SRC_MIN_SAMPLE,
+        })
+    source_rows.sort(key=lambda r: -r["total"])
+
+    # Month trend per source, oldest→newest. A source is only worth trending
+    # once it has real volume, so thin sources don't fill the payload with noise.
+    trend_sources = {r["source"] for r in source_rows if r["significant"]}
+    trend = {}
+    for (src, ym), b in source_month.items():
+        if src not in trend_sources:
+            continue
+        t = b["total"]
+        trend.setdefault(src, []).append({
+            "month":       ym,
+            "total":       t,
+            "pickup_rate": round(b["pickup"] / t * 100, 1) if t else 0.0,
+            "dead_rate":   round(b["dead"]   / t * 100, 1) if t else 0.0,
+        })
+    for rowsx in trend.values():
+        rowsx.sort(key=lambda r: r["month"])
+
     return {
         "since":           since,
         "days_analyzed":   days,
@@ -8124,10 +8202,13 @@ def get_connectivity_analytics(days: int = 90, user: str = Depends(verify_token)
         "worst_windows":   worst,
         "state_counts":    state_counts,
         "state_breakdown": state_rows,
+        "source_breakdown": source_rows,
+        "source_trend":     trend,
         "summary": {
             "total_calls":          overall_total,
             "overall_pickup_rate":  round(overall_rate, 1),
             "min_sample_for_rank":  MIN_SAMPLE,
+            "min_sample_per_source": SRC_MIN_SAMPLE,
             "parse_failures":       parse_failures,
             "fallback_calls":       fallback_calls,
         },

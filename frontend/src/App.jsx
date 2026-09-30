@@ -8136,6 +8136,75 @@ function ConnectivityPanel(){
                 </div>
               )}
 
+              {/* Pickup rate by SOURCE — the sourcing feedback loop. Conversions
+                  are far too rare (~0.2%) to tell a good source from a bad one;
+                  pickup is dense enough to read in days. The month trend is the
+                  part that matters: a blended lifetime rate hides a source whose
+                  stock has gone stale. dead% = caller wrote "disconnected" /
+                  "wrong number" — numbers that were never dialable at all. */}
+              {data.source_breakdown?.length>0&&(
+                <div style={{marginTop:18,background:"#060e20",borderRadius:8,
+                  padding:12,border:"1px solid #40485d20"}}>
+                  <div style={{fontSize:10,color:"#a3aac4",fontWeight:700,
+                    letterSpacing:".08em",textTransform:"uppercase",marginBottom:8}}>
+                    📦 Pickup rate by lead source
+                  </div>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                    <thead>
+                      <tr style={{color:"#40485d",fontSize:10,letterSpacing:".06em",textTransform:"uppercase"}}>
+                        <th style={{textAlign:"left",padding:"4px 6px",fontWeight:600}}>Source</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Dials</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Pickup</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Pickup %</th>
+                        <th style={{textAlign:"right",padding:"4px 6px",fontWeight:600}}>Dead %</th>
+                        <th style={{textAlign:"left",padding:"4px 10px",fontWeight:600}}>Trend (pickup % by month)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.source_breakdown.slice(0,12).map(r=>{
+                        const rate=r.pickup_rate
+                        const color=!r.significant?"#40485d":rate>=25?"#69f6b8":rate>=15?"#ffe083":rate>=8?"#ffa44a":"#ff6e84"
+                        const dcolor=r.dead_rate>=5?"#ff6e84":r.dead_rate>=2?"#ffa44a":"#40485d"
+                        const tr=(data.source_trend||{})[r.source]||[]
+                        return(
+                          <tr key={r.source} style={{borderTop:"1px solid #40485d12"}}>
+                            <td style={{padding:"4px 6px",color:"#dee5ff",fontWeight:600}}>{r.source}</td>
+                            <td style={{padding:"4px 6px",color:"#a3aac4",textAlign:"right"}}>{r.total}</td>
+                            <td style={{padding:"4px 6px",color:"#69f6b8",textAlign:"right"}}>{r.pickup}</td>
+                            <td style={{padding:"4px 6px",color,textAlign:"right",fontWeight:700}}
+                              title={r.significant?"":`<${data.summary.min_sample_per_source} dials — too small to rank reliably`}>
+                              {r.significant?`${rate}%`:`${rate}%*`}
+                            </td>
+                            <td style={{padding:"4px 6px",color:dcolor,textAlign:"right",
+                              fontWeight:r.dead_rate>=2?700:400}}
+                              title={`${r.dead} dial${r.dead===1?"":"s"} where the caller noted a disconnected / wrong number`}>
+                              {r.dead_rate?`${r.dead_rate}%`:"—"}
+                            </td>
+                            <td style={{padding:"4px 10px",color:"#a3aac4",whiteSpace:"nowrap"}}>
+                              {tr.length<2?<span style={{color:"#40485d"}}>—</span>:tr.map((t,i)=>(
+                                <span key={t.month} title={`${t.month}: ${t.pickup_rate}% pickup over ${t.total} dials`}>
+                                  {i>0&&<span style={{color:"#40485d",margin:"0 3px"}}>
+                                    {t.pickup_rate>tr[i-1].pickup_rate+1?"↗":t.pickup_rate<tr[i-1].pickup_rate-1?"↘":"→"}
+                                  </span>}
+                                  <span style={{color:t.pickup_rate>=15?"#69f6b8":t.pickup_rate>=8?"#ffa44a":"#ff6e84"}}>
+                                    {t.pickup_rate}
+                                  </span>
+                                </span>
+                              ))}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                  <div style={{marginTop:6,fontSize:9,color:"#40485d",lineHeight:1.5}}>
+                    * needs ≥{data.summary.min_sample_per_source} dials to rank. <b>Dead %</b> = caller noted a
+                    disconnected or wrong number — stock that was never dialable, so it is pure wasted dials.
+                    A source trending ↘ has gone stale: stop pulling from it before the blended rate hides it.
+                  </div>
+                </div>
+              )}
+
               <div style={{marginTop:14,fontSize:10,color:"#40485d",lineHeight:1.5}}>
                 Bucketed by <b>prospect's local time</b> (lead state → IANA tz, DST-aware).
                 {data.summary.fallback_calls>0&&(
