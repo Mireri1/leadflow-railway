@@ -6512,6 +6512,12 @@ RECORD_STATES = set(s.strip().upper() for s in os.getenv("RECORD_STATES",
     "NV,OH,MO,KS,ID,NC,TN,AL,GA,NY,NJ,TX,AZ,CO,VA,SC,LA,OK,IA,IN,KY,ME,MN,MS,ND,NE,NM,SD,UT,WI,WY,AR,HI,RI,DC,WV,AK"
     ).split(",") if s.strip())
 TWILIO_INTELLIGENCE_SID = os.getenv("TWILIO_INTELLIGENCE_SID", "")
+# Recordings shorter than this are not worth a transcription call — they are
+# hellos and hangups, not coachable conversations.
+INTEL_MIN_SECONDS = int(os.getenv("INTEL_MIN_SECONDS", "20"))
+# media_channel -> who is talking. record-from-answer-dual puts the parent leg
+# (our caller) on 1 and the dialled leg (the prospect) on 2.
+_INTEL_SPEAKER = {"1": "AGENT", "2": "PROSPECT"}
 
 # Spoken notice played to the PROSPECT (not the caller) the moment they answer,
 # before the two legs are bridged, whenever the call is being recorded. Short on
@@ -6740,8 +6746,14 @@ async def twilio_recording_status(request: Request, lead_id: str = ""):
     dur = form.get("RecordingDuration") or "0"
     audit_log("twilio", "call_recording", "lead", lead_id or None,
               {"recording_url": rec_url, "recording_sid": rec_sid, "call_sid": call_sid, "duration": dur})
+    # int() was in the `if` condition, OUTSIDE the try — a malformed
+    # RecordingDuration would 500 back at Twilio instead of being ignored.
+    try:
+        dur_s = int(float(dur or 0))
+    except (TypeError, ValueError):
+        dur_s = 0
     # Kick Voice Intelligence transcription when configured
-    if TWILIO_INTELLIGENCE_SID and rec_sid and int(dur or 0) >= 20:
+    if TWILIO_INTELLIGENCE_SID and rec_sid and dur_s >= INTEL_MIN_SECONDS:
         try:
             ir = req_lib.post(
                 "https://intelligence.twilio.com/v2/Transcripts",
@@ -6749,7 +6761,23 @@ async def twilio_recording_status(request: Request, lead_id: str = ""):
                 data={"ServiceSid": TWILIO_INTELLIGENCE_SID,
                       "Channel": json_lib.dumps({"media_properties": {"source_sid": rec_sid}})},
                 timeout=15)
-            print(f"[INTEL] transcript requested for {rec_sid}: HTTP {ir.status_code}")
+            t_sid = (ir.json() or {}).get("sid", "") if ir.status_code in (200, 201) else ""
+            print(f"[INTEL] transcript requested for {rec_sid}: HTTP {ir.status_code} sid={t_sid or '-'}")
+            if ir.status_code not in (200, 201):
+                print(f"[INTEL] create rejected: {ir.text[:200]}")
+            # Remember which lead this transcript belongs to, NOW, while we
+            # still know. The webhook used to reverse-look-it-up with
+            # `audit_log?details=ilike.*<sid>*` — the only ilike-on-details
+            # query in the file, and `details` is stored as a JSON *string*, so
+            # on a jsonb column that filter matches nothing and every
+            # transcript silently lands with lead_id=None, unattributable.
+            if t_sid and lead_id:
+                try:
+                    _settings_set_json(f"intel_lead_{t_sid}",
+                                       {"lead_id": str(lead_id),
+                                        "at": datetime.utcnow().isoformat()})
+                except Exception as e:
+                    print(f"[INTEL] lead-link store failed for {t_sid}: {e}")
         except Exception as e:
             print(f"[INTEL] transcript request failed: {e}")
     return {"ok": True}
@@ -6763,6 +6791,18 @@ async def twilio_intelligence_webhook(request: Request):
     except Exception:
         form = await request.form()
         payload = dict(form)
+    # This was the only Twilio webhook in the file with no signature check at
+    # all. Validated when the header is present; when it is absent we log and
+    # continue rather than hard-fail, because this endpoint has never run in
+    # production and silently rejecting every callback would be a worse first
+    # experience than an unsigned one. The blast radius is small either way:
+    # the body only carries a transcript SID that is then fetched from our own
+    # Twilio account.
+    if request.headers.get("X-Twilio-Signature"):
+        if not _twilio_sig_ok(request, payload):
+            raise HTTPException(status_code=403, detail="Bad Twilio signature")
+    else:
+        print("[INTEL] webhook arrived unsigned (no X-Twilio-Signature header)")
     t_sid = payload.get("transcript_sid") or payload.get("TranscriptSid") or ""
     if not t_sid:
         return {"ok": False}
@@ -6770,18 +6810,37 @@ async def twilio_intelligence_webhook(request: Request):
         sr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}/Sentences?PageSize=500",
                          auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=20)
         sents = (sr.json() or {}).get("sentences", []) if sr.status_code == 200 else []
-        text = " ".join(f"[{x.get('media_channel','?')}] {x.get('transcript','')}" for x in sents)[:8000]
-        # link back to the lead via the recording audit row
+        # Name the speakers instead of emitting bare channel numbers. With
+        # record-from-answer-dual on <Dial>, channel 1 is the parent leg (our
+        # caller) and channel 2 the dialled leg (the prospect). Labelling them
+        # here means the coach prompt no longer has to explain a numbering
+        # convention, and a transcript is readable on its own in the audit row.
+        text = " ".join(f"[{_INTEL_SPEAKER.get(str(x.get('media_channel')), 'SPEAKER?')}] "
+                        f"{x.get('transcript','')}" for x in sents)[:8000]
+        # Lead linkage: prefer the mapping recorded when the transcript was
+        # REQUESTED (see /twilio/recording-status). The audit-row reverse lookup
+        # below is kept only as a fallback for transcripts created before this.
         lead_id = None
-        tr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}",
-                         auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=15)
-        src_sid = ((tr.json() or {}).get("channel") or {}).get("media_properties", {}).get("source_sid", "") if tr.status_code == 200 else ""
-        if src_sid:
-            ar = req_lib.get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
-                             f"&details=ilike.*{src_sid}*&select=resource_id&limit=1",
-                             headers=SB_ADMIN_HEADERS, timeout=10)
-            if ar.status_code == 200 and ar.json():
-                lead_id = ar.json()[0].get("resource_id")
+        try:
+            link = _settings_get_json(f"intel_lead_{t_sid}")
+            if isinstance(link, dict) and link.get("lead_id"):
+                lead_id = link["lead_id"]
+                _settings_set_json(f"intel_lead_{t_sid}", {})   # consume
+        except Exception as e:
+            print(f"[INTEL] lead-link read failed for {t_sid}: {e}")
+        if not lead_id:
+            tr = req_lib.get(f"https://intelligence.twilio.com/v2/Transcripts/{t_sid}",
+                             auth=(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")), timeout=15)
+            src_sid = ((tr.json() or {}).get("channel") or {}).get("media_properties", {}).get("source_sid", "") if tr.status_code == 200 else ""
+            if src_sid:
+                ar = req_lib.get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
+                                 f"&details=ilike.*{src_sid}*&select=resource_id&limit=1",
+                                 headers=SB_ADMIN_HEADERS, timeout=10)
+                if ar.status_code == 200 and ar.json():
+                    lead_id = ar.json()[0].get("resource_id")
+                if not lead_id:
+                    print(f"[INTEL] no lead link for {t_sid} (src {src_sid}) — "
+                          f"transcript stored unattributed")
         audit_log("twilio", "call_transcript", "lead", lead_id, {"transcript_sid": t_sid, "text": text})
         print(f"[INTEL] transcript stored ({len(text)} chars, lead {lead_id})")
     except Exception as e:
@@ -6812,7 +6871,8 @@ def coach_run(days: int = 7, preview: int = 1, user: str = Depends(verify_admin)
         return {"analyzed": 0, "detail": "No transcripts yet — they accumulate once TWILIO_INTELLIGENCE_SID is configured and calls are recorded."}
     system = (
         "You are a cold-call coach for Vision Cleaning Company (commercial janitorial). "
-        "You get transcripts of the caller's recorded outbound calls ([1]=caller, [2]=prospect). "
+        "You get transcripts of the caller's recorded outbound calls. Each line is "
+        "prefixed [AGENT] (our caller) or [PROSPECT] (the business we rang). "
         "Return STRICT JSON: {\"calls\":[{\"date\",\"score\":1-10,\"strength\",\"fix\"}],"
         "\"patterns\":[str],\"script_changes\":[{\"situation\",\"say_this\"}],\"drill\":str}. "
         "Score on: opening hook, discovery questions, objection handling, asking for the walkthrough. "
