@@ -7,13 +7,86 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt, os, re, time, json as json_lib, requests as req_lib
+import jwt, os, re, time, json as json_lib, requests as _requests
 import imaplib, email as email_lib, threading
 from email.header import decode_header
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pydantic import BaseModel
 from urllib.parse import quote as url_quote
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except ImportError:                                    # pragma: no cover
+    Retry = None
+
+# ── Retrying HTTP transport (req_lib) ───────────────────────────────────────
+# Every outbound call in this file goes through req_lib. It used to be the bare
+# `requests` module, which means: a new TCP connection and a fresh DNS lookup
+# per call, and ZERO retries. A transient resolver blip therefore killed whole
+# background jobs — production logged
+#   [INV-REFILL] failed: ... Failed to resolve 'ucpwpjokyconwzwqvdad.supabase.co'
+# every ~10 minutes for 7 hours straight, so the low-inventory refill (the thing
+# that stops the caller running dry) simply never ran. Nothing was broken; one
+# DNS lookup failed and there was no second attempt.
+#
+# SAFETY — the retry policy is deliberately asymmetric:
+#   connect errors (DNS / TCP)  -> retried for EVERY method. The request never
+#                                  reached the server, so a replay cannot
+#                                  duplicate anything.
+#   read errors / 5xx statuses  -> retried ONLY for idempotent methods, which is
+#                                  urllib3's default allowed_methods. A POST
+#                                  that already reached Supabase must NEVER be
+#                                  replayed: retrying POST /call_outcomes would
+#                                  double-log a call and corrupt total_calls.
+# raise_on_status stays False because every caller here inspects
+# r.status_code — raising instead would change behaviour at ~250 call sites.
+HTTP_RETRY_TOTAL    = int(os.getenv("HTTP_RETRY_TOTAL", "4"))     # 0 disables
+HTTP_RETRY_CONNECT  = int(os.getenv("HTTP_RETRY_CONNECT", "3"))
+HTTP_RETRY_BACKOFF  = float(os.getenv("HTTP_RETRY_BACKOFF", "0.5"))  # 0s,1s,2s…
+
+def _build_retry():
+    if Retry is None or HTTP_RETRY_TOTAL <= 0:
+        return None
+    kw = dict(total=HTTP_RETRY_TOTAL, connect=HTTP_RETRY_CONNECT, read=2, status=2,
+              backoff_factor=HTTP_RETRY_BACKOFF,
+              status_forcelist=(429, 502, 503, 504), raise_on_status=False)
+    try:
+        return Retry(**kw)                             # urllib3 >= 1.26 / 2.x
+    except TypeError:                                  # pragma: no cover
+        kw.pop("raise_on_status", None)
+        return Retry(**kw)
+
+_HTTP_RETRY = _build_retry()
+
+class _RetryingHTTP:
+    """Drop-in for the `requests` module (get/post/patch/delete) backed by a
+    per-thread Session. Per-thread because requests.Session is not documented
+    as thread-safe and this process runs a background maintenance thread
+    alongside the request handlers; urllib3's connection pool underneath each
+    Session is. Also gives us connection reuse, which cuts the DNS lookups that
+    were failing in the first place."""
+    def __init__(self):
+        self._local = threading.local()
+
+    @property
+    def session(self):
+        sess = getattr(self._local, "sess", None)
+        if sess is None:
+            sess = _requests.Session()
+            adapter = HTTPAdapter(max_retries=_HTTP_RETRY, pool_connections=10,
+                                  pool_maxsize=20) if _HTTP_RETRY else HTTPAdapter()
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            self._local.sess = sess
+        return sess
+
+    def get(self, *a, **kw):    return self.session.get(*a, **kw)
+    def post(self, *a, **kw):   return self.session.post(*a, **kw)
+    def patch(self, *a, **kw):  return self.session.patch(*a, **kw)
+    def delete(self, *a, **kw): return self.session.delete(*a, **kw)
+
+req_lib = _RetryingHTTP()
 
 SECRET_KEY      = os.getenv("SECRET_KEY",      "leadflow-secret")
 TEAM_PASSWORD   = os.getenv("TEAM_PASSWORD",   "LeadFlow2024")
@@ -167,10 +240,21 @@ AUTOCOMPLETE_CACHE_TTL_SECONDS = int(os.getenv("AUTOCOMPLETE_CACHE_TTL_SECONDS",
 # fetch ceiling so a runaway query can't hammer a public API or flood the DB.
 # One switch halts all free sources; mirrors PLACES_KILL_SWITCH ergonomics.
 FREE_SOURCES_KILL_SWITCH = os.getenv("FREE_SOURCES_KILL_SWITCH", "0") == "1"
-# Overpass mirrors, tried in order — public instances 504 under load, so we
-# fall through to the next. kumi is usually fastest; .de is the canonical one.
+# Overpass mirrors. Public instances 504 and time out under load — production
+# logged BOTH of the original two failing on the same pull (kumi read-timeout,
+# .de HTTP 504), which returned found=0 and looked exactly like "no leads
+# matched". More mirrors = more chances one is healthy; they are tried in a
+# ROTATING order (see _overpass_order) so a persistently slow instance does not
+# eat the time budget on every single run.
 OVERPASS_MIRRORS = [m.strip() for m in os.getenv("OVERPASS_MIRRORS",
-    "https://overpass.kumi.systems/api/interpreter,https://overpass-api.de/api/interpreter").split(",") if m.strip()]
+    "https://overpass.kumi.systems/api/interpreter,"
+    "https://overpass-api.de/api/interpreter,"
+    "https://overpass.private.coffee/api/interpreter,"
+    "https://overpass.osm.jp/api/interpreter,"
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter").split(",") if m.strip()]
+# Per-request ceiling. The budget below is the real limit; this just stops one
+# hung mirror from blocking longer than any single attempt is ever worth.
+OVERPASS_ATTEMPT_TIMEOUT = int(os.getenv("OVERPASS_ATTEMPT_TIMEOUT", "20"))
 # Public Overpass blocks requests with no User-Agent (returns 406). Identify us.
 OVERPASS_HEADERS = {"User-Agent": "LeadFlow/1.0 (Vision Cleaning lead sourcing)"}
 # NPPES / NPI registry — free US healthcare-provider directory.
@@ -186,7 +270,10 @@ OSM_ENRICH_CAP = int(os.getenv("OSM_ENRICH_CAP", "50"))
 # Wall-clock budgets so a big-state pull (6 Overpass queries + 50 sequential
 # Apollo calls) can't blow the HTTP gateway timeout and hang. Each phase returns
 # whatever it gathered so far — partial coverage beats a dead request.
-OSM_FETCH_BUDGET_SEC  = int(os.getenv("OSM_FETCH_BUDGET_SEC", "35"))
+# 35s was not enough to try even one category against two mirrors at the old
+# 40s-per-attempt timeout, so the budget tripped after the first failure and the
+# rest of the verticals were skipped ("fetch budget hit — stopping at Education").
+OSM_FETCH_BUDGET_SEC  = int(os.getenv("OSM_FETCH_BUDGET_SEC", "90"))
 OSM_ENRICH_BUDGET_SEC = int(os.getenv("OSM_ENRICH_BUDGET_SEC", "40"))
 
 # Google Places pricing (May 2025) — used for usage_events cost tracking
@@ -4209,6 +4296,17 @@ OSM_CATEGORY_INDUSTRY = {
     "Entertainment": "Entertainment", "Offices": "Office", "Hospitality": "Hotel",
 }
 
+_overpass_rotation = {"i": 0}
+
+def _overpass_order():
+    """Mirrors, rotated one step per call. Spreads load and guarantees that a
+    mirror which is slow-but-not-dead cannot be the first attempt every time."""
+    if not OVERPASS_MIRRORS:
+        return []
+    i = _overpass_rotation["i"] % len(OVERPASS_MIRRORS)
+    _overpass_rotation["i"] = (i + 1) % len(OVERPASS_MIRRORS)
+    return OVERPASS_MIRRORS[i:] + OVERPASS_MIRRORS[:i]
+
 def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
     """Query Overpass for businesses by cleaning-vertical. Free, no key. When a
     city is given, scopes to that CITY's boundary (small area = fast, reliable on
@@ -4242,18 +4340,29 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
     # One Overpass call PER category — a whole-state query across all 6 verticals
     # 504s on big states (TX/CA/GA). Per-category queries are small + reliable;
     # we merge + dedup the elements. Free, so the extra calls cost nothing.
-    def _overpass(ql):
-        # Tight HTTP timeout so a single slow query can't blow past the fetch
-        # budget (which is only checked between categories). A slow mirror is
-        # abandoned fast and we move on — partial coverage beats a hung request.
-        for ep in OVERPASS_MIRRORS:
+    mirror_errors = []
+
+    def _overpass(ql, deadline):
+        # Per-attempt timeout is clamped to the time actually LEFT in the
+        # budget. Previously it was a flat 40s while the budget was 35s and only
+        # checked between categories, so one slow mirror could overrun the whole
+        # budget before the check ever ran.
+        for ep in _overpass_order():
+            left = deadline - time.time()
+            if left <= 2:
+                mirror_errors.append("budget exhausted before all mirrors tried")
+                break
+            host = ep.split("/")[2]
             try:
-                r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS, timeout=40)
+                r = req_lib.post(ep, data=ql.encode("utf-8"), headers=OVERPASS_HEADERS,
+                                 timeout=min(OVERPASS_ATTEMPT_TIMEOUT, max(3, int(left))))
                 if r.status_code == 200:
                     return r.json().get("elements", [])
-                print(f"[OSM] {ep.split('/')[2]} HTTP {r.status_code} — next mirror")
+                mirror_errors.append(f"{host} HTTP {r.status_code}")
+                print(f"[OSM] {host} HTTP {r.status_code} — next mirror")
             except Exception as e:
-                print(f"[OSM] {ep.split('/')[2]} failed ({e}) — next mirror")
+                mirror_errors.append(f"{host} {type(e).__name__}")
+                print(f"[OSM] {host} failed ({e}) — next mirror")
         return None
 
     seen_ids, elements = set(), []
@@ -4266,8 +4375,9 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
             print(f"[OSM] fetch budget ({OSM_FETCH_BUDGET_SEC}s) hit — stopping at {cat}, partial result")
             break
         body = "\n".join(f"  nwr{sel}(area.a);" for sel in sels)
-        ql = (f"[out:json][timeout:40];\n" + area_def + "\n(" + body + "\n);\nout center 250;")
-        els = _overpass(ql)
+        ql = (f"[out:json][timeout:{OVERPASS_ATTEMPT_TIMEOUT}];\n"
+              + area_def + "\n(" + body + "\n);\nout center 250;")
+        els = _overpass(ql, fetch_deadline)
         if els is None:
             print(f"[OSM] {cat}: all mirrors failed — skipping")
             continue
@@ -4325,6 +4435,13 @@ def fetch_osm(state_abbrev: str, categories: list, city: str = "") -> list:
         })
     if skipped_dead:
         print(f"[OSM] skipped {skipped_dead} closed/disused features")
+    # A pull that found nothing because every mirror was down must NOT look
+    # identical to a pull that found nothing because nothing matched. The caller
+    # reads this off the returned list, so stash it where source_osm can see it.
+    fetch_osm.last_errors = mirror_errors
+    fetch_osm.last_elements = len(elements)
+    if not elements and mirror_errors:
+        print(f"[OSM] NO DATA — every mirror failed: {'; '.join(mirror_errors[:6])}")
     return leads
 
 # NPPES rejects a state-only query ("requires additional search criteria"), so a
@@ -4467,8 +4584,11 @@ def source_osm(body: FreeSourceRequest, user: str = Depends(verify_token)):
            else list(OSM_CATEGORY_SELECTORS.keys())
     cities = [c.strip() for c in (body.cities or "").split(",") if c.strip()] or [""]
     all_raw = []
+    mirror_errors, elements_seen = [], 0
     for city in cities:
         all_raw += fetch_osm(body.state, cats, city)
+        mirror_errors += getattr(fetch_osm, "last_errors", []) or []
+        elements_seen += getattr(fetch_osm, "last_elements", 0) or 0
 
     # OSM is phone-sparse. Optionally Apollo-enrich the phoneless rows (up to a
     # cap) so the wide net becomes callable instead of getting dropped. Admin
@@ -4488,8 +4608,20 @@ def source_osm(body: FreeSourceRequest, user: str = Depends(verify_token)):
     audit_log(user, "source_osm", "lead", None,
               {"state": body.state, "categories": cats, "enriched": enriched, **res})
     enrich_note = f" · {enriched} Apollo-enriched" if enriched else ""
-    res["summary"] = (f"OSM: {res['found']} found · {res['alreadyInDb']} already in DB · "
-                      f"{res['droppedUncallable']} uncallable{enrich_note} · {res['saved']} new saved")
+    res["mirrorErrors"] = mirror_errors[:8]
+    # Zero elements + every mirror erroring is an OUTAGE, not an empty result
+    # set. These looked the same before ("found=0 saved=0", HTTP 200), so a week
+    # of dead Overpass mirrors read as "OSM just has no leads for us".
+    res["sourceUnavailable"] = bool(elements_seen == 0 and mirror_errors)
+    if res["sourceUnavailable"]:
+        res["summary"] = ("⚠️ OSM unavailable — every Overpass mirror failed, so this is a "
+                          "SOURCE OUTAGE, not an empty result. Nothing was saved. Tried: "
+                          + "; ".join(mirror_errors[:4])
+                          + ". Retry later, or set OVERPASS_MIRRORS to a working instance.")
+    else:
+        res["summary"] = (f"OSM: {res['found']} found · {res['alreadyInDb']} already in DB · "
+                          f"{res['droppedUncallable']} uncallable{enrich_note} · {res['saved']} new saved"
+                          + (f" · {len(mirror_errors)} mirror error(s) — partial coverage" if mirror_errors else ""))
     return res
 
 @app.post("/api/sources/npi")
@@ -5642,15 +5774,31 @@ def _paginated_get(url: str, headers: dict = None, page_size: int = 1000, max_pa
         end   = start + page_size - 1
         try:
             r = req_lib.get(url, headers={**base_headers, "Range": f"{start}-{end}"}, timeout=30)
-            batch = r.json() if r.status_code in (200, 206) else []
+            # A mid-walk error truncates the result, and a truncated list is
+            # INDISTINGUISHABLE from "end of data" to every caller — so stats,
+            # analytics and lead lists would quietly under-report instead of
+            # failing. Retries (see req_lib) now absorb the transient cases;
+            # anything that still gets here is logged loudly with the page
+            # offset and the body so it is diagnosable from the Railway logs
+            # rather than showing up as a number that is merely too low.
+            if r.status_code not in (200, 206):
+                print(f"[PAGINATED-GET] TRUNCATED at rows {start}-{end}: HTTP "
+                      f"{r.status_code} {r.text[:200]} — returning {len(rows)} partial rows "
+                      f"for {url.split('?')[0]}")
+                break
+            batch = r.json()
             if not isinstance(batch, list) or len(batch) == 0:
                 break
             rows.extend(batch)
             if len(batch) < page_size:
                 break
         except Exception as e:
-            print(f"[PAGINATED-GET] page {page} failed: {e}")
+            print(f"[PAGINATED-GET] TRUNCATED at rows {start}-{end}: {type(e).__name__}: {e} "
+                  f"— returning {len(rows)} partial rows for {url.split('?')[0]}")
             break
+    else:
+        print(f"[PAGINATED-GET] hit the {max_pages}-page ceiling ({len(rows)} rows) — "
+              f"result may be incomplete for {url.split('?')[0]}")
     return rows
 
 @app.get("/api/leads/lookup")
