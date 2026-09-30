@@ -1547,7 +1547,7 @@ def lookup_phone_line(phone: str):
         return ("dead", "invalid_format")
     try:
         r = req_lib.get(
-            f"https://lookups.twilio.com/v2/PhoneNumbers/+{digits}?Fields=line_type_intelligence",
+            f"https://lookups.twilio.com/v2/PhoneNumbers/+{digits}",
             auth=(TWILIO_SID, TWILIO_TOKEN), timeout=8)
         if r.status_code == 404:
             return ("dead", "unallocated")
