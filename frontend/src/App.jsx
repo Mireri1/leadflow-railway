@@ -2,6 +2,47 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 
 const API_BASE = ""
 
+// Prospect-local calling-window buckets. Lower sorts FIRST, and these are a
+// sort key only — never a filter: if the only stock left is Ohio at 5pm ET
+// she still needs numbers to dial, so off-hours leads sink rather than
+// disappear. Mirrors TZ_BUCKET_* in backend/main.py.
+const TZ_PRIME = 0          // prospect-local business hours, outside lunch
+const TZ_LUNCH = 1          // business hours, but the lunch hour
+const TZ_OFF   = 2          // before open / after close at the prospect's desk
+const TZ_FALLBACK_KEY = "*" // bucket used when a lead's state won't resolve
+
+// {STATE: TZ_*} for every key the server sent, at instant `now`. Pure and
+// module-level so it can be cross-checked against dialer_tz_bucket() in
+// backend/main.py — the two deciding differently would order the caller's
+// queue one way and the server's another for the same lead and instant.
+// Returns null when the feature is off or the config hasn't arrived, which
+// collapses the dialer sort to exactly its previous behaviour.
+function tzBucketsFor(cfg, now){
+  if(!cfg||!cfg.order||!cfg.state_timezones) return null
+  const sh = cfg.start_hour==null?8:cfg.start_hour
+  const eh = cfg.end_hour==null?17:cfg.end_hour
+  const lunch = new Set(cfg.lunch_hours||[12])
+  const hourIn = iana=>{
+    try{
+      const h = Number(new Intl.DateTimeFormat("en-US",
+        {timeZone:iana,hour:"numeric",hour12:false}).format(now))
+      return Number.isNaN(h) ? null : (h===24?0:h)   // some ICU builds say 24 for midnight
+    }catch{ return null }
+  }
+  const bucketFor = h => h===null ? TZ_PRIME
+    : ((h<sh||h>=eh) ? TZ_OFF : (lunch.has(h) ? TZ_LUNCH : TZ_PRIME))
+  const out = {}
+  for(const st in cfg.state_timezones) out[st] = bucketFor(hourIn(cfg.state_timezones[st]))
+  // Mirror the backend's fallback for a lead whose state won't resolve:
+  // bucket it off Vision's own offset rather than burying it. Off-hours leads
+  // sink, and burying every state-less lead would quietly starve the queue of
+  // perfectly dialable stock.
+  const fb = cfg.fallback_offset_hours
+  out[TZ_FALLBACK_KEY] = bucketFor(typeof fb==="number"
+    ? ((now.getUTCHours()+fb)%24+24)%24 : null)
+  return out
+}
+
 const STATES = [
   "","AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
   "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
@@ -122,11 +163,14 @@ function isValidUsPhone(phone){
   return true
 }
 
-// Rough US-state → IANA timezone. Pacific time states use Los_Angeles, etc.
-// Used by the dialer's "local time" badge so the caller doesn't dial MD at
-// 5am Pacific. Some states span two zones — we pick the dominant one (e.g.
-// FL→Eastern even though the panhandle is Central). Good enough for "is it
-// safe to call?", not for legal compliance.
+// OFFLINE FALLBACK ONLY — backend/main.py US_STATE_TIMEZONES is canonical and
+// arrives via /api/call/config as `dialer_tz.state_timezones` (keyed by
+// abbreviation AND full name, and covering PR/VI/GU/MP which this table does
+// not). resolveTz() prefers the server copy and drops to this one when the
+// config hasn't loaded. Do not extend this table — extend the backend map.
+// Some states span two zones; we pick the dominant one (e.g. FL→Eastern even
+// though the panhandle is Central). Good enough for "is it safe to call?",
+// not for legal compliance.
 const STATE_TZ = {
   AL:"America/Chicago",AK:"America/Anchorage",AZ:"America/Phoenix",AR:"America/Chicago",
   CA:"America/Los_Angeles",CO:"America/Denver",CT:"America/New_York",DE:"America/New_York",
@@ -142,8 +186,15 @@ const STATE_TZ = {
   VT:"America/New_York",VA:"America/New_York",WA:"America/Los_Angeles",WV:"America/New_York",
   WI:"America/Chicago",WY:"America/Denver",DC:"America/New_York",
 }
-function localTimeAt(state){
-  const tz = STATE_TZ[(state||"").toUpperCase()]
+// state → IANA tz. Prefers the server-sent map (canonical, handles full
+// state names and the territories); STATE_TZ is the offline fallback.
+function resolveTz(state, tzMap){
+  const k = (state==null?"":String(state)).trim().toUpperCase()
+  if(!k) return null
+  return (tzMap && tzMap[k]) || STATE_TZ[k] || null
+}
+function localTimeAt(state, tzMap){
+  const tz = resolveTz(state, tzMap)
   if(!tz) return null
   try{
     const now = new Date()
@@ -4152,6 +4203,46 @@ export default function App(){
     return {segIntentCounts,segSourceCounts}
   },[segBase])
 
+  // ── Prospect-local calling window ────────────────────────────────────────
+  // The dialer orders by the clock at the desk being RUNG, not by hers. Her
+  // 9am–2pm PT shift is 11am–4pm in Missouri and 12pm–5pm in Ohio, so Ohio
+  // stock was being handed to her at the prospect's lunch and after their
+  // close — and the queue, ordering purely by call count, had no idea.
+  //
+  // Window + the state→IANA table come from /api/call/config (`dialer_tz`):
+  // one timezone table in the codebase, no JS copy to rot. If the config
+  // hasn't loaded (or DIALER_TZ_ORDER=0), tzBucketByState stays null and the
+  // sort below is exactly what it was before.
+  const [tzTick,setTzTick]=useState(0)
+  useEffect(()=>{
+    if(!user) return
+    // 5 min is fine enough to catch the boundary that flips a market shut
+    // (Ohio at 5pm ET) and cheap enough to not think about.
+    //
+    // Held while a call is open. A retick re-buckets, which re-sorts the
+    // dialer, and `dialerIdx` is a POSITION in that list — so the card behind
+    // the modal would silently become a different lead. Nothing is logged
+    // wrongly (CallModal closes over the lead object it was opened with), but
+    // hanging up and finding a different company on screen is its own bug.
+    if(callModal) return
+    const iv=setInterval(()=>setTzTick(t=>t+1),5*60*1000)
+    return ()=>clearInterval(iv)
+  },[user,callModal])
+  const dialerTz=twilioCall?.dialer_tz||null
+  // {STATE: bucket} for every key the server sent, rebuilt when the hour may
+  // have moved. Precomputed into a plain lookup on purpose: the alternative
+  // is building an Intl.DateTimeFormat inside a sort comparator, which is
+  // O(n log n) formatter constructions on every render.
+  const tzBucketByState=useMemo(()=>tzBucketsFor(dialerTz,new Date()),[dialerTz,tzTick])
+  // Bucket for one lead. Unknown / blank state → the fallback bucket, never
+  // TZ_OFF, so it stays dialable.
+  const tzBucketOf=useCallback(l=>{
+    if(!tzBucketByState) return TZ_PRIME
+    const k=(l&&l.state?String(l.state):"").trim().toUpperCase()
+    return (k && k in tzBucketByState) ? tzBucketByState[k]
+                                       : (tzBucketByState[TZ_FALLBACK_KEY]??TZ_PRIME)
+  },[tzBucketByState])
+
   if(!user) return <Login onLogin={u=>setUser(u)}/>
 
   const si=v=>STATUS_OPTIONS.find(s=>s.value===v)||STATUS_OPTIONS[0]
@@ -5407,6 +5498,13 @@ export default function App(){
                   && (!dialerCity || (l.city||"").toLowerCase().startsWith(dialerCity.toLowerCase().trim()))
                   && (!dialerUnanswered || l.status==="no_answer")
                 ).slice().sort((a,b)=>{
+                  // Prospect-local window FIRST: a lead whose office is open
+                  // beats a better-scored lead whose office is at lunch or
+                  // shut. Null-safe — tzBucketOf returns TZ_PRIME for every
+                  // lead when the config hasn't loaded, which collapses this
+                  // to the original ordering exactly.
+                  const ta=tzBucketOf(a), tb=tzBucketOf(b)
+                  if(ta!==tb) return ta-tb                              // open offices first
                   const ca=a.total_calls||0, cb=b.total_calls||0
                   if(ca!==cb) return ca-cb                              // fewest calls first
                   const la=a.last_called_at||"", lb=b.last_called_at||""
@@ -5469,14 +5567,32 @@ export default function App(){
                 // industry-specific script for the call. Both are pure
                 // lookups against state already loaded; the script cache
                 // gets populated by the dialer-render effect below.
-                const lt = localTimeAt(lead.state)
+                const lt = localTimeAt(lead.state, dialerTz&&dialerTz.state_timezones)
+                // SAFETY badge: 8am-7pm local. Deliberately WIDER than the
+                // prioritisation window (tzBucketOf / DIALER_LOCAL_*_HOUR):
+                // this one warns "do not ring at all", that one only decides
+                // what to offer first. Different jobs, different bounds.
                 const offHours = lt && (lt.hour < 8 || lt.hour >= 19)  // outside 8am-7pm local
+                const tzb = tzBucketOf(lead)
                 const industryScript = lead.industry ? scriptCache[lead.industry] : null
                 return(
                   <div style={{maxWidth:520,margin:"0 auto"}}>
                     <div style={{textAlign:"center",color:"#a3aac4",fontSize:13,marginBottom:24,
                       fontFamily:"'Space Grotesk',sans-serif"}}>
                       {dialerLeads.length} unclaimed lead{dialerLeads.length!==1?"s":""} · showing {idx+1} of {dialerLeads.length}
+                      {tzBucketByState&&(()=>{
+                        // Composition of the queue by the prospect's own
+                        // clock. Shown so the sort is visible rather than
+                        // mysterious — she can see that the Ohio stock hasn't
+                        // vanished, it's just behind the open offices.
+                        let open=0,lunch=0,shut=0
+                        dialerLeads.forEach(l=>{const b=tzBucketOf(l)
+                          if(b===TZ_OFF) shut++; else if(b===TZ_LUNCH) lunch++; else open++})
+                        if(!lunch&&!shut) return null
+                        return <span style={{color:"#6b7398"}}>
+                          {" · "}{open} open{lunch?` · ${lunch} at lunch`:""}{shut?` · ${shut} closed`:""}
+                        </span>
+                      })()}
                     </div>
                     <div style={{background:"#0f1930",borderRadius:20,padding:40,textAlign:"center",marginBottom:16}}>
                       <div style={{width:80,height:80,borderRadius:"50%",background:ac+"22",margin:"0 auto 20px",
@@ -5501,6 +5617,18 @@ export default function App(){
                                     color:offHours?"#ff6e84":"#69f6b8",
                                     border:`1px solid ${offHours?"#ff6e8430":"#69f6b830"}`}}>
                             🕐 {lt.time} {lt.tzShort}{offHours?" · off-hours":""}
+                          </span>
+                        )}
+                        {/* Why this lead sits where it does in the queue.
+                            Suppressed when the off-hours safety badge above
+                            already says it, so the card never shows two
+                            chips making the same point. */}
+                        {tzb!==TZ_PRIME&&!offHours&&(
+                          <span className="pill"
+                            title="Prospect-local calling window — sorted after open offices, not skipped"
+                            style={{background:"#ffc95c18",color:"#ffc95c",
+                                    border:"1px solid #ffc95c30"}}>
+                            {tzb===TZ_LUNCH?"🍽 their lunch hour":"🌙 past their close"}
                           </span>
                         )}
                       </div>
