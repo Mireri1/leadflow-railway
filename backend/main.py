@@ -5747,7 +5747,7 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
                              -(l.get("score") or 0)))
 
     # NANP guard (PostgREST regex would need a function; keep in Python).
-    NO_DIAL = {"awaiting_email_reply", "do_not_contact", "retired"}
+    NO_DIAL = NO_DIAL_STATUSES
     cutoff_iso = None
     if snooze_hours > 0:
         cutoff_iso = (datetime.utcnow() - timedelta(hours=snooze_hours)).isoformat()
@@ -6156,7 +6156,8 @@ def _act_decode(t: str, expect: str = ""):
     except Exception:
         return (None, None)
 
-def _act_lead(lead_id):
+def _get_lead(lead_id):
+    """Fetch one lead by id, or None. Shared by /act and the AI note sorter."""
     try:
         r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}&select=*",
                         headers=SB_HEADERS, timeout=10)
@@ -6187,7 +6188,7 @@ def act_page(t: str = ""):
     lead_id, kind = _act_decode(t)
     if not lead_id:
         return _act_err("This link expired or was already changed. Open the lead in LeadFlow instead.")
-    lead = _act_lead(lead_id)
+    lead = _get_lead(lead_id)
     if not lead:
         return _act_err("That lead no longer exists.", 404)
     company = _act_esc(lead.get("company") or "(unknown company)")
@@ -6256,7 +6257,7 @@ async def act_submit(request: Request):
     lead_id, kind = _act_decode(form.get("t", ""))
     if not lead_id:
         return _act_err("This link expired or was already changed.")
-    lead = _act_lead(lead_id)
+    lead = _get_lead(lead_id)
     if not lead:
         return _act_err("That lead no longer exists.", 404)
     now = datetime.utcnow().isoformat()
@@ -6972,6 +6973,9 @@ def delete_lead(lead_id: str, user: str = Depends(verify_token)):
 # Fail-closed and silent: no ANTHROPIC_API_KEY, an API error, an empty note —
 # nothing is written and the call save is unaffected either way.
 SENT_TAG_RE = re.compile(r"\[sent:(?:warm|neutral|cold)\]\s*", re.I)
+# Statuses that must never gain a callback date: the number is dead, suppressed,
+# or parked. Mirrors NO_DIAL_STATUSES in App.jsx.
+NO_DIAL_STATUSES = {"awaiting_email_reply", "do_not_contact", "retired"}
 
 def ai_sort_call_note(note: str, company: str = "", status: str = "",
                       existing_callback: str = "") -> dict:
@@ -7007,14 +7011,35 @@ def _apply_ai_sort(lead_id, note: str, caller: str, lead_full: dict):
                                  lead_full.get("callbackDate") or "")
         if sort.get("engine") in ("", "empty"):
             return
-        patch, notes = {}, (lead_full.get("notes") or "")
+
+        # RE-READ before writing. lead_full was fetched before the Haiku round
+        # trip, so it is a seconds-old snapshot, and `notes` here is a
+        # read-modify-write. Concurrent writers to the same field are real:
+        # POST /api/admin/validate-phones sweeps status in (new,no_answer) —
+        # precisely the leads a caller is dialing — and stamps [phone:*] plus
+        # do_not_contact on dead numbers. Merging onto the stale snapshot would
+        # silently drop that tag, and a dead number could be handed a callback
+        # date. Falling back to the snapshot on a failed read is safe: it is
+        # strictly no worse than not re-reading at all.
+        fresh = _get_lead(lead_id) or lead_full
+        notes = fresh.get("notes") or ""
+        status_now = (fresh.get("status") or "")
+
+        patch = {}
         sentiment = sort.get("sentiment")
         if sentiment in ("warm", "neutral", "cold"):
             # Replace any prior tag rather than stacking them — the note field
             # is the only store, so a stale tag would win on a naive prepend.
             cleaned = SENT_TAG_RE.sub("", notes).strip()
             patch["notes"] = f"[sent:{sentiment}] {cleaned}".strip()[:4000]
-        if sort.get("apply_callback"):
+        # A suppressed/dead/parked lead must never gain a callback date: the
+        # notification bell and the dashboard overdue banner filter only on
+        # status != converted, so a do_not_contact lead carrying a date shows
+        # up in Cristine's bell as a number to call. Re-check the CURRENT
+        # status and the CURRENT date, not the snapshot's.
+        if (sort.get("apply_callback")
+                and status_now not in NO_DIAL_STATUSES
+                and not (fresh.get("callbackDate") or "").strip()):
             patch["callbackDate"] = sort["callbackDate"]
         if not patch:
             return
