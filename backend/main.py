@@ -1529,15 +1529,22 @@ def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: 
     return {"found": len(raw_leads or []), "saved": saved,
             "alreadyInDb": already_in_db, "droppedUncallable": dropped_uncallable}
 
-# ── Phone line validation (Twilio Lookup v2, env-gated) ─────────────────────
-# Set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in Railway to activate. ~$0.008/
-# lookup. Without creds every check returns "unknown" and nothing changes.
+# ── Phone line validation (Twilio Lookup v2 basic, env-gated) ──────────────
+# Set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in Railway to activate. Uses the
+# FREE basic lookup (no Fields param) — the billed line_type_intelligence
+# package cost ~$0.008/number, i.e. ~$90 to sweep a 11.5k backlog, to learn a
+# line type nothing in this codebase branches on. Basic still returns the only
+# verdict we act on: whether the number is allocated and dialable at all.
+# Without creds every check returns "unknown" and nothing changes.
 TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
 def lookup_phone_line(phone: str):
     """Returns ('ok'|'dead'|'unknown', line_type). 'dead' = carrier says the
-    number is invalid/unallocated. Fail-open: any API trouble → 'unknown'."""
+    number is invalid/unallocated. Fail-open: any API trouble → 'unknown'.
+
+    line_type is '' on the free basic lookup — kept in the signature so callers
+    and the [phone:*] notes tag keep working unchanged."""
     if not (TWILIO_SID and TWILIO_TOKEN):
         return ("unknown", "")
     digits = re.sub(r"\D", "", phone or "")
@@ -1546,8 +1553,9 @@ def lookup_phone_line(phone: str):
     if len(digits) != 11:
         return ("dead", "invalid_format")
     try:
+        # No ?Fields= → free basic lookup. Returns {valid, phone_number, …}.
         r = req_lib.get(
-            f"https://lookups.twilio.com/v2/PhoneNumbers/+{digits}?Fields=line_type_intelligence",
+            f"https://lookups.twilio.com/v2/PhoneNumbers/+{digits}",
             auth=(TWILIO_SID, TWILIO_TOKEN), timeout=8)
         if r.status_code == 404:
             return ("dead", "unallocated")
@@ -1556,11 +1564,11 @@ def lookup_phone_line(phone: str):
         data = r.json()
         if data.get("valid") is False:
             return ("dead", "invalid")
-        lti = (data.get("line_type_intelligence") or {})
-        ltype = (lti.get("type") or "").lower()
-        # landline/mobile/fixedVoip all ring; 'nonFixedVoip' often burner but
-        # still dialable. Nothing here retires — only hard-invalid does.
-        return ("ok", ltype)
+        if data.get("valid") is True:
+            return ("ok", "")
+        # 200 with no explicit verdict → don't guess, don't spend a dial's
+        # worth of confidence on it. Fail-open, same as a transport error.
+        return ("unknown", "")
     except Exception as e:
         print(f"[LOOKUP] {phone}: {e}")
         return ("unknown", "")
@@ -1570,7 +1578,7 @@ def validate_phones(limit: int = 200, dry_run: int = 0, user: str = Depends(veri
     """Sweep undialed/no-contact leads through carrier lookup; dead numbers
     get status=do_not_contact + a notes tag so no dial is ever spent on them.
     Requires TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN; runs newest leads first.
-    Re-runnable: already-tagged leads are skipped."""
+    Re-runnable: already-tagged leads are skipped. Free — see lookup_phone_line."""
     if not (TWILIO_SID and TWILIO_TOKEN):
         return {"configured": False, "detail": "Set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in Railway first."}
     rows = _paginated_get(
@@ -1581,20 +1589,24 @@ def validate_phones(limit: int = 200, dry_run: int = 0, user: str = Depends(veri
     now = datetime.utcnow().isoformat()
     for l in todo:
         verdict, ltype = lookup_phone_line(l.get("phone"))
+        # ltype is '' on the free basic lookup — keep the tag as plain
+        # "[phone:ok]" rather than "[phone:ok ]" so the re-run skip check
+        # ("[phone:" in notes) and any later parsing stay clean.
+        tag = f"[phone:{verdict}{(' ' + ltype) if ltype else ''}]"
         if verdict == "dead":
             dead += 1
             if not dry_run:
                 req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{l['id']}",
                     headers=SB_HEADERS,
                     json={"status": "do_not_contact", "updatedAt": now,
-                          "notes": ((l.get("notes") or "") + f"\n[phone:dead {ltype}]").strip()},
+                          "notes": ((l.get("notes") or "") + f"\n{tag}").strip()},
                     timeout=10)
         elif verdict == "ok":
             ok += 1
             if not dry_run:
                 req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{l['id']}",
                     headers=SB_HEADERS,
-                    json={"notes": ((l.get("notes") or "") + f"\n[phone:ok {ltype}]").strip(),
+                    json={"notes": ((l.get("notes") or "") + f"\n{tag}").strip(),
                           "updatedAt": now}, timeout=10)
         else:
             unknown += 1
@@ -2549,12 +2561,22 @@ def imap_poll_replies():
                         emoji = "🛑" if is_negative else ("🔥" if sentiment == "positive" else "📬")
                         said = snippet[:280].strip() or "(no readable text — check the inbox)"
                         app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+                        # Negative replies get no reply/rebook buttons — they
+                        # asked to be left alone and are already suppressed.
+                        acts = [{"label": "Open LeadFlow", "url": app_url}]
+                        if not is_negative:
+                            acts = [{"label": "✍️ Draft reply", "url": _act_link(lead_id, "reply"),
+                                     "style": "primary"},
+                                    {"label": f"📅 Rebook +{ACT_REBOOK_DAYS}d",
+                                     "url": _act_link(lead_id, "rebook")},
+                                    {"label": "🚫 Drop", "url": _act_link(lead_id, "drop")},
+                                    {"label": "Open LeadFlow", "url": app_url}]
                         send_slack(
                             f"{emoji} Email reply — {target.get('company') or from_addr}",
                             f"*From:* {from_addr}\n*Sentiment:* {sentiment}\n*They said:* {said}"
                             + ("\n\n_Said NO — added to suppression list. Do NOT call._" if is_negative
                                else "\n\n_Lead flipped to *interested* — worth a same-day call._"),
-                            actions=[{"label": "Open LeadFlow", "url": app_url, "style": "primary"}],
+                            actions=acts,
                         )
                 except Exception as e:
                     print(f"[IMAP-POLL] reply slack failed: {e}")
@@ -5676,43 +5698,88 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
 
     Replaces the old pattern of fetching every lead and filtering client-side
     (a 1MB+ payload on every dialer-tab open). 50 leads is more than one
-    caller can churn through in a shift, with room to skip."""
+    caller can churn through in a shift, with room to skip.
+
+    WARM-FIRST ordering: every already-engaged lead (interested /
+    interested_no_dm / callback) comes ahead of the fresh-by-score stock. A
+    lead who already said "call me back" converts at a multiple of a
+    never-dialed number, and the old single fresh-first ORDER BY buried them:
+    ordering by total_calls.asc put every warm lead (calls > 0) behind
+    thousands of virgin rows, so in practice the dialer never surfaced one.
+    The two tiers are fetched as SEPARATE queries on purpose — a warm tier
+    folded into the fresh ORDER BY would fall off the end of the 5-page fetch
+    cap for exactly the same reason."""
     limit = max(1, min(int(limit or 50), 200))
     snooze_hours = max(0, min(int(snooze_hours or 0), 168))
 
-    # Filters at the PostgREST level; one paginated GET covers worst case.
     # NOTE: leads.assignedTo stores unassigned as empty string "", not NULL —
     # legacy data convention. So the "mine or unassigned" filter needs the
     # eq.<empty> branch as well as is.null. Tested both branches in prod.
-    base = (f"{SUPABASE_URL}/rest/v1/leads?select=*"
-            f"&or=(assignedTo.eq.{url_quote(user)},assignedTo.is.null,assignedTo.eq.)"
-            f"&status=not.in.(awaiting_email_reply,do_not_contact,retired)"
-            f"&phone=neq."  # empty-string check matches the legacy convention
-            f"&order=total_calls.asc.nullsfirst,last_called_at.asc.nullsfirst,score.desc")
-    rows = _paginated_get(base, page_size=1000, max_pages=5)
-    if not isinstance(rows, list):
-        rows = []
+    mine_or_free = f"&or=(assignedTo.eq.{url_quote(user)},assignedTo.is.null,assignedTo.eq.)"
+    # empty-string phone check matches the legacy convention
+    common = f"{mine_or_free}&phone=neq."
+
+    # Tier 1 — warm. Small set, so one page is plenty. Ordered in Python
+    # below, not here: leads.callbackDate stores "unset" as empty string (the
+    # same legacy convention as assignedTo), and "" sorts BEFORE real dates
+    # ascending, so a PostgREST callbackDate.asc.nullslast would float every
+    # warm lead with no date to the very top and bury the actual due ones.
+    warm = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/leads?select=*{common}"
+        f"&status=in.(interested,interested_no_dm,callback)"
+        f"&order=score.desc",
+        page_size=1000, max_pages=2)
+    # Tier 2 — fresh stock, least-touched first.
+    fresh = _paginated_get(
+        f"{SUPABASE_URL}/rest/v1/leads?select=*{common}"
+        f"&status=not.in.(awaiting_email_reply,do_not_contact,retired,interested,interested_no_dm,callback)"
+        f"&order=total_calls.asc.nullsfirst,last_called_at.asc.nullsfirst,score.desc",
+        page_size=1000, max_pages=5)
+    if not isinstance(warm, list):  warm = []
+    if not isinstance(fresh, list): fresh = []
+
+    # Soonest callback first — an overdue promise is the most urgent dial in
+    # the building. Undated warm leads sort last within the tier (still ahead
+    # of the whole fresh tier), highest score first among equals.
+    WARM_PRIORITY = {"interested": 0, "interested_no_dm": 1, "callback": 2}
+    warm.sort(key=lambda l: ((l.get("callbackDate") or "9999-12-31")[:10],
+                             WARM_PRIORITY.get(l.get("status") or "", 9),
+                             -(l.get("score") or 0)))
 
     # NANP guard (PostgREST regex would need a function; keep in Python).
     NO_DIAL = {"awaiting_email_reply", "do_not_contact", "retired"}
-    SNOOZED_OUTCOMES = {"no_answer", "voicemail", "called", "not_interested"}
     cutoff_iso = None
     if snooze_hours > 0:
         cutoff_iso = (datetime.utcnow() - timedelta(hours=snooze_hours)).isoformat()
 
-    out = []
-    for l in rows:
-        if (l.get("status") or "") in NO_DIAL: continue
-        if not is_valid_us_phone(l.get("phone")): continue
+    # Snooze now applies to BOTH tiers. It used to be gated on a set of
+    # no-contact statuses, which left warm leads with no cooldown at all —
+    # a lead called 10 minutes ago sat at the very top of the new warm tier
+    # and would be redialed on the next queue refresh.
+    def _eligible(l, seen):
+        if (l.get("status") or "") in NO_DIAL: return False
+        if l.get("id") in seen: return False
+        if not is_valid_us_phone(l.get("phone")): return False
         if cutoff_iso:
             lca = l.get("last_called_at") or ""
-            if lca and lca >= cutoff_iso and (l.get("status") or "") in SNOOZED_OUTCOMES:
-                continue
-        out.append(l)
+            if lca and lca >= cutoff_iso:
+                return False
+        return True
+
+    out, seen = [], set()
+    for tier in (warm, fresh):
+        for l in tier:
+            if not _eligible(l, seen): continue
+            seen.add(l.get("id"))
+            out.append(l)
+            if len(out) >= limit:
+                break
         if len(out) >= limit:
             break
-    return {"queue": out, "fetched": len(rows), "returned": len(out),
-            "user": user, "snooze_hours": snooze_hours}
+    warm_returned = sum(1 for l in out
+                        if (l.get("status") or "") in ("interested", "interested_no_dm", "callback"))
+    return {"queue": out, "fetched": len(warm) + len(fresh), "returned": len(out),
+            "warm_returned": warm_returned, "user": user, "snooze_hours": snooze_hours}
 
 @app.post("/api/leads")
 def create_lead(lead: dict, user: str = Depends(verify_token)):
@@ -5807,7 +5874,10 @@ async def analyze_note(request: Request, user: str = Depends(verify_token)):
 # approves it (→ Angelo + downstream hiring) → it routes back here so decisions
 # and follow-ups are tracked to close the loop. Stored as JSON in app_settings
 # (appt_<leadId>) — no schema/DDL change. Calendar/Twilio/Notion hang off this.
-APPT_STAGES = ["pending", "approved", "confirmed", "won", "lost"]
+# no_show = the walkthrough was booked and simply never happened. It used to
+# get filed as "lost", which made the win rate read as a selling problem
+# when it was really a show-rate problem — two different fixes.
+APPT_STAGES = ["pending", "approved", "confirmed", "won", "lost", "no_show"]
 ANGELO_SLACK_WEBHOOK_URL = os.getenv("ANGELO_SLACK_WEBHOOK_URL", "")
 
 def _settings_get_json(key):
@@ -5859,9 +5929,14 @@ def _notify_walkthrough_update(appt, stage, by):
         return
     titles = {"confirmed": "📍 Walkthrough confirmed",
               "won":       "🏆 Walkthrough WON — new client",
-              "lost":      "❌ Walkthrough lost"}
+              "lost":      "❌ Walkthrough lost",
+              "no_show":   "👻 Walkthrough no-show — never happened"}
     fields = [f"*Company:* {appt.get('company','—')}", f"*Walkthrough date:* {(appt.get('date') or '—')[:10]}",
               f"*Area:* {appt.get('area','—')}", f"*Updated by:* {by}"]
+    if appt.get("contractValue"):
+        fields.insert(1, f"*Contract value:* ${appt['contractValue']:,.0f}/mo")
+    if stage == "no_show":
+        fields.append("_Still a live lead — it went back to the callback queue, not to lost._")
     if appt.get("decision"):
         fields.append(f"*Decision:* {appt['decision']}")
     if appt.get("phone"):
@@ -6029,6 +6104,217 @@ async def appt_approve_submit(request: Request):
       <div style="text-align:center"><h2>✅ Approved</h2>
       <p style="color:#a3aac4">{appt.get('company','')} sent to Angelo for hiring.</p></div></body></html>""")
 
+# ── /act — signed one-click lead actions from Slack ─────────────────────────
+# Eric reads Slack on his phone all day and LeadFlow maybe twice. A reply ping
+# that needs a laptop to answer is a ping that waits until evening, so the
+# three things he actually does with a warm reply are links in the ping itself:
+#
+#   rebook  → callbackDate = +3 days, status=callback   (park it, keep it alive)
+#   drop    → status=do_not_contact + audit tag         (it's dead, stop dialing)
+#   reply   → AI-drafted reply, shown for review, sent on submit
+#
+# Same shape as /appt-approve and /email-queue: GET only RENDERS (Slack's
+# link-prefetch bot GETs every URL it unfurls, so a GET that acted would drop
+# leads on its own), the POST does the work. Signed with SECRET_KEY, 7-day
+# expiry, and the token carries the action — a rebook link can't become a drop.
+ACT_KINDS = ("rebook", "drop", "reply")
+ACT_REBOOK_DAYS = int(os.getenv("ACT_REBOOK_DAYS", "3"))
+
+def _act_link(lead_id, kind: str) -> str:
+    tok = jwt.encode({"leadId": str(lead_id), "act": "lead_act", "do": kind,
+                      "exp": datetime.utcnow() + timedelta(days=7)},
+                     SECRET_KEY, algorithm=ALGORITHM)
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    return f"{app_url}/act?t={tok}"
+
+def _act_buttons(lead_id, include_reply: bool = True) -> list:
+    """Slack action elements for a lead ping. Safe to drop into any block kit
+    message that concerns exactly one lead."""
+    if not lead_id:
+        return []
+    out = [{"type": "button", "text": {"type": "plain_text", "text": "✍️ Draft reply", "emoji": True},
+            "url": _act_link(lead_id, "reply"), "style": "primary"}] if include_reply else []
+    out += [
+        {"type": "button", "text": {"type": "plain_text", "text": f"📅 Rebook +{ACT_REBOOK_DAYS}d", "emoji": True},
+         "url": _act_link(lead_id, "rebook")},
+        {"type": "button", "text": {"type": "plain_text", "text": "🚫 Drop", "emoji": True},
+         "url": _act_link(lead_id, "drop"), "style": "danger"},
+    ]
+    return out
+
+def _act_decode(t: str, expect: str = ""):
+    """Returns (leadId, kind) or (None, None). Rejects a token minted for a
+    different action even when the signature is good."""
+    try:
+        payload = jwt.decode(t, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("act") != "lead_act":
+            return (None, None)
+        kind = payload.get("do")
+        if kind not in ACT_KINDS or (expect and kind != expect):
+            return (None, None)
+        return (str(payload.get("leadId") or ""), kind)
+    except Exception:
+        return (None, None)
+
+def _act_lead(lead_id):
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}&select=*",
+                        headers=SB_HEADERS, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        return rows[0] if isinstance(rows, list) and rows else None
+    except Exception as e:
+        print(f"[ACT] lead fetch failed for {lead_id}: {e}")
+        return None
+
+_ACT_SHELL = ('<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;margin:0;'
+              'padding:40px;display:flex;justify-content:center">'
+              '<div style="max-width:560px;width:100%">{inner}</div></body></html>')
+
+def _act_html(inner: str, status: int = 200):
+    return HTMLResponse(_ACT_SHELL.format(inner=inner), status_code=status)
+
+def _act_err(msg: str, status: int = 400):
+    return _act_html(f"<h2>Can't do that</h2><p style='color:#a3aac4'>{msg}</p>", status)
+
+def _act_esc(v) -> str:
+    """Minimal HTML escape — lead text and AI drafts land in this page."""
+    return (str(v or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+@app.get("/act")
+def act_page(t: str = ""):
+    """Confirmation page for a Slack action link. Renders only — never acts."""
+    lead_id, kind = _act_decode(t)
+    if not lead_id:
+        return _act_err("This link expired or was already changed. Open the lead in LeadFlow instead.")
+    lead = _act_lead(lead_id)
+    if not lead:
+        return _act_err("That lead no longer exists.", 404)
+    company = _act_esc(lead.get("company") or "(unknown company)")
+    who = _act_esc(" ".join(x for x in [lead.get("firstName"), lead.get("lastName")] if x) or "—")
+    meta = (f"<p style='color:#a3aac4'>{company} · {who}"
+            f"{' · ' + _act_esc(lead.get('phone')) if lead.get('phone') else ''}"
+            f"{' · status ' + _act_esc(lead.get('status')) if lead.get('status') else ''}</p>")
+    btn = ("background:#69f6b8;color:#06301c;border:0;border-radius:10px;padding:14px 28px;"
+           "font-size:16px;font-weight:700;cursor:pointer")
+    danger = btn.replace("#69f6b8", "#ff6e84").replace("#06301c", "#2b0710")
+
+    if kind == "rebook":
+        when = (datetime.utcnow() + timedelta(days=ACT_REBOOK_DAYS)).date().isoformat()
+        inner = (f"<h2>📅 Rebook for {when}?</h2>{meta}"
+                 f"<p style='color:#a3aac4'>Sets the callback date to <b>{when}</b> and puts the lead back in "
+                 f"the callback queue. Nothing is emailed.</p>"
+                 f"<form method='post' action='/act'><input type='hidden' name='t' value='{_act_esc(t)}'/>"
+                 f"<button type='submit' style='{btn}'>📅 Rebook for {when}</button></form>")
+        return _act_html(inner)
+
+    if kind == "drop":
+        inner = (f"<h2>🚫 Drop this lead?</h2>{meta}"
+                 f"<p style='color:#a3aac4'>Sets status to <b>do_not_contact</b> — it leaves the dialer queue "
+                 f"and every follow-up list for good. Reversible only by editing the lead in LeadFlow.</p>"
+                 f"<form method='post' action='/act'><input type='hidden' name='t' value='{_act_esc(t)}'/>"
+                 f"<button type='submit' style='{danger}'>🚫 Drop it</button></form>")
+        return _act_html(inner)
+
+    # reply — draft now so he can read it BEFORE sending; the draft is carried
+    # in the form so the POST sends exactly what was on screen.
+    email = (lead.get("email") or "").strip()
+    if not email:
+        return _act_err(f"{company} has no email address on file, so there's nothing to reply to.")
+    src = _last_reply_text(lead)
+    draft = suggest_email_reply(email, f"Re: {lead.get('company') or 'your message'}", src)
+    if not draft:
+        draft = ("Thanks for getting back to me — happy to put a quote together.\n\n"
+                 "Would a quick 15-minute walkthrough work this week? Let me know a day "
+                 "that suits and I'll come by.\n\nEric\nVision Cleaning Company")
+    subject = f"Re: {lead.get('company') or 'your message'}"
+    inner = (f"<h2>✍️ Send this reply?</h2>{meta}"
+             f"<p style='color:#8893b0;font-size:13px'>To {_act_esc(email)} · edit it if you want — what's in the "
+             f"box is what gets sent.</p>"
+             f"<form method='post' action='/act'>"
+             f"<input type='hidden' name='t' value='{_act_esc(t)}'/>"
+             f"<input name='subject' value='{_act_esc(subject)}' "
+             f"style='width:100%;box-sizing:border-box;background:#000011;border:1px solid #22304f;color:#dee5ff;"
+             f"border-radius:8px;padding:10px;font-size:14px;font-family:inherit;margin-bottom:10px'/>"
+             f"<textarea name='draft' rows='11' style='width:100%;box-sizing:border-box;background:#000011;"
+             f"border:1px solid #22304f;color:#dee5ff;border-radius:8px;padding:12px;font-size:14px;"
+             f"font-family:inherit;line-height:1.5'>{_act_esc(draft)}</textarea>"
+             f"<button type='submit' style='{btn};margin-top:14px'>✉️ Send it</button></form>")
+    return _act_html(inner)
+
+def _last_reply_text(lead) -> str:
+    """The prospect's own words to reply to — the 📧/📞 stamp the IMAP poller
+    and the inbound concierge prepend to notes. Falls back to the notes head."""
+    notes = lead.get("notes") or ""
+    m = re.search(r"(?:📧 Reply|🛑 Negative reply|📞 Inbound call)[^:]*:(.*)",
+                  notes, re.S)
+    return (m.group(1) if m else notes).strip()[:1500]
+
+@app.post("/act")
+async def act_submit(request: Request):
+    form = await request.form()
+    lead_id, kind = _act_decode(form.get("t", ""))
+    if not lead_id:
+        return _act_err("This link expired or was already changed.")
+    lead = _act_lead(lead_id)
+    if not lead:
+        return _act_err("That lead no longer exists.", 404)
+    now = datetime.utcnow().isoformat()
+    company = _act_esc(lead.get("company") or "the lead")
+
+    if kind == "rebook":
+        when = (datetime.utcnow() + timedelta(days=ACT_REBOOK_DAYS)).date().isoformat()
+        try:
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                          headers=SB_HEADERS,
+                          json={"status": "callback", "callbackDate": when, "updatedAt": now},
+                          timeout=10)
+        except Exception as e:
+            return _act_err(f"Couldn't save that: {e}", 502)
+        audit_log("slack-link", "act_rebook", "lead", lead_id,
+                  {"company": lead.get("company"), "callbackDate": when})
+        return _act_html(f"<h2>📅 Rebooked</h2><p style='color:#a3aac4'>{company} is back in the callback "
+                         f"queue for <b>{when}</b>.</p>")
+
+    if kind == "drop":
+        try:
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                          headers=SB_HEADERS,
+                          json={"status": "do_not_contact", "updatedAt": now,
+                                "notes": ((lead.get("notes") or "") + "\n[act:dropped-from-slack]").strip()[:4000]},
+                          timeout=10)
+        except Exception as e:
+            return _act_err(f"Couldn't save that: {e}", 502)
+        audit_log("slack-link", "act_drop", "lead", lead_id, {"company": lead.get("company")})
+        return _act_html(f"<h2>🚫 Dropped</h2><p style='color:#a3aac4'>{company} is set to do_not_contact and "
+                         f"is out of every calling list.</p>")
+
+    # reply
+    email = (lead.get("email") or "").strip()
+    body_text = (form.get("draft") or "").strip()
+    subject = (form.get("subject") or "").strip() or f"Re: {lead.get('company') or 'your message'}"
+    if not email:
+        return _act_err("No email address on file for this lead.")
+    if not body_text:
+        return _act_err("The reply was empty — nothing sent.")
+    to_name = " ".join(x for x in [lead.get("firstName"), lead.get("lastName")] if x)
+    html_body = "<br/>".join(_act_esc(ln) for ln in body_text.splitlines())
+    ok, err = send_smtp_email(email, to_name, subject, html_body, reply_to=OUTREACH_REPLY_TO)
+    if not ok:
+        return _act_err(f"Send failed: {_act_esc(err)}", 502)
+    try:
+        req_lib.post(f"{SUPABASE_URL}/rest/v1/email_log", headers=SB_ADMIN_HEADERS,
+                     json={"lead_id": lead.get("id"), "sent_by": "slack-link", "to_email": email,
+                           "to_name": to_name, "subject": subject, "body": html_body,
+                           "company": lead.get("company") or "", "status": "sent", "sent_at": now},
+                     timeout=10)
+    except Exception as e:
+        print(f"[ACT] email_log write failed for {lead_id}: {e}")
+    audit_log("slack-link", "act_reply_sent", "lead", lead_id,
+              {"company": lead.get("company"), "to": email, "subject": subject})
+    return _act_html(f"<h2>✉️ Sent</h2><p style='color:#a3aac4'>Your reply went to {_act_esc(email)}. "
+                     f"Any response lands back in Slack.</p>")
+
 # ── Twilio inbound (after-hours concierge + shift-hours forwarding) ──────────
 # Point the Twilio number's Voice webhook at POST {APP_URL}/twilio/voice.
 # During INBOUND_FORWARD_HOURS_PT (default 6-14 = cristine's shift) calls ring
@@ -6044,13 +6330,21 @@ PT_OFFSET_HOURS          = int(os.getenv("PT_OFFSET_HOURS", "-7"))
 
 def _twilio_sig_ok(request: Request, form) -> bool:
     """Validate X-Twilio-Signature (HMAC-SHA1 of public URL + sorted params).
-    TWILIO_VALIDATE_SIGNATURE=0 disables for debugging."""
+    TWILIO_VALIDATE_SIGNATURE=0 disables for debugging.
+
+    The signed string is the FULL url Twilio requested — query string included.
+    Signing only request.url.path 403'd every webhook we hand query params to:
+    /twilio/bridge?to=…&cid=…&rec=… and /twilio/recording-status?lead_id=…,
+    i.e. the whole click-to-call + recording path was dead on arrival. The
+    param-less webhooks (/twilio/voice etc.) are unaffected either way."""
     if os.getenv("TWILIO_VALIDATE_SIGNATURE", "1") != "1":
         return True
     token = os.getenv("TWILIO_AUTH_TOKEN", "")
     if not token:
         return False
     url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app") + request.url.path
+    if request.url.query:
+        url += "?" + request.url.query
     data = url + "".join(k + str(form.get(k) or "") for k in sorted(form.keys()))
     mac = _b64.b64encode(_hmac.new(token.encode(), data.encode(), _hashlib.sha1).digest()).decode()
     return _hmac.compare_digest(mac, request.headers.get("X-Twilio-Signature", ""))
@@ -6534,7 +6828,17 @@ def walkthrough_channel_test(user: str = Depends(verify_admin)):
 @app.post("/api/appointments/{lead_id}/transition")
 async def transition_appointment(lead_id: str, request: Request, user: str = Depends(verify_token)):
     """Move an appointment to a new stage (admin). 'approved' fires the Angelo
-    handoff; 'won'/'lost' close the loop."""
+    handoff; 'won'/'lost'/'no_show' close the loop.
+
+    'won' REQUIRES a contract_value (monthly $) in the body and flips the lead
+    to converted. Won deals were being closed with no number attached, which
+    left revenue un-answerable from LeadFlow — the system of record for the
+    sales loop couldn't say what a win was worth. The value lives on the
+    appointment JSON in app_settings; nothing is written to call_outcomes,
+    which has no contract_value column (a stray key rejects the whole insert).
+
+    'no_show' keeps the lead dialable — it hands it back to the callback queue
+    for a re-book instead of burying it as a loss."""
     if not is_admin(user):
         raise HTTPException(status_code=403, detail="Admin only")
     try:
@@ -6548,18 +6852,64 @@ async def transition_appointment(lead_id: str, request: Request, user: str = Dep
     appt = _settings_get_json(key)
     if not appt:
         raise HTTPException(status_code=404, detail="appointment not found")
+
+    # Validate BEFORE any mutation so a bad 'won' leaves the appointment
+    # exactly as it was rather than half-transitioned.
+    contract_value = None
+    if stage == "won":
+        raw = body.get("contract_value", body.get("contractValue"))
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            raise HTTPException(status_code=400,
+                detail="contract_value (monthly $) is required to mark a walkthrough won")
+        try:
+            contract_value = float(str(raw).replace(",", "").replace("$", "").strip())
+        except Exception:
+            raise HTTPException(status_code=400, detail="contract_value must be a number")
+        if contract_value <= 0:
+            raise HTTPException(status_code=400, detail="contract_value must be greater than 0")
+
     now = datetime.utcnow().isoformat() + "Z"
     appt["stage"] = stage
+    if contract_value is not None:
+        appt["contractValue"] = contract_value
+        appt["wonAt"] = now
     if body.get("subAssigned") is not None: appt["subAssigned"] = body["subAssigned"]
     if body.get("decision") is not None: appt["decision"] = body["decision"]
     if body.get("note"):
         appt["notes"] = ((appt.get("notes", "") + "\n") if appt.get("notes") else "") + f"[{now[:10]}] {body['note']}"
-    appt.setdefault("history", []).append({"stage": stage, "at": now, "by": user})
+    appt.setdefault("history", []).append(
+        {"stage": stage, "at": now, "by": user,
+         **({"contractValue": contract_value} if contract_value is not None else {})})
     appt["updatedAt"] = now
     _settings_set_json(key, appt)
+
+    # Won → the lead itself becomes converted. Wrapped: the appointment record
+    # is already saved above, so a lead-patch hiccup must not 500 the decision.
+    if stage == "won":
+        try:
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                          headers=SB_HEADERS,
+                          json={"status": "converted", "updatedAt": datetime.utcnow().isoformat()},
+                          timeout=10)
+        except Exception as e:
+            print(f"[APPT] won → lead convert failed for {lead_id}: {e}")
+    # No-show → back into the callback queue for a re-book, still dialable.
+    elif stage == "no_show":
+        try:
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                          headers=SB_HEADERS,
+                          json={"status": "callback", "callbackDate": local_today(),
+                                "updatedAt": datetime.utcnow().isoformat()},
+                          timeout=10)
+        except Exception as e:
+            print(f"[APPT] no_show → lead requeue failed for {lead_id}: {e}")
+
+    audit_log(user, "appointment_transition", "lead", lead_id,
+              {"stage": stage, "company": appt.get("company"),
+               "contract_value": contract_value})
     if stage == "approved":
         _notify_angelo(appt)
-    elif stage in ("confirmed", "won", "lost"):
+    elif stage in ("confirmed", "won", "lost", "no_show"):
         _notify_walkthrough_update(appt, stage, user)
     return appt
 
@@ -6604,6 +6954,95 @@ def delete_lead(lead_id: str, user: str = Depends(verify_token)):
         return {"deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── AI note sorter — runs in the background after every logged call ─────────
+# The caller types one line of prose and moves on; this reads it and does the
+# filing they'd otherwise skip. Deliberately narrow about what it may write:
+#
+#   WRITES  the [sent:warm|neutral|cold] tag on the lead (the frontend's
+#           parseSentiment/<SentimentDot/> already render it, so this lights
+#           up existing UI with no frontend change), and a callbackDate the
+#           note stated in plain English ("try me after the 15th") ONLY when
+#           the lead has none.
+#   NEVER   overwrites an existing callbackDate, and never touches status.
+#           Both are load-bearing for the Follow-Ups buckets and the whole
+#           pipeline; a wrong AI guess there is worse than no guess, so the
+#           suggested status is recorded in the audit row for review instead.
+#
+# Fail-closed and silent: no ANTHROPIC_API_KEY, an API error, an empty note —
+# nothing is written and the call save is unaffected either way.
+SENT_TAG_RE = re.compile(r"\[sent:(?:warm|neutral|cold)\]\s*", re.I)
+
+def ai_sort_call_note(note: str, company: str = "", status: str = "",
+                      existing_callback: str = "") -> dict:
+    """Classify one just-logged call note into a filing decision.
+
+    Returns {sentiment, outcome, callbackDate, summary, engine, apply_callback}
+    where apply_callback is True only when the note named a future date AND the
+    lead has none on file. Reuses haiku_analyze_note so there is exactly one
+    note-reading prompt in this codebase to keep in sync."""
+    note = (note or "").strip()
+    if not note:
+        return {"sentiment": "", "outcome": "", "callbackDate": "", "summary": "",
+                "engine": "empty", "apply_callback": False}
+    res = haiku_analyze_note(note, company, status) or {}
+    cb = (res.get("callbackDate") or "").strip()
+    # Only ever ADD a date, never move one, and never schedule into the past.
+    apply_cb = bool(cb) and not (existing_callback or "").strip() and cb > local_today()
+    return {"sentiment": res.get("sentiment") or "",
+            "outcome": res.get("outcome") or "",
+            "callbackDate": cb,
+            "summary": res.get("summary") or "",
+            "engine": res.get("engine") or "",
+            "apply_callback": apply_cb}
+
+def _apply_ai_sort(lead_id, note: str, caller: str, lead_full: dict):
+    """Run the sorter and persist its narrow writes. Called on a daemon thread
+    from log_call — must never raise into the request path."""
+    try:
+        if not lead_id or not (note or "").strip():
+            return
+        sort = ai_sort_call_note(note, lead_full.get("company") or "",
+                                 lead_full.get("status") or "",
+                                 lead_full.get("callbackDate") or "")
+        if sort.get("engine") in ("", "empty"):
+            return
+        patch, notes = {}, (lead_full.get("notes") or "")
+        sentiment = sort.get("sentiment")
+        if sentiment in ("warm", "neutral", "cold"):
+            # Replace any prior tag rather than stacking them — the note field
+            # is the only store, so a stale tag would win on a naive prepend.
+            cleaned = SENT_TAG_RE.sub("", notes).strip()
+            patch["notes"] = f"[sent:{sentiment}] {cleaned}".strip()[:4000]
+        if sort.get("apply_callback"):
+            patch["callbackDate"] = sort["callbackDate"]
+        if not patch:
+            return
+        patch["updatedAt"] = datetime.utcnow().isoformat()
+        r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}",
+                          headers=SB_HEADERS, json=patch, timeout=10)
+        if r.status_code not in (200, 201, 204):
+            print(f"[AI-SORT] patch failed for lead {lead_id}: {r.status_code} {r.text[:160]}")
+            return
+        # suggested_status is recorded, NOT applied — see the note above.
+        audit_log(caller, "ai_sort_note", "lead", lead_id,
+                  {"sentiment": sentiment, "suggested_status": sort.get("outcome"),
+                   "callback_set": patch.get("callbackDate") or "",
+                   "summary": sort.get("summary"), "engine": sort.get("engine")})
+    except Exception as e:
+        print(f"[AI-SORT] failed for lead {lead_id}: {e}")
+
+def _spawn_ai_sort(lead_id, note: str, caller: str, lead_full: dict):
+    """Fire-and-forget the sorter so a ~2s Haiku round trip never sits in the
+    caller's save path — they're dialing the next number already."""
+    if not ANTHROPIC_API_KEY:
+        return
+    try:
+        threading.Thread(target=_apply_ai_sort,
+                         args=(lead_id, note, caller, lead_full or {}),
+                         daemon=True).start()
+    except Exception as e:
+        print(f"[AI-SORT] spawn failed for lead {lead_id}: {e}")
 
 @app.post("/api/calls")
 def log_call(call: dict, user: str = Depends(verify_token)):
@@ -6731,6 +7170,11 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                     _notify_walkthrough_client_call(appt, call, caller, lead_full)
             except Exception as e:
                 print(f"[APPT-CALL] relay failed for lead {lead_id}: {e}")
+
+            # 🧠 AI note sorter — background, after every logged call. Files
+            # the sentiment tag and any plain-English callback date the caller
+            # wrote in prose. Never blocks or fails the save.
+            _spawn_ai_sort(lead_id, call.get("notes") or "", caller, lead_full)
 
             # Email follow-up trigger. Two paths:
             #   (a) Caller checked "Send follow-up email" in the modal → fire now,
@@ -8975,18 +9419,42 @@ async def apollo_phone_webhook(secret: str, lead_id: str, request: Request):
         print(f"[APOLLO-WEBHOOK] no phone in payload for lead {lead_id}")
         return {"ok": True, "phone": None}
 
+    # Stamp WHERE the number came from. A revealed Apollo mobile is a direct
+    # line to a decision-maker and behaves nothing like a scraped main line —
+    # different connect rate, different opener — but once written to leads.phone
+    # the two are indistinguishable. The tag keeps them tellable apart in the
+    # notes (same tokenized pattern as [INTENT:*] / [sent:*], no schema change).
+    src = (chosen.get("type_cd") or "other").strip().lower() or "other"
+    src = re.sub(r"[^a-z0-9_]+", "_", src)
+    tag = f"[phonesrc:apollo_{src}]"
+    notes = None
+    try:
+        lr = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=notes",
+                         headers=SB_HEADERS, timeout=10)
+        rows = lr.json() if lr.status_code == 200 else []
+        if isinstance(rows, list) and rows:
+            notes = rows[0].get("notes") or ""
+    except Exception as e:
+        print(f"[APOLLO-WEBHOOK] notes read failed for {lead_id}: {e}")
+
+    payload = {"phone": phone, "updatedAt": datetime.utcnow().isoformat()}
+    if notes is not None:
+        # Re-reveals replace the old tag instead of stacking a second one.
+        cleaned = re.sub(r"\[phonesrc:[^\]]*\]\s*", "", notes).strip()
+        payload["notes"] = (f"{tag} {cleaned}".strip() if cleaned else tag)[:4000]
+
     try:
         req_lib.patch(
             f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
             headers=SB_HEADERS,
-            json={"phone": phone, "updatedAt": datetime.utcnow().isoformat()},
+            json=payload,
             timeout=10,
         )
-        print(f"[APOLLO-WEBHOOK] updated lead {lead_id} with phone {phone}")
+        print(f"[APOLLO-WEBHOOK] updated lead {lead_id} with phone {phone} {tag}")
     except Exception as e:
         print(f"[APOLLO-WEBHOOK] update failed for {lead_id}: {e}")
 
-    return {"ok": True, "phone": phone}
+    return {"ok": True, "phone": phone, "phone_source": f"apollo_{src}"}
 
 @app.get("/api/admin/apollo/budget")
 def apollo_budget(user: str = Depends(verify_token)):

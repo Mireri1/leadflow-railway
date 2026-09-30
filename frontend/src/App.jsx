@@ -256,7 +256,26 @@ function cleanNote(notes){
   return (notes||"").replace(/\[INTENT:[a-z_]+\]/gi,"").replace(/\[(hvage|clnage):\d+\]/gi,"")
     .replace(/\[inspected:[\d-]+\]/gi,"")
     .replace(/\[sent:(warm|neutral|cold)\]/gi,"")
+    .replace(/\[phonesrc:[^\]]*\]/gi,"")
+    .replace(/\[phone:[^\]]*\]/gi,"")
+    .replace(/\[act:[^\]]*\]/gi,"")
     .replace(/\s*\|\s*/g," · ").replace(/\s+/g," ").trim()
+}
+// Where a lead's phone number came from. [phonesrc:apollo_mobile] means Apollo
+// revealed a direct mobile — a decision-maker's own line, not a front desk —
+// so it's worth showing the caller before they pick their opener.
+function parsePhoneSource(notes){
+  const m = (notes||"").match(/\[phonesrc:([a-z0-9_]+)\]/i)
+  return m ? m[1].toLowerCase() : null
+}
+const PHONE_SRC_META = {
+  apollo_mobile: { label:"📱 Apollo direct mobile", color:"#69f6b8" },
+  apollo_work:   { label:"☎️ Apollo work line",     color:"#69b4f6" },
+}
+function phoneSourceMeta(notes){
+  const src = parsePhoneSource(notes)
+  if(!src) return null
+  return PHONE_SRC_META[src] || { label:`📞 Apollo (${src.replace(/^apollo_/,"")})`, color:"#a3aac4" }
 }
 // Last reported health-inspection date for a lead — from the [inspected:DATE]
 // token, or parsed from the note text for leads scraped before the token.
@@ -1933,6 +1952,13 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
             )}
             <div style={{display:"flex",gap:12,fontSize:12,color:"#a3aac4",flexWrap:"wrap",alignItems:"center"}}>
               {lead.phone&&<span>📞 {lead.phone}</span>}
+              {lead.phone&&(()=>{                        /* no hooks — safe inline */
+                const ps=phoneSourceMeta(lead.notes)
+                return ps?<span style={{fontSize:10,fontWeight:700,color:ps.color,border:`1px solid ${ps.color}44`,
+                  background:`${ps.color}14`,borderRadius:5,padding:"2px 6px"}}
+                  title="Where this number came from — a direct mobile reaches the decision maker, a main line reaches a front desk">
+                  {ps.label}</span>:null
+              })()}
               {lead.email&&<span>✉ {lead.email}</span>}
               {!lead.firstName&&(
                 <button onClick={findDecisionMaker} disabled={findingDM}
@@ -3239,8 +3265,22 @@ const APPT_STAGE_META = {
   confirmed: { label:"📅 Confirmed",                  color:"#69b4f6" },
   won:       { label:"🏆 Won",                        color:"#69f6b8" },
   lost:      { label:"❌ Lost",                       color:"#ff6e84" },
+  no_show:   { label:"👻 No-show",                    color:"#ffa869" },
 }
-const APPT_STAGES = ["pending","approved","confirmed","won","lost"]
+const APPT_STAGES = ["pending","approved","confirmed","won","lost","no_show"]
+
+// Won needs a number. Backend rejects a won transition without one, so ask
+// here rather than letting the click fail — and keep the ask identical on the
+// Appointments board and the Walkthroughs panel.
+// Returns the parsed monthly value, or null if the user cancelled / typed junk.
+function promptContractValue(company){
+  const raw = window.prompt(
+    `🏆 Marking ${company||"this deal"} as WON.\n\nMonthly contract value in dollars?`, "")
+  if(raw===null) return null                        // cancelled
+  const n = parseFloat(String(raw).replace(/[$,\s]/g,""))
+  if(!isFinite(n)||n<=0){ window.alert("Enter a monthly dollar amount greater than 0 — nothing was saved."); return null }
+  return n
+}
 function AppointmentsBoard(){
   const [appts,setAppts]=useState([])
   const [loading,setLoading]=useState(true)
@@ -3250,8 +3290,14 @@ function AppointmentsBoard(){
   function load(){ setLoading(true); api("/api/appointments").then(r=>setAppts(r.appointments||[])).catch(()=>setAppts([])).finally(()=>setLoading(false)) }
   useEffect(()=>{ load() },[]) // eslint-disable-line
   async function transition(a,stage,extra){
+    let body={stage,...(extra||{})}
+    if(stage==="won"&&body.contract_value==null){
+      const v=promptContractValue(a.company)
+      if(v===null) return                                    // cancelled → no call
+      body.contract_value=v
+    }
     setBusy(a.leadId+stage)
-    try{ await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage,...(extra||{})})}); load() }
+    try{ await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify(body)}); load() }
     catch{} finally{ setBusy("") }
   }
   async function addNote(a){
@@ -3261,8 +3307,11 @@ function AppointmentsBoard(){
   }
   const nextActions=a=>{
     if(a.stage==="pending")   return [["approved","✅ Approve & send to Angelo"]]
-    if(a.stage==="approved")  return [["confirmed","📅 Mark confirmed"]]
-    if(a.stage==="confirmed") return [["won","🏆 Won"],["lost","❌ Lost"]]
+    // A booked walkthrough can fall through at either stage, so "Didn't happen"
+    // is offered from approved onward — not only after it was confirmed.
+    if(a.stage==="approved")  return [["confirmed","📅 Mark confirmed"],["no_show","👻 Didn't happen"]]
+    if(a.stage==="confirmed") return [["won","🏆 Won"],["lost","❌ Lost"],["no_show","👻 Didn't happen"]]
+    if(a.stage==="no_show")   return [["confirmed","📅 Rebooked — confirm"],["lost","❌ Lost"]]
     return []
   }
   const byStage={}; APPT_STAGES.forEach(s=>byStage[s]=[]); appts.forEach(a=>{(byStage[a.stage]||byStage.pending).push(a)})
@@ -3343,11 +3392,22 @@ function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
   })
   const daysAgo=d=>{try{return Math.max(0,Math.round((new Date(today+"T12:00:00")-new Date(d+"T12:00:00"))/864e5))}catch{return 0}}
   async function decide(a,stage){
-    if(!window.confirm(`Mark ${a.company||"this deal"} as ${stage.toUpperCase()}?`)) return
+    const body={stage}
+    if(stage==="won"){
+      // The value prompt IS the confirmation for a win — no second dialog.
+      const v=promptContractValue(a.company)
+      if(v===null) return
+      body.contract_value=v
+    }else if(!window.confirm(
+      stage==="no_show"
+        ? `Mark the ${a.company||"this"} walkthrough as never happened?\n\nThe lead stays live and goes back in today's callback queue.`
+        : `Mark ${a.company||"this deal"} as ${stage.toUpperCase()}?`)) return
     setBusy(a.leadId+stage)
     try{
-      await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify({stage})})
-      notify(stage==="won"?"🏆 Won — update sent to your chat":"Marked lost — update sent to your chat");load()
+      await api(`/api/appointments/${a.leadId}/transition`,{method:"POST",body:JSON.stringify(body)})
+      notify(stage==="won"?"🏆 Won — update sent to your chat"
+            :stage==="no_show"?"👻 Logged as no-show — back in the callback queue"
+            :"Marked lost — update sent to your chat");load()
     }catch{ notify("Couldn't update — try again","error") }
     finally{ setBusy("") }
   }
@@ -3435,6 +3495,11 @@ function WalkthroughsPanel({onCall, notify, admin, reloadSignal}){
                           style={{fontSize:11,padding:"7px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
                             border:"1px solid #ff6e8466",background:"#ff6e8418",color:"#ff6e84"}}>
                           {busy===a.leadId+"lost"?"…":"❌ Lost"}</button>
+                        <button disabled={busy===a.leadId+"no_show"} onClick={()=>decide(a,"no_show")}
+                          title="The walkthrough never happened — keeps the lead live instead of counting it as a loss"
+                          style={{fontSize:11,padding:"7px 12px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
+                            border:"1px solid #ffa86966",background:"#ffa86918",color:"#ffa869"}}>
+                          {busy===a.leadId+"no_show"?"…":"👻 Didn't happen"}</button>
                         <button onClick={()=>{setNoteFor(noteFor===a.leadId?null:a.leadId);setNoteText("")}}
                           style={{fontSize:11,padding:"7px 10px",borderRadius:7,cursor:"pointer",fontFamily:"inherit",
                             border:"1px solid #40485d40",background:"transparent",color:"#a3aac4"}}>📝 Note</button>
