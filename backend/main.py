@@ -979,35 +979,54 @@ def clean(v): return str(v).strip() if v else ""
 CLEANING_FIT_TIERS = [
     # (points, [keywords]) — high to low, FIRST MATCH WINS. Keywords are
     # substrings matched against industry + company + title.
-    # 2026-08 audit recalibration: 11.5k-call outcome data showed hospitals/
-    # nursing/public schools connect at ~6% and engage at 0.4% (in-house
-    # janitorial), while dialysis/urgent-care/clinics engage 3-5% and
-    # manufacturing/logistics connect 17-18%. Specific outsourcing-friendly
-    # medical keywords are listed BEFORE the institutional demotion tier.
-    (40, ["dialysis", "urgent care", "imaging center", "radiology", "ambulatory",
-          "surgery center", "surgical center", "outpatient", "rehabilitation", "rehab",
-          "assisted living", "senior living", "hospice"]),
-    (38, ["manufacturing", "manufacturer", "warehouse", "distribution", "factory", "plant",
+    #
+    # 2026-10 re-rank on Cristine's OWN outcomes (Jul 1 – Sep 30, 6,416 dials,
+    # interested/callback/converted per 100 dials; average 1.2). The 2026-08
+    # tiers came from an 11.5k-call audit that was mostly the previous caller,
+    # whose claimed contacts were largely unsubstantiated (see "Caller metrics
+    # are not comparable across the Jun-8 caller switch"), and they put
+    # manufacturing/logistics near the top. Her data says the opposite:
+    #   dental 3.8 · dialysis 2.5 · urgent care 2.2 · medical equipment 1.6
+    #   nursing/assisted 1.4 · hospitality 1.4 · generic clinic 1.1
+    #   warehouse/logistics 0.8 · office 0.6 · mental-health/rehab 0.25
+    #   manufacturing 0.0 (223 dials)
+    # Industrial stock ANSWERS at 9-12% — it is the easiest pickup we have — and
+    # almost never wants a quote. Score orders the dialer, so it must track
+    # interest, not pickup.
+    (40, ["dialysis", "renal disease", "esrd", "nephrology", "urgent care", "dental", "dentist", "orthodont",
+          "medical equipment", "medical supply", "medical supplies", "durable medical",
+          "home medical"]),
+    # Behavioural / addiction / rehab clinics: 804 dials, 2 interested. Listed
+    # BEFORE the clinic tier so "Clinic/Center, Mental Health" can't score as a
+    # clinic.
+    (14, ["behavioral health", "mental health", "psychiatric", "substance", "addiction",
+          "detox", "rehabilitation", "rehab"]),
+    # Outpatient medical we have too few dials on to measure — outsourcing-
+    # friendly by type, so kept above the generic clinic.
+    (34, ["imaging center", "radiology", "ambulatory", "surgery center", "surgical center",
+          "outpatient"]),
+    (30, ["clinic", "veterinary", "veterinarian", "physical therapy", "therapy", "pediatric",
+          "dermatology", "cardiology", "oncology", "orthopedic", "ophthalmology", "optometr",
+          "chiropract", "family medicine", "internal medicine", "primary care", "wellness",
+          "physician", "practice", "medicine", "medical"]),
+    (30, ["casino", "arena", "stadium", "convention", "event venue", "events venue", "banquet",
+          "theater", "theatre", "cinema", "fitness", "gym", "athletic", "recreation",
+          "bowling", "hotel", "motel", "resort", "conference center", "nightclub", "country club"]),
+    (28, ["assisted living", "senior living", "hospice"]),
+    (24, ["daycare", "day care", "preschool", "pre-school", "childcare", "child care",
+          "montessori", "learning center", "academy", "private school"]),
+    # High pickup, near-zero interest (see above). Dialable, just not first.
+    (16, ["manufacturing", "manufacturer", "warehouse", "distribution", "factory", "plant",
           "industrial", "fabrication", "machining", "processing", "logistics", "freight",
           "fulfillment", "storage", "cold storage", "assembly", "foundry", "refinery"]),
-    (36, ["clinic", "dental", "dentist", "orthodont", "veterinary", "veterinarian",
-          "physical therapy", "therapy", "pediatric", "dermatology", "cardiology", "oncology",
-          "orthopedic", "ophthalmology", "optometr", "chiropract",
-          "family medicine", "internal medicine", "primary care", "wellness",
-          "physician", "practice", "medicine", "medical"]),
-    (32, ["daycare", "day care", "preschool", "pre-school", "childcare", "child care",
-          "montessori", "learning center", "academy", "private school"]),
     # In-house institutions — hospitals, nursing, public education, chains'
     # HQ-decided categories. Kept dialable but bottom of every queue.
     (14, ["hospital", "health system", "medical center", "nursing home", "nursing facility",
           "skilled nursing", "long term care", "trauma", "emergency", "surgery", "surgical",
-          "surgeon", "behavioral health", "psychiatric", "school", "university", "college",
+          "surgeon", "psychiatric", "school", "university", "college",
           "campus", "education", "educational", "charter", "head start", "institute",
           "seminary", "pharmacy", "laboratory", "home health", "health", "healthcare"]),
-    (34, ["casino", "arena", "stadium", "convention", "event venue", "events venue", "banquet",
-          "theater", "theatre", "cinema", "fitness", "gym", "athletic", "recreation",
-          "bowling", "hotel", "motel", "resort", "conference center", "nightclub", "country club"]),
-    (24, ["office", "corporate", "headquarters", "bank", "credit union", "financial",
+    (16, ["office", "corporate", "headquarters", "bank", "credit union", "financial",
           "dealership", "property management", "law firm", "attorney", "legal", "accounting",
           "cpa", "insurance", "real estate", "realty", "church", "worship", "ministry",
           "clubhouse", "municipal", "city hall", "government", "library"]),
@@ -4427,11 +4446,16 @@ OSM_CATEGORY_SELECTORS = {
                       '["office"="property_management"]', '["office"="telecommunication"]',
                       '["office"="construction_company"]'],
     "Hospitality":   ['["tourism"="hotel"]', '["amenity"="events_venue"]', '["leisure"="resort"]'],
+    # 2026-10: dental is the best-converting vertical we have (3.8 interested per
+    # 100 dials, and OSM is where those leads came from). Its own category so
+    # the refill can pull dentists without the generic clinics around them.
+    "Dental":        ['["amenity"="dentist"]', '["healthcare"="dentist"]'],
 }
 # Map a category to the industry label stored on the lead (drives fit scoring).
 OSM_CATEGORY_INDUSTRY = {
     "Healthcare": "Healthcare", "Education": "Education", "Industrial": "Industrial",
     "Entertainment": "Entertainment", "Offices": "Office", "Hospitality": "Hotel",
+    "Dental": "Dental Office",
 }
 
 _overpass_rotation = {"i": 0}
@@ -5720,7 +5744,11 @@ JOBS_KEYWORDS          = [k.strip() for k in os.getenv("JOBS_KEYWORDS",
     ).split(",") if k.strip()]
 # A posting older than this is filled or abandoned either way.
 JOBS_MAX_DAYS_OLD      = int(os.getenv("JOBS_MAX_DAYS_OLD", "30"))
-JOBS_REFRESH_ENABLED   = os.getenv("JOBS_REFRESH_ENABLED", "1") == "1"
+# Paused by default (2026-10). Its leads are mostly warehouses and
+# distribution centres — the verticals that answer and don't buy — and its first
+# 36 dials produced 0 interested, with notes like "we do the cleaning
+# ourselves". POST /api/sources/jobs still works for a manual pull.
+JOBS_REFRESH_ENABLED   = os.getenv("JOBS_REFRESH_ENABLED", "0") == "1"
 JOBS_REFRESH_METROS    = [m.strip() for m in os.getenv("JOBS_REFRESH_METROS",
     "Las Vegas, NV|Columbus, OH|Kansas City, MO").split("|") if m.strip()]
 HEALTH_REFRESH_STATES    = [x.strip().upper() for x in os.getenv(
@@ -11836,8 +11864,20 @@ WEEKLY_REFILL_METROS = [m.strip() for m in os.getenv("WEEKLY_REFILL_METROS",
     "Charlotte, NC|Las Vegas, NV|St. Louis, MO|Columbus, OH|Kansas City, MO|Boise, ID|"
     "Las Vegas, NV|Wichita, KS|Tampa, FL|Denver, CO|Columbus, OH|Reno, NV"
     ).split("|") if m.strip()]
+# 2026-10: the verticals Cristine's own calls convert best (see
+# CLEANING_FIT_TIERS). Manufacturing/logistics are OUT — they answer at 9-12%
+# and produced 2 interested in 481 dials.
 WEEKLY_REFILL_INDUSTRIES = os.getenv("WEEKLY_REFILL_INDUSTRIES",
-    "Manufacturing,Logistics,Industrial,Healthcare,Medical Equipment")
+    "Dialysis Center,Dental Office,Urgent Care,Medical Equipment")
+# Places results per refill LOCATION. run_scrape divides this across every
+# industry, so the old hard-coded 30 meant 3 results per search and 20-46 new
+# leads per refill — against ~140 first dials a day.
+REFILL_PLACES_PER_LOCATION = int(os.getenv("REFILL_PLACES_PER_LOCATION", "60"))
+# Free sources run first on every refill (CMS dialysis, NPI dialysis / urgent
+# care / dental, OSM dentists). If they alone save this many, Places is skipped.
+REFILL_SKIP_PLACES_IF_FREE_SAVED = int(os.getenv("REFILL_SKIP_PLACES_IF_FREE_SAVED", "150"))
+REFILL_FREE_SOURCES_ENABLED = os.getenv("REFILL_FREE_SOURCES_ENABLED", "1") == "1"
+REFILL_OSM_CATEGORIES = [c.strip() for c in os.getenv("REFILL_OSM_CATEGORIES", "Dental").split(",") if c.strip()]
 WEEKLY_REVIEW_SCAN_INDUSTRIES = os.getenv("WEEKLY_REVIEW_SCAN_INDUSTRIES",
     "clinic,dialysis,urgent,dental,daycare,kindergarten,manufacturing,logistics")
 
@@ -11932,26 +11972,83 @@ def _pick_refill_metros(idx: int, pickup: dict):
                 (idx + 2) % n, skipped)
     return chosen, i % n, skipped
 
+def _refill_free_sources(states, metros):
+    """Free top-up for a refill, in the best verticals only. Every source is
+    independent and fails soft — one dead API must not cost the others.
+    Returns (saved, {label: saved})."""
+    parts = {}
+    if not REFILL_FREE_SOURCES_ENABLED:
+        return 0, parts
+    def _run(label, fn):
+        try:
+            res = fn()
+            n = (res or {}).get("saved", 0) if isinstance(res, dict) else 0
+        except Exception as e:
+            print(f"[REFILL:free] {label} failed: {str(e)[:160]}")
+            n = 0
+        parts[label] = parts.get(label, 0) + n
+    for st in states:
+        # CMS dialysis (1-2 star) — where the 2.5/100 dialysis leads came from.
+        _run(f"dialysis {st}", lambda st=st: source_health(
+            FreeSourceRequest(state=st, restaurants=False, enrich=False), user="eric"))
+        # NPI statewide: NPI_STATEWIDE_TAXONOMIES (dialysis, urgent care,
+        # surgical, dental), with the persisted per-state offset going deeper
+        # each run.
+        _run(f"NPI {st}", lambda st=st: source_npi(
+            FreeSourceRequest(state=st, limit=FREE_SOURCE_MAX_ROWS), user="eric"))
+    if REFILL_OSM_CATEGORIES:
+        for m in metros:
+            st = _metro_state(m)
+            city = m.split(",")[0].strip()
+            if not st or not city:
+                continue
+            _run(f"OSM {city}", lambda st=st, city=city: source_osm(
+                FreeSourceRequest(state=st, cities=city, categories=REFILL_OSM_CATEGORIES),
+                user="eric"))
+    return sum(parts.values()), parts
+
 def _do_refill_scrape(trigger: str):
-    """Shared core for the weekly AND the low-inventory refill: scrape the next
-    2 metros in the rotation across the target verticals, Slack the result."""
+    """Shared core for the weekly AND the low-inventory refill: free sources for
+    the next metros' states first, then Google Places across the target
+    verticals unless the free pull already covered it. Slacks the result."""
     idx = int(_settings_get_json("refill_rotation_idx") or 0)
     metros, new_idx, skipped = _pick_refill_metros(idx, _recent_pickup_by_state())
     _settings_set_json("refill_rotation_idx", new_idx)
     if skipped:
         print(f"[REFILL:{trigger}] skipped cold metros: "
               + ", ".join(f"{m} ({pct}% on {d})" for m, d, pct in skipped))
-    res = run_scrape(ScrapeRequest(industry="Manufacturing",
-                                   industries=WEEKLY_REFILL_INDUSTRIES,
-                                   locations=metros, limit=30), user="eric")
-    saved = res.get("saved", 0) if isinstance(res, dict) else 0
-    dupes = res.get("alreadyInDb", 0) if isinstance(res, dict) else 0
-    print(f"[REFILL:{trigger}] {metros}: saved={saved} dupes={dupes}")
+    states = sorted({_metro_state(m) for m in metros} - {""})
+    free_saved, free_parts = _refill_free_sources(states, metros)
+
+    places_saved = dupes = 0
+    places_note = ""
+    if free_saved >= REFILL_SKIP_PLACES_IF_FREE_SAVED:
+        places_note = f"Places skipped — free sources already saved {free_saved}."
+    else:
+        inds = [i.strip() for i in WEEKLY_REFILL_INDUSTRIES.split(",") if i.strip()]
+        try:
+            res = run_scrape(ScrapeRequest(industry=(inds[0] if inds else "Dialysis Center"),
+                                           industries=WEEKLY_REFILL_INDUSTRIES,
+                                           locations=metros, limit=REFILL_PLACES_PER_LOCATION),
+                             user="eric")
+            places_saved = res.get("saved", 0) if isinstance(res, dict) else 0
+            dupes = res.get("alreadyInDb", 0) if isinstance(res, dict) else 0
+        except Exception as e:
+            # A spend-cap refusal or Places outage must not hide the free leads
+            # that did land.
+            places_note = f"Places failed: {str(getattr(e, 'detail', e))[:160]}"
+            print(f"[REFILL:{trigger}] places failed: {e}")
+    saved = free_saved + places_saved
+    free_txt = ", ".join(f"{k} {v}" for k, v in free_parts.items() if v) or "none new"
+    print(f"[REFILL:{trigger}] {metros}: saved={saved} (free={free_saved} {free_parts}; "
+          f"places={places_saved}, dupes={dupes}) {places_note}")
     skip_note = ("\n_Skipped as cold: " + ", ".join(f"{m} ({pct}% pickup on {d} dials)"
                  for m, d, pct in skipped) + "_") if skipped else ""
     send_slack(f"🔄 Lead refill ({trigger})",
-               f"Scraped *{', '.join(metros)}* across {WEEKLY_REFILL_INDUSTRIES}: "
-               f"*{saved} fresh leads* saved ({dupes} already in DB). Live in the dialer now."
+               f"*{saved} fresh leads* for *{', '.join(metros)}* — best verticals only "
+               f"({WEEKLY_REFILL_INDUSTRIES}).\n"
+               f"Free sources: {free_saved} ({free_txt}). "
+               f"Google Places: {places_saved} ({dupes} already in DB). {places_note}"
                + skip_note)
     return saved
 
@@ -11993,7 +12090,11 @@ DEMOTED_RETIRE_WEEKLY_CAP = int(os.getenv("DEMOTED_RETIRE_WEEKLY_CAP", "2000"))
 REFILL_MIN_PICKUP_PCT     = float(os.getenv("REFILL_MIN_PICKUP_PCT", "9"))
 REFILL_MIN_PICKUP_DIALS   = int(os.getenv("REFILL_MIN_PICKUP_DIALS", "100"))
 REFILL_PICKUP_WINDOW_DAYS = int(os.getenv("REFILL_PICKUP_WINDOW_DAYS", "45"))
-REFILL_MIN_FRESH = int(os.getenv("REFILL_MIN_FRESH", "250"))
+# ~2 days of her dialing (~140 first dials/day). Below this, refill now.
+REFILL_MIN_FRESH = int(os.getenv("REFILL_MIN_FRESH", "300"))
+# Was a hard-coded 20h: one refill a day could never keep up when a refill
+# saved 20-46 leads. The fail-closed cooldown stamp is what stops a loop now.
+REFILL_COOLDOWN_HOURS = float(os.getenv("REFILL_COOLDOWN_HOURS", "12"))
 
 def run_inventory_refill_if_due():
     if not WEEKLY_REFILL_ENABLED or not GOOGLE_KEY:
@@ -12007,7 +12108,7 @@ def run_inventory_refill_if_due():
         if rows:
             try:
                 last = datetime.fromisoformat((rows[0].get("value") or "").replace("Z", ""))
-                if (datetime.utcnow() - last) < timedelta(hours=20):
+                if (datetime.utcnow() - last) < timedelta(hours=REFILL_COOLDOWN_HOURS):
                     return
             except Exception:
                 pass
@@ -12076,6 +12177,15 @@ def run_health_refresh_if_due():
     if not _record_weekly_run("last_health_refresh"):
         return
     total_new, by_state = 0, {}
+    # Restaurant inspection data only exists for the metros in
+    # HEALTH_INSPECTION_SOURCES (Chicago, NYC, Austin). For any other state the
+    # dated feed is structurally empty and only the CMS dialysis half can
+    # return rows — say so, instead of a silent "new=0" every week.
+    covered = {src["state"] for src in HEALTH_INSPECTION_SOURCES}
+    uncovered = [st for st in HEALTH_REFRESH_STATES if st not in covered]
+    if uncovered:
+        print(f"[HEALTH-REFRESH] no restaurant-inspection feed for {uncovered} "
+              f"(feeds exist for {sorted(covered)}) — CMS dialysis only there")
     for st in HEALTH_REFRESH_STATES:
         try:
             res = source_health(FreeSourceRequest(state=st, limit=HEALTH_MAX_AGE_DAYS,
