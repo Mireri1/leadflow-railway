@@ -583,6 +583,7 @@ const CSS = `
   .lrow-cb{background:#8b5cf608!important}
   @media(max-width:1023px){.lg-sidebar{display:none!important}.lg-main{margin-left:0!important}}
   @media(max-width:767px){.mobile-nav{display:flex!important}.lg-topnav-tabs{display:none!important}}
+  @media(max-width:1199px){.lg-tally{display:none!important}}
 `
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
@@ -1734,6 +1735,76 @@ function QualChip({label, value, options, onChange}){
 }
 
 // ─── CallModal ───────────────────────────────────────────────────────────────
+
+// ── Running call tally ───────────────────────────────────────────────────
+// The caller's count for the day, straight from /api/quota → tally, so she
+// never keeps a paper count. The SERVER classifies outcomes (call_tally() over
+// CONTACT_OUTCOMES / ENGAGED_OUTCOMES in main.py); this file never re-derives
+// "answered", it only renders. The one local edit is tallyBump(), the instant
+// +1 on a ⚡ quick no-answer/voicemail tap, which the refetch then overwrites.
+const TALLY_ITEMS=[
+  {k:"dials",          label:"Dials",          icon:"📞", color:"#dee5ff"},
+  {k:"answered",       label:"Answered",       icon:"✅", color:"#69f6b8"},
+  {k:"no_answer",      label:"No answer",      icon:"✕",  color:"#a3aac4"},
+  {k:"voicemail",      label:"Voicemail",      icon:"📼", color:"#a3aac4"},
+  {k:"gatekeeper",     label:"Gatekeeper",     icon:"🚪", color:"#ffe083", sub:true},
+  {k:"not_interested", label:"Not interested", icon:"👎", color:"#ff6e84", sub:true},
+  {k:"interested",     label:"Interested",     icon:"⭐", color:"#69f6b8", sub:true},
+]
+
+// Normalise whatever /api/quota returned. A server from before the tally
+// existed only sends my_calls_today — show dials and zeros, never crash.
+function tallyOf(quota){
+  const t=(quota&&quota.tally)||{}
+  const dials=t.dials??(quota&&quota.my_calls_today)??0
+  const out={dials}
+  TALLY_ITEMS.forEach(({k})=>{ if(k!=="dials") out[k]=t[k]||0 })
+  out.answer_rate=t.answer_rate??(dials?Math.round(1000*out.answered/dials)/10:0)
+  return out
+}
+
+// Optimistic ±1 for the ⚡ quick-log path (no_answer / voicemail only — those
+// are never contacts, so no outcome classification is needed here).
+function tallyBump(quota, outcome, delta=1){
+  const q=quota||{}
+  const t={...tallyOf(q)}
+  t.dials=Math.max(0,t.dials+delta)
+  if(outcome==="no_answer"||outcome==="voicemail") t[outcome]=Math.max(0,(t[outcome]||0)+delta)
+  t.answer_rate=t.dials?Math.round(1000*t.answered/t.dials)/10:0
+  return {...q, my_calls_today:t.dials, tally:t}
+}
+
+function TallyStrip({quota, compact=false}){
+  const t=tallyOf(quota)
+  const tip=TALLY_ITEMS.map(i=>`${i.sub?"   ":""}${i.label}: ${t[i.k]}`).join("\n")
+    +`\nAnswer rate: ${t.answer_rate}%`
+  if(compact){
+    return(
+      <div className="lg-tally" title={`Today\n${tip}`}
+        style={{display:"flex",alignItems:"center",gap:10,fontSize:12,fontWeight:700,whiteSpace:"nowrap",
+          padding:"6px 12px",borderRadius:9,background:"#0f1930",border:"1px solid #40485d40",
+          fontFamily:"'Space Grotesk',sans-serif"}}>
+        {TALLY_ITEMS.filter(i=>!i.sub).map(i=>(
+          <span key={i.k} style={{color:i.color}}>{i.icon} {t[i.k]}</span>
+        ))}
+        {t.interested>0&&<span style={{color:"#69f6b8"}}>⭐ {t.interested}</span>}
+      </div>
+    )
+  }
+  return(
+    <div title={tip} style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"stretch"}}>
+      {TALLY_ITEMS.map(i=>(
+        <div key={i.k} style={{flex:"1 1 92px",minWidth:92,background:i.sub?"#0b1428":"#141f38",
+          border:"1px solid #40485d30",borderRadius:10,padding:"8px 10px"}}>
+          <div style={{fontSize:20,fontWeight:700,color:i.color,fontFamily:"'Space Grotesk',sans-serif",lineHeight:1.1}}>
+            {t[i.k]}</div>
+          <div style={{fontSize:10.5,color:"#a3aac4",marginTop:2,whiteSpace:"nowrap"}}>{i.icon} {i.label}
+            {i.k==="answered"&&t.dials>0&&<span style={{color:"#a3a6ff",fontWeight:700}}> · {t.answer_rate}%</span>}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   // Local mirror so the Find-DM button can update the displayed contact info
@@ -3839,7 +3910,9 @@ export default function App(){
         last_called_at:nowIso,
         total_calls:(l.total_calls||0)+1}:l
       setLeads(p=>p.map(upd)); setAllLeads(p=>p.map(upd))
-      if(callId) setLastQuick({callId,leadId:lead.id,prevStatus:lead.status||"new",
+      setQuota(q=>tallyBump(q,outcome,+1))
+      api("/api/quota").then(q=>q&&setQuota(q)).catch(()=>{})
+      if(callId) setLastQuick({callId,leadId:lead.id,outcome,prevStatus:lead.status||"new",
         prevLastCalled:lead.last_called_at||null,
         company:lead.company||lead.firstName||"lead",at:Date.now()})
       notify(`⚡ ${outcome==="voicemail"?"Voicemail":"No answer"} — ${lead.company||lead.firstName||"lead"}`)
@@ -3857,6 +3930,8 @@ export default function App(){
       const upd=l=>l.id===q.leadId?{...l,status:q.prevStatus,last_called_at:q.prevLastCalled,
         total_calls:Math.max(0,(l.total_calls||1)-1)}:l
       setLeads(p=>p.map(upd)); setAllLeads(p=>p.map(upd))
+      setQuota(prev=>tallyBump(prev,q.outcome,-1))
+      api("/api/quota").then(r=>r&&setQuota(r)).catch(()=>{})
       notify(`↩ Undone — ${q.company} restored`)
     }catch{ notify("Couldn't undo — the 2-minute window may have passed","error") }
   }
@@ -3977,6 +4052,21 @@ export default function App(){
       api("/api/industries").then(r=>setIndustries(r.industries||[])).catch(()=>{})
       api("/api/quota").then(r=>setQuota(r)).catch(()=>{})
     }
+  },[user])
+
+  // Running tally safety net: every save path in App already refetches
+  // /api/quota, but CallModals mounted inside sub-panels (Walkthroughs,
+  // Qualified, My Week) don't. A 60s poll + refresh-on-focus keeps the count
+  // right whatever screen the call was logged from. One tiny query.
+  useEffect(()=>{
+    if(!user) return
+    const pull=()=>api("/api/quota").then(q=>q&&setQuota(q)).catch(()=>{})
+    const iv=setInterval(pull, 60*1000)
+    const onFocus=()=>{ if(document.visibilityState!=="hidden") pull() }
+    window.addEventListener("focus",onFocus)
+    document.addEventListener("visibilitychange",onFocus)
+    return()=>{ clearInterval(iv); window.removeEventListener("focus",onFocus)
+      document.removeEventListener("visibilitychange",onFocus) }
   },[user])
 
   // Record sign-out on tab/browser close so sessions don't stay open forever
@@ -4411,6 +4501,7 @@ export default function App(){
             </div>
           )}
         </div>
+        <TallyStrip quota={quota} compact/>
         <button onClick={()=>{const l=pickNextLead(); if(l){setCallModal(l)}else{notify("Nothing queued — pull fresh leads or check follow-ups","error")}}}
           title="Jump to the single best next dial: due callbacks → warm → freshest"
           style={{fontSize:12,fontWeight:700,padding:"8px 14px",borderRadius:9,cursor:"pointer",fontFamily:"inherit",
@@ -4599,6 +4690,7 @@ export default function App(){
                     </div>
                     {pct>=100&&<div style={{fontSize:11,color:"#69f6b8",marginTop:6,fontWeight:600}}>Quota hit! Keep going.</div>}
                     {pct<50&&done>0&&<div style={{fontSize:11,color:"#a3aac4",marginTop:6}}>{target-done} calls to go</div>}
+                    <div style={{marginTop:12}}><TallyStrip quota={quota}/></div>
                   </div>
                 )
               })()}
@@ -5472,6 +5564,12 @@ export default function App(){
                     </select>
                   </div>
                 </div>
+              </div>
+              {/* Running tally — her count for today, so she never keeps one on paper. */}
+              <div style={{marginBottom:20}}>
+                <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",
+                  textTransform:"uppercase",marginBottom:8}}>Today so far</div>
+                <TallyStrip quota={quota}/>
               </div>
               {(()=>{
                 // Skip bad-phone leads — caller dialing a non-NANP number is
