@@ -8910,17 +8910,45 @@ def get_quota(user: str = Depends(verify_token)):
             default_rows = r_default.json() if r_default.status_code == 200 else []
             quota = int(default_rows[0]["value"]) if isinstance(default_rows, list) and default_rows else DEFAULT_QUOTA
 
-        # Get this user's calls today
+        # Get this user's calls today — outcome only, so the same read also
+        # feeds the running tally (no second query per refresh).
         r2 = req_lib.get(
-            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=id&calledBy=eq.{user}"
+            f"{SUPABASE_URL}/rest/v1/call_outcomes?select=outcome&calledBy=eq.{user}"
             f"&calledAt=gte.{local_day_start_utc()}",
             headers={**SB_HEADERS, "Prefer": ""}, timeout=10)
         my_calls = r2.json() if r2.status_code == 200 else []
-        my_count = len(my_calls) if isinstance(my_calls, list) else 0
-
-        return {"quota": quota, "my_calls_today": my_count}
+        if not isinstance(my_calls, list):
+            my_calls = []
+        return {"quota": quota, "my_calls_today": len(my_calls),
+                "tally": call_tally([c.get("outcome") for c in my_calls])}
     except:
-        return {"quota": DEFAULT_QUOTA, "my_calls_today": 0}
+        return {"quota": DEFAULT_QUOTA, "my_calls_today": 0, "tally": call_tally([])}
+
+def call_tally(outcomes) -> dict:
+    """The caller's running count for the day, so nobody keeps a paper tally.
+
+    "answered" is CONTACT_OUTCOMES — a human picked up, gatekeeper included —
+    so it matches the leaderboard's contact rate exactly. "interested" is
+    ENGAGED_OUTCOMES (interested / interested_no_dm / callback / converted).
+    Every dial lands in exactly one of no_answer / voicemail / answered / other,
+    so those four always sum to dials; gatekeeper, not_interested and
+    interested are breakdowns OF answered, not extra buckets."""
+    outs = [(o or "").strip().lower() for o in outcomes]
+    n = len(outs)
+    answered = sum(o in CONTACT_OUTCOMES for o in outs)
+    no_answer = sum(o == "no_answer" for o in outs)
+    voicemail = sum(o == "voicemail" for o in outs)
+    return {
+        "dials": n,
+        "answered": answered,
+        "no_answer": no_answer,
+        "voicemail": voicemail,
+        "other": n - answered - no_answer - voicemail,
+        "gatekeeper": sum(o == "gatekeeper" for o in outs),
+        "not_interested": sum(o == "not_interested" for o in outs),
+        "interested": sum(o in ENGAGED_OUTCOMES for o in outs),
+        "answer_rate": round(100 * answered / n, 1) if n else 0.0,
+    }
 
 @app.put("/api/quota")
 def set_quota(body: dict, user: str = Depends(verify_admin)):
