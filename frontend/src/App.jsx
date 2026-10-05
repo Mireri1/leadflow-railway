@@ -43,6 +43,34 @@ function tzBucketsFor(cfg, now){
   return out
 }
 
+// Due follow-ups lead the dialer. Mirrors is_due_followup() in
+// backend/main.py — keep the two in step. A lead she already reached
+// (callback / gatekeeper with a name and a time) used to sort behind every
+// never-dialed lead because the first ladder key was "fewest calls", so
+// 36 gatekeeper hand-offs in one week were never called back.
+const FOLLOWUP_RECALL_HOURS = 3       // tried this recently → let it rest
+const FOLLOWUP_MAX_OVERDUE_DAYS = 21  // older strays stay on the Follow-Ups tab
+const FOLLOWUP_DONE = new Set(["not_interested","converted","retired","do_not_contact","awaiting_email_reply"])
+function isDueFollowUp(l, today, nowMs){
+  const cb = (l&&l.callbackDate||"").slice(0,10)
+  if(!cb || cb>today) return false
+  const late = Math.round((new Date(today+"T12:00:00")-new Date(cb+"T12:00:00"))/86400000)
+  if(!(late<=FOLLOWUP_MAX_OVERDUE_DAYS)) return false
+  if(FOLLOWUP_DONE.has(l.status||"")) return false
+  if(l.last_called_at){
+    const t = Date.parse(l.last_called_at)
+    if(!Number.isNaN(t) && nowMs-t < FOLLOWUP_RECALL_HOURS*3600000) return false
+  }
+  return true
+}
+// The receptionist's "try tomorrow" means the next business day — a Friday
+// gatekeeper booked for Saturday rings an empty office.
+function nextBusinessDay(from){
+  const d = from ? new Date(from) : new Date()
+  do { d.setDate(d.getDate()+1) } while(d.getDay()===0||d.getDay()===6)
+  return localDate(d)
+}
+
 const STATES = [
   "","AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
   "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
@@ -1859,11 +1887,20 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [apptDate,setApptDate]    = useState("")       // walkthrough appointment (optional)
   const [apptArea,setApptArea]    = useState("")
 
-  // Gatekeeper defaults to a 3-day retry: long enough that the message has
-  // been passed on, short enough that the conversation is still remembered.
+  // Gatekeeper capture. Oct 1-5: receptionists handed over a name and a time
+  // on most gatekeeper calls ("Tanisha, tomorrow", "Mary, in 30 minutes") —
+  // all of it went into free-text notes, none onto the lead, and the default
+  // +3-day retry ignored the time they gave. The name now lands on the lead
+  // (so the dialer can say "Ask for Tanisha"), and the default is the NEXT
+  // BUSINESS DAY, with one-tap chips for the other common answers.
+  const [gkName,setGkName]   = useState(()=>[leadProp?.firstName,leadProp?.lastName].filter(Boolean).join(" "))
+  const [gkEmail,setGkEmail] = useState(()=>leadProp?.email||"")
+  // "Corporate handles cleaning" — parks every open location of the chain.
+  const [corp,setCorp]       = useState(false)
+  const [hqPhone,setHqPhone] = useState("")
   function pickGatekeeper(){
     setPrimary("gatekeeper"); setSecondary(""); setCbReason("")
-    setCbDate(d=>d||addDays(3))
+    setCbDate(d=>d||nextBusinessDay())
   }
 
   // Smart-fill: map Haiku's note read onto the outcome chips + callback date.
@@ -1934,8 +1971,26 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     if(primary==="answered"&&!secondary){ setModalError("Select the call result."); return }
     if(needsQual&&!hasQualData){ setModalError("Fill out at least one qualification field below."); return }
     if(secondary==="callback"&&!cbDate){ setModalError("Please select a callback date."); return }
-    if(primary==="gatekeeper"&&!cbDate){ setModalError("Please pick a follow-up date."); return }
-    if(primary==="gatekeeper"&&!confirmFarDate(cbDate,"Follow-up")) return
+    const corpOn = corp && (primary==="gatekeeper"||outcome==="not_interested")
+    if(primary==="gatekeeper"&&!corpOn&&!cbDate){ setModalError("Please pick a follow-up date."); return }
+    if(primary==="gatekeeper"&&!corpOn&&!confirmFarDate(cbDate,"Follow-up")) return
+    const gkEmailClean = gkEmail.trim()
+    if(primary==="gatekeeper"&&gkEmailClean&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(gkEmailClean)){
+      setModalError("That email doesn't look right — fix it or clear it."); return }
+    // Corporate: show exactly which locations get parked BEFORE anything saves,
+    // so a loose name match can't quietly shelve an unrelated business.
+    if(corpOn){
+      let dry
+      try{ dry = await api(`/api/leads/${lead.id}/corporate`,{method:"POST",body:JSON.stringify({dry_run:true})}) }
+      catch{ setModalError("Couldn't look up other locations — try again."); return }
+      const names = (dry.siblings||[]).map(x=>`• ${x.company}${x.state?` (${x.state})`:""}`)
+      const msg = dry.generic_name
+        ? `"${lead.company}" is too generic a name to match other locations safely — only THIS lead will be parked.\n\nContinue?`
+        : (names.length
+            ? `Corporate handles cleaning — park this lead AND ${dry.count} other open location${dry.count!==1?"s":""}?\n\n${names.slice(0,25).join("\n")}${names.length>25?`\n…and ${names.length-25} more`:""}\n\nNew leads from this chain will be skipped too. Leads already interested or on a callback are never touched.`
+            : `No other open locations of this chain found — park this lead, and skip the chain on future imports?`)
+      if(!window.confirm(msg)) return
+    }
     // Substantiation prompt. A flag Eric reads next week is worth far less than
     // the caller adding one line now, while they still remember the call. This
     // fires only when a CONVERSATION is claimed with nothing at all behind it —
@@ -1977,7 +2032,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       const callPayload = {
         leadId:lead.id, outcome, notes:fullNotes,
         duration:finalDuration,
-        callbackDate:(secondary==="callback"||primary==="gatekeeper")?cbDate:"",
+        callbackDate:(secondary==="callback"||(primary==="gatekeeper"&&!corpOn))?cbDate:"",
         calledBy:getUser(), calledAt:new Date().toISOString(),
         budgetfocus: budgetFocus||null, vendorstatus: vendorStatus||null,
         decisionmaker: decisionMaker||null, timeline: timeline||null,
@@ -2005,12 +2060,25 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // only when the deal is dead (not interested / converted). A plain
       // no-answer/voicemail on a lead with a scheduled callback must NOT wipe
       // the date — that silently dropped leads out of Follow-Ups and the bell.
-      const newCb = (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||"")
+      const newCb = corpOn ? ""
+        : (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||"")
       const cbPatch = newCb ? {callbackDate:newCb}
-        : (["not_interested","converted"].includes(outcome) ? {callbackDate:""} : {})
+        : ((corpOn||["not_interested","converted"].includes(outcome)) ? {callbackDate:""} : {})
+      // Decision-maker the receptionist named → onto the lead, so the next
+      // dial (and the dialer banner) asks for them by name.
+      const dmPatch = {}
+      if(primary==="gatekeeper"){
+        const parts = gkName.trim().split(/\s+/).filter(Boolean)
+        const was = [lead.firstName,lead.lastName].filter(Boolean).join(" ")
+        if(parts.length && parts.join(" ")!==was){
+          dmPatch.firstName = parts[0]; dmPatch.lastName = parts.slice(1).join(" ")
+        }
+        if(gkEmailClean && gkEmailClean!==(lead.email||"")) dmPatch.email = gkEmailClean
+      }
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
         status:statusMap[outcome]||"called",
         ...cbPatch,
+        ...dmPatch,
         followupsequence: followUpSeq||null,
         nextfollowup: nextFollowUp||null,
         followupstep: fuDays ? 0 : null,
@@ -2029,7 +2097,19 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           return
         }
       }
+      if(corpOn){
+        try{
+          await api(`/api/leads/${lead.id}/corporate`,{method:"POST",
+            body:JSON.stringify({dry_run:false,hq_phone:hqPhone.trim()})})
+        }catch{
+          setModalError("Call saved, but parking the other locations FAILED — tap Save again to retry.")
+          return
+        }
+      }
       onSaved(); onClose()
+      // They gave an email for the decision-maker → open the email composer
+      // with it, while the call is fresh.
+      if(dmPatch.email && onEmail) onEmail({...lead, ...dmPatch})
     }catch(ex){setModalError("Couldn't save — check your internet and try again.")}
     finally{setSave(false)}
   }
@@ -2407,16 +2487,57 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
             border:"1px solid #7dd3fc25"}}>
             <div style={{fontSize:10,color:"#7dd3fc",letterSpacing:".1em",fontWeight:700,marginBottom:4}}>
-              TRY AGAIN ON
+              WHO DECIDES · WHEN TO CALL BACK
             </div>
             <div style={{fontSize:11,color:"#a3aac4",marginBottom:10}}>
-              Counts as a real contact. Note who you spoke to and what they said —
-              next time you can ask for the decision-maker by name.
+              Ask: <i>"Who handles your cleaning contract — and when's the best time to catch them?"</i>
             </div>
-            <div className="ff">
-              <label>Follow-up Date</label>
-              <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+              <div className="ff" style={{flex:"1 1 160px",marginBottom:0}}>
+                <label>Decision-maker name</label>
+                <input value={gkName} onChange={e=>setGkName(e.target.value)} placeholder="e.g. Tanisha Brooks"/>
+              </div>
+              <div className="ff" style={{flex:"1 1 160px",marginBottom:0}}>
+                <label>Their email (optional)</label>
+                <input type="email" value={gkEmail} onChange={e=>setGkEmail(e.target.value)} placeholder="name@company.com"/>
+              </div>
             </div>
+            {!corp&&<>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+                {[["Later today",localDate()],["Next business day",nextBusinessDay()],["In 3 days",addDays(3)],["Next week",addDays(7)]].map(([lbl,d])=>(
+                  <button key={lbl} type="button" onClick={()=>setCbDate(d)}
+                    style={{padding:"5px 10px",borderRadius:8,fontSize:12,cursor:"pointer",
+                      background:cbDate===d?"#7dd3fc22":"#0f1930",color:cbDate===d?"#7dd3fc":"#a3aac4",
+                      border:`1px solid ${cbDate===d?"#7dd3fc":"#1e2a45"}`}}>{lbl}</button>
+                ))}
+              </div>
+              <div className="ff">
+                <label>Follow-up Date</label>
+                <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+              </div>
+            </>}
+          </div>
+        )}
+
+        {/* Corporate handles cleaning → stop dialing every location of the
+            chain. One receptionist's answer applies to all of them. */}
+        {(primary==="gatekeeper"||outcome==="not_interested")&&(
+          <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:12,
+            border:`1px solid ${corp?"#f9731655":"#1e2a45"}`}}>
+            <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,color:corp?"#fdba74":"#a3aac4"}}>
+              <input type="checkbox" checked={corp} onChange={e=>setCorp(e.target.checked)}/>
+              🏢 Corporate / head office handles cleaning
+            </label>
+            {corp&&<>
+              <div style={{fontSize:11,color:"#a3aac4",margin:"8px 0"}}>
+                Parks this lead and every other open location of the same chain (you'll see the list before it saves).
+                Got the corporate number? It's added as one lead to call.
+              </div>
+              <div className="ff" style={{marginBottom:0}}>
+                <label>Corporate phone (optional)</label>
+                <input value={hqPhone} onChange={e=>setHqPhone(e.target.value)} placeholder="(555) 555-5555"/>
+              </div>
+            </>}
           </div>
         )}
 
@@ -2587,9 +2708,15 @@ function EmailModal({lead,onClose,onSent}){
       label:"📵 Missed call",
       subject:lead?.company?`Sorry we missed you — ${lead.company}`:"Sorry we missed you",
       body:`Hi ${_name},\n\nSorry we missed each other — we tried reaching you about cleaning service at ${_co}.\n\nVision Cleaning Company provides commercial cleaning on daily, weekly, bi-weekly, or monthly schedules, and we'd love to put a free, no-obligation quote together for you. If a call is tough to fit in, simply reply to this email with your approximate square footage and how often you'd like service, and we'll send a custom quote your way within 24 hours.\n\nYou can also learn more about us and the services we offer at https://visioncleaningcompanyllc.com.\n\nHope to connect soon.\n\n${SIG}`},
+    // The front desk gave us this person's name/email — they haven't heard
+    // from us yet, so "thanks for taking our call" would be wrong.
+    referred:{
+      label:"🚪 Front desk referred",
+      subject:lead?.company?`Cleaning at ${lead.company} — your front desk pointed me to you`:"Your front desk pointed me to you",
+      body:`Hi ${_name},\n\nI called ${_co} today and your front desk mentioned you're the right person to talk to about cleaning — I'll try you by phone as well.\n\nVision Cleaning Company provides commercial cleaning for medical offices, clinics, and other facilities on daily, weekly, bi-weekly, or monthly schedules, built around your hours. Every plan is customized and flat-rate.\n\nIf it's easier, simply reply with your approximate square footage and how often you'd like service, and we'll send a free, no-obligation quote within 24 hours. You can also learn more at https://visioncleaningcompanyllc.com.\n\nThanks — looking forward to connecting.\n\n${SIG}`},
   }
   const defaultPreset=["interested","callback","converted"].includes(lead?.status)?"asked"
-    :lead?.status==="no_answer"?"missed":"spoke"
+    :lead?.status==="no_answer"?"missed":lead?.status==="gatekeeper"?"referred":"spoke"
 
   const [preset,setPreset]=useState(defaultPreset)
   const [toEmail,setToEmail]=useState(lead?.email||"")
@@ -5596,6 +5723,8 @@ export default function App(){
                   if(!SNOOZED_OUTCOMES.has(l.status)) return false
                   return l.last_called_at >= snoozeCutoff
                 }
+                const dueToday=localDate(), dueNowMs=Date.now()
+                const dueNow=l=>tzBucketOf(l)!==TZ_OFF && isDueFollowUp(l,dueToday,dueNowMs)
                 const dialerLeads=(allLeads.length?allLeads:leads).filter(l=>
                   (!l.assignedTo||l.assignedTo===user)
                   && !NO_DIAL_STATUSES.has(l.status)
@@ -5606,6 +5735,15 @@ export default function App(){
                   && (!dialerCity || (l.city||"").toLowerCase().startsWith(dialerCity.toLowerCase().trim()))
                   && (!dialerUnanswered || l.status==="no_answer")
                 ).slice().sort((a,b)=>{
+                  // A due follow-up whose office is open beats everything:
+                  // she already got through once, the person to ask for is
+                  // known. Oldest due date first among them.
+                  const da=dueNow(a), db=dueNow(b)
+                  if(da!==db) return da?-1:1
+                  if(da&&db){
+                    const xa=(a.callbackDate||"").slice(0,10), xb=(b.callbackDate||"").slice(0,10)
+                    if(xa!==xb) return xa<xb?-1:1
+                  }
                   // Prospect-local window FIRST: a lead whose office is open
                   // beats a better-scored lead whose office is at lunch or
                   // shut. Null-safe — tzBucketOf returns TZ_PRIME for every
@@ -5688,6 +5826,8 @@ export default function App(){
                     <div style={{textAlign:"center",color:"#a3aac4",fontSize:13,marginBottom:24,
                       fontFamily:"'Space Grotesk',sans-serif"}}>
                       {dialerLeads.length} unclaimed lead{dialerLeads.length!==1?"s":""} · showing {idx+1} of {dialerLeads.length}
+                      {(()=>{const n=dialerLeads.filter(dueNow).length
+                        return n?<span style={{color:"#fbbf24",fontWeight:600}}>{" · "}{n} follow-up{n!==1?"s":""} due first</span>:null})()}
                       {tzBucketByState&&(()=>{
                         // Composition of the queue by the prospect's own
                         // clock. Shown so the sort is visible rather than
@@ -5702,6 +5842,25 @@ export default function App(){
                         </span>
                       })()}
                     </div>
+                    {dueNow(lead)&&(()=>{
+                      // She got through before — say who to ask for and why
+                      // this lead jumped the queue, before she dials.
+                      const dm=[lead.firstName,lead.lastName].filter(Boolean).join(" ")
+                      const cb=(lead.callbackDate||"").slice(0,10)
+                      const late=cb<dueToday
+                      return(
+                      <div style={{background:"#fbbf2414",border:"1px solid #fbbf2455",borderRadius:14,
+                        padding:"12px 16px",marginBottom:12,textAlign:"left"}}>
+                        <div style={{color:"#fbbf24",fontWeight:700,fontSize:14}}>
+                          ⏰ Follow-up {late?`overdue since ${cb}`:"due today"}
+                          {lead.status==="gatekeeper"?" · reached the front desk last time":""}
+                        </div>
+                        <div style={{color:"#dee5ff",fontSize:15,marginTop:4}}>
+                          {dm?<>Ask for <b>{dm}</b>{lead.title?` (${lead.title})`:""}</>
+                            :"No decision-maker name on file — ask who handles cleaning"}
+                        </div>
+                      </div>)
+                    })()}
                     <div style={{background:"#0f1930",borderRadius:20,padding:40,textAlign:"center",marginBottom:16}}>
                       <div style={{width:80,height:80,borderRadius:"50%",background:ac+"22",margin:"0 auto 20px",
                         display:"flex",alignItems:"center",justifyContent:"center",
