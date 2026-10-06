@@ -71,6 +71,13 @@ Supabase columns: `budgetfocus`, `vendorstatus`, `decisionmaker`, `timeline`, `q
 - `duration` is MODAL-OPEN time, not carrier talk time, so a caller who dials separately and logs afterwards also reads near-zero. The flag therefore means **unverifiable**, not fabricated — keep the name honest.
 - Flags stored in `follow_up_outcome` field on call_outcomes.
 
+### Cold-call script (2026-10 rewrite — two steps, terse; don't soften it back)
+- `buildOpener(lead)` in App.jsx is the script Cristine sees (CallModal card + "Opening line" box on the dialer card). The DB `scripts` table (Settings → Scripts) is a separate, optional per-industry overlay.
+- **Step 1 — get past the front desk.** With a name on file: *"Hey, is [First] around?"* — nothing else, no company name, no reason; if asked, *"Just following up with them."* Without a name: *"Hey, quick question — who handles facilities over there?"* → get the name, thanks, hang up, log **Gatekeeper** with the name, ring back next day by name. **Never put the pitch or company name in step 1** — that is the receptionist's cue to screen, and it is exactly what the old "Hi, I won't take up much of your time… the one thing we specialize in…" opener did.
+- **Step 2 — DM on the line:** *"Hey [Name], this is [Caller] with Vision Cleaning — we handle commercial cleaning for a few places in the area. Quick question: are you under contract with someone right now, or handling it in-house?"* Their answer IS the Vendor Status qual field; `QUALIFY_QUESTIONS` follow from it.
+- Hot-intent lines (inspection / reviews / new build) are **ammo after the DM answers**, never the opener.
+- Gatekeeper outcome now has a **DM-name field**: it is prefixed to the call note (`DM: <name> ·`) and PATCHed onto the lead's `firstName`/`lastName`, so tomorrow's step 1 asks by name. Retry prefill is `nextBusinessDay()` (was +3d) — the script says call back the next day.
+
 ### Follow-Up Sequences
 - Hot Lead: 24h → 48h → 5 days
 - Standard: 48h → 5 days → 7 days

@@ -438,41 +438,57 @@ function NoteAssist({getNote, context, onApply}){
     </div>
   )
 }
-// Signal-aware cold-call opener. Picks the script by the lead's hottest intent
-// (and facility type), fills in the name/city, ends with the walkthrough ask.
+// Cold-call script — two steps, deliberately terse (2026-10 rewrite; the
+// previous "Hi, I won't take up much of your time… the one thing we
+// specialize in…" opener was too soft and pitched the gatekeeper).
+//   STEP 1 is ONLY about getting past the front desk. No company name, no
+//          reason, no pitch — a pitch is the receptionist's cue to screen; a
+//          casual first-name ask is not. With no name on file the whole call
+//          is "who handles facilities?" → thanks → hang up → log Gatekeeper
+//          with the name → ring back tomorrow asking for them by name.
+//   STEP 2 is one direct question the moment the DM is on the line.
+// The signal lines (inspection / reviews / new build) are kept as AMMO for
+// after the DM answers — never led with.
+function repName(){
+  const u=(getUser()||"").trim()
+  return u ? u.charAt(0).toUpperCase()+u.slice(1) : "[your name]"
+}
 function buildOpener(lead){
   const ints = parseIntents(lead?.notes, lead)
   const ind = (lead?.industry||"").toLowerCase()
-  const city = lead?.city || "your area"
-  const ask = "Can we set up 15 minutes for us to stop by, walk the facility, and provide you a quote?"
-  const askSpace = "Can we set up 15 minutes for us to stop by, walk the space, and provide you a quote?"
-  let opener=null, reference=null
+  const first = (lead?.firstName||"").trim()
+  const hasName = !!first
+  const step1 = hasName
+    ? { ask:`Hey, is ${first} around?`,
+        ifAsked:`Just following up with them.`,
+        note:"Nothing else. No company name, no reason. Stay casual." }
+    : { ask:"Hey, quick question — who handles facilities over there?",
+        ifAsked:null,
+        note:"Get the name, say thanks, hang up. Log it as Gatekeeper with the name — tomorrow you ask for them by name." }
+  const step2 = `Hey ${first||"[Name]"}, this is ${repName()} with Vision Cleaning — we handle commercial cleaning for a few places in the area. Quick question: are you under contract with someone right now, or handling it in-house?`
+  let ammo=null, reference=null
   if(ints.includes("health_violation")){
     reference = cleanNote(lead.notes)
-    opener = ind.includes("hospital")
-      ? `Your infection rates are running worse than the national benchmark — and that's the one thing we specialize in fixing. ${ask}`
-      : `You got cited for infection control on your last inspection — and that's the one thing we specialize in fixing. ${ask}`
+    ammo = ind.includes("hospital")
+      ? "Your infection rates are running worse than the national benchmark — that's exactly what we fix."
+      : "You got cited for infection control on your last inspection — that's exactly what we fix."
   } else if(ints.includes("cleanliness")){
     reference = cleanNote(lead.notes)
-    opener = `You've got some bad reviews calling out cleanliness — and that's the one thing we specialize in fixing. ${askSpace}`
+    ammo = "Some of your recent reviews call out cleanliness — that's exactly what we fix."
   } else if(ints.includes("newbuild")){
     reference = cleanNote(lead.notes)
-    opener = `You've got a new space opening up — and getting it move-in clean and keeping it that way is the one thing we specialize in. ${askSpace}`
-  } else {
-    opener = `Commercial cleaning for places like yours here in ${city} is the one thing we specialize in. ${askSpace}`
+    ammo = "You've got a new space opening up — we get it move-in clean and keep it that way."
   }
-  const greet = lead?.firstName
-    ? `Hi ${lead.firstName} — I won't take up much of your time. `
-    : "Hi — I won't take up much of your time. "
-  return { opener: greet + opener, reference, hot: ints.length>0 }
+  const close = "Can we set up 15 minutes to stop by, walk the space, and get you a quote?"
+  return { step1, step2, ammo, reference, close, hasName, hot: ints.length>0 }
 }
-// Once they agree to the walkthrough — run the qualification section below.
-// Each prompt maps to one of the existing qual chips so it gets captured.
+// After the DM answers the step-2 question — their answer IS the first qual
+// field. Each prompt maps to one of the existing qual chips so it gets captured.
 const QUALIFY_QUESTIONS = [
-  ["Do you have a cleaning company now — and how's that going?", "→ Vendor Status"],
-  ["Is your priority keeping costs down, top quality, or a balance?", "→ Focus"],
-  ["Are you the one who'd sign off, or is someone else involved?", "→ Contact Type"],
-  ["When are you looking to make a change?", "→ Timeline"],
+  ["Their answer to “under contract or in-house?”", "→ Vendor Status"],
+  ["When's that up — or when would you look at it?", "→ Timeline"],
+  ["Are you the one who'd sign off on it?", "→ Contact Type"],
+  ["What matters more — price, quality, or a balance?", "→ Focus"],
 ]
 
 async function api(path, opts={}) {
@@ -1694,6 +1710,14 @@ function addDays(days){
   d.setDate(d.getDate() + days)
   return localDate(d)
 }
+// Tomorrow, skipping Sat/Sun — the script's "call back the next day" means the
+// next day the front desk is staffed.
+function nextBusinessDay(){
+  const d = new Date()
+  d.setDate(d.getDate() + 1)
+  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate() + 1)
+  return localDate(d)
+}
 // UTC timestamp → LOCAL date string. Slicing a UTC ISO timestamp [:10] gives
 // tomorrow's date after ~8pm ET, which broke every "called today?" compare
 // during the evening shift. Always convert through Date first.
@@ -1859,11 +1883,13 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [apptDate,setApptDate]    = useState("")       // walkthrough appointment (optional)
   const [apptArea,setApptArea]    = useState("")
 
-  // Gatekeeper defaults to a 3-day retry: long enough that the message has
-  // been passed on, short enough that the conversation is still remembered.
+  // Gatekeeper → ring back the NEXT business day, by name. The script's step 1
+  // on a no-name lead is just "who handles facilities?" + hang up, so the whole
+  // value of the call is the name captured here and the next-day retry.
+  const [gkName,setGkName] = useState("")
   function pickGatekeeper(){
     setPrimary("gatekeeper"); setSecondary(""); setCbReason("")
-    setCbDate(d=>d||addDays(3))
+    setCbDate(d=>d||nextBusinessDay())
   }
 
   // Smart-fill: map Haiku's note read onto the outcome chips + callback date.
@@ -1968,7 +1994,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     try{
       setTimerRunning(false)
       const finalDuration = duration ? parseInt(duration)*60 : timerSeconds
-      const fullNotes = cbReason ? `[${cbReason}] ${notes}`.trim() : notes
+      const gk = primary==="gatekeeper" ? gkName.trim() : ""
+      const fullNotes = [cbReason?`[${cbReason}]`:"", gk?`DM: ${gk} ·`:"", notes].filter(Boolean).join(" ").trim()
       // Per-call email follow-up: only meaningful when this was a failed dial
       // and the lead has the contact info we'd email + VCC is configured.
       const emailEligible = (primary==="no_answer"||primary==="voicemail")
@@ -2015,6 +2042,9 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         nextfollowup: nextFollowUp||null,
         followupstep: fuDays ? 0 : null,
         ...(aiSent ? {notes: embedSentiment(lead.notes, aiSent)} : {}),
+        // Name the gatekeeper gave up → onto the lead, so tomorrow's step 1
+        // reads "Hey, is <First> around?" instead of asking again.
+        ...(gk ? {firstName: gk.split(/\s+/)[0], lastName: gk.split(/\s+/).slice(1).join(" ")} : {}),
         ...(!lead.assignedTo ? {assignedTo: getUser()} : {}),
         updatedAt:new Date().toISOString()
       })})
@@ -2277,28 +2307,41 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           )
         })()}
 
-        {/* Signal-aware opener — the first line that earns the next 20 seconds. */}
+        {/* The script — two steps, terse. Step 1 gets past the desk, step 2 is
+            the one question for the DM. Hot-intent lines are ammo, not the
+            opener. */}
         {(()=>{
           const o = buildOpener(lead)
+          const lbl={fontSize:10,letterSpacing:".1em",fontWeight:700,marginBottom:6}
+          const line={fontSize:15,color:"#dee5ff",lineHeight:1.5,fontWeight:600}
+          const sub={fontSize:11,color:"#a3aac4",lineHeight:1.5,marginTop:5}
           return (
             <div style={{marginBottom:16,background:o.hot?"#ff4d6d10":"#69f6b810",
               border:`1px solid ${o.hot?"#ff4d6d40":"#69f6b830"}`,borderRadius:10,padding:14}}>
-              <div style={{fontSize:10,letterSpacing:".1em",fontWeight:700,marginBottom:8,
-                color:o.hot?"#ff8da3":"#69f6b8"}}>
-                {o.hot?"🎯 SUGGESTED OPENER — LEAD WITH THIS":"💬 SUGGESTED OPENER"}
+              <div style={{...lbl,color:"#7dd3fc"}}>1 · GET PAST THE FRONT DESK</div>
+              <div style={line}>&ldquo;{o.step1.ask}&rdquo;</div>
+              <div style={sub}>
+                {o.step1.note}
+                {o.step1.ifAsked&&<> If asked what it&apos;s regarding: <b style={{color:"#c9d2ee"}}>&ldquo;{o.step1.ifAsked}&rdquo;</b></>}
+                {!o.hasName&&<> Then <b style={{color:"#7dd3fc"}}>4 · Gatekeeper</b> below and type the name.</>}
               </div>
-              <div style={{fontSize:15,color:"#dee5ff",lineHeight:1.55,fontWeight:500}}>
-                {o.opener}
+
+              <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid #ffffff12"}}>
+                <div style={{...lbl,color:"#69f6b8"}}>2 · DECISION MAKER ON THE LINE</div>
+                <div style={line}>&ldquo;{o.step2}&rdquo;</div>
+                {o.ammo&&(
+                  <div style={{...sub,marginTop:8}}>
+                    🎯 <b style={{color:"#ff8da3"}}>Ammo once they answer:</b> <span style={{color:"#dee5ff"}}>&ldquo;{o.ammo}&rdquo;</span>
+                    {o.reference&&<div style={{marginTop:3}}>📋 What they were flagged for (if they ask): {o.reference}</div>}
+                  </div>
+                )}
+                <div style={sub}>Then the ask: <b style={{color:"#c9d2ee"}}>&ldquo;{o.close}&rdquo;</b></div>
               </div>
-              {o.reference&&(
-                <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid #ffffff12",fontSize:11,color:"#a3aac4",lineHeight:1.5}}>
-                  📋 <b style={{color:"#c9d2ee"}}>What they were flagged for</b> (if they ask): {o.reference}
-                </div>
-              )}
-              {/* Once they say yes — run the qualification section below. */}
+
+              {/* Their answer to step 2 is the first qual field — capture below. */}
               <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid #ffffff12"}}>
-                <div style={{fontSize:10,letterSpacing:".08em",fontWeight:700,color:"#69f6b8",marginBottom:6}}>
-                  ✅ ONCE THEY SAY YES — RUN YOUR QUALIFICATION (capture below)
+                <div style={{...lbl,color:"#69f6b8",fontSize:10}}>
+                  ✅ WHILE THEY TALK — CAPTURE BELOW
                 </div>
                 {QUALIFY_QUESTIONS.map(([q,where],i)=>(
                   <div key={i} style={{fontSize:11.5,color:"#c9d2ee",lineHeight:1.5,marginBottom:3}}>
@@ -2407,15 +2450,22 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
             border:"1px solid #7dd3fc25"}}>
             <div style={{fontSize:10,color:"#7dd3fc",letterSpacing:".1em",fontWeight:700,marginBottom:4}}>
-              TRY AGAIN ON
+              WHO HANDLES FACILITIES? → CALL BACK TOMORROW BY NAME
             </div>
             <div style={{fontSize:11,color:"#a3aac4",marginBottom:10}}>
-              Counts as a real contact. Note who you spoke to and what they said —
-              next time you can ask for the decision-maker by name.
+              Counts as a real contact. Type the name they gave you — it goes on the lead,
+              so tomorrow&apos;s script opens with &ldquo;Hey, is {gkName.trim().split(/\s+/)[0]||"[Name]"} around?&rdquo;
             </div>
-            <div className="ff">
-              <label>Follow-up Date</label>
-              <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+              <div className="ff" style={{flex:"1 1 180px"}}>
+                <label>Decision-maker&apos;s name</label>
+                <input value={gkName} onChange={e=>setGkName(e.target.value)}
+                  placeholder={lead.firstName?`On file: ${lead.firstName}`:"e.g. Mike"} autoFocus/>
+              </div>
+              <div className="ff" style={{flex:"1 1 160px"}}>
+                <label>Call back on</label>
+                <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+              </div>
             </div>
           </div>
         )}
@@ -5762,6 +5812,22 @@ export default function App(){
                           <span style={{color:"#69f6b8",fontWeight:600}}>✨ Never called — fresh lead</span>
                         )}
                       </div>
+                      {/* Step 1 of the script, visible BEFORE she dials — the
+                          front-desk line is decided by whether a name is on
+                          file, and that's what she needs in the first second. */}
+                      {lead.phone&&(()=>{
+                        const o=buildOpener(lead)
+                        return (
+                          <div style={{background:"#0f1930",borderRadius:12,padding:"12px 16px",marginBottom:12,textAlign:"left",
+                            border:"1px solid #7dd3fc25"}}>
+                            <div style={{fontSize:"0.6rem",color:"#7dd3fc",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",marginBottom:6}}>
+                              📞 Opening line{o.hasName?"":" · no name on file"}
+                            </div>
+                            <div style={{fontSize:15,color:"#dee5ff",fontWeight:600,lineHeight:1.45}}>&ldquo;{o.step1.ask}&rdquo;</div>
+                            <div style={{fontSize:11,color:"#a3aac4",marginTop:5,lineHeight:1.5}}>{o.step1.note}</div>
+                          </div>
+                        )
+                      })()}
                       {lead.phone&&twilioCall?.ready&&(
                         <button className="btn btn-p"
                           style={{width:"100%",padding:"13px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",
