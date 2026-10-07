@@ -110,6 +110,21 @@ Supabase columns: `budgetfocus`, `vendorstatus`, `decisionmaker`, `timeline`, `q
   - `filter_selfcheck` first PATCHes a non-existent id (`id=eq.-1`) with every filter, proving syntax and columns before any real write.
   - Corporate mentions are **reported only**; parking a chain stays a person's decision.
 
+### ✉️ "Send an email to …" — opened at save, sent at end of day if she forgets (2026-10)
+- **At save:** any call where a NEW email reached the lead (typed in 👤 or read from the note) opens EmailModal after the CallModal closes, on **every outcome**. Most of her "send an email to …" notes are logged as no-answer, and it used to open on gatekeeper only.
+  - Script choice: decision-maker talked → ✉️ *Asked for info*; the desk named someone → 🚪 *Front desk referred*; a generic inbox → *Asked for info*. It is passed as `lead._emailPreset` (UI-only, never saved).
+- **End of day:** `run_eod_email_sweep_if_due()` (bg loop, once per UTC day on/after `EOD_EMAIL_HOUR_UTC`=23, ≈4pm PT after her 9–2 shift) sends what she didn't. It sends ONLY when ALL of these hold:
+  - that call's note asks for an email (`note_asks_for_email`: "send an email/info to", "better to email", "gave the email", "through email"…, and NOT "I already sent");
+  - the address is IN that note (never guessed, never the lead's Apollo address), well-formed, and not ours (`email_address_ok`);
+  - the address is not on the suppression list, and the lead is not `do_not_contact`;
+  - **nothing went to the lead since the call** and nothing went to that address in `EOD_EMAIL_DEDUPE_DAYS` (14). That covers email_log *and* campaign_sent audit rows. A failed dedupe read counts as "already sent" (fail-closed);
+  - the call is older than `EOD_EMAIL_GRACE_MIN` (30), the latest asking call per lead wins, and at most `EOD_EMAIL_MAX` (20) go per day.
+- **Day stamp is written BEFORE any send and a failed stamp = no sends** (same rule as the weekly jobs). A twin service whose settings writes are RLS-dropped must never be able to email prospects.
+- Each send is logged exactly like a manual one (`email_log`, sent_by = the caller), plus a `send_email_auto_eod` audit row and one Slack summary of every address.
+- **Templates:** `eod_email_content()` mirrors the EmailModal "asked"/"referred" presets. **Change the wording in both places.**
+- **Admin:** `POST /api/admin/eod-emails` — `dry_run=1` (DEFAULT) lists would-send + skip reasons; `dry_run=0` sends now (dedupe still applies).
+- **Kill switch:** `EOD_EMAIL_ENABLED=0`.
+
 ### Follow-Up Sequences
 - Hot Lead: 24h → 48h → 5 days
 - Standard: 48h → 5 days → 7 days

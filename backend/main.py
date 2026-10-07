@@ -3134,6 +3134,11 @@ def _bg_maintenance_loop():
             run_dialer_hour_scores_if_due()
         except Exception as e:
             print(f"[HOUR-RANK] loop exception: {e}")
+        # End-of-day: send the emails her notes said to send (once per UTC day).
+        try:
+            run_eod_email_sweep_if_due()
+        except Exception as e:
+            print(f"[EOD-EMAIL] loop exception: {e}")
         # Daily once-called recycle — internal cooldown, no-ops most ticks.
         try:
             run_once_called_recycle_if_due()
@@ -15519,6 +15524,201 @@ def send_email(req: SendEmailRequest, user: str = Depends(verify_token)):
     )
 
     return {"sent": True, "log_id": log_id}
+
+
+# ── End-of-day "she was told to email them" safety net (2026-10) ─────────────
+# Her notes are full of "reps said to send an email to maya@…" — the desk's
+# preferred route to the decision-maker. The call form opens the composer on
+# save, but if she closes it (or is mid-shift and moves on) the promised email
+# never goes. After her shift this sends it, ONLY when:
+#   • that call's note asks for an email (EMAIL_ASK_RE) and the address is IN
+#     that note (never guessed, never the lead's Apollo address);
+#   • the address is well-formed and not ours, and not on the suppression list;
+#   • nothing has gone to that lead since the call, and nothing to that address
+#     in EOD_EMAIL_DEDUPE_DAYS (manual send, campaign, or an earlier sweep);
+#   • the lead isn't do_not_contact; at most EOD_EMAIL_MAX per day.
+# Every send is logged exactly like a manual one (email_log + audit) and the
+# whole batch is summarised in Slack. Kill: EOD_EMAIL_ENABLED=0.
+EOD_EMAIL_ENABLED     = os.getenv("EOD_EMAIL_ENABLED", "1") == "1"
+EOD_EMAIL_HOUR_UTC    = int(os.getenv("EOD_EMAIL_HOUR_UTC", "23"))     # ~4pm PT, after her 9–2 PT shift
+EOD_EMAIL_MAX         = int(os.getenv("EOD_EMAIL_MAX", "20"))
+EOD_EMAIL_DEDUPE_DAYS = int(os.getenv("EOD_EMAIL_DEDUPE_DAYS", "14"))
+EOD_EMAIL_GRACE_MIN   = int(os.getenv("EOD_EMAIL_GRACE_MIN", "30"))     # leave her time to send it herself
+
+EMAIL_ASK_RE = re.compile(
+    r"\b(?:send(?:ing)?|e-?mail (?:her|him|them|it|info|information|over|the info)|e-?mail (?:to|at)|"
+    r"to e-?mail|better to e-?mail|(?:gave|give) (?:me |us )?(?:the |this |her |his |an |their |our )?e-?mail|"
+    r"e-?mail address|asked for (?:an? )?e-?mail|prefers? (?:an? )?e-?mail|check (?:the )?e-?mail|"
+    r"(?:info|information|details) (?:to|at) (?:his |her |their |the )?e-?mail|"
+    r"(?:through|via|by) e-?mail)\b", re.I | re.ASCII)
+_EMAIL_ALREADY_SENT_RE = re.compile(
+    r"\b(?:i|we)\s+(?:already\s+|just\s+)?(?:sent|emailed|e-mailed)\b|\balready (?:sent|emailed)\b|\band sent (?:info|information|an? e-?mail)",
+    re.I | re.ASCII)
+_EMAIL_OK_RE = re.compile(r"^[A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}$", re.ASCII)
+_OWN_EMAIL_DOMAINS = ("visioncleaningcompanyllc.com",)
+_DM_OUTCOMES_FOR_EMAIL = {"answered", "interested", "interested_no_dm", "callback", "not_interested", "converted"}
+
+def note_asks_for_email(note: str) -> bool:
+    n = note or ""
+    return bool(EMAIL_ASK_RE.search(n)) and not _EMAIL_ALREADY_SENT_RE.search(n)
+
+def email_address_ok(addr: str) -> bool:
+    a = (addr or "").strip()
+    return bool(_EMAIL_OK_RE.match(a)) and not a.lower().endswith(_OWN_EMAIL_DOMAINS)
+
+_EMAIL_SIG = ("Best regards,\nVision Cleaning Company\nconnect@visioncleaningcompanyllc.com\n"
+              "https://visioncleaningcompanyllc.com")
+
+def eod_email_content(outcome: str, name: str, company: str):
+    """(preset, subject, plain-text body). Mirrors the EmailModal presets in
+    App.jsx ("asked" / "referred") — keep the wording in step.
+    Named person + front-desk call → "referred" (they haven't heard from us);
+    a decision-maker asked, or a generic inbox → "asked" (as requested)."""
+    co = company or "your facility"
+    who = name or "there"
+    if name and (outcome or "") not in _DM_OUTCOMES_FOR_EMAIL:
+        subject = (f"Cleaning at {company} — your front desk pointed me to you" if company
+                   else "Your front desk pointed me to you")
+        body = (f"Hi {who},\n\nI called {co} today and your front desk mentioned you're the right person to talk "
+                f"to about cleaning — I'll try you by phone as well.\n\nVision Cleaning Company provides commercial "
+                f"cleaning for medical offices, clinics, and other facilities on daily, weekly, bi-weekly, or monthly "
+                f"schedules, built around your hours. Every plan is customized and flat-rate.\n\nIf it's easier, simply "
+                f"reply with your approximate square footage and how often you'd like service, and we'll send a free, "
+                f"no-obligation quote within 24 hours. You can also learn more at https://visioncleaningcompanyllc.com."
+                f"\n\nThanks — looking forward to connecting.\n\n{_EMAIL_SIG}")
+        return "referred", subject, body
+    subject = (f"Cleaning info + quote for {company} — Vision Cleaning" if company
+               else "Cleaning info + quote — Vision Cleaning")
+    body = (f"Hi {who},\n\nThank you for your interest — as requested, here's a quick overview of Vision Cleaning "
+            f"Company.\n\nWe provide commercial cleaning for offices, medical facilities, schools, gyms, and more — "
+            f"daily, weekly, bi-weekly, or monthly, on a schedule built around your operation. Every plan is customized "
+            f"and flat-rate, so there are no surprises.\n\nFor a free, no-obligation quote for {co}, simply reply with:\n"
+            f"• Approximate square footage\n• How often you'd like service (daily / weekly / bi-weekly / monthly)\n"
+            f"• Any priority areas (restrooms, floors, windows, etc.)\n\nWe'll have a custom quote back to you within "
+            f"24 hours. You can also learn more or request a quote any time at https://visioncleaningcompanyllc.com."
+            f"\n\nWe appreciate the opportunity and look forward to working with you.\n\n{_EMAIL_SIG}")
+    return "asked", subject, body
+
+def _plain_to_html(text: str) -> str:
+    esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "".join(f"<p>{esc(l) or '&nbsp;'}</p>" for l in text.split("\n"))
+
+def _email_sent_since(lead_id, addr: str, since_iso: str) -> bool:
+    """True if anything went to this lead since the call, or to this address
+    within EOD_EMAIL_DEDUPE_DAYS. RAISES on a failed read — the caller treats
+    an unknown answer as "already sent" (never risk a double email)."""
+    dedupe_since = (datetime.utcnow() - timedelta(days=EOD_EMAIL_DEDUPE_DAYS)).isoformat()
+    checks = [
+        f"{SUPABASE_URL}/rest/v1/email_log?select=id&lead_id=eq.{int(lead_id)}&sent_at=gte.{since_iso}&limit=1",
+        f"{SUPABASE_URL}/rest/v1/email_log?select=id&to_email=ilike.{url_quote(addr, safe='')}"
+        f"&sent_at=gte.{dedupe_since}&limit=1",
+        f"{SUPABASE_URL}/rest/v1/audit_log?select=id&action=eq.campaign_sent&resource_id=eq.{int(lead_id)}"
+        f"&created_at=gte.{since_iso}&limit=1",
+    ]
+    for url in checks:
+        r = req_lib.get(url, headers=SB_ADMIN_HEADERS, timeout=15)
+        if r.status_code != 200:
+            raise RuntimeError(f"dedupe read HTTP {r.status_code}")
+        if r.json():
+            return True
+    return False
+
+def eod_email_candidates(day_start_iso: str, now_utc: datetime) -> dict:
+    """Pure-ish selection (reads only). Returns {"send": [...], "skipped": [...]}."""
+    cutoff = (now_utc - timedelta(minutes=EOD_EMAIL_GRACE_MIN)).isoformat()
+    calls = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=id,leadId,outcome,notes,calledAt,calledBy"
+                           f"&calledAt=gte.{day_start_iso}&calledAt=lte.{cutoff}&notes=like.*@*&order=id", max_pages=10)
+    latest = {}
+    for c in calls:                                   # the latest asking call per lead wins
+        if c.get("leadId") and note_asks_for_email(c.get("notes") or ""):
+            latest[c["leadId"]] = c
+    send, skipped = [], []
+    today = (datetime.utcnow() + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d")
+    for lid, c in latest.items():
+        fx = extract_note_details(c.get("notes") or "", None, today)
+        addr = (fx.get("email") or "").strip()
+        base = {"lead_id": lid, "call_id": c.get("id"), "to": addr, "note": (c.get("notes") or "")[:160]}
+        if not email_address_ok(addr):
+            skipped.append({**base, "why": "no valid address in the note"}); continue
+        if email_is_suppressed(addr):
+            skipped.append({**base, "why": "address is on the suppression list"}); continue
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{int(lid)}&select=*", headers=SB_HEADERS, timeout=15)
+        lead = (r.json() or [None])[0] if r.status_code == 200 else None
+        if not lead:
+            skipped.append({**base, "why": "lead not readable"}); continue
+        if lead.get("status") == "do_not_contact":
+            skipped.append({**base, "why": "do_not_contact"}); continue
+        try:
+            if _email_sent_since(lid, addr, c.get("calledAt") or day_start_iso):
+                skipped.append({**base, "why": "already emailed"}); continue
+        except Exception as e:
+            skipped.append({**base, "why": f"couldn't verify not already emailed ({e})"}); continue
+        name = fx.get("name") or ""
+        preset, subject, body = eod_email_content(c.get("outcome"), name, lead.get("company") or "")
+        send.append({**base, "company": lead.get("company"), "name": name, "preset": preset,
+                     "subject": subject, "body": body, "caller": c.get("calledBy") or "system",
+                     "outcome": c.get("outcome")})
+    return {"send": send[:max(0, EOD_EMAIL_MAX)], "over_cap": max(0, len(send) - EOD_EMAIL_MAX), "skipped": skipped}
+
+def _send_eod_batch(cands: list) -> list:
+    results = []
+    for e in cands:
+        ok, err = send_smtp_email(e["to"], e["name"], e["subject"], _plain_to_html(e["body"]),
+                                  reply_to=OUTREACH_REPLY_TO)
+        results.append({**{k: e[k] for k in ("lead_id", "company", "to", "preset")}, "sent": ok, "error": err})
+        if not ok:
+            print(f"[EOD-EMAIL] send failed lead {e['lead_id']} → {e['to']}: {err}")
+            continue
+        try:
+            req_lib.post(f"{SUPABASE_URL}/rest/v1/email_log", headers=SB_ADMIN_HEADERS, timeout=10, json={
+                "lead_id": e["lead_id"], "sent_by": e["caller"], "to_email": e["to"], "to_name": e["name"] or "",
+                "subject": e["subject"], "body": _plain_to_html(e["body"]), "company": e["company"] or "",
+                "status": "sent", "sent_at": datetime.utcnow().isoformat()})
+        except Exception as ex:
+            print(f"[EOD-EMAIL] email_log write failed for lead {e['lead_id']}: {ex}")
+        audit_log("system", "send_email_auto_eod", "lead", e["lead_id"],
+                  {"to": e["to"], "preset": e["preset"], "for_caller": e["caller"], "call_id": e["call_id"]})
+    return results
+
+def run_eod_email_sweep_if_due(force: bool = False) -> dict:
+    """bg loop, once per UTC day on/after EOD_EMAIL_HOUR_UTC. The day stamp is
+    written BEFORE any send and a failed stamp means "not today" (fail-closed,
+    same rule as the weekly jobs) — a twin service with RLS-dropped writes
+    must never be able to send."""
+    if not EOD_EMAIL_ENABLED and not force:
+        return {"skipped": "disabled"}
+    now = datetime.utcnow()
+    if not force:
+        if now.hour < EOD_EMAIL_HOUR_UTC:
+            return {"skipped": "too early"}
+        if (_settings_get_json("last_eod_email_sweep") or "") == now.strftime("%Y-%m-%d"):
+            return {"skipped": "already ran today"}
+        if not _settings_set_json("last_eod_email_sweep", now.strftime("%Y-%m-%d")):
+            print("[EOD-EMAIL] could not stamp today's run — not sending (fail-closed)")
+            return {"skipped": "stamp failed"}
+    cands = eod_email_candidates(local_day_start_utc(), now)
+    results = _send_eod_batch(cands["send"])
+    sent = [r for r in results if r["sent"]]
+    if sent or cands["over_cap"]:
+        lines = "\n".join(f"• {r['company'] or '?'} → {r['to']} ({r['preset']})" for r in sent[:15])
+        extra = f"\n…{cands['over_cap']} more held back by EOD_EMAIL_MAX" if cands["over_cap"] else ""
+        send_slack(f"📧 End of day: sent {len(sent)} email{'s' if len(sent) != 1 else ''} the desk asked for",
+                   f"Notes said \"send an email to…\" and nothing had gone yet.\n{lines}{extra}")
+    print(f"[EOD-EMAIL] sent={len(sent)} failed={len(results)-len(sent)} skipped={len(cands['skipped'])}")
+    return {"sent": len(sent), "results": results, "skipped": cands["skipped"], "over_cap": cands["over_cap"]}
+
+@app.post("/api/admin/eod-emails")
+def admin_eod_emails(dry_run: int = 1, user: str = Depends(verify_admin)):
+    """Preview (default) or send now the end-of-day emails. dry_run=1 sends
+    nothing and shows each candidate's address, script and skip reasons."""
+    if dry_run:
+        c = eod_email_candidates(local_day_start_utc(), datetime.utcnow())
+        return {"dry_run": True, "would_send": [{k: e[k] for k in ("lead_id", "company", "to", "name", "preset", "subject", "note")}
+                                                 for e in c["send"]],
+                "over_cap": c["over_cap"], "skipped": c["skipped"]}
+    out = run_eod_email_sweep_if_due(force=True)
+    audit_log(user, "eod_emails_manual_run", "lead", None, {"sent": out.get("sent")})
+    return out
 
 @app.get("/api/email/history")
 def get_email_history(lead_id: int = 0, user: str = Depends(verify_token)):
