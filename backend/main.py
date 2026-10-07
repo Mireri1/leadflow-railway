@@ -15608,6 +15608,9 @@ def _email_sent_since(lead_id, addr: str, since_iso: str) -> bool:
     within EOD_EMAIL_DEDUPE_DAYS. RAISES on a failed read — the caller treats
     an unknown answer as "already sent" (never risk a double email)."""
     dedupe_since = (datetime.utcnow() - timedelta(days=EOD_EMAIL_DEDUPE_DAYS)).isoformat()
+    # calledAt comes back as "…+00:00": a raw "+" in a query string decodes
+    # to a space and PostgREST 400s, so every timestamp is URL-encoded.
+    since_iso, dedupe_since = url_quote(str(since_iso), safe=""), url_quote(dedupe_since, safe="")
     checks = [
         f"{SUPABASE_URL}/rest/v1/email_log?select=id&lead_id=eq.{int(lead_id)}&sent_at=gte.{since_iso}&limit=1",
         f"{SUPABASE_URL}/rest/v1/email_log?select=id&to_email=ilike.{url_quote(addr, safe='')}"
