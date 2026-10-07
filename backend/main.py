@@ -13213,6 +13213,17 @@ def daily_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
         # (long-nurture / Future Follow-Ups) is noise at the daily cadence.
         qual_lines = _digest_qualified_highlights(calls if isinstance(calls, list) else [], today)
 
+        # ── Script funnel, today: did the two-step script produce names and
+        # did yesterday's names turn into decision-maker conversations? ──
+        script_txt = ""
+        try:
+            f = compute_script_funnel(45)["today"]
+            script_txt = (f"  Names captured: *{f['names']}* · Day-2 dials by name: *{f['named_dials']}*"
+                          f" → DM reached: *{f['dm_reached']}* → interested: *{f['engaged']}*"
+                          f"\n  Contract renewals captured: *{f['renewals']}*")
+        except Exception as e:
+            print(f"[daily-summary] script funnel failed: {e}")
+
         # ── Patterns + week-over-week trend (the seasonality base) ──
         themes_today = _theme_tally(calls).most_common(3)
         themes_txt = "\n".join(f"  • {t}: *{n}*" for t, n in themes_today) or "  No notes logged"
@@ -13228,7 +13239,8 @@ def daily_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
 
         if preview:
             return {"preview": True, "date": today, "calls": total_calls,
-                    "qualified_highlights": qual_lines, "themes": themes_txt, "trend": trend_txt}
+                    "qualified_highlights": qual_lines, "themes": themes_txt, "trend": trend_txt,
+                    "script": script_txt}
 
         fields = [
             {"label": "Calls Made", "value": f":telephone_receiver: *{total_calls}*"},
@@ -13239,6 +13251,7 @@ def daily_summary(preview: int = 0, user: str = Depends(verify_cron_or_admin)):
                 "\n".join(f"  • {(x.get('company') or x.get('from') or '?')} ({x.get('sentiment','?')})"
                            for x in replies[:5]))}] if replies else []),
             {"label": "Callbacks Due", "value": f":calendar: *{total_callbacks}*"},
+            *([{"label": "📇 Script: names → DM conversations", "value": script_txt}] if script_txt else []),
             *([{"label": "⭐ Qualified highlights (actionable)", "value": qual_lines}] if qual_lines else []),
             {"label": "Top Callers", "value": lb_text},
             {"label": "Today's objections / themes", "value": themes_txt},
@@ -13938,6 +13951,73 @@ def compute_receptivity(days=180):
             "overall": _agg_recept(rows),
             "by_industry": by_industry, "by_dow": by_dow, "by_hour": by_hour,
             "by_month": by_month, "by_industry_month": by_industry_month}
+
+# ── Script funnel (2026-10) — is the two-step script working? ────────────────
+# Reads only call_outcomes. The CallModal stamps "DM: <name> ·" on the call
+# that captured a decision-maker's name and "[renews YYYY-MM]" on the call
+# that captured a contract end, so the funnel needs no leads join:
+#   dials → reached (CONTACT_OUTCOMES) → gatekeeper → names captured
+#   → day-2 dials (later calls on a lead whose earlier call captured a name)
+#   → DM reached (contact outcome, not gatekeeper, on a day-2 dial)
+#   → engaged (ENGAGED_OUTCOMES on a day-2 dial) · renewals captured.
+# Pre-rewrite calls carry no stamps, so names/day-2 read 0 before 2026-10-07;
+# that is the baseline, not a bug.
+_DM_STAMP_RE = re.compile(r"(?:^|[\]\s])DM: ")
+_RENEW_STAMP_RE = re.compile(r"\[renews \d{4}-\d{2}\]")
+
+def _funnel_blank():
+    return {"dials": 0, "reached": 0, "gatekeeper": 0, "names": 0,
+            "named_dials": 0, "dm_reached": 0, "engaged": 0, "renewals": 0}
+
+def compute_script_funnel(days: int = 42) -> dict:
+    days = max(7, min(int(days or 42), 180))
+    tz_off = int(os.getenv("RECEPTIVITY_TZ_OFFSET_HOURS", "-4"))
+    now_local = datetime.utcnow() + timedelta(hours=tz_off)
+    today = now_local.strftime("%Y-%m-%d")
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
+    rows = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes"
+                          f"?select=leadId,outcome,notes,calledAt,calledBy&calledAt=gte.{since}&order=calledAt.asc")
+    weeks, callers = {}, {}
+    today_c = _funnel_blank()
+    named_leads = set()      # leads whose name was captured on an EARLIER call
+    for r in rows:
+        ts = r.get("calledAt") or ""
+        try:
+            d_local = datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None) + timedelta(hours=tz_off)
+        except Exception:
+            continue
+        wk = (d_local - timedelta(days=d_local.weekday())).strftime("%Y-%m-%d")
+        day = d_local.strftime("%Y-%m-%d")
+        who = r.get("calledBy") or "?"
+        out = (r.get("outcome") or "").lower()
+        notes = r.get("notes") or ""
+        lid = str(r.get("leadId"))
+        buckets = [weeks.setdefault(wk, _funnel_blank()), callers.setdefault(who, _funnel_blank())]
+        if day == today:
+            buckets.append(today_c)
+        is_contact = out in CONTACT_OUTCOMES
+        is_named_dial = lid in named_leads
+        for b in buckets:
+            b["dials"] += 1
+            if is_contact: b["reached"] += 1
+            if out == "gatekeeper": b["gatekeeper"] += 1
+            if _DM_STAMP_RE.search(notes): b["names"] += 1
+            if _RENEW_STAMP_RE.search(notes): b["renewals"] += 1
+            if is_named_dial:
+                b["named_dials"] += 1
+                if is_contact and out != "gatekeeper": b["dm_reached"] += 1
+                if out in ENGAGED_OUTCOMES: b["engaged"] += 1
+        if _DM_STAMP_RE.search(notes):
+            named_leads.add(lid)
+    return {"days": days, "since": since[:10], "today": today_c,
+            "weeks": [{"week": k, **v} for k, v in sorted(weeks.items())],
+            "by_caller": [{"caller": k, **v} for k, v in sorted(callers.items(), key=lambda kv: -kv[1]["dials"])]}
+
+@app.get("/api/analytics/script-funnel")
+def script_funnel_analytics(days: int = 42, user: str = Depends(verify_token)):
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    return compute_script_funnel(days)
 
 @app.get("/api/analytics/receptivity")
 def receptivity_analytics(days: int = 180, user: str = Depends(verify_token)):

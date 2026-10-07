@@ -1721,6 +1721,22 @@ function nextBusinessDay(){
   while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate() + 1)
   return localDate(d)
 }
+// Contract renewal → callback date. "Under contract until March" means the
+// decision window opens ~2-3 months before: ring RENEWAL_LEAD_DAYS before the
+// 1st of that month, never earlier than tomorrow (a renewal this month or
+// already past = call now).
+const RENEWAL_LEAD_DAYS = 75
+function renewalCallbackDate(ym){            // ym = "YYYY-MM"
+  if(!/^\d{4}-\d{2}$/.test(ym||"")) return ""
+  const d = new Date(ym+"-01T12:00:00")
+  d.setDate(d.getDate() - RENEWAL_LEAD_DAYS)
+  const t = new Date(); t.setDate(t.getDate()+1); t.setHours(12,0,0,0)
+  return localDate(d < t ? t : d)
+}
+function fmtMonth(v){                        // "2027-03" | "2027-03-01" → "Mar 2027"
+  const m=/^(\d{4})-(\d{2})/.exec(v||""); if(!m) return ""
+  return new Date(+m[1], +m[2]-1, 1).toLocaleDateString([], {month:"short", year:"numeric"})
+}
 // UTC timestamp → LOCAL date string. Slicing a UTC ISO timestamp [:10] gives
 // tomorrow's date after ~8pm ET, which broke every "called today?" compare
 // during the evening shift. Always convert through Date first.
@@ -1894,6 +1910,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [dmTitle,setDmTitle] = useState(lead.title||"")
   const [dmPhone,setDmPhone] = useState(lead.dm_phone||"")
   const [dmReach,setDmReach] = useState(lead.reach_notes||"")   // "callback info": when/how to reach them
+  const [contractEnds,setContractEnds] = useState((lead.contract_ends||"").slice(0,7))   // "YYYY-MM"
   const [dmEdit,setDmEdit]   = useState(false)
   const [savingDm,setSavingDm] = useState(false)
   const [dmSaveStatus,setDmSaveStatus] = useState("")
@@ -1902,7 +1919,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const dmTitleChanged = dmTitle.trim()!==(lead.title||"").trim()
   const dmPhoneChanged = dmPhone.trim()!==(lead.dm_phone||"").trim()
   const dmReachChanged = dmReach.trim()!==(lead.reach_notes||"").trim()
-  const dmExtraChanged = dmPhoneChanged||dmReachChanged
+  const contractEndsChanged = (contractEnds||"")!==(lead.contract_ends||"").slice(0,7)
+  const dmExtraChanged = dmPhoneChanged||dmReachChanged||contractEndsChanged
   const dmDirty = dmNameChanged||dmTitleChanged||dmExtraChanged
   // Name/title live on columns that have always existed, so they ride the
   // same PATCH as the outcome. dm_phone (009) and reach_notes (010) go in
@@ -1913,11 +1931,12 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     if(dmTitleChanged) p.title=dmTitle.trim()
     return p
   }
-  const DM_PHONE_ERR="The direct line / callback info could NOT be stored — the leads table is missing the dm_phone or reach_notes column. Tell Eric to run backend/migrations/009_leads_dm_phone.sql and 010_leads_reach_notes.sql. (Name and title saved fine.)"
+  const DM_PHONE_ERR="The direct line / callback info / contract end could NOT be stored — the leads table is missing the dm_phone, reach_notes or contract_ends column. Tell Eric to run backend/migrations/009, 010 and 011. (Name, title and the call itself saved fine.)"
   async function saveDmExtra(){
     const body={updatedAt:new Date().toISOString()}
     if(dmPhoneChanged) body.dm_phone=dmPhone.trim()||null
     if(dmReachChanged) body.reach_notes=dmReach.trim()||null
+    if(contractEndsChanged) body.contract_ends=contractEnds?contractEnds+"-01":null
     const r=await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify(body)})
     return Array.isArray(r)&&r[0] ? r[0] : body
   }
@@ -1939,7 +1958,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     }catch(ex){ setDmSaveStatus("Couldn't save — "+(ex.message||"try again")) }
     finally{ setSavingDm(false) }
   }
-  function resetDm(){ setDmName(leadFullName); setDmTitle(lead.title||""); setDmPhone(lead.dm_phone||""); setDmReach(lead.reach_notes||""); setDmSaveStatus("") }
+  function resetDm(){ setDmName(leadFullName); setDmTitle(lead.title||""); setDmPhone(lead.dm_phone||""); setDmReach(lead.reach_notes||""); setContractEnds((lead.contract_ends||"").slice(0,7)); setDmSaveStatus("") }
   // Gatekeeper → ring back the NEXT business day, by name. The script's step 1
   // on a no-name lead is just "who handles facilities?" + hang up, so the whole
   // value of the call is the name captured above and the next-day retry.
@@ -2054,7 +2073,11 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // A newly-captured name is stamped on the call note too, so History
       // shows WHEN the name was learned, not just that the lead has one.
       const newName = dmNameChanged && dmName.trim()
-      const fullNotes = [cbReason?`[${cbReason}]`:"", newName?`DM: ${dmName.trim()} ·`:"", notes].filter(Boolean).join(" ").trim()
+      // "[renews YYYY-MM]" marks the call that captured the contract end —
+      // the script-funnel analytics count it, and History shows it.
+      const newRenewal = contractEndsChanged && contractEnds
+      const fullNotes = [cbReason?`[${cbReason}]`:"", newName?`DM: ${dmName.trim()} ·`:"",
+        newRenewal?`[renews ${contractEnds}]`:"", notes].filter(Boolean).join(" ").trim()
       // Per-call email follow-up: only meaningful when this was a failed dial
       // and the lead has the contact info we'd email + VCC is configured.
       const emailEligible = (primary==="no_answer"||primary==="voicemail")
@@ -2091,11 +2114,17 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // only when the deal is dead (not interested / converted). A plain
       // no-answer/voicemail on a lead with a scheduled callback must NOT wipe
       // the date — that silently dropped leads out of Follow-Ups and the bell.
-      const newCb = (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||"")
+      // Renewal: "under contract until <month>" books a callback ~75 days
+      // before it. On a Not Interested that is the ONLY thing keeping the
+      // lead alive, so the lead status becomes `callback` (the call row
+      // itself stays not_interested — that is what they said today).
+      const renewalCb = (newRenewal && outcome!=="converted") ? renewalCallbackDate(contractEnds) : ""
+      const newCb = (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||renewalCb||"")
       const cbPatch = newCb ? {callbackDate:newCb}
         : (["not_interested","converted"].includes(outcome) ? {callbackDate:""} : {})
+      const leadStatus = (outcome==="not_interested" && renewalCb) ? "callback" : (statusMap[outcome]||"called")
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
-        status:statusMap[outcome]||"called",
+        status:leadStatus,
         ...cbPatch,
         followupsequence: followUpSeq||null,
         nextfollowup: nextFollowUp||null,
@@ -2403,6 +2432,12 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                       : <span style={{color:"#6b7398",fontSize:12}}>📱 No direct line yet — ask for it when you reach them</span>}
                     {lead.phone&&<span style={{color:"#a3aac4",fontSize:12}}>☎️ Main: {lead.phone}</span>}
                   </div>
+                  {lead.contract_ends&&(
+                    <div style={{marginTop:6,fontSize:13,color:"#c4b5fd",fontWeight:600}}>
+                      📆 Contract renews {fmtMonth(lead.contract_ends)}
+                      {lead.callbackDate&&<span style={{color:"#6b7398",fontWeight:400}}> · callback {lead.callbackDate}</span>}
+                    </div>
+                  )}
                   {/* Callback info — what the desk said about catching them. The
                       one line that decides WHEN tomorrow's call happens. */}
                   <div style={{marginTop:6,fontSize:13,color:lead.reach_notes?"#ffe083":"#6b7398",fontWeight:lead.reach_notes?600:400}}>
@@ -2639,6 +2674,41 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
             </div>
           </div>
         )}
+
+        {/* 📆 Contract / renewal — the step-2 answer. Shown on every DM
+            outcome, including Not Interested: "we're under contract until
+            March" is a dated renewal, not a dead lead, and "we're in-house"
+            is market intel the receptivity analytics should see. Optional
+            everywhere — nothing here blocks the save. */}
+        {primary==="answered"&&secondary&&secondary!=="interested_no_dm"&&(()=>{
+          const cbPreview = contractEnds ? renewalCallbackDate(contractEnds) : ""
+          return (
+            <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
+              border:`1px solid ${contractEnds||vendorStatus?"#c4b5fd40":"#40485d20"}`}}>
+              <div style={{fontSize:10,letterSpacing:".1em",fontWeight:700,marginBottom:10,color:"#c4b5fd"}}>
+                📆 &ldquo;UNDER CONTRACT, OR IN-HOUSE?&rdquo; — WHAT THEY SAID <span style={{color:"#5a6a8a",fontWeight:400}}>(optional)</span>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                {!needsQual&&(
+                  <QualChip label="Vendor Status" value={vendorStatus} onChange={setVendor}
+                    options={["Happy with Current","Open to Options","Actively Shopping","No Vendor","In-House Staff"]}/>
+                )}
+                <div style={{display:"flex",gap:12,alignItems:"flex-end",flexWrap:"wrap"}}>
+                  <div className="ff" style={{marginBottom:0,maxWidth:200}}>
+                    <label>Contract ends (month)</label>
+                    <input type="month" value={contractEnds} onChange={e=>setContractEnds(e.target.value)}/>
+                  </div>
+                  <div style={{fontSize:12,lineHeight:1.5,paddingBottom:6,color:contractEnds?"#dee5ff":"#6b7398"}}>
+                    {contractEnds
+                      ? <>Renews <b>{fmtMonth(contractEnds)}</b>{(secondary==="callback"||cbDate)?"":<> → callback set for <b style={{color:"#c4b5fd"}}>{cbPreview}</b> (~{RENEWAL_LEAD_DAYS} days before)</>}
+                          {secondary==="not_interested"&&<span style={{color:"#a3aac4"}}> · lead stays in the pipeline</span>}</>
+                      : <>If they&apos;re under contract, ask when it&apos;s up — we&apos;ll schedule the callback ahead of the renewal.</>}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )
+        })()}
 
         {/* Notes + Follow-up + Submit */}
         {primary&&(step>=2||primary!=="answered")&&(
@@ -5300,6 +5370,11 @@ export default function App(){
                                     borderRadius:4,border:"1px solid #ffe08340",maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                                   🕐 {lead.reach_notes}</span>
                               )}
+                              {lead.contract_ends&&(
+                                <span title="Current cleaning contract renews — callback is scheduled ahead of it"
+                                  style={{fontSize:9,fontWeight:700,background:"#c4b5fd18",color:"#c4b5fd",padding:"2px 7px",
+                                    borderRadius:4,border:"1px solid #c4b5fd40"}}>📆 RENEWS {fmtMonth(lead.contract_ends).toUpperCase()}</span>
+                              )}
                               {/* Hot-intent badges first — WHY this lead matters right now. */}
                               {parseIntents(lead.notes, lead).map(k=>{
                                 const m=INTENT_META[k]
@@ -5967,6 +6042,8 @@ export default function App(){
                         <ScoreRing score={score}/>
                         <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>{info.label}</span>
                         {lead.industry&&<span className="pill" style={{background:"#a3a6ff18",color:"#a3a6ff"}}>{lead.industry}</span>}
+                        {lead.contract_ends&&<span className="pill" title="Current cleaning contract renews — call ahead of it"
+                          style={{background:"#c4b5fd18",color:"#c4b5fd",border:"1px solid #c4b5fd30"}}>📆 Renews {fmtMonth(lead.contract_ends)}</span>}
                         {/* Local-time-at-lead chip — turns red outside business
                             hours (before 8am / after 7pm local) so the caller
                             doesn't ring MD businesses at 5am Pacific. */}
@@ -6571,6 +6648,7 @@ export default function App(){
                                 border:`1px solid ${info.color}30`,width:"fit-content"}}>{info.label}</span>
                               <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",
                                 display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>
+                                {lead.contract_ends?<><span style={{color:"#c4b5fd",fontWeight:600}}>📆 Renews {fmtMonth(lead.contract_ends)}</span><br/></>:""}
                                 {lead.reach_notes?<><span style={{color:"#ffe083",fontWeight:600}}>🕐 {lead.reach_notes}</span><br/></>:""}
                                 {lead.dm_phone?<><span style={{color:"#7dd3fc"}}>📱</span> <span style={{color:"#7dd3fc",fontWeight:600}}>{lead.dm_phone}</span> direct<br/></>:""}
                                 {lead.phone?<><span style={{color:"#a3a6ff"}}>📞</span> {lead.phone}<br/></>:""}
@@ -7087,6 +7165,7 @@ export default function App(){
               </div>
 
               {/* ── Google Places Usage + Leads Pulled (admin only) ── */}
+              {isAdmin()&&<ScriptFunnelPanel/>}
               {isAdmin()&&<ReceptivityPanel/>}
               {isAdmin()&&<NoteInsightsPanel/>}
               {isAdmin()&&<HoursPanel/>}
@@ -7642,6 +7721,110 @@ function HoursPanel(){
 }
 
 // ─── ReceptivityPanel (admin) — which industry is warm, when + macro backdrop ─
+// ─── ScriptFunnelPanel (admin) — is the two-step script working? ─────────────
+// Reads /api/analytics/script-funnel: per ISO week and per caller, how many
+// dials reached a desk, how many of those produced a NAME, how many day-2
+// calls went out by name, how many reached the decision maker, how many of
+// those were interested, and how many contract renewals were captured. The
+// stamps it counts only exist from the 2026-10 rewrite, so earlier weeks read
+// 0 on names/day-2 — that is the baseline.
+function ScriptFunnelPanel(){
+  const [data,setData]=useState(null)
+  const [days,setDays]=useState(42)
+  const [show,setShow]=useState(false)
+  const [loading,setLoading]=useState(false)
+  function load(d){
+    setLoading(true)
+    api(`/api/analytics/script-funnel?days=${d||days}`).then(setData).catch(()=>setData({error:true})).finally(()=>setLoading(false))
+  }
+  const pct=(a,b)=>b?`${Math.round(a/b*100)}%`:"—"
+  const cols=[
+    ["dials","Dials",null],
+    ["reached","Reached",r=>pct(r.reached,r.dials)],
+    ["gatekeeper","Desk only",null],
+    ["names","Names got",r=>pct(r.names,r.reached)],
+    ["named_dials","Day-2 by name",null],
+    ["dm_reached","DM reached",r=>pct(r.dm_reached,r.named_dials)],
+    ["engaged","Interested",r=>pct(r.engaged,r.dm_reached)],
+    ["renewals","Renewals",null],
+  ]
+  const th={fontSize:9,letterSpacing:".08em",textTransform:"uppercase",color:"#8893b0",fontWeight:700,padding:"6px 8px",textAlign:"right",whiteSpace:"nowrap"}
+  const td={fontSize:12,color:"#dee5ff",padding:"6px 8px",textAlign:"right",fontFamily:"'Space Grotesk',sans-serif",whiteSpace:"nowrap"}
+  const Table=({rows,labelKey,labelHdr})=>(
+    <div style={{overflowX:"auto"}}>
+      <table style={{borderCollapse:"collapse",width:"100%"}}>
+        <thead><tr>
+          <th style={{...th,textAlign:"left"}}>{labelHdr}</th>
+          {cols.map(([k,l])=><th key={k} style={th}>{l}</th>)}
+        </tr></thead>
+        <tbody>
+          {rows.map((r,i)=>(
+            <tr key={i} style={{borderTop:"1px solid #40485d20"}}>
+              <td style={{...td,textAlign:"left",color:"#c9d2ee"}}>{r[labelKey]}</td>
+              {cols.map(([k,,rate])=>(
+                <td key={k} style={td}>
+                  <span style={{color:r[k]?"#dee5ff":"#40485d"}}>{r[k]}</span>
+                  {rate&&r[k]>0&&<span style={{fontSize:10,color:"#69f6b8",marginLeft:5}}>{rate(r)}</span>}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+  return (
+    <div style={{background:"#0f1930",borderRadius:16,overflow:"hidden",marginTop:24,border:"1px solid #7dd3fc20"}}>
+      <div onClick={()=>{setShow(s=>!s); if(!data) load()}}
+        style={{padding:"16px 24px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,color:"#dee5ff",fontSize:15}}>📇 Script funnel — names → decision-maker conversations</div>
+          <div style={{fontSize:11,color:"#a3aac4",marginTop:2}}>Dials → desk reached → name captured → day-2 call by name → DM reached → interested · renewals captured.</div>
+        </div>
+        <span style={{color:"#40485d"}}>{show?"▾":"▸"}</span>
+      </div>
+      {show&&(
+        <div style={{padding:"0 24px 22px"}}>
+          <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:12}}>
+            {[28,42,90,180].map(d=>(
+              <button key={d} onClick={()=>{setDays(d);load(d)}}
+                style={{fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",
+                  border:`1px solid ${days===d?"#7dd3fc":"#40485d40"}`,background:days===d?"#7dd3fc22":"transparent",color:days===d?"#7dd3fc":"#a3aac4"}}>
+                {d}d</button>
+            ))}
+            {loading&&<span style={{fontSize:11,color:"#5a6a8a"}}>loading…</span>}
+            <span style={{fontSize:11,color:"#5a6a8a",marginLeft:"auto"}}>Green % = conversion from the previous column</span>
+          </div>
+          {data&&data.error&&<div style={{fontSize:12,color:"#ff8da3"}}>Couldn&apos;t load — try again.</div>}
+          {data&&!data.error&&(
+            <>
+              {data.today&&(
+                <div style={{background:"#060e20",border:"1px solid #40485d30",borderRadius:10,padding:"10px 14px",marginBottom:14,
+                  display:"flex",gap:18,flexWrap:"wrap",fontSize:12,color:"#c9d2ee"}}>
+                  <b style={{color:"#7dd3fc"}}>Today</b>
+                  <span>Names captured <b>{data.today.names}</b></span>
+                  <span>Day-2 by name <b>{data.today.named_dials}</b></span>
+                  <span>DM reached <b>{data.today.dm_reached}</b></span>
+                  <span>Interested <b>{data.today.engaged}</b></span>
+                  <span>Renewals <b>{data.today.renewals}</b></span>
+                </div>
+              )}
+              <div style={{fontSize:10,color:"#8893b0",letterSpacing:".08em",fontWeight:700,marginBottom:6}}>BY WEEK (Mon start)</div>
+              <Table rows={[...(data.weeks||[])].reverse()} labelKey="week" labelHdr="Week of"/>
+              <div style={{fontSize:10,color:"#8893b0",letterSpacing:".08em",fontWeight:700,margin:"16px 0 6px"}}>BY CALLER (last {data.days} days)</div>
+              <Table rows={data.by_caller||[]} labelKey="caller" labelHdr="Caller"/>
+              <div style={{fontSize:11,color:"#5a6a8a",marginTop:12,lineHeight:1.5}}>
+                &ldquo;Names got&rdquo; counts calls stamped <code>DM:</code> by the Who&apos;s in charge strip; &ldquo;Day-2 by name&rdquo; is any later call on
+                a lead whose name was captured on an earlier call. Both start at zero before the 2026-10 script rewrite.
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ReceptivityPanel(){
   const [data,setData]=useState(null)
   const [macro,setMacro]=useState(null)
