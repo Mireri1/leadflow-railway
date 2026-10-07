@@ -6665,6 +6665,111 @@ def is_due_followup(lead: dict, today: str, now_utc: datetime) -> bool:
             pass
     return True
 
+def _note_filter_selfcheck() -> dict:
+    """Run every conditional PATCH write_note_fields() uses against a lead id
+    that cannot exist. A 200 with [] proves the filter syntax and the columns;
+    a 400 names what's wrong BEFORE a real write is attempted."""
+    out = {}
+    for label, flt, body in (
+        ("name", "&and=(or(firstName.is.null,firstName.eq.),or(lastName.is.null,lastName.eq.))", {"firstName": "x"}),
+        ("email", "&or=(email.is.null,email.eq.)", {"email": "x"}),
+        ("dm_phone", "&or=(dm_phone.is.null,dm_phone.eq.)", {"dm_phone": "x"}),
+        ("reach_notes", "&or=(reach_notes.is.null,reach_notes.eq.)", {"reach_notes": "x"}),
+    ):
+        try:
+            r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.-1{flt}",
+                              headers={**SB_HEADERS, "Prefer": "return=representation"}, json=body, timeout=15)
+            out[label] = "ok" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:120]}"
+        except Exception as e:
+            out[label] = f"error: {e}"
+    return out
+
+@app.post("/api/admin/backfill-note-details")
+def backfill_note_details(days: int = 14, dry_run: int = 1, user: str = Depends(verify_admin)):
+    """Read recent call notes into EMPTY lead fields — the names, direct lines,
+    emails and callback info the caller typed into notes before the call form
+    did it for her. dry_run=1 (default) changes nothing and lists every
+    proposed write. A real run uses the same conditional PATCHes as the live
+    path (never overwrites). Corporate mentions are REPORTED only: parking a
+    chain stays a person's decision."""
+    days = max(1, min(int(days or 14), 120))
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
+    today = (datetime.utcnow() + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d")
+    calls = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=id,leadId,outcome,notes,calledAt"
+                           f"&calledAt=gte.{since}&notes=not.is.null&order=id", max_pages=40)
+    # Latest mention wins, field by field (a later note naming the DM beats an
+    # earlier guess). The phone travels with the name it was read alongside.
+    latest = {}
+    for c in calls:
+        lid, note = c.get("leadId"), c.get("notes") or ""
+        if not lid or not note.strip():
+            continue
+        fx = extract_note_details(note, None, today)
+        cur = latest.setdefault(lid, {"src": {}})
+        if fx["name"]:
+            cur.update(name=fx["name"], title=fx["title"], phone=fx["phone"])
+            cur["src"]["name"] = note
+        for k in ("email", "when"):
+            if fx[k]:
+                cur[k] = fx[k]; cur["src"][k] = note
+        if fx["corporate"]:
+            cur["corporate"] = note
+    ids = [str(i) for i in latest]
+    leads = {}
+    for i in range(0, len(ids), 150):
+        chunk = ids[i:i + 150]
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=in.({','.join(chunk)})&select=*",
+                        headers=SB_HEADERS, timeout=30)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"lead read failed: {r.text[:200]}")
+        for l in r.json():
+            leads[l["id"]] = l
+    proposals, corporate = [], []
+    for lid, fx in latest.items():
+        lead = leads.get(lid) or (leads.get(int(lid)) if str(lid).isdigit() else None)
+        if not lead:
+            continue
+        # Same rule as the live path; the lead's own main line is excluded.
+        main = re.sub(r"\D", "", str(lead.get("phone") or ""))[-10:]
+        f = dict(fx)
+        if f.get("phone") and re.sub(r"\D", "", f["phone"])[-10:] == main:
+            f["phone"] = ""
+        fields = note_fields_for_lead(f, lead)
+        if fields:
+            proposals.append({"id": lead["id"], "company": lead.get("company"), "state": lead.get("state"),
+                              "status": lead.get("status"), "set": fields,
+                              "from_note": (fx["src"].get("name") or fx["src"].get("email")
+                                            or fx["src"].get("when") or "")[:160]})
+        if fx.get("corporate") and lead.get("status") not in ("retired", "do_not_contact"):
+            corporate.append({"id": lead["id"], "company": lead.get("company"), "state": lead.get("state"),
+                              "status": lead.get("status"), "note": fx["corporate"][:160]})
+    counts = {}
+    for p_ in proposals:
+        for k in p_["set"]:
+            counts[k] = counts.get(k, 0) + 1
+    out = {"dry_run": bool(dry_run), "days": days, "calls_read": len(calls), "leads_with_details": len(latest),
+           "would_update": len(proposals), "field_counts": counts,
+           "filter_selfcheck": _note_filter_selfcheck(),
+           "proposals": proposals, "corporate_mentions": corporate}
+    if dry_run:
+        return out
+    bad = {k: v for k, v in out["filter_selfcheck"].items() if v != "ok"}
+    applied = failed = 0
+    failures = []
+    for p_ in proposals:
+        fields = {k: v for k, v in p_["set"].items() if not (k in bad)}
+        res = write_note_fields(p_["id"], fields)
+        if res["applied"]:
+            applied += 1
+        if res["failed"]:
+            failed += 1
+            failures.append({"id": p_["id"], "failed": res["failed"]})
+    audit_log(user, "backfill_note_details", "lead", None,
+              {"days": days, "proposed": len(proposals), "applied": applied, "failed": failed,
+               "skipped_fields": list(bad)})
+    out.update(applied=applied, failed=failed, failures=failures[:50], skipped_fields=bad)
+    return out
+
 @app.get("/api/admin/dialer-hour-scores")
 def admin_dialer_hour_scores(recompute: int = 0, user: str = Depends(verify_admin)):
     """What the dialer's best-hour ranking is based on. recompute=1 rescores
@@ -9037,6 +9142,300 @@ def delete_lead(lead_id: str, user: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Details typed into a call note → lead fields (2026-10) ────────────────────
+# Line-for-line mirror of extractNoteDetails() in App.jsx; the two are
+# cross-checked over every note in call_outcomes — keep them in step. Used as
+# the old-browser safety net in log_call and by the admin backfill. Every
+# pattern is ASCII-mode and anchors use \Z, because Python and JS otherwise
+# disagree on Unicode digits/whitespace and on `$` before a trailing newline.
+_NX = re.ASCII
+_NX_I = re.ASCII | re.IGNORECASE
+NOTE_NAME_STOP = set(("I Im I'm Reps Rep Receptionist Reception Front Desk Office Manager Owner Doctor "
+  "She He They We You It Its It's The A An This That There Their His Her Our Your My Someone Somebody Nobody "
+  "Corporate Corp Main National Company Hospital Clinic Dental Urgent Care Medical Center Practice HR "
+  "Today Tomorrow Yesterday Monday Tuesday Wednesday Thursday Friday Saturday Sunday Mon Tue Tues Wed Thu Thur Thurs Fri Sat Sun "
+  "January February March April May June July August September October November December "
+  "Jan Feb Mar Apr Jun Jul Aug Sep Sept Oct Nov Dec AM PM VM LVM Voicemail Left Called Call Callback "
+  "Said Says Gave Asked Not No Yes Ok Okay Decision Maker DM Facilities Facility Maintenance Cleaning Vendor "
+  "Admin Administrator Director Supervisor Lead Assistant Operator Staff Team Nurse Patient Patients "
+  "Mr Mrs Ms Miss Dr Sir Maam Ma'am Number Email Phone Ext Extension Line Direct Next Week Lunch Meeting "
+  "Out Off In On At Is Was Will Would Can Could Should Has Have Had Be Been And But Or So If When Back "
+  "Better Best Gatekeeper Gatekeepers Hung Busy Unavailable Available Please Thanks Thank Hello Hi Bye Sorry "
+  "Spoke Talked Transferred Person Charge Contact Name Billing Insurance Front Calling Sent Send Email Mail "
+  "Using Use Uses Used Cleaner Cleaners Gatekeep Have Need Needs Handled Happy Transfer Signed Just Already Small New "
+  "Makers Doctors Owners People Persons Everyone Anyone Nobody Hospitals Clinics Offices").split())
+NOTE_HONORIFIC_RE = re.compile(r"^(Dr|Mr|Mrs|Ms|Miss)\.?\Z", _NX_I)
+NOTE_NAME_AT_RE = re.compile(r"^((?:(?:Dr|Mr|Mrs|Ms|Miss)\.?\s+)?[A-Z][a-z][A-Za-z'’\-]*(?:\s+[A-Z][a-z][A-Za-z'’\-]*)?)", _NX)
+NOTE_ORG_AFTER_RE = re.compile(r"^\s+(?:hospital|clinic|dental|dentistry|medical|center|care|urgent|health|healthcare|group|office|pharmacy|llc|inc|corp|company|dds|pc|associates|family|regional|memorial|labs?|imaging|surgery|rehab|corporate|corp|headquarters)\b", _NX_I)
+NOTE_NOT_DM_RE = re.compile(r"^\s*,?\s*(?:the\s+|a\s+)?(?:rep|reps|receptionist|front desk|secretary|operator|from hr|in hr|from the front|at the front|from billing|in billing)\b", _NX_I)
+NOTE_CUE_RE = re.compile(r"\b(office manager|practice manager|facilities manager|facility manager|operations manager|general manager|manager|owner|director|administrator|supervisor|decision(?:[- ]?maker)?|dm|(?:the |her |his |their )?name|in charge|ask(?:ed)? for|look(?:ing)? for|contact|spoke (?:with|to)|talked (?:with|to)|speak (?:with|to)|said|says|gave(?: me)?|pass(?:ed)? (?:it |my (?:info|number|information) )?(?:on )?to|transfer(?:red)? (?:me )?to|reach|call|try|with|for|(?:voicemail|vm|mailbox) of)\b(?:\s*,)?(?:\s+(?:is|was|are|will be))?[\s\-–—:,]*", _NX_I)
+NOTE_CUE_TITLE = {"office manager": "Office Manager", "practice manager": "Practice Manager",
+  "facilities manager": "Facilities Manager", "facility manager": "Facilities Manager",
+  "operations manager": "Operations Manager", "general manager": "General Manager", "manager": "Manager",
+  "owner": "Owner", "director": "Director", "administrator": "Administrator", "supervisor": "Supervisor"}
+NOTE_CUE_P1 = re.compile(r"^(?:.*manager|owner|director|administrator|supervisor|decision(?:[- ]?maker)?|dm|(?:the |her |his |their )?name|in charge|ask(?:ed)? for|look(?:ing)? for|contact)\Z", _NX_I)
+NOTE_LEAD_ROLE_RE = re.compile(r"^\s*,?\s*(?:is|was)?\s*(?:the\s+)?(office manager|practice manager|facilities manager|facility manager|operations manager|general manager|manager|owner|director|administrator|supervisor|decision[- ]?maker|dm|person in charge|one in charge|who (?:makes|made|handles|decides|is in charge|does the hiring))\b", _NX_I)
+NOTE_FILLER_RE = re.compile(r"^(?:(?:that|it'?s|it is|its|is|was|to|her|his|their|the|a|my|our)\s+|(?:name|number|cell|cell phone|direct line|direct number|extension|ext|email|contact)\b\s*(?:and\s+(?:name|number)\b)?\s*(?:is|was)?\s*[-:,]?\s*|[\d()\s.\-+]{7,})", _NX_I)
+NOTE_LEAD_FOLLOW_RE = re.compile(r"^(?:\s*\Z|\s*[,\-–—:(]|\s+\d|\s+(?:is|was|will|has|had|'s|’s|isn't|wasn't|won't|can|could|said|says|from|at|on|in|out|off|(?:mon|tue|wed|thu|fri)[a-z]*)\b)", _NX_I)
+_NX_WS_RE = re.compile(r"\s+", _NX)
+_NX_EXOTIC_WS_RE = re.compile("[   -     　﻿]")
+
+def _nx_trim(s: str) -> str:
+    return re.sub(r"^\s+|\s+\Z", "", s, flags=_NX)
+
+def _note_strip_filler(s: str) -> str:
+    while True:
+        prev = s
+        s = NOTE_FILLER_RE.sub("", s, count=1)
+        if s == prev or not s:
+            return s
+
+def _note_name_clean(raw: str) -> str:
+    if not raw:
+        return ""
+    words = [w for w in _NX_WS_RE.split(_nx_trim(raw)) if w != ""]
+    hon = ""
+    if words and NOTE_HONORIFIC_RE.match(words[0]):
+        hon = re.sub(r"\.\Z", "", words.pop(0)) + "."
+    words = [re.sub(r"['’]s\Z", "", w) for w in words]
+    bare = lambda w: re.sub(r"[^A-Za-z']", "", w)
+    words = [w for i, w in enumerate(words) if not (i > 0 and bare(w) in NOTE_NAME_STOP)]
+    if not words or bare(words[0]) in NOTE_NAME_STOP:
+        return ""
+    if any(len(bare(w)) < 2 for w in words):
+        return ""
+    return f"{hon} {words[-1]}" if hon else " ".join(words)
+
+def _note_role_title(s) -> str:
+    k = _nx_trim(_NX_WS_RE.sub(" ", str(s or "").lower().replace("-", " ")))
+    return NOTE_CUE_TITLE.get(k, "")
+
+def _extract_note_name(text: str) -> dict:
+    t = _nx_trim(_NX_WS_RE.sub(" ", str(text or "")))
+    best = None
+    def consider(prio, pos, name, title):
+        nonlocal best
+        if not name:
+            return
+        if best is None or prio < best[0] or (prio == best[0] and pos < best[1]):
+            best = (prio, pos, name, title or "")
+    lead = NOTE_NAME_AT_RE.match(t)
+    if lead:
+        after = t[len(lead.group(1)):]
+        if NOTE_LEAD_FOLLOW_RE.match(after) and not NOTE_NOT_DM_RE.match(after) and not NOTE_ORG_AFTER_RE.match(after):
+            role = NOTE_LEAD_ROLE_RE.match(after)
+            consider(1 if role else 2, 0, _note_name_clean(lead.group(1)),
+                     _note_role_title(role.group(1)) if role else "")
+    for m in NOTE_CUE_RE.finditer(t):
+        cue = m.group(1).lower()
+        rest = _note_strip_filler(t[m.end():])
+        nm = NOTE_NAME_AT_RE.match(rest)
+        if nm:
+            after = rest[len(nm.group(1)):]
+            if not NOTE_NOT_DM_RE.match(after) and not NOTE_ORG_AFTER_RE.match(after):
+                role = NOTE_LEAD_ROLE_RE.match(after)
+                p1 = bool(role) or bool(NOTE_CUE_P1.match(cue))
+                consider(1 if p1 else 2, m.start(), _note_name_clean(nm.group(1)),
+                         _note_role_title(cue) or (_note_role_title(role.group(1)) if role else ""))
+    return {"name": best[2], "title": best[3]} if best else {"name": "", "title": ""}
+
+NOTE_SWITCHBOARD_RE = re.compile(r"\b(?:main|office|front desk|corporate|hospital|headquarters|hq|switchboard|general|company|clinic)\b[^.;\n]{0,15}\Z", _NX_I)
+_NOTE_PHONE_RE = re.compile(r"(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?([2-9]\d{2})[\s.\-]?(\d{4})(?!\d)", _NX)
+
+def _extract_note_phone(text, main_phone, any_line=False) -> str:
+    main = re.sub(r"\D", "", str(main_phone or ""), flags=_NX)[-10:]
+    t = str(text or "")
+    for m in _NOTE_PHONE_RE.finditer(t):
+        if m.group(1) + m.group(2) + m.group(3) == main:
+            continue
+        if not any_line and NOTE_SWITCHBOARD_RE.search(t[max(0, m.start() - 30):m.start()]):
+            continue
+        return f"({m.group(1)}) {m.group(2)}-{m.group(3)}"
+    return ""
+
+_NOTE_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", _NX)
+def _extract_note_email(text) -> str:
+    m = _NOTE_EMAIL_RE.search(str(text or ""))
+    return re.sub(r"\.+\Z", "", m.group(0)).lower() if m else ""
+
+NOTE_WHEN_RE = re.compile(r"\b(?:today|tomorrow|tmrw|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|mon|tue|tues|wed|thu|thur|thurs|fri|mornings?|afternoons?|evenings?|lunch|next week|after (?:an? |\d+)|before \d+|in an? hour|in \d+ (?:min|mins|minutes|hours?)|\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}(?::\d{2})?\s*(?:-|to)\s*\d{1,2}(?::\d{2})?(?!\s*(?:hours?|hrs?|days?|min|mins|minutes|weeks?|months?|years?))|ext\.?\s*\d+|extension\s*\d+)\b", _NX_I)
+NOTE_OWN_ACTION_RE = re.compile(r"\b(?:i|we)\s+(?:called|left|lvm|emailed|sent|texted|will call|am calling)\b|\blvm\b|\bvm\b|voicemail|hung up", _NX_I)
+NOTE_STALE_RE = re.compile(r"\b(?:today|in an? hour|in \d+ (?:min|mins|minutes|hours?)|after (?:an hour|\d+ (?:min|mins|minutes|hours?)))\b", _NX_I)
+_NOTE_SAID_RE = re.compile(r"^(?:(?:the )?reps?|she|he|they|receptionist)\s+(?:said|says|told me)\s*(?:that\s*)?[-–:,]?\s*", _NX_I)
+_NOTE_PHONE_STRIP_RE = re.compile(r"(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]?[2-9]\d{2}[\s.\-]?\d{4}(?!\d)", _NX)
+
+def _extract_note_when(text) -> str:
+    src = re.sub(r"\b(Dr|Mr|Mrs|Ms|St)\.", r"\1", str(text or ""), flags=_NX)
+    parts = [_nx_trim(_NX_WS_RE.sub(" ", p)) for p in re.split(r"[.;!?\n]+", src)]
+    parts = [p for p in parts if p]
+    hits = [p for p in parts if NOTE_WHEN_RE.search(NOTE_STALE_RE.sub(" ", p)) and not NOTE_OWN_ACTION_RE.search(p)]
+    if not hits:
+        return ""
+    w = _NOTE_SAID_RE.sub("", " · ".join(hits[:2]), count=1)
+    w = _nx_trim(_NX_WS_RE.sub(" ", _NOTE_PHONE_STRIP_RE.sub("", w)))
+    return re.sub(r"\s+\Z", "", w[:99], flags=_NX) + "…" if len(w) > 100 else w
+
+NOTE_CB_DAY_RE = re.compile(r"\b(?:call(?:\s*back)?|callback|call-back|cb|try(?:\s*again)?|back|available|reach|in the office|returns?|come in)\b(?:\s+(?!(?:on|in|after|until|by|around|at|next)\b)[A-Za-z'’]+)?(?:\s+(?:on|in|after|until|by|around|at|next))?\s+(today|tomorrow|tmrw|monday|tuesday|wednesday|thursday|friday)\b", _NX_I)
+NOTE_NEG_RE = re.compile(r"\b(?:not|isn't|wasn't|won't|isnt|wont|off|out|never|no)\s*\Z", _NX_I)
+
+def _extract_note_callback_day(text) -> str:
+    t = str(text or "")
+    for m in NOTE_CB_DAY_RE.finditer(t):
+        if NOTE_NEG_RE.search(t[max(0, m.start() - 16):m.start()]):
+            continue
+        d = m.group(1).lower()
+        return "tomorrow" if d == "tmrw" else d
+    return ""
+
+NOTE_VENDOR_RULES = [
+    ("In-House Staff", re.compile(r"\b(?:in[- ]house|do (?:their|our|the|its) own clean|own (?:cleaning |janitorial )?(?:staff|crew|team|janitor)|clean (?:it )?(?:themselves|ourselves))", _NX_I)),
+    ("Open to Options", re.compile(r"\b(?:open to (?:a |new |other |options|quotes?|bids?|proposals?|changing|switching)|looking for (?:a |new )?(?:cleaning|vendor|quotes?|bids?)|(?:want|would like) (?:a )?(?:quote|bid|proposal))", _NX_I)),
+    ("No Vendor", re.compile(r"\b(?:(?:don't|do not|doesn't|does not) have (?:a |any )?(?:cleaning (?:company|service|vendor)|cleaners?|vendor|janitorial)|no (?:cleaning )?(?:vendor|cleaners?|cleaning (?:company|service)))\b", _NX_I)),
+    ("Happy with Current", re.compile(r"\b(?:(?:happy|satisfied|content|good) with (?:the |their |our )?(?:current |existing )?(?:vendor|cleaning|cleaners?|company|service|provider|janitorial)|(?:have|has|got) (?:a |an |their |someone |somebody )?(?:own )?(?:cleaning (?:company|service|vendor|crew)|cleaners?|vendor|janitorial)|(?:have|has) someone (?:do|doing|for|that does) (?:the )?clean|under (?:a )?contract|(?:new|signed a) contract)", _NX_I)),
+]
+def _extract_note_vendor(text) -> str:
+    t = str(text or "")
+    for label, rx in NOTE_VENDOR_RULES:
+        m = rx.search(t)
+        if m and not NOTE_NEG_RE.search(t[max(0, m.start() - 16):m.start()]):
+            return label
+    return ""
+
+NOTE_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+NOTE_CONTRACT_RE = re.compile(r"\bcontract\b[^.;\n]{0,30}?\b(?:ends?|ending|is up|up|expires?|expiring|until|thru|through|renews?|renewal|runs? (?:out|through|until))\b(?:\s+(?:in|on|at|around|by|of))?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b(?:\s*,?\s*(20\d\d))?", _NX_I)
+def _extract_note_contract_end(text, today_ymd) -> str:
+    m = NOTE_CONTRACT_RE.search(str(text or ""))
+    if not m:
+        return ""
+    mon = NOTE_MONTHS.index(m.group(1)[:3].lower()) + 1
+    ty, tm = int(str(today_ymd)[:4]), int(str(today_ymd)[5:7])
+    y = int(m.group(2)) if m.group(2) else (ty if mon > tm else ty + 1)
+    if not (ty <= y <= ty + 6):
+        return ""
+    return f"{y}-{mon:02d}"
+
+NOTE_CORPORATE_RE = re.compile(r"\bcorporate\b[^.;\n]{0,40}?\b(?:handl|decid|decision|take|takes|manag|does|do\b|in charge|contract|choose|pick|responsible)|\b(?:handled|decided|managed|done|chosen|contracted)\s+(?:by|at|through)\s+(?:the\s+|our\s+)?(?:corporate|head ?office|headquarters|hq|main office)|\bhead ?office (?:handl|decid|does)|\bnational company\b", _NX_I)
+
+def extract_note_details(note, lead=None, today_ymd: str = "") -> dict:
+    """Never raises — note parsing must never touch a call save."""
+    empty = {"name": "", "title": "", "phone": "", "email": "", "when": "", "cbDay": "",
+             "vendor": "", "contractEnds": "", "corporate": False, "hqPhone": ""}
+    try:
+        text = _NX_EXOTIC_WS_RE.sub(" ", str(note or ""))
+        if not _nx_trim(text):
+            return empty
+        nm = _extract_note_name(text)
+        co_word = re.search(r"[a-z][a-z'’]*", str((lead or {}).get("company") or "").lower())
+        if nm["name"] and not re.search(r"\s", nm["name"], _NX) and co_word and co_word.group(0) == nm["name"].lower():
+            nm = {"name": "", "title": ""}
+        main = (lead or {}).get("phone")
+        corp = bool(NOTE_CORPORATE_RE.search(text))
+        return {
+            "name": nm["name"], "title": nm["title"],
+            "phone": _extract_note_phone(text, main) if nm["name"] else "",
+            "email": _extract_note_email(text),
+            "when": _extract_note_when(text),
+            "cbDay": _extract_note_callback_day(text),
+            "vendor": _extract_note_vendor(text),
+            "contractEnds": _extract_note_contract_end(text, today_ymd) if today_ymd else "",
+            "corporate": corp,
+            "hqPhone": _extract_note_phone(text, main, True) if corp else "",
+        }
+    except Exception as e:
+        print(f"[NOTE-EXTRACT] failed, ignoring: {e}")
+        return empty
+
+def split_person_name(full: str):
+    """'Tanisha Brooks' → ('Tanisha','Brooks'); 'Dr. Webb' → ('Dr. Webb','') —
+    the script says "Hey, is <firstName> around?", and "is Dr. around?" is
+    what the plain split produced. Mirrors splitPersonName() in App.jsx."""
+    parts = [w for w in re.split(r"\s+", (full or "").strip()) if w]
+    if not parts:
+        return "", ""
+    if len(parts) >= 2 and re.match(r"^(Dr|Mr|Mrs|Ms|Miss)\.?\Z", parts[0], re.I):
+        return " ".join(parts), ""
+    return parts[0], " ".join(parts[1:])
+
+def note_fields_for_lead(fx: dict, lead: dict) -> dict:
+    """Which extracted details may be written to THIS lead: only into fields
+    that are empty, and only columns the row actually has (dm_phone 009,
+    reach_notes 010 may not be migrated yet)."""
+    lead = lead or {}
+    out = {}
+    has = lambda k: bool(str(lead.get(k) or "").strip())
+    if fx.get("name") and not has("firstName") and not has("lastName"):
+        out["name"] = fx["name"]
+        if fx.get("title") and not has("title"):
+            out["title"] = fx["title"]
+    if fx.get("email") and not has("email"):
+        out["email"] = fx["email"]
+    if fx.get("phone") and "dm_phone" in lead and not has("dm_phone"):
+        out["dm_phone"] = fx["phone"]
+    if fx.get("when") and "reach_notes" in lead and not has("reach_notes"):
+        out["reach_notes"] = fx["when"]
+    return out
+
+def write_note_fields(lead_id, fields: dict) -> dict:
+    """Conditional PATCHes — each carries a filter that the target column is
+    still empty, so a value someone saved a moment ago is never overwritten,
+    even under a race. One PATCH per group so a missing column only loses its
+    own field. Never raises. Returns {"applied": {...}, "failed": [...]}."""
+    applied, failed = {}, []
+    if not lead_id or not fields:
+        return {"applied": applied, "failed": failed}
+    base = f"{SUPABASE_URL}/rest/v1/leads?id=eq.{int(lead_id)}"
+    hdr = {**SB_HEADERS, "Prefer": "return=representation"}
+    now = datetime.utcnow().isoformat()
+    def cond_patch(flt, body, label):
+        try:
+            r = req_lib.patch(base + flt, headers=hdr, json={**body, "updatedAt": now}, timeout=15)
+            if r.status_code == 200:
+                try:
+                    rows = r.json()
+                except Exception:
+                    rows = []
+                if rows:
+                    applied.update(body)
+                return
+            failed.append(label)
+            print(f"[NOTE-FIELDS] lead {lead_id} {label}: HTTP {r.status_code} {r.text[:160]}")
+        except Exception as e:
+            failed.append(label)
+            print(f"[NOTE-FIELDS] lead {lead_id} {label}: {e}")
+    if fields.get("name"):
+        first, last = split_person_name(fields["name"])
+        body = {"firstName": first, "lastName": last}
+        if fields.get("title"):
+            body["title"] = fields["title"]
+        cond_patch("&and=(or(firstName.is.null,firstName.eq.),or(lastName.is.null,lastName.eq.))", body, "name")
+    if fields.get("email"):
+        cond_patch("&or=(email.is.null,email.eq.)", {"email": fields["email"]}, "email")
+    if fields.get("dm_phone"):
+        cond_patch("&or=(dm_phone.is.null,dm_phone.eq.)", {"dm_phone": fields["dm_phone"]}, "dm_phone")
+    if fields.get("reach_notes"):
+        cond_patch("&or=(reach_notes.is.null,reach_notes.eq.)", {"reach_notes": fields["reach_notes"]}, "reach_notes")
+    return {"applied": applied, "failed": failed}
+
+def _note_safety_net(lead_id, lead_full: dict, notes: str, call_id=None):
+    """log_call for a client that did NOT read the note itself (an old browser
+    bundle, or another API caller). Fills empty lead fields from the note and
+    stamps "DM: <name> ·" on the call so the script funnel counts it. Never
+    raises — this must not be able to fail a call save."""
+    try:
+        if not (notes or "").strip():
+            return
+        today = (datetime.utcnow() + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d")
+        fx = extract_note_details(notes, lead_full, today)
+        res = write_note_fields(lead_id, note_fields_for_lead(fx, lead_full))
+        if res["applied"].get("firstName") and call_id:
+            name = " ".join(x for x in (res["applied"].get("firstName"), res["applied"].get("lastName")) if x)
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{int(call_id)}",
+                          headers=SB_HEADERS, json={"notes": f"DM: {name} · {notes}"}, timeout=10)
+        if res["applied"] or res["failed"]:
+            print(f"[NOTE-NET] lead {lead_id}: applied={list(res['applied'])} failed={res['failed']}")
+    except Exception as e:
+        print(f"[NOTE-NET] lead {lead_id}: {e}")
+
 @app.post("/api/calls")
 def log_call(call: dict, user: str = Depends(verify_token)):
     try:
@@ -9050,6 +9449,11 @@ def log_call(call: dict, user: str = Depends(verify_token)):
         # Pop the email-followup flag — Supabase's call_outcomes table doesn't
         # have a column for it; we use the local var only for the trigger logic.
         send_email_followup = bool(call.pop("send_email_followup", False))
+        # Current clients read the note into the lead themselves (respecting
+        # her ✕). No marker = an old bundle → the server safety net does it.
+        # Popped here: call_outcomes has no such column and would reject the
+        # whole insert.
+        client_read_note = bool(call.pop("note_capture", None))
         flags = []
 
         # Prefer the CARRIER's talk time over the modal timer. This is what
@@ -9249,6 +9653,9 @@ def log_call(call: dict, user: str = Depends(verify_token)):
                     _notify_walkthrough_client_call(appt, call, caller, lead_full)
             except Exception as e:
                 print(f"[APPT-CALL] relay failed for lead {lead_id}: {e}")
+
+            if not client_read_note and lead_full:
+                _note_safety_net(lead_id, lead_full, call.get("notes") or "", _new_call_id)
 
             # Email follow-up trigger. Two paths:
             #   (a) Caller checked "Send follow-up email" in the modal → fire now,

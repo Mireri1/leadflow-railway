@@ -1967,6 +1967,223 @@ function TallyStrip({quota, compact=false}){
   )
 }
 
+// ─── Details typed into a call note → lead fields (2026-10) ───────────────────
+// Cristine writes what the desk tells her straight into the note — "reps said
+// Pamela 573-761-0458 is the decision maker", "Tammy is not in today, back
+// tomorrow", "corporate handles the cleaning", "send an email to maya@…".
+// On Oct 7 not one of 16 names reached the lead, because the 👤 fields sit
+// elsewhere in the form. Instead of retraining her, CallModal reads the note
+// as she types and fills the EMPTY fields it can (she sees each as a chip and
+// can drop it). Pure and module-level: mirrored line-for-line by
+// extract_note_details() in backend/main.py (old-bundle safety net + backfill)
+// and cross-checked against every note in call_outcomes. Keep them in step.
+const NOTE_NAME_STOP = new Set(("I Im I'm Reps Rep Receptionist Reception Front Desk Office Manager Owner Doctor "+
+  "She He They We You It Its It's The A An This That There Their His Her Our Your My Someone Somebody Nobody "+
+  "Corporate Corp Main National Company Hospital Clinic Dental Urgent Care Medical Center Practice HR "+
+  "Today Tomorrow Yesterday Monday Tuesday Wednesday Thursday Friday Saturday Sunday Mon Tue Tues Wed Thu Thur Thurs Fri Sat Sun "+
+  "January February March April May June July August September October November December "+
+  "Jan Feb Mar Apr Jun Jul Aug Sep Sept Oct Nov Dec AM PM VM LVM Voicemail Left Called Call Callback "+
+  "Said Says Gave Asked Not No Yes Ok Okay Decision Maker DM Facilities Facility Maintenance Cleaning Vendor "+
+  "Admin Administrator Director Supervisor Lead Assistant Operator Staff Team Nurse Patient Patients "+
+  "Mr Mrs Ms Miss Dr Sir Maam Ma'am Number Email Phone Ext Extension Line Direct Next Week Lunch Meeting "+
+  "Out Off In On At Is Was Will Would Can Could Should Has Have Had Be Been And But Or So If When Back "+
+  "Better Best Gatekeeper Gatekeepers Hung Busy Unavailable Available Please Thanks Thank Hello Hi Bye Sorry "+
+  "Spoke Talked Transferred Person Charge Contact Name Billing Insurance Front Calling Sent Send Email Mail "+
+  "Using Use Uses Used Cleaner Cleaners Gatekeep Have Need Needs Handled Happy Transfer Signed Just Already Small New "+
+  "Makers Doctors Owners People Persons Everyone Anyone Nobody Hospitals Clinics Offices").split(/\s+/))
+const NOTE_HONORIFIC_RE = /^(Dr|Mr|Mrs|Ms|Miss)\.?$/i
+const NOTE_NAME_AT_RE = /^((?:(?:Dr|Mr|Mrs|Ms|Miss)\.?\s+)?[A-Z][a-z][A-Za-z'’\-]*(?:\s+[A-Z][a-z][A-Za-z'’\-]*)?)/
+// "call Carson Tahoe Hospital" — a business name, not a person.
+const NOTE_ORG_AFTER_RE = /^\s+(?:hospital|clinic|dental|dentistry|medical|center|care|urgent|health|healthcare|group|office|pharmacy|llc|inc|corp|company|dds|pc|associates|family|regional|memorial|labs?|imaging|surgery|rehab|corporate|corp|headquarters)\b/i
+// Someone who is NOT the decision-maker: "Brianna, the rep", "Nick from HR".
+const NOTE_NOT_DM_RE = /^\s*,?\s*(?:the\s+|a\s+)?(?:rep|reps|receptionist|front desk|secretary|operator|from hr|in hr|from the front|at the front|from billing|in billing)\b/i
+// Cue → (priority, title). Priority 1 = the cue DEFINES the decision-maker,
+// 2 = the name is merely mentioned. Lower wins; ties go to the earliest.
+const NOTE_CUE_RE = /\b(office manager|practice manager|facilities manager|facility manager|operations manager|general manager|manager|owner|director|administrator|supervisor|decision(?:[- ]?maker)?|dm|(?:the |her |his |their )?name|in charge|ask(?:ed)? for|look(?:ing)? for|contact|spoke (?:with|to)|talked (?:with|to)|speak (?:with|to)|said|says|gave(?: me)?|pass(?:ed)? (?:it |my (?:info|number|information) )?(?:on )?to|transfer(?:red)? (?:me )?to|reach|call|try|with|for|(?:voicemail|vm|mailbox) of)\b(?:\s*,)?(?:\s+(?:is|was|are|will be))?[\s\-–—:,]*/gi
+const NOTE_CUE_TITLE = {"office manager":"Office Manager","practice manager":"Practice Manager",
+  "facilities manager":"Facilities Manager","facility manager":"Facilities Manager",
+  "operations manager":"Operations Manager","general manager":"General Manager","manager":"Manager",
+  "owner":"Owner","director":"Director","administrator":"Administrator","supervisor":"Supervisor"}
+const NOTE_CUE_P1 = /^(?:.*manager|owner|director|administrator|supervisor|decision(?:[- ]?maker)?|dm|(?:the |her |his |their )?name|in charge|ask(?:ed)? for|look(?:ing)? for|contact)$/i
+// "Tammy is the decision maker", "Kam, the manager", "Linda is the owner".
+const NOTE_LEAD_ROLE_RE = /^\s*,?\s*(?:is|was)?\s*(?:the\s+)?(office manager|practice manager|facilities manager|facility manager|operations manager|general manager|manager|owner|director|administrator|supervisor|decision[- ]?maker|dm|person in charge|one in charge|who (?:makes|made|handles|decides|is in charge|does the hiring))\b/i
+// Filler between a cue and the name: "said that Tanisha", "its Tracey",
+// "gave his number 6144841940 William Allen".
+const NOTE_FILLER_RE = /^(?:(?:that|it'?s|it is|its|is|was|to|her|his|their|the|a|my|our)\s+|(?:name|number|cell|cell phone|direct line|direct number|extension|ext|email|contact)\b\s*(?:and\s+(?:name|number)\b)?\s*(?:is|was)?\s*[-:,]?\s*|[\d()\s.\-+]{7,})/i
+function noteStripFiller(s){
+  let prev
+  do{ prev = s; s = s.replace(NOTE_FILLER_RE,"") }while(s!==prev && s)
+  return s
+}
+// A note that OPENS with the name: "Tammy is not in today", "Fhuong Lee Monday…".
+const NOTE_LEAD_FOLLOW_RE = /^(?:\s*$|\s*[,\-–—:(]|\s+\d|\s+(?:is|was|will|has|had|'s|’s|isn't|wasn't|won't|can|could|said|says|from|at|on|in|out|off|(?:mon|tue|wed|thu|fri)[a-z]*)\b)/i
+
+function noteNameClean(raw){
+  if(!raw) return ""
+  let words = raw.trim().split(/\s+/)
+  const hon = NOTE_HONORIFIC_RE.test(words[0]) ? words.shift().replace(/\.$/,"")+"." : ""
+  words = words.map(w=>w.replace(/['’]s$/,""))                    // "Brent's number" → Brent
+  const bare = w => w.replace(/[^A-Za-z']/g,"")
+  words = words.filter((w,i)=>!(i>0 && NOTE_NAME_STOP.has(bare(w))))
+  if(!words.length || NOTE_NAME_STOP.has(bare(words[0]))) return ""
+  if(words.some(w=>bare(w).length<2)) return ""
+  return hon ? `${hon} ${words[words.length-1]}` : words.join(" ")   // doctors go by "Dr. <Last>"
+}
+function noteRoleTitle(s){ const k=String(s||"").toLowerCase().replace(/-/g," ").replace(/\s+/g," ").trim(); return NOTE_CUE_TITLE[k]||"" }
+
+function extractNoteName(text){
+  const t = String(text||"").replace(/\s+/g," ").trim()
+  let best = null
+  const consider = (prio, pos, name, title) => {
+    if(!name) return
+    if(!best || prio<best.prio || (prio===best.prio && pos<best.pos)) best = {prio, pos, name, title:title||""}
+  }
+  const lead = t.match(NOTE_NAME_AT_RE)
+  if(lead){
+    const after = t.slice(lead[1].length)
+    if(NOTE_LEAD_FOLLOW_RE.test(after) && !NOTE_NOT_DM_RE.test(after) && !NOTE_ORG_AFTER_RE.test(after)){
+      const role = after.match(NOTE_LEAD_ROLE_RE)
+      consider(role?1:2, 0, noteNameClean(lead[1]), role?noteRoleTitle(role[1]):"")
+    }
+  }
+  NOTE_CUE_RE.lastIndex = 0
+  let m
+  while((m = NOTE_CUE_RE.exec(t))){
+    const cue = m[1].toLowerCase()
+    const rest = noteStripFiller(t.slice(m.index+m[0].length))
+    const nm = rest.match(NOTE_NAME_AT_RE)
+    if(nm){
+      const after = rest.slice(nm[1].length)
+      if(!NOTE_NOT_DM_RE.test(after) && !NOTE_ORG_AFTER_RE.test(after)){
+        const role = after.match(NOTE_LEAD_ROLE_RE)        // "Tanisha, the decision maker"
+        const p1 = !!role || NOTE_CUE_P1.test(cue)
+        consider(p1?1:2, m.index, noteNameClean(nm[1]), noteRoleTitle(cue) || (role?noteRoleTitle(role[1]):""))
+      }
+    }
+    if(m[0].length===0) NOTE_CUE_RE.lastIndex++
+  }
+  return best ? {name:best.name, title:best.title} : {name:"", title:""}
+}
+
+// "call the main (775) 445-8000", "hospital number 573…" — a switchboard, not the DM's line.
+const NOTE_SWITCHBOARD_RE = /\b(?:main|office|front desk|corporate|hospital|headquarters|hq|switchboard|general|company|clinic)\b[^.;\n]{0,15}$/i
+function extractNotePhone(text, mainPhone, anyLine){
+  const main = String(mainPhone||"").replace(/\D/g,"").slice(-10)
+  const re = /(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?([2-9]\d{2})[\s.\-]?(\d{4})(?!\d)/g
+  let m
+  const t = String(text||"")
+  while((m = re.exec(t))){
+    if(m[1]+m[2]+m[3]===main) continue
+    if(!anyLine && NOTE_SWITCHBOARD_RE.test(t.slice(Math.max(0,m.index-30), m.index))) continue
+    return `(${m[1]}) ${m[2]}-${m[3]}`
+  }
+  return ""
+}
+function extractNoteEmail(text){
+  const m = String(text||"").match(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/)
+  return m ? m[0].replace(/\.+$/,"").toLowerCase() : ""
+}
+
+// When to reach them — the sentence that carries a day/time, minus our own actions.
+const NOTE_WHEN_RE = /\b(?:today|tomorrow|tmrw|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|mon|tue|tues|wed|thu|thur|thurs|fri|mornings?|afternoons?|evenings?|lunch|next week|after (?:an? |\d+)|before \d+|in an? hour|in \d+ (?:min|mins|minutes|hours?)|\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}(?::\d{2})?\s*(?:-|to)\s*\d{1,2}(?::\d{2})?(?!\s*(?:hours?|hrs?|days?|min|mins|minutes|weeks?|months?|years?))|ext\.?\s*\d+|extension\s*\d+)\b/i
+// Only true on the day it was written — never a standing "how to reach them".
+const NOTE_STALE_RE = /\b(?:today|in an? hour|in \d+ (?:min|mins|minutes|hours?)|after (?:an hour|\d+ (?:min|mins|minutes|hours?)))\b/gi
+const NOTE_OWN_ACTION_RE = /\b(?:i|we)\s+(?:called|left|lvm|emailed|sent|texted|will call|am calling)\b|\blvm\b|\bvm\b|voicemail|hung up/i
+function extractNoteWhen(text){
+  const parts = String(text||"").replace(/\b(Dr|Mr|Mrs|Ms|St)\./g,"$1").split(/[.;!?\n]+/).map(s=>s.replace(/\s+/g," ").trim()).filter(Boolean)
+  const hits = parts.filter(s=>NOTE_WHEN_RE.test(s.replace(NOTE_STALE_RE," ")) && !NOTE_OWN_ACTION_RE.test(s))
+  if(!hits.length) return ""
+  let w = hits.slice(0,2).join(" · ").replace(/^(?:(?:the )?reps?|she|he|they|receptionist)\s+(?:said|says|told me)\s*(?:that\s*)?[-–:,]?\s*/i,"")
+  w = w.replace(/(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]?[2-9]\d{2}[\s.\-]?\d{4}(?!\d)/g,"").replace(/\s+/g," ").trim()
+  const cps = Array.from(w)                      // code points, so "100" means the same in Python
+  return cps.length>100 ? cps.slice(0,99).join("").replace(/\s+$/,"")+"…" : w
+}
+
+// The day she was told to ring back on, if the note states one outright.
+const NOTE_CB_DAY_RE = /\b(?:call(?:\s*back)?|callback|call-back|cb|try(?:\s*again)?|back|available|reach|in the office|returns?|come in)\b(?:\s+(?!(?:on|in|after|until|by|around|at|next)\b)[A-Za-z'’]+)?(?:\s+(?:on|in|after|until|by|around|at|next))?\s+(today|tomorrow|tmrw|monday|tuesday|wednesday|thursday|friday)\b/gi
+const NOTE_NEG_RE = /\b(?:not|isn't|wasn't|won't|isnt|wont|off|out|never|no)\s*$/i
+function extractNoteCallbackDay(text){
+  const t = String(text||"")
+  NOTE_CB_DAY_RE.lastIndex = 0
+  let m
+  while((m = NOTE_CB_DAY_RE.exec(t))){
+    if(NOTE_NEG_RE.test(t.slice(Math.max(0,m.index-16), m.index))) continue
+    const d = m[1].toLowerCase()
+    return d==="tmrw" ? "tomorrow" : d
+  }
+  return ""
+}
+
+// Vendor Status qual chip — only the unambiguous phrasings.
+const NOTE_VENDOR_RULES = [
+  ["In-House Staff", /\b(?:in[- ]house|do (?:their|our|the|its) own clean|own (?:cleaning |janitorial )?(?:staff|crew|team|janitor)|clean (?:it )?(?:themselves|ourselves))/i],
+  ["Open to Options", /\b(?:open to (?:a |new |other |options|quotes?|bids?|proposals?|changing|switching)|looking for (?:a |new )?(?:cleaning|vendor|quotes?|bids?)|(?:want|would like) (?:a )?(?:quote|bid|proposal))/i],
+  ["No Vendor", /\b(?:(?:don't|do not|doesn't|does not) have (?:a |any )?(?:cleaning (?:company|service|vendor)|cleaners?|vendor|janitorial)|no (?:cleaning )?(?:vendor|cleaners?|cleaning (?:company|service)))\b/i],
+  ["Happy with Current", /\b(?:(?:happy|satisfied|content|good) with (?:the |their |our )?(?:current |existing )?(?:vendor|cleaning|cleaners?|company|service|provider|janitorial)|(?:have|has|got) (?:a |an |their |someone |somebody )?(?:own )?(?:cleaning (?:company|service|vendor|crew)|cleaners?|vendor|janitorial)|(?:have|has) someone (?:do|doing|for|that does) (?:the )?clean|under (?:a )?contract|(?:new|signed a) contract)/i],
+]
+function extractNoteVendor(text){
+  const t = String(text||"")
+  for(const [label, re] of NOTE_VENDOR_RULES){
+    const m = t.match(re)
+    // "Not looking for a cleaning vendor" is not Open to Options.
+    if(m && !NOTE_NEG_RE.test(t.slice(Math.max(0,m.index-16), m.index))) return label
+  }
+  return ""
+}
+
+// "contract is up in March" → "2027-03" (the next such month).
+const NOTE_MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
+const NOTE_CONTRACT_RE = /\bcontract\b[^.;\n]{0,30}?\b(?:ends?|ending|is up|up|expires?|expiring|until|thru|through|renews?|renewal|runs? (?:out|through|until))\b(?:\s+(?:in|on|at|around|by|of))?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b(?:\s*,?\s*(20\d\d))?/i
+function extractNoteContractEnd(text, todayYmd){
+  const m = String(text||"").match(NOTE_CONTRACT_RE)
+  if(!m) return ""
+  const mon = NOTE_MONTHS.indexOf(m[1].slice(0,3).toLowerCase())+1
+  const ty = Number(String(todayYmd).slice(0,4)), tm = Number(String(todayYmd).slice(5,7))
+  let y = m[2] ? Number(m[2]) : (mon > tm ? ty : ty+1)
+  if(!(y>=ty && y<=ty+6)) return ""
+  return `${y}-${String(mon).padStart(2,"0")}`
+}
+
+const NOTE_CORPORATE_RE = /\bcorporate\b[^.;\n]{0,40}?\b(?:handl|decid|decision|take|takes|manag|does|do\b|in charge|contract|choose|pick|responsible)|\b(?:handled|decided|managed|done|chosen|contracted)\s+(?:by|at|through)\s+(?:the\s+|our\s+)?(?:corporate|head ?office|headquarters|hq|main office)|\bhead ?office (?:handl|decid|does)|\bnational company\b/i
+
+function extractNoteDetails(note, lead, todayYmd){
+  const empty = {name:"",title:"",phone:"",email:"",when:"",cbDay:"",vendor:"",contractEnds:"",corporate:false,hqPhone:""}
+  try{
+    // Exotic spaces → " " first, so every \s below means the same thing here
+    // and in the Python mirror (JS and Python disagree on Unicode whitespace).
+    const text = String(note||"").replace(/[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/g," ")
+    if(!text.trim()) return empty
+    let {name, title} = extractNoteName(text)
+    // "it's the Petco corporate decision" — a one-word "name" that is the
+    // company's own first word is the business, not a person.
+    const coWord = String((lead&&lead.company)||"").toLowerCase().match(/[a-z][a-z'’]*/)
+    if(name && !/\s/.test(name) && coWord && coWord[0]===name.toLowerCase()){ name=""; title="" }
+    return {
+      name, title,
+      // A number counts as the DM's line only when the note also names them —
+      // "reps gave the number of the main office" is not a direct line.
+      phone: name ? extractNotePhone(text, lead&&lead.phone) : "",
+      email: extractNoteEmail(text),
+      when: extractNoteWhen(text),
+      cbDay: extractNoteCallbackDay(text),
+      vendor: extractNoteVendor(text),
+      contractEnds: todayYmd ? extractNoteContractEnd(text, todayYmd) : "",
+      corporate: NOTE_CORPORATE_RE.test(text),
+      // "corporate handles it … 866-944-6046" → the number to try instead.
+      hqPhone: NOTE_CORPORATE_RE.test(text) ? extractNotePhone(text, lead&&lead.phone, true) : "",
+    }
+  }catch(e){ return empty }      // never let note parsing touch a call save
+}
+
+// "Tanisha Brooks" → ["Tanisha","Brooks"]; "Dr. Webb" → ["Dr. Webb",""]. The
+// script says "Hey, is <firstName> around?" — a plain split made that
+// "is Dr. around?". Mirrors split_person_name() in backend/main.py.
+function splitPersonName(full){
+  const parts=String(full||"").trim().split(/\s+/).filter(Boolean)
+  if(!parts.length) return ["",""]
+  if(parts.length>=2 && /^(Dr|Mr|Mrs|Ms|Miss)\.?$/i.test(parts[0])) return [parts.join(" "),""]
+  return [parts[0], parts.slice(1).join(" ")]
+}
 function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   // Local mirror so the Find-DM button can update the displayed contact info
   // without closing the modal or refetching from the server. lead.id is
@@ -2058,7 +2275,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   // their OWN PATCH — a missing column must only ever fail those two fields.
   function dmPatch(){
     const p={}
-    if(dmNameChanged){ const parts=dmName.trim().split(/\s+/).filter(Boolean); p.firstName=parts[0]||""; p.lastName=parts.slice(1).join(" ") }
+    if(dmNameChanged){ const [f,l]=splitPersonName(dmName); p.firstName=f; p.lastName=l }
     if(dmTitleChanged) p.title=dmTitle.trim()
     if(dmEmailChanged) p.email=dmEmail.trim()
     return p
@@ -2095,9 +2312,10 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   // Gatekeeper → ring back the NEXT business day, by name. The script's step 1
   // on a no-name lead is just "who handles facilities?" + hang up, so the whole
   // value of the call is the name captured above and the next-day retry.
+  const gkAutoCbRef = useRef("")      // the date pickGatekeeper prefilled (still "untouched" if equal)
   function pickGatekeeper(){
     setPrimary("gatekeeper"); setSecondary(""); setCbReason("")
-    setCbDate(d=>d||nextBusinessDay())
+    setCbDate(d=>{ if(d) return d; const v=nextBusinessDay(); gkAutoCbRef.current=v; return v })
     if(!leadFullName) setTimeout(()=>dmNameRef.current&&dmNameRef.current.focus(),0)
   }
 
@@ -2164,6 +2382,96 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   // What step is the user on?
   const step = !primary ? 1 : primary!=="answered" ? 3 : !secondary ? 2 : needsQual&&!hasQualData ? 2.5 : 3
 
+  // 📝 From the note → the fields. See extractNoteDetails(). Rules that make
+  // this safe to run on every keystroke:
+  //   • only ever fills a field that is EMPTY on the lead and that she hasn't
+  //     typed into herself (a value we set is remembered in fxAuto, so we can
+  //     update or withdraw OUR value as the note changes, never hers);
+  //   • every value it sets shows as a chip under the note; tapping ✕ puts the
+  //     field back and stops it re-filling (fxSkip);
+  //   • it only sets state — the save path is the same one her typing uses, so
+  //     a missing column fails exactly as loudly (and no louder) as before.
+  const noteFx = useMemo(()=>extractNoteDetails(notes, lead, localDate()), [notes, lead])
+  const [fxSkip,setFxSkip] = useState({})
+  const fxAuto = useRef({})
+  const cbFromNote = (()=>{
+    const d = noteFx.cbDay
+    if(!d) return ""
+    if(d==="today") return localDate()
+    if(d==="tomorrow") return nextBusinessDay()
+    const dow = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"].indexOf(d)
+    return dow>0 ? nextWeekday(dow) : ""
+  })()
+  useEffect(()=>{
+    // One rule for every field: take it if empty (or still ours), give it back
+    // if the note no longer says it. `allowed` = may this field be filled now.
+    const fill = (key, allowed, value, setter) => {
+      const want = (allowed && !fxSkip[key] && value) ? value : ""
+      setter(cur => {
+        const c = cur==null ? "" : cur
+        const ours = fxAuto.current[key]
+        if(want){
+          if(c==="" || c===ours){ fxAuto.current[key]=want; return want }
+          return c                                         // she typed something — hers wins
+        }
+        if(ours && c===ours){ fxAuto.current[key]=""; return "" }   // note changed — withdraw ours
+        return c
+      })
+    }
+    fill("name",   !leadFullName,                    noteFx.name,  setDmName)
+    fill("title",  !(lead.title||"").trim() && !!noteFx.name, noteFx.title, setDmTitle)
+    fill("email",  !(lead.email||"").trim(),         noteFx.email, setDmEmail)
+    fill("phone",  !(lead.dm_phone||"").trim(),      noteFx.phone, setDmPhone)
+    fill("when",   !(lead.reach_notes||"").trim(),   noteFx.when,  setDmReach)
+    fill("vendor", true,                             noteFx.vendor, setVendor)
+    fill("contract", !(lead.contract_ends||""),      noteFx.contractEnds, setContractEnds)
+    // Callback day: only for outcomes that HAVE a date, and only while the
+    // date is still blank or the gatekeeper default — never over her pick.
+    {
+      const want = ((primary==="gatekeeper"||secondary==="callback") && !fxSkip.cbDate && cbFromNote) ? cbFromNote : ""
+      setCbDate(cur => {
+        const c = cur||"", ours = fxAuto.current.cbDate
+        if(want){
+          if(c==="" || c===ours || c===gkAutoCbRef.current){ fxAuto.current.cbDate=want; return want }
+          return c
+        }
+        if(ours && c===ours){ fxAuto.current.cbDate=""; return gkAutoCbRef.current || "" }
+        return c
+      })
+    }
+    // Corporate: ticks the box (the save still shows the sibling list to
+    // confirm, and Cancel there just saves the call without parking).
+    {
+      const want = (primary==="gatekeeper"||outcome==="not_interested") && !fxSkip.corporate && noteFx.corporate
+      setCorp(cur => {
+        if(want && !cur){ fxAuto.current.corporate=true; return true }
+        if(!want && cur && fxAuto.current.corporate){ fxAuto.current.corporate=false; return false }
+        return cur
+      })
+      fill("hqPhone", want, noteFx.hqPhone, setHqPhone)
+    }
+  },[noteFx, cbFromNote, primary, secondary, outcome, fxSkip, leadFullName,
+     lead.title, lead.email, lead.dm_phone, lead.reach_notes, lead.contract_ends])
+  // Chips: what the note filled in, each with ✕ to drop it.
+  const FX_LABEL = {name:"👤", title:"🏷", email:"✉️", phone:"📱", when:"🕐", vendor:"🧹", contract:"📆 Renews", cbDate:"📅", hqPhone:"🏢 HQ", corporate:"🏢"}
+  const fxCur = {name:dmName, title:dmTitle, email:dmEmail, phone:dmPhone, when:dmReach, vendor:vendorStatus,
+    contract:contractEnds, cbDate:cbDate, hqPhone:hqPhone, corporate:corp}
+  const fxChips = Object.keys(FX_LABEL).filter(k=>{
+    const ours = fxAuto.current[k]
+    return ours && fxCur[k]===ours
+  }).map(k=>({k, text: k==="corporate" ? "Corporate handles cleaning"
+    : k==="cbDate" ? `Call back ${fmtDayShort(cbDate)}`
+    : k==="contract" ? fmtMonth(contractEnds)
+    : String(fxCur[k])}))
+  function dropFx(k){
+    const restore = {name:()=>setDmName(""), title:()=>setDmTitle(""), email:()=>setDmEmail(""), phone:()=>setDmPhone(""),
+      when:()=>setDmReach(""), vendor:()=>setVendor(""), contract:()=>setContractEnds(""), hqPhone:()=>setHqPhone(""),
+      cbDate:()=>setCbDate(gkAutoCbRef.current||""), corporate:()=>setCorp(false)}
+    fxAuto.current[k] = k==="corporate" ? false : ""
+    restore[k]&&restore[k]()
+    setFxSkip(sk=>({...sk,[k]:true}))
+  }
+
   async function log(){
     setModalError("")
     if(!primary){ setModalError("Select what happened on the call."); return }
@@ -2174,7 +2482,12 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     if(primary==="gatekeeper"&&!corpOn&&!confirmFarDate(cbDate,"Follow-up")) return
     // Corporate: show exactly which locations get parked BEFORE anything
     // saves, so a loose name match can't quietly shelve an unrelated business.
-    if(corpOn){
+    // `useCorp` instead of corpOn from here on: when the box was ticked FROM
+    // THE NOTE, Cancel on the sibling list means "just save the call", not
+    // "abort" — she never asked for the park, so she must never lose the save.
+    let useCorp = corpOn
+    const corpFromNote = !!fxAuto.current.corporate
+    if(useCorp){
       let dry
       try{ dry = await api(`/api/leads/${lead.id}/corporate`,{method:"POST",body:JSON.stringify({dry_run:true})}) }
       catch{ setModalError("Couldn't look up other locations — try again."); return }
@@ -2184,7 +2497,16 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         : (names.length
             ? `Corporate handles cleaning — park this lead AND ${dry.count} other open location${dry.count!==1?"s":""}?\n\n${names.slice(0,25).join("\n")}${names.length>25?`\n…and ${names.length-25} more`:""}\n\nNew leads from this chain will be skipped too. Leads already interested or on a callback are never touched.`
             : `No other open locations of this chain found — park this lead, and skip the chain on future imports?`)
-      if(!window.confirm(msg)) return
+      const ask = corpFromNote
+        ? `Your note says corporate handles the cleaning.\n\n${msg}\n\nOK = park them · Cancel = just save this call`
+        : msg
+      if(!window.confirm(ask)){
+        if(!corpFromNote) return
+        useCorp = false
+        fxAuto.current.corporate = false
+        setCorp(false); setFxSkip(sk=>({...sk,corporate:true}))
+        if(primary==="gatekeeper"&&!cbDate){ setModalError("Pick a follow-up date, then save."); return }
+      }
     }
     // Substantiation prompt. A flag Eric reads next week is worth far less than
     // the caller adding one line now, while they still remember the call. This
@@ -2240,7 +2562,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       const callPayload = {
         leadId:lead.id, outcome, notes:fullNotes,
         duration:finalDuration,
-        callbackDate:(secondary==="callback"||(primary==="gatekeeper"&&!corpOn))?cbDate:"",
+        callbackDate:(secondary==="callback"||(primary==="gatekeeper"&&!useCorp))?cbDate:"",
         calledBy:getUser(), calledAt:new Date().toISOString(),
         budgetfocus: budgetFocus||null, vendorstatus: vendorStatus||null,
         decisionmaker: decisionMaker||null, timeline: timeline||null,
@@ -2248,6 +2570,9 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         followupsequence: followUpSeq||null,
         script_id: scriptId ? parseInt(scriptId) : null,
         converted: outcome === "converted",
+        // Tells the server this client already read the note into the lead
+        // (and respected any ✕), so its old-browser safety net stays out.
+        note_capture: "v1",
         // email follow-up is now fully server-side (auto on no-answer/voicemail)
       }
       if(!callPostedRef.current){
@@ -2273,10 +2598,10 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // lead alive, so the lead status becomes `callback` (the call row
       // itself stays not_interested — that is what they said today).
       const renewalCb = (newRenewal && outcome!=="converted") ? renewalCallbackDate(contractEnds) : ""
-      const newCb = corpOn ? ""
+      const newCb = useCorp ? ""
         : (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||renewalCb||"")
       const cbPatch = newCb ? {callbackDate:newCb}
-        : ((corpOn||["not_interested","converted"].includes(outcome)) ? {callbackDate:""} : {})
+        : ((useCorp||["not_interested","converted"].includes(outcome)) ? {callbackDate:""} : {})
       const leadStatus = (outcome==="not_interested" && renewalCb) ? "callback" : (statusMap[outcome]||"called")
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
         status:leadStatus,
@@ -2302,7 +2627,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // chain, save the HQ number. The call itself is already saved, so a
       // failure here keeps the modal open for a retry (callPostedRef guards
       // against a duplicate call row).
-      if(corpOn){
+      if(useCorp){
         try{
           await api(`/api/leads/${lead.id}/corporate`,{method:"POST",
             body:JSON.stringify({dry_run:false,hq_phone:hqPhone.trim()})})
@@ -2932,6 +3257,21 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
               <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{resize:"vertical"}}
                 placeholder={secondary==="callback"?"What did they say? When should you call back?":"Dictate or type — then hit Smart-fill…"}/>
               <NoteAssist getNote={()=>notes} context={{company:lead.company,status:outcome}} onApply={applyAi}/>
+              {fxChips.length>0&&(
+                <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:8}}>
+                  <span style={{fontSize:11,color:"#6b7398"}}>📝 From your note — saving:</span>
+                  {fxChips.map(c=>(
+                    <span key={c.k} title="Read from your note. Tap ✕ if it's wrong."
+                      style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12,padding:"3px 4px 3px 9px",borderRadius:12,
+                        background:"#69f6b812",border:"1px solid #69f6b840",color:"#dee5ff",maxWidth:"100%"}}>
+                      <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:280}}>{FX_LABEL[c.k]} {c.text}</span>
+                      <button type="button" onClick={()=>dropFx(c.k)} aria-label={`Don't save ${c.text}`}
+                        style={{border:"none",background:"#ffffff14",color:"#a3aac4",borderRadius:10,width:18,height:18,
+                          lineHeight:"16px",padding:0,cursor:"pointer",fontSize:11}}>✕</button>
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
             {/* Callback is included deliberately. "I spoke to Trudy, she set the
                 walkthrough for Wednesday" reads as a callback to the caller —

@@ -84,6 +84,32 @@ Supabase columns: `budgetfocus`, `vendorstatus`, `decisionmaker`, `timeline`, `q
 - **`dm_phone` is NOT the switchboard.** `phone` stays UNIQUE (007) and is what dedupe, the dialer queue and the Twilio bridge key on; `dm_phone` is a plain text column, not unique. `POST /api/call/start` accepts an optional `phone` override but only a number already on that lead (`phone` or `dm_phone`, last-10-digit match) — it must never become "dial anything through our Twilio". It reads the lead with `select=*` so it keeps working before 009 runs.
 - **Visibility**: dialer card shows a blue 👤 ASK FOR banner (name + title) under the company and a 📱 Direct line block ABOVE the main line (tel: + ☎️ Call direct); with a direct line on file the opening-line box leads with step 2. Lead rows carry a `👤 ASK FOR <FIRST>` chip first in the chip row and the direct line under the main number; a **👤 Named Contact** quick filter (`namedOnly`) sits beside Needs Another Call. `buildOpener` returns `direct` for this.
 
+### 📝 Notes → lead fields (2026-10 — work around how she writes, don't retrain her)
+- **Why:** Oct 7, 16 of 25 gatekeeper calls named the decision-maker, and 3 gave a direct number. All of it was typed into the call NOTE ("reps said - Pamela 573… is the decision maker", "Tammy is not in today, back tomorrow"), and **0** reached the lead, because the 👤 fields sit elsewhere in the form. Two notes also said "corporate handles the cleaning" without the 🏢 box ticked.
+- **Extractor:** `extractNoteDetails(note, lead, today)` (App.jsx) and `extract_note_details()` (main.py) are **line-for-line mirrors**, pure, never throw. They return name / title / phone / email / when / cbDay / vendor / contractEnds / corporate / hqPhone.
+  - Parity: cross-checked on 24.5k cases (every note in call_outcomes + 5k fuzzed with odd whitespace, Unicode digits and casing) with **0 mismatches**.
+  - Python is ASCII-mode with `\Z` anchors and both sides normalise exotic spaces first. That is what makes them agree; **change both together and re-run the parity check.**
+- **Rules that keep it safe:**
+  - A decision-maker cue (owner / manager / "the name is" / "decision maker") outranks a mere mention ("spoke to").
+  - "Brianna, the rep" / "Nick from HR" are not DMs.
+  - "Carson Tahoe Hospital" and "the Petco corporate decision" are businesses, not people.
+  - A number labelled main / office / hospital / corporate is not a direct line, and a number is only taken when the note also names someone.
+  - Same-day phrases ("off today", "in 30 min", "after an hour") never become standing callback info.
+  - Vendor phrases respect negation ("not looking for a vendor" ≠ Open to Options).
+  - "Dr. Webb" is saved as firstName "Dr. Webb" (`splitPersonName` / `split_person_name`), so the script never says "is Dr. around?".
+- **CallModal:** an effect fills ONLY fields that are empty on the lead AND that she hasn't typed into (`fxAuto` remembers our own values, so they can be updated or withdrawn as the note changes; hers are never touched).
+  - Each value shows as a chip under the note ("📝 From your note — saving:"); ✕ reverts it and `fxSkip` stops it re-filling.
+  - Everything rides the existing save path, including the `DM:` stamp the script funnel counts, the dm_phone/reach_notes PATCH, and the referral email.
+  - The callback day only replaces a blank date or the gatekeeper default, never her pick.
+  - Corporate ticks the box. **Cancel on the sibling list then saves the call without parking it** (she never asked for the park, so she must never lose the save).
+- **Old-browser safety net:** the client sends `note_capture:"v1"` on `POST /api/calls`, and log_call pops it before the insert.
+  - Without it (a stale bundle, or another API caller), `_note_safety_net()` runs the Python extractor after the save and writes via `write_note_fields()`: **conditional PATCHes** (`firstName/lastName`, `email`, `dm_phone`, `reach_notes` each filtered to still-empty, so a race can't overwrite).
+  - It writes one PATCH per group, so a missing 009/010 column only loses its own field, then stamps `DM:` on the call. It never raises.
+- **Backfill:** `POST /api/admin/backfill-note-details?days=14&dry_run=1` (dry_run is the DEFAULT).
+  - The latest mention per lead wins, through the same empty-only rules and the same conditional writes.
+  - `filter_selfcheck` first PATCHes a non-existent id (`id=eq.-1`) with every filter, proving syntax and columns before any real write.
+  - Corporate mentions are **reported only**; parking a chain stays a person's decision.
+
 ### Follow-Up Sequences
 - Hot Lead: 24h → 48h → 5 days
 - Standard: 48h → 5 days → 7 days
