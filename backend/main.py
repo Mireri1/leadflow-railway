@@ -6450,6 +6450,46 @@ def list_leads(status: str = "", search: str = "", sort: str = "smart",
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Due follow-ups lead the dialer (2026-10) ────────────────────────────────
+# Oct 1-5: 36 gatekeepers each handed over a decision-maker's name and a time
+# ("Tanisha, tomorrow", "Tammy, Thursday", "Mary, in 30 minutes"); NONE was
+# called back, and 49 callbacks sat due. The queue's first key after the
+# prospect's clock was "fewest calls", so every lead she had already reached
+# sorted behind ~800 never-dialed ones. A due follow-up now goes first —
+# unless its office is shut, unless it was tried in the last
+# FOLLOWUP_RECALL_HOURS (so one no-answer doesn't pin it to the top), and only
+# while it is at most FOLLOWUP_MAX_OVERDUE_DAYS late (older strays stay on the
+# Follow-Ups tab instead of taking over the dialer). Mirrored by
+# isDueFollowUp() in App.jsx — keep the two in step.
+FOLLOWUP_RECALL_HOURS      = float(os.getenv("FOLLOWUP_RECALL_HOURS", "3"))
+FOLLOWUP_MAX_OVERDUE_DAYS  = int(os.getenv("FOLLOWUP_MAX_OVERDUE_DAYS", "21"))
+_FOLLOWUP_DONE_STATUSES = {"not_interested", "converted", "retired", "do_not_contact",
+                           "awaiting_email_reply"}
+
+def is_due_followup(lead: dict, today: str, now_utc: datetime) -> bool:
+    cb = (lead.get("callbackDate") or "")[:10]
+    if not cb or cb > today:
+        return False
+    try:
+        if (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(cb, "%Y-%m-%d")).days \
+                > FOLLOWUP_MAX_OVERDUE_DAYS:
+            return False
+    except ValueError:
+        return False
+    if (lead.get("status") or "") in _FOLLOWUP_DONE_STATUSES:
+        return False
+    lca = lead.get("last_called_at") or ""
+    if lca:
+        try:
+            t = datetime.fromisoformat(lca.replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if now_utc - t < timedelta(hours=FOLLOWUP_RECALL_HOURS):
+                return False
+        except ValueError:
+            pass
+    return True
+
 @app.get("/api/dialer/queue")
 def dialer_queue(limit: int = 50, snooze_hours: int = 4,
                  user: str = Depends(verify_token)):
@@ -6484,6 +6524,18 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
     rows = _paginated_get(base, page_size=1000, max_pages=5)
     if not isinstance(rows, list):
         rows = []
+    # Due follow-ups have the MOST calls, so the ladder above puts them last —
+    # past the 5000-row ceiling once stock is large. Fetch them on their own
+    # (a few dozen rows) and merge, so the due-first sort below can see them.
+    today = (datetime.utcnow() + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d")
+    oldest_due = (datetime.utcnow() + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)
+                  - timedelta(days=FOLLOWUP_MAX_OVERDUE_DAYS)).strftime("%Y-%m-%d")
+    due_rows = _paginated_get(
+        base + f"&callbackDate=gte.{oldest_due}&callbackDate=lte.{today}T23:59:59",
+        page_size=500, max_pages=2)
+    if isinstance(due_rows, list) and due_rows:
+        seen = {l.get("id") for l in rows}
+        rows = rows + [l for l in due_rows if l.get("id") not in seen]
 
     # NANP guard (PostgREST regex would need a function; keep in Python).
     NO_DIAL = {"awaiting_email_reply", "do_not_contact", "retired"}
@@ -6511,8 +6563,8 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
     # land in a different bucket than its neighbour just because the loop
     # crossed an hour boundary mid-iteration.
     tz_counts = {}
+    now_utc = datetime.now(timezone.utc)
     if DIALER_TZ_ORDER:
-        now_utc = datetime.now(timezone.utc)
         # Decorate-sort-undecorate rather than stamping a field onto the lead.
         # These dicts are whole `leads` rows and callers PATCH rows straight
         # back; Supabase rejects an ENTIRE write that names a column it does
@@ -6536,13 +6588,24 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
         # contact, then best score), so that whole ladder survives untouched
         # *within* each bucket — no need to restate it here and no risk of the
         # two definitions drifting apart.
-        decorated.sort(key=lambda pair: pair[0])
+        # Due follow-ups whose office is open come first, oldest due date
+        # first; everything else keeps the bucket-then-ladder order.
+        def _key(pair):
+            b, l = pair
+            due = b != TZ_BUCKET_OFF and is_due_followup(l, today, now_utc)
+            return (0, (l.get("callbackDate") or "")[:10], b) if due else (1, "", b)
+        decorated.sort(key=_key)
         out = [l for _, l in decorated]
+    else:
+        out.sort(key=lambda l: (0, (l.get("callbackDate") or "")[:10])
+                 if is_due_followup(l, today, now_utc) else (1, ""))
+    due_count = sum(1 for l in out if is_due_followup(l, today, now_utc))
 
     eligible = len(out)
     out = out[:limit]
     return {"queue": out, "fetched": len(rows), "eligible": eligible,
             "returned": len(out), "user": user, "snooze_hours": snooze_hours,
+            "due_followups": due_count,
             "tz_order": DIALER_TZ_ORDER,
             "tz_window": [DIALER_LOCAL_START_HOUR, DIALER_LOCAL_END_HOUR],
             "tz_buckets": {"prime": tz_counts.get(TZ_BUCKET_PRIME, 0),
