@@ -1893,6 +1893,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [dmName,setDmName]   = useState(leadFullName)
   const [dmTitle,setDmTitle] = useState(lead.title||"")
   const [dmPhone,setDmPhone] = useState(lead.dm_phone||"")
+  const [dmReach,setDmReach] = useState(lead.reach_notes||"")   // "callback info": when/how to reach them
   const [dmEdit,setDmEdit]   = useState(false)
   const [savingDm,setSavingDm] = useState(false)
   const [dmSaveStatus,setDmSaveStatus] = useState("")
@@ -1900,20 +1901,25 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const dmNameChanged  = dmName.trim()!==leadFullName
   const dmTitleChanged = dmTitle.trim()!==(lead.title||"").trim()
   const dmPhoneChanged = dmPhone.trim()!==(lead.dm_phone||"").trim()
-  const dmDirty = dmNameChanged||dmTitleChanged||dmPhoneChanged
+  const dmReachChanged = dmReach.trim()!==(lead.reach_notes||"").trim()
+  const dmExtraChanged = dmPhoneChanged||dmReachChanged
+  const dmDirty = dmNameChanged||dmTitleChanged||dmExtraChanged
   // Name/title live on columns that have always existed, so they ride the
-  // same PATCH as the outcome. dm_phone (migration 009) goes in its OWN
-  // PATCH — a missing column must only ever fail the direct-line save.
+  // same PATCH as the outcome. dm_phone (009) and reach_notes (010) go in
+  // their OWN PATCH — a missing column must only ever fail those two fields.
   function dmPatch(){
     const p={}
     if(dmNameChanged){ const parts=dmName.trim().split(/\s+/).filter(Boolean); p.firstName=parts[0]||""; p.lastName=parts.slice(1).join(" ") }
     if(dmTitleChanged) p.title=dmTitle.trim()
     return p
   }
-  const DM_PHONE_ERR="The direct line could NOT be stored — the leads table is missing the dm_phone column. Tell Eric to run backend/migrations/009_leads_dm_phone.sql. (Name and title saved fine.)"
-  async function saveDmPhone(){
-    const r=await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({dm_phone:dmPhone.trim()||null,updatedAt:new Date().toISOString()})})
-    return Array.isArray(r)&&r[0] ? r[0] : {dm_phone:dmPhone.trim()||null}
+  const DM_PHONE_ERR="The direct line / callback info could NOT be stored — the leads table is missing the dm_phone or reach_notes column. Tell Eric to run backend/migrations/009_leads_dm_phone.sql and 010_leads_reach_notes.sql. (Name and title saved fine.)"
+  async function saveDmExtra(){
+    const body={updatedAt:new Date().toISOString()}
+    if(dmPhoneChanged) body.dm_phone=dmPhone.trim()||null
+    if(dmReachChanged) body.reach_notes=dmReach.trim()||null
+    const r=await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify(body)})
+    return Array.isArray(r)&&r[0] ? r[0] : body
   }
   async function saveContact(){
     setSavingDm(true); setDmSaveStatus("")
@@ -1924,8 +1930,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         const r=await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({...p,updatedAt:new Date().toISOString()})})
         fresh={...fresh,...(Array.isArray(r)&&r[0]?r[0]:p)}
       }
-      if(dmPhoneChanged){
-        try{ fresh={...fresh,...(await saveDmPhone())} }
+      if(dmExtraChanged){
+        try{ fresh={...fresh,...(await saveDmExtra())} }
         catch(ex){ setLead(fresh); onSaved&&onSaved(); setDmSaveStatus(DM_PHONE_ERR); return }
       }
       setLead(fresh); setDmEdit(false); setDmSaveStatus("✓ Saved")
@@ -1933,7 +1939,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     }catch(ex){ setDmSaveStatus("Couldn't save — "+(ex.message||"try again")) }
     finally{ setSavingDm(false) }
   }
-  function resetDm(){ setDmName(leadFullName); setDmTitle(lead.title||""); setDmPhone(lead.dm_phone||""); setDmSaveStatus("") }
+  function resetDm(){ setDmName(leadFullName); setDmTitle(lead.title||""); setDmPhone(lead.dm_phone||""); setDmReach(lead.reach_notes||""); setDmSaveStatus("") }
   // Gatekeeper → ring back the NEXT business day, by name. The script's step 1
   // on a no-name lead is just "who handles facilities?" + hang up, so the whole
   // value of the call is the name captured above and the next-day retry.
@@ -2104,8 +2110,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // Direct line — separate PATCH (see dmPatch). The call and the name are
       // already saved; a missing column must not lose either, so this is
       // loud but non-blocking.
-      if(dmPhoneChanged){
-        try{ await saveDmPhone() }
+      if(dmExtraChanged){
+        try{ await saveDmExtra() }
         catch{ window.alert("Call saved. "+DM_PHONE_ERR) }
       }
       // Booked a walkthrough → create the appointment (pending admin approval).
@@ -2397,6 +2403,11 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                       : <span style={{color:"#6b7398",fontSize:12}}>📱 No direct line yet — ask for it when you reach them</span>}
                     {lead.phone&&<span style={{color:"#a3aac4",fontSize:12}}>☎️ Main: {lead.phone}</span>}
                   </div>
+                  {/* Callback info — what the desk said about catching them. The
+                      one line that decides WHEN tomorrow's call happens. */}
+                  <div style={{marginTop:6,fontSize:13,color:lead.reach_notes?"#ffe083":"#6b7398",fontWeight:lead.reach_notes?600:400}}>
+                    🕐 {lead.reach_notes||<span style={{fontSize:12,fontWeight:400}}>No callback info yet — ask the desk &ldquo;when&apos;s a good time to catch {lead.firstName}?&rdquo;</span>}
+                  </div>
                   {dmSaveStatus&&<div style={{fontSize:11,color:dmSaveStatus.startsWith("✓")?"#69f6b8":"#ff8da3",marginTop:6}}>{dmSaveStatus}</div>}
                 </div>
               )}
@@ -2421,6 +2432,11 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                       <label>Direct line / cell</label>
                       <input value={dmPhone} onChange={e=>setDmPhone(e.target.value)} placeholder="(702) 555-0134" inputMode="tel"/>
                     </div>
+                  </div>
+                  <div className="ff" style={{marginTop:8,marginBottom:0}}>
+                    <label>Callback info — when / how to reach them</label>
+                    <input value={dmReach} onChange={e=>setDmReach(e.target.value)}
+                      placeholder='e.g. "in Tue/Thu mornings", "try after 2pm", "ext 204"'/>
                   </div>
                   <div style={{display:"flex",gap:8,alignItems:"center",marginTop:8,flexWrap:"wrap"}}>
                     <button type="button" className="btn btn-p" style={{fontSize:11,padding:"6px 12px"}}
@@ -2587,9 +2603,16 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                 ? <>Tomorrow&apos;s script opens with &ldquo;Hey, is <b style={{color:"#dee5ff"}}>{dmName.trim().split(/\s+/)[0]}</b> around?&rdquo;</>
                 : <>Type the name they gave you in <b style={{color:"#7dd3fc"}}>👤 Who&apos;s in charge</b> above — it saves with this call.</>}
             </div>
-            <div className="ff" style={{maxWidth:220}}>
-              <label>Call back on</label>
-              <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+            <div style={{display:"flex",gap:14,alignItems:"flex-end",flexWrap:"wrap"}}>
+              <div className="ff" style={{maxWidth:220,marginBottom:0}}>
+                <label>Call back on</label>
+                <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+              </div>
+              {(dmReach.trim()||lead.reach_notes)&&(
+                <div style={{fontSize:12,color:"#ffe083",fontWeight:600,paddingBottom:8}}>
+                  🕐 {dmReach.trim()||lead.reach_notes} <span style={{color:"#6b7398",fontWeight:400}}>— pick the date to match</span>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -4136,9 +4159,12 @@ export default function App(){
     const walk=pool.filter(l=>wt.has(String(l.id))&&l.status!=="converted"&&mine(l))
       .sort((a,b)=>(wt.get(String(a.id)).date||"").localeCompare(wt.get(String(b.id)).date||""))
     // 3 · ⏰ Callbacks due, not yet tried today.
+    //     A lead with a named contact comes first: that call opens "Hey, is
+    //     Mike around?" and is the new script's whole day-2 payoff.
     const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l)
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
-      .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
+      .sort((a,b)=>(((a.firstName||"").trim()?0:1)-((b.firstName||"").trim()?0:1))
+        ||(a.callbackDate||"").localeCompare(b.callbackDate||""))
     // 4 · 🚨 Complaint list: violation/review-flagged, still fresh (<4 tries),
     //     not already dialed today. Newest complaints score highest.
     const complaints=pool.filter(l=>mine(l)
@@ -5268,6 +5294,12 @@ export default function App(){
                                   style={{fontSize:9,fontWeight:700,background:"#7dd3fc22",color:"#7dd3fc",padding:"2px 7px",
                                     borderRadius:4,border:"1px solid #7dd3fc66"}}>👤 ASK FOR {lead.firstName.toUpperCase()}</span>
                               )}
+                              {lead.reach_notes&&(
+                                <span title={lead.reach_notes}
+                                  style={{fontSize:9,fontWeight:700,background:"#ffe08318",color:"#ffe083",padding:"2px 7px",
+                                    borderRadius:4,border:"1px solid #ffe08340",maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                  🕐 {lead.reach_notes}</span>
+                              )}
                               {/* Hot-intent badges first — WHY this lead matters right now. */}
                               {parseIntents(lead.notes, lead).map(k=>{
                                 const m=INTENT_META[k]
@@ -5928,6 +5960,7 @@ export default function App(){
                           <div style={{fontSize:22,fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",lineHeight:1.2}}>
                             {[lead.firstName,lead.lastName].filter(Boolean).join(" ")}</div>
                           {lead.title&&<div style={{fontSize:12,color:"#a3aac4",marginTop:2}}>{lead.title}</div>}
+                          {lead.reach_notes&&<div style={{fontSize:13,color:"#ffe083",fontWeight:600,marginTop:6}}>🕐 {lead.reach_notes}</div>}
                         </div>
                       )}
                       <div style={{display:"flex",justifyContent:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
@@ -6403,8 +6436,13 @@ export default function App(){
             // retries, then oldest first — so the top row is always the most
             // important miss, no matter how long the list gets.
             const attemptedSince=l=>l.last_called_at&&tsLocalDate(l.last_called_at)>=l.callbackDate
-            const statusPrio={interested:0,interested_no_dm:1,callback:2}
+            // gatekeeper (3) is the new script's day-2 call — we have a name to
+            // ask for, so it outranks a routine retry. Within a status, a
+            // lead with a named contact comes before one without.
+            const statusPrio={interested:0,interested_no_dm:1,callback:2,gatekeeper:3}
+            const named=l=>(l.firstName||"").trim()?0:1
             const byUrgency=(a,b)=>((statusPrio[a.status]??9)-(statusPrio[b.status]??9))
+              ||(named(a)-named(b))
               ||a.callbackDate.localeCompare(b.callbackDate)
             const overdueAll=rest.filter(l=>l.callbackDate<today)
             const buckets = [
@@ -6533,6 +6571,8 @@ export default function App(){
                                 border:`1px solid ${info.color}30`,width:"fit-content"}}>{info.label}</span>
                               <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",
                                 display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>
+                                {lead.reach_notes?<><span style={{color:"#ffe083",fontWeight:600}}>🕐 {lead.reach_notes}</span><br/></>:""}
+                                {lead.dm_phone?<><span style={{color:"#7dd3fc"}}>📱</span> <span style={{color:"#7dd3fc",fontWeight:600}}>{lead.dm_phone}</span> direct<br/></>:""}
                                 {lead.phone?<><span style={{color:"#a3a6ff"}}>📞</span> {lead.phone}<br/></>:""}
                                 {lead.notes||""}
                               </div>
