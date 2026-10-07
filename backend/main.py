@@ -7046,16 +7046,31 @@ def call_start(body: dict, user: str = Depends(verify_token)):
     lead_id = body.get("leadId")
     if not lead_id:
         raise HTTPException(status_code=400, detail="leadId required")
-    r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}&select=id,phone,state,company",
+    # select=* (not a column list) so this keeps working before migration
+    # 009 adds dm_phone — a missing named column would 400 and read as
+    # "Lead has no phone".
+    r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id), safe='')}&select=*",
                     headers=SB_HEADERS, timeout=10)
     rows = r.json() if r.status_code == 200 else []
-    if not rows or not rows[0].get("phone"):
+    if not rows or not (rows[0].get("phone") or rows[0].get("dm_phone")):
         raise HTTPException(status_code=404, detail="Lead has no phone")
     lead = rows[0]
     st = (lead.get("state") or "").strip().upper()
     nums = _twilio_numbers()
     from_num = next((n for n, ns in nums if ns == st), nums[0][0])
-    to_num = _e164(lead["phone"])
+    # Optional `phone` override lets the dialer ring the DM's direct line
+    # instead of the switchboard. Only a number ON THIS LEAD is accepted —
+    # this endpoint must never become "dial any number through our Twilio".
+    digits = lambda v: re.sub(r"\D", "", str(v or ""))
+    dial = lead.get("phone") or lead.get("dm_phone")
+    want = body.get("phone")
+    if want:
+        allowed = [v for v in (lead.get("phone"), lead.get("dm_phone")) if v]
+        match = next((v for v in allowed if digits(v) and digits(v)[-10:] == digits(want)[-10:]), None)
+        if not match:
+            raise HTTPException(status_code=400, detail="That number is not on this lead")
+        dial = match
+    to_num = _e164(dial)
     caller_phone = _e164(os.getenv("CALLER_PHONE") or INBOUND_FORWARD_NUMBER)
     record = _should_record(st)
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
@@ -8630,9 +8645,25 @@ def update_lead(lead_id: str, data: dict, user: str = Depends(verify_token)):
             np = normalize_us_phone(data.get("phone"))
             if np:
                 data["phone"] = np
+        # Decision-maker direct line (migration 009). Same canonical format as
+        # `phone` so the dialer's tel: links and the Twilio override compare
+        # digit-for-digit. An unparseable value is stored as typed (an
+        # extension like "x204" is still useful to the caller).
+        if data.get("dm_phone"):
+            np = normalize_us_phone(data.get("dm_phone"))
+            if np:
+                data["dm_phone"] = np
         r = req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lead_id}",
                          headers=SB_HEADERS, json=data, timeout=30)
+        # Supabase rejects an ENTIRE write that names an unknown column (e.g.
+        # dm_phone before 009 runs). That used to come back as HTTP 200 with
+        # the PostgREST error as the body, so the client thought it saved.
+        if r.status_code >= 400:
+            print(f"[LEAD-PATCH] {lead_id} HTTP {r.status_code}: {r.text[:200]}")
+            raise HTTPException(status_code=r.status_code, detail=r.text[:300])
         return r.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

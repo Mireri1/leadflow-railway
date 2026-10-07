@@ -438,41 +438,60 @@ function NoteAssist({getNote, context, onApply}){
     </div>
   )
 }
-// Signal-aware cold-call opener. Picks the script by the lead's hottest intent
-// (and facility type), fills in the name/city, ends with the walkthrough ask.
+// Cold-call script — two steps, deliberately terse (2026-10 rewrite; the
+// previous "Hi, I won't take up much of your time… the one thing we
+// specialize in…" opener was too soft and pitched the gatekeeper).
+//   STEP 1 is ONLY about getting past the front desk. No company name, no
+//          reason, no pitch — a pitch is the receptionist's cue to screen; a
+//          casual first-name ask is not. With no name on file the whole call
+//          is "who handles facilities?" → thanks → hang up → log Gatekeeper
+//          with the name → ring back tomorrow asking for them by name.
+//   STEP 2 is one direct question the moment the DM is on the line.
+// The signal lines (inspection / reviews / new build) are kept as AMMO for
+// after the DM answers — never led with.
+function repName(){
+  const u=(getUser()||"").trim()
+  return u ? u.charAt(0).toUpperCase()+u.slice(1) : "[your name]"
+}
 function buildOpener(lead){
   const ints = parseIntents(lead?.notes, lead)
   const ind = (lead?.industry||"").toLowerCase()
-  const city = lead?.city || "your area"
-  const ask = "Can we set up 15 minutes for us to stop by, walk the facility, and provide you a quote?"
-  const askSpace = "Can we set up 15 minutes for us to stop by, walk the space, and provide you a quote?"
-  let opener=null, reference=null
+  const first = (lead?.firstName||"").trim()
+  const hasName = !!first
+  const direct = !!(lead?.dm_phone||"").trim()   // DM's own line on file → step 1 is usually skipped
+  const step1 = hasName
+    ? { ask:`Hey, is ${first} around?`,
+        ifAsked:`Just following up with them.`,
+        note: direct
+          ? `You have ${first}'s direct line — dial it and they may pick up themselves; go straight to step 2. If a desk answers, this line still works.`
+          : "Nothing else. No company name, no reason. Stay casual." }
+    : { ask:"Hey, quick question — who handles facilities over there?",
+        ifAsked:null,
+        note:"Get the name, say thanks, hang up. Log it as Gatekeeper with the name — tomorrow you ask for them by name." }
+  const step2 = `Hey ${first||"[Name]"}, this is ${repName()} with Vision Cleaning — we handle commercial cleaning for a few places in the area. Quick question: are you under contract with someone right now, or handling it in-house?`
+  let ammo=null, reference=null
   if(ints.includes("health_violation")){
     reference = cleanNote(lead.notes)
-    opener = ind.includes("hospital")
-      ? `Your infection rates are running worse than the national benchmark — and that's the one thing we specialize in fixing. ${ask}`
-      : `You got cited for infection control on your last inspection — and that's the one thing we specialize in fixing. ${ask}`
+    ammo = ind.includes("hospital")
+      ? "Your infection rates are running worse than the national benchmark — that's exactly what we fix."
+      : "You got cited for infection control on your last inspection — that's exactly what we fix."
   } else if(ints.includes("cleanliness")){
     reference = cleanNote(lead.notes)
-    opener = `You've got some bad reviews calling out cleanliness — and that's the one thing we specialize in fixing. ${askSpace}`
+    ammo = "Some of your recent reviews call out cleanliness — that's exactly what we fix."
   } else if(ints.includes("newbuild")){
     reference = cleanNote(lead.notes)
-    opener = `You've got a new space opening up — and getting it move-in clean and keeping it that way is the one thing we specialize in. ${askSpace}`
-  } else {
-    opener = `Commercial cleaning for places like yours here in ${city} is the one thing we specialize in. ${askSpace}`
+    ammo = "You've got a new space opening up — we get it move-in clean and keep it that way."
   }
-  const greet = lead?.firstName
-    ? `Hi ${lead.firstName} — I won't take up much of your time. `
-    : "Hi — I won't take up much of your time. "
-  return { opener: greet + opener, reference, hot: ints.length>0 }
+  const close = "Can we set up 15 minutes to stop by, walk the space, and get you a quote?"
+  return { step1, step2, ammo, reference, close, hasName, direct, hot: ints.length>0 }
 }
-// Once they agree to the walkthrough — run the qualification section below.
-// Each prompt maps to one of the existing qual chips so it gets captured.
+// After the DM answers the step-2 question — their answer IS the first qual
+// field. Each prompt maps to one of the existing qual chips so it gets captured.
 const QUALIFY_QUESTIONS = [
-  ["Do you have a cleaning company now — and how's that going?", "→ Vendor Status"],
-  ["Is your priority keeping costs down, top quality, or a balance?", "→ Focus"],
-  ["Are you the one who'd sign off, or is someone else involved?", "→ Contact Type"],
-  ["When are you looking to make a change?", "→ Timeline"],
+  ["Their answer to “under contract or in-house?”", "→ Vendor Status"],
+  ["When's that up — or when would you look at it?", "→ Timeline"],
+  ["Are you the one who'd sign off on it?", "→ Contact Type"],
+  ["What matters more — price, quality, or a balance?", "→ Focus"],
 ]
 
 async function api(path, opts={}) {
@@ -1694,6 +1713,14 @@ function addDays(days){
   d.setDate(d.getDate() + days)
   return localDate(d)
 }
+// Tomorrow, skipping Sat/Sun — the script's "call back the next day" means the
+// next day the front desk is staffed.
+function nextBusinessDay(){
+  const d = new Date()
+  d.setDate(d.getDate() + 1)
+  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate() + 1)
+  return localDate(d)
+}
 // UTC timestamp → LOCAL date string. Slicing a UTC ISO timestamp [:10] gives
 // tomorrow's date after ~8pm ET, which broke every "called today?" compare
 // during the evening shift. Always convert through Date first.
@@ -1859,11 +1886,67 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [apptDate,setApptDate]    = useState("")       // walkthrough appointment (optional)
   const [apptArea,setApptArea]    = useState("")
 
-  // Gatekeeper defaults to a 3-day retry: long enough that the message has
-  // been passed on, short enough that the conversation is still remembered.
+  // 👤 Who's in charge — the name + direct line are what the new script's
+  // step 1 produces, so they get a home here that saves with the call (and
+  // on demand). Initialised from the lead; only CHANGED fields are written.
+  const leadFullName = [lead.firstName,lead.lastName].filter(Boolean).join(" ").trim()
+  const [dmName,setDmName]   = useState(leadFullName)
+  const [dmTitle,setDmTitle] = useState(lead.title||"")
+  const [dmPhone,setDmPhone] = useState(lead.dm_phone||"")
+  const [dmReach,setDmReach] = useState(lead.reach_notes||"")   // "callback info": when/how to reach them
+  const [dmEdit,setDmEdit]   = useState(false)
+  const [savingDm,setSavingDm] = useState(false)
+  const [dmSaveStatus,setDmSaveStatus] = useState("")
+  const dmNameRef = useRef(null)
+  const dmNameChanged  = dmName.trim()!==leadFullName
+  const dmTitleChanged = dmTitle.trim()!==(lead.title||"").trim()
+  const dmPhoneChanged = dmPhone.trim()!==(lead.dm_phone||"").trim()
+  const dmReachChanged = dmReach.trim()!==(lead.reach_notes||"").trim()
+  const dmExtraChanged = dmPhoneChanged||dmReachChanged
+  const dmDirty = dmNameChanged||dmTitleChanged||dmExtraChanged
+  // Name/title live on columns that have always existed, so they ride the
+  // same PATCH as the outcome. dm_phone (009) and reach_notes (010) go in
+  // their OWN PATCH — a missing column must only ever fail those two fields.
+  function dmPatch(){
+    const p={}
+    if(dmNameChanged){ const parts=dmName.trim().split(/\s+/).filter(Boolean); p.firstName=parts[0]||""; p.lastName=parts.slice(1).join(" ") }
+    if(dmTitleChanged) p.title=dmTitle.trim()
+    return p
+  }
+  const DM_PHONE_ERR="The direct line / callback info could NOT be stored — the leads table is missing the dm_phone or reach_notes column. Tell Eric to run backend/migrations/009_leads_dm_phone.sql and 010_leads_reach_notes.sql. (Name and title saved fine.)"
+  async function saveDmExtra(){
+    const body={updatedAt:new Date().toISOString()}
+    if(dmPhoneChanged) body.dm_phone=dmPhone.trim()||null
+    if(dmReachChanged) body.reach_notes=dmReach.trim()||null
+    const r=await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify(body)})
+    return Array.isArray(r)&&r[0] ? r[0] : body
+  }
+  async function saveContact(){
+    setSavingDm(true); setDmSaveStatus("")
+    try{
+      let fresh={...lead}
+      const p=dmPatch()
+      if(Object.keys(p).length){
+        const r=await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({...p,updatedAt:new Date().toISOString()})})
+        fresh={...fresh,...(Array.isArray(r)&&r[0]?r[0]:p)}
+      }
+      if(dmExtraChanged){
+        try{ fresh={...fresh,...(await saveDmExtra())} }
+        catch(ex){ setLead(fresh); onSaved&&onSaved(); setDmSaveStatus(DM_PHONE_ERR); return }
+      }
+      setLead(fresh); setDmEdit(false); setDmSaveStatus("✓ Saved")
+      onSaved&&onSaved()
+    }catch(ex){ setDmSaveStatus("Couldn't save — "+(ex.message||"try again")) }
+    finally{ setSavingDm(false) }
+  }
+  function resetDm(){ setDmName(leadFullName); setDmTitle(lead.title||""); setDmPhone(lead.dm_phone||""); setDmReach(lead.reach_notes||""); setDmSaveStatus("") }
+  // Gatekeeper → ring back the NEXT business day, by name. The script's step 1
+  // on a no-name lead is just "who handles facilities?" + hang up, so the whole
+  // value of the call is the name captured above and the next-day retry.
   function pickGatekeeper(){
     setPrimary("gatekeeper"); setSecondary(""); setCbReason("")
-    setCbDate(d=>d||addDays(3))
+    setCbDate(d=>d||nextBusinessDay())
+    if(!leadFullName) setTimeout(()=>dmNameRef.current&&dmNameRef.current.focus(),0)
   }
 
   // Smart-fill: map Haiku's note read onto the outcome chips + callback date.
@@ -1968,7 +2051,10 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     try{
       setTimerRunning(false)
       const finalDuration = duration ? parseInt(duration)*60 : timerSeconds
-      const fullNotes = cbReason ? `[${cbReason}] ${notes}`.trim() : notes
+      // A newly-captured name is stamped on the call note too, so History
+      // shows WHEN the name was learned, not just that the lead has one.
+      const newName = dmNameChanged && dmName.trim()
+      const fullNotes = [cbReason?`[${cbReason}]`:"", newName?`DM: ${dmName.trim()} ·`:"", notes].filter(Boolean).join(" ").trim()
       // Per-call email follow-up: only meaningful when this was a failed dial
       // and the lead has the contact info we'd email + VCC is configured.
       const emailEligible = (primary==="no_answer"||primary==="voicemail")
@@ -2015,9 +2101,19 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         nextfollowup: nextFollowUp||null,
         followupstep: fuDays ? 0 : null,
         ...(aiSent ? {notes: embedSentiment(lead.notes, aiSent)} : {}),
+        // Name/title the desk (or the DM) gave up → onto the lead, so
+        // tomorrow's step 1 reads "Hey, is <First> around?".
+        ...dmPatch(),
         ...(!lead.assignedTo ? {assignedTo: getUser()} : {}),
         updatedAt:new Date().toISOString()
       })})
+      // Direct line — separate PATCH (see dmPatch). The call and the name are
+      // already saved; a missing column must not lose either, so this is
+      // loud but non-blocking.
+      if(dmExtraChanged){
+        try{ await saveDmExtra() }
+        catch{ window.alert("Call saved. "+DM_PHONE_ERR) }
+      }
       // Booked a walkthrough → create the appointment (pending admin approval).
       // This is the revenue event — if it fails, KEEP the modal open and say so
       // (the call itself saved; callPostedRef prevents a duplicate on retry).
@@ -2277,28 +2373,121 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           )
         })()}
 
-        {/* Signal-aware opener — the first line that earns the next 20 seconds. */}
+        {/* 👤 Who's in charge — the single most visible thing on the card when
+            a name is on file (it decides which step-1 line she uses), and the
+            capture form when it isn't. Saves on demand or with the call. */}
+        {(()=>{
+          const hasName=!!leadFullName
+          const editing=dmEdit||!hasName
+          const inp={flex:"2 1 150px",marginBottom:0}
+          return (
+            <div style={{marginBottom:14,background:"#7dd3fc10",border:`1px solid ${hasName?"#7dd3fc55":"#7dd3fc30"}`,borderRadius:10,padding:"12px 14px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+                <div style={{fontSize:10,letterSpacing:".1em",fontWeight:700,color:"#7dd3fc"}}>👤 WHO&apos;S IN CHARGE</div>
+                {hasName&&!dmEdit&&(
+                  <button type="button" onClick={()=>{resetDm();setDmEdit(true)}}
+                    style={{fontSize:11,padding:"4px 10px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",
+                      border:"1px solid #7dd3fc40",background:"transparent",color:"#7dd3fc"}}>✏️ Edit / add direct line</button>
+                )}
+              </div>
+              {hasName&&!dmEdit&&(
+                <div style={{marginTop:6}}>
+                  <div style={{fontSize:21,fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",lineHeight:1.2}}>
+                    Ask for {leadFullName}
+                  </div>
+                  {lead.title&&<div style={{fontSize:12,color:"#a3aac4",marginTop:2}}>{lead.title}</div>}
+                  <div style={{fontSize:13,marginTop:6,display:"flex",gap:14,flexWrap:"wrap",alignItems:"center"}}>
+                    {lead.dm_phone
+                      ? <a href={`tel:${String(lead.dm_phone).replace(/[^\d+]/g,"")}`}
+                          style={{color:"#7dd3fc",fontWeight:700,textDecoration:"none",fontSize:15}}>📱 Direct: {lead.dm_phone}</a>
+                      : <span style={{color:"#6b7398",fontSize:12}}>📱 No direct line yet — ask for it when you reach them</span>}
+                    {lead.phone&&<span style={{color:"#a3aac4",fontSize:12}}>☎️ Main: {lead.phone}</span>}
+                  </div>
+                  {/* Callback info — what the desk said about catching them. The
+                      one line that decides WHEN tomorrow's call happens. */}
+                  <div style={{marginTop:6,fontSize:13,color:lead.reach_notes?"#ffe083":"#6b7398",fontWeight:lead.reach_notes?600:400}}>
+                    🕐 {lead.reach_notes||<span style={{fontSize:12,fontWeight:400}}>No callback info yet — ask the desk &ldquo;when&apos;s a good time to catch {lead.firstName}?&rdquo;</span>}
+                  </div>
+                  {dmSaveStatus&&<div style={{fontSize:11,color:dmSaveStatus.startsWith("✓")?"#69f6b8":"#ff8da3",marginTop:6}}>{dmSaveStatus}</div>}
+                </div>
+              )}
+              {editing&&(
+                <div style={{marginTop:8}}>
+                  {!hasName&&(
+                    <div style={{fontSize:11,color:"#a3aac4",marginBottom:8,lineHeight:1.5}}>
+                      No name on file. When the desk tells you who handles facilities, type it here — it saves with
+                      the call, and tomorrow&apos;s script asks for them by name. Got their cell or extension? Add it too.
+                    </div>
+                  )}
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <div className="ff" style={inp}>
+                      <label>Name</label>
+                      <input ref={dmNameRef} value={dmName} onChange={e=>setDmName(e.target.value)} placeholder="e.g. Mike Torres"/>
+                    </div>
+                    <div className="ff" style={inp}>
+                      <label>Title / role</label>
+                      <input value={dmTitle} onChange={e=>setDmTitle(e.target.value)} placeholder="Facilities Manager"/>
+                    </div>
+                    <div className="ff" style={inp}>
+                      <label>Direct line / cell</label>
+                      <input value={dmPhone} onChange={e=>setDmPhone(e.target.value)} placeholder="(702) 555-0134" inputMode="tel"/>
+                    </div>
+                  </div>
+                  <div className="ff" style={{marginTop:8,marginBottom:0}}>
+                    <label>Callback info — when / how to reach them</label>
+                    <input value={dmReach} onChange={e=>setDmReach(e.target.value)}
+                      placeholder='e.g. "in Tue/Thu mornings", "try after 2pm", "ext 204"'/>
+                  </div>
+                  <div style={{display:"flex",gap:8,alignItems:"center",marginTop:8,flexWrap:"wrap"}}>
+                    <button type="button" className="btn btn-p" style={{fontSize:11,padding:"6px 12px"}}
+                      disabled={savingDm||!dmDirty} onClick={saveContact}>{savingDm?"Saving…":"💾 Save contact"}</button>
+                    {hasName&&<button type="button" className="btn btn-g" style={{fontSize:11,padding:"6px 12px"}}
+                      onClick={()=>{resetDm();setDmEdit(false)}}>Cancel</button>}
+                    <span style={{fontSize:11,color:dmSaveStatus&&!dmSaveStatus.startsWith("✓")?"#ff8da3":"#6b7398"}}>
+                      {dmSaveStatus||"Also saves automatically when you log the call."}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })()}
+
+        {/* The script — two steps, terse. Step 1 gets past the desk, step 2 is
+            the one question for the DM. Hot-intent lines are ammo, not the
+            opener. */}
         {(()=>{
           const o = buildOpener(lead)
+          const lbl={fontSize:10,letterSpacing:".1em",fontWeight:700,marginBottom:6}
+          const line={fontSize:15,color:"#dee5ff",lineHeight:1.5,fontWeight:600}
+          const sub={fontSize:11,color:"#a3aac4",lineHeight:1.5,marginTop:5}
           return (
             <div style={{marginBottom:16,background:o.hot?"#ff4d6d10":"#69f6b810",
               border:`1px solid ${o.hot?"#ff4d6d40":"#69f6b830"}`,borderRadius:10,padding:14}}>
-              <div style={{fontSize:10,letterSpacing:".1em",fontWeight:700,marginBottom:8,
-                color:o.hot?"#ff8da3":"#69f6b8"}}>
-                {o.hot?"🎯 SUGGESTED OPENER — LEAD WITH THIS":"💬 SUGGESTED OPENER"}
+              <div style={{...lbl,color:"#7dd3fc"}}>1 · GET PAST THE FRONT DESK</div>
+              <div style={line}>&ldquo;{o.step1.ask}&rdquo;</div>
+              <div style={sub}>
+                {o.step1.note}
+                {o.step1.ifAsked&&<> If asked what it&apos;s regarding: <b style={{color:"#c9d2ee"}}>&ldquo;{o.step1.ifAsked}&rdquo;</b></>}
+                {!o.hasName&&<> Then <b style={{color:"#7dd3fc"}}>4 · Gatekeeper</b> below and type the name.</>}
               </div>
-              <div style={{fontSize:15,color:"#dee5ff",lineHeight:1.55,fontWeight:500}}>
-                {o.opener}
+
+              <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid #ffffff12"}}>
+                <div style={{...lbl,color:"#69f6b8"}}>2 · DECISION MAKER ON THE LINE</div>
+                <div style={line}>&ldquo;{o.step2}&rdquo;</div>
+                {o.ammo&&(
+                  <div style={{...sub,marginTop:8}}>
+                    🎯 <b style={{color:"#ff8da3"}}>Ammo once they answer:</b> <span style={{color:"#dee5ff"}}>&ldquo;{o.ammo}&rdquo;</span>
+                    {o.reference&&<div style={{marginTop:3}}>📋 What they were flagged for (if they ask): {o.reference}</div>}
+                  </div>
+                )}
+                <div style={sub}>Then the ask: <b style={{color:"#c9d2ee"}}>&ldquo;{o.close}&rdquo;</b></div>
               </div>
-              {o.reference&&(
-                <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid #ffffff12",fontSize:11,color:"#a3aac4",lineHeight:1.5}}>
-                  📋 <b style={{color:"#c9d2ee"}}>What they were flagged for</b> (if they ask): {o.reference}
-                </div>
-              )}
-              {/* Once they say yes — run the qualification section below. */}
+
+              {/* Their answer to step 2 is the first qual field — capture below. */}
               <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid #ffffff12"}}>
-                <div style={{fontSize:10,letterSpacing:".08em",fontWeight:700,color:"#69f6b8",marginBottom:6}}>
-                  ✅ ONCE THEY SAY YES — RUN YOUR QUALIFICATION (capture below)
+                <div style={{...lbl,color:"#69f6b8",fontSize:10}}>
+                  ✅ WHILE THEY TALK — CAPTURE BELOW
                 </div>
                 {QUALIFY_QUESTIONS.map(([q,where],i)=>(
                   <div key={i} style={{fontSize:11.5,color:"#c9d2ee",lineHeight:1.5,marginBottom:3}}>
@@ -2407,15 +2596,23 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
             border:"1px solid #7dd3fc25"}}>
             <div style={{fontSize:10,color:"#7dd3fc",letterSpacing:".1em",fontWeight:700,marginBottom:4}}>
-              TRY AGAIN ON
+              CALL BACK TOMORROW — BY NAME
             </div>
             <div style={{fontSize:11,color:"#a3aac4",marginBottom:10}}>
-              Counts as a real contact. Note who you spoke to and what they said —
-              next time you can ask for the decision-maker by name.
+              Counts as a real contact. {dmName.trim()
+                ? <>Tomorrow&apos;s script opens with &ldquo;Hey, is <b style={{color:"#dee5ff"}}>{dmName.trim().split(/\s+/)[0]}</b> around?&rdquo;</>
+                : <>Type the name they gave you in <b style={{color:"#7dd3fc"}}>👤 Who&apos;s in charge</b> above — it saves with this call.</>}
             </div>
-            <div className="ff">
-              <label>Follow-up Date</label>
-              <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+            <div style={{display:"flex",gap:14,alignItems:"flex-end",flexWrap:"wrap"}}>
+              <div className="ff" style={{maxWidth:220,marginBottom:0}}>
+                <label>Call back on</label>
+                <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+              </div>
+              {(dmReach.trim()||lead.reach_notes)&&(
+                <div style={{fontSize:12,color:"#ffe083",fontWeight:600,paddingBottom:8}}>
+                  🕐 {dmReach.trim()||lead.reach_notes} <span style={{color:"#6b7398",fontWeight:400}}>— pick the date to match</span>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -3706,6 +3903,7 @@ export default function App(){
   // "Needs Another Call" quick-filter: unanswered leads (no_answer) with under
   // 4 attempts — the pool to work when there's nothing fresh (4×-before-giveup).
   const [needsAttemptOnly,setNeedsAttemptOnly] = useState(false)
+  const [namedOnly,setNamedOnly] = useState(false)   // leads where we already know who's in charge
   // Per-state collapse for the state-grouped Leads view. Key = state code (or
   // "__none__" for leads with no state). Empty = all expanded.
   const [collapsedStates,setCollapsedStates] = useState({})
@@ -3776,9 +3974,11 @@ export default function App(){
     if(!user) return
     api("/api/call/config").then(setTwilioCall).catch(()=>setTwilioCall(null))
   },[user])
-  async function startTwilioCall(lead){
+  async function startTwilioCall(lead, phone){
+    // `phone` (optional) must be a number ON this lead — the server checks
+    // it against lead.phone / lead.dm_phone and refuses anything else.
     try{
-      const r=await api("/api/call/start",{method:"POST",body:JSON.stringify({leadId:lead.id})})
+      const r=await api("/api/call/start",{method:"POST",body:JSON.stringify({leadId:lead.id, ...(phone?{phone}:{})})})
       notify(`☎️ ${r.detail||"Your phone is ringing"} — caller ID ${r.caller_id}${r.recording?" · 🔴 recording":""}`)
     }catch(e){ notify("Couldn't start the call — "+(e.message||"check Twilio setup"),"error") }
   }
@@ -3959,9 +4159,12 @@ export default function App(){
     const walk=pool.filter(l=>wt.has(String(l.id))&&l.status!=="converted"&&mine(l))
       .sort((a,b)=>(wt.get(String(a.id)).date||"").localeCompare(wt.get(String(b.id)).date||""))
     // 3 · ⏰ Callbacks due, not yet tried today.
+    //     A lead with a named contact comes first: that call opens "Hey, is
+    //     Mike around?" and is the new script's whole day-2 payoff.
     const due=pool.filter(l=>l.callbackDate&&l.callbackDate<=t&&l.status!=="converted"&&mine(l)
         &&(!l.last_called_at||tsLocalDate(l.last_called_at)<t))
-      .sort((a,b)=>(a.callbackDate||"").localeCompare(b.callbackDate||""))
+      .sort((a,b)=>(((a.firstName||"").trim()?0:1)-((b.firstName||"").trim()?0:1))
+        ||(a.callbackDate||"").localeCompare(b.callbackDate||""))
     // 4 · 🚨 Complaint list: violation/review-flagged, still fresh (<4 tries),
     //     not already dialed today. Newest complaints score highest.
     const complaints=pool.filter(l=>mine(l)
@@ -4285,8 +4488,9 @@ export default function App(){
     if(availableOnly&&l.assignedTo&&l.assignedTo!==user) return false
     if(emailedOnly&&!emailedFlags[l.id]) return false
     if(needsAttemptOnly&&!(l.status==="no_answer"&&(l.total_calls||0)<4)) return false
+    if(namedOnly&&!(l.firstName||"").trim()) return false
     return true
-  }),[leads,fIndustry,fState,fCity,availableOnly,emailedOnly,needsAttemptOnly,user,emailedFlags])
+  }),[leads,fIndustry,fState,fCity,availableOnly,emailedOnly,needsAttemptOnly,namedOnly,user,emailedFlags])
   const displayLeads=useMemo(()=>segBase.filter(l=>{
     if(fSource&&(l.source||"").toLowerCase()!==fSource) return false
     if(fIntent&&!parseIntents(l.notes, l).includes(fIntent)) return false
@@ -4384,7 +4588,7 @@ export default function App(){
     return [...newToday, ...older]
   }
 
-  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setFSource("");setFIntent("");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false);setNeedsAttemptOnly(false)}
+  function reset(){setSearch("");setFIndustry("");setFState("");setFCity("");setFStatus("all");setFSource("");setFIntent("");setCbOnly(false);setAvailOnly(false);setEmailedOnly(false);setNeedsAttemptOnly(false);setNamedOnly(false)}
 
   return(
     <div style={{minHeight:"100vh",background:"#060e20"}}>
@@ -4927,6 +5131,20 @@ export default function App(){
                     )
                   })()}
                   {(()=>{
+                    const namedCount = leads.filter(l=>(l.firstName||"").trim()).length
+                    return (
+                      <button
+                        onClick={()=>setNamedOnly(p=>!p)}
+                        title="Leads where we already know who handles facilities — open with their name, skip the pitch to the desk."
+                        style={{fontSize:12,padding:"8px 14px",borderRadius:8,border:"none",cursor:"pointer",
+                          fontFamily:"'Inter',sans-serif",fontWeight:600,transition:"all .15s",
+                          background:namedOnly?"#7dd3fc":"#192540",
+                          color:namedOnly?"#06253a":"#a3aac4"}}>
+                        👤 Named Contact{namedCount>0?` (${namedCount})`:""}
+                      </button>
+                    )
+                  })()}
+                  {(()=>{
                     // Bridge: carry the current Leads view (state + city +
                     // unanswered intent) straight into the scoped Dialer so she
                     // can start calling exactly what she's filtered to. Count
@@ -5069,6 +5287,19 @@ export default function App(){
                             )}
                             <div style={{fontSize:13,color:"#a3aac4",marginTop:1}}>{lead.company||"—"}{lead.city&&lead.state?` · ${lead.city}, ${lead.state}`:lead.state?` · ${lead.state}`:lead.city?` · ${lead.city}`:""}</div>
                             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
+                              {/* 👤 Named contact — the script's step 1 depends on it, so it
+                                  is the first chip and the only blue one. */}
+                              {(lead.firstName||"").trim()&&(
+                                <span title={`Open with: "Hey, is ${lead.firstName} around?"`}
+                                  style={{fontSize:9,fontWeight:700,background:"#7dd3fc22",color:"#7dd3fc",padding:"2px 7px",
+                                    borderRadius:4,border:"1px solid #7dd3fc66"}}>👤 ASK FOR {lead.firstName.toUpperCase()}</span>
+                              )}
+                              {lead.reach_notes&&(
+                                <span title={lead.reach_notes}
+                                  style={{fontSize:9,fontWeight:700,background:"#ffe08318",color:"#ffe083",padding:"2px 7px",
+                                    borderRadius:4,border:"1px solid #ffe08340",maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                  🕐 {lead.reach_notes}</span>
+                              )}
                               {/* Hot-intent badges first — WHY this lead matters right now. */}
                               {parseIntents(lead.notes, lead).map(k=>{
                                 const m=INTENT_META[k]
@@ -5097,12 +5328,20 @@ export default function App(){
                             </div>
                           </div>
                         </div>
-                        <div style={{display:"flex",alignItems:"center",gap:7,fontSize:13,color:"#dee5ff",opacity:.85}}>
-                          {lead.phone?(
-                            <><svg width={14} height={14} fill="none" viewBox="0 0 24 24" stroke="#a3a6ff" strokeWidth={2}>
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/>
-                            </svg>{lead.phone}</>
-                          ):<span style={{color:"#40485d"}}>—</span>}
+                        <div style={{fontSize:13,color:"#dee5ff",opacity:.85}}>
+                          <div style={{display:"flex",alignItems:"center",gap:7}}>
+                            {lead.phone?(
+                              <><svg width={14} height={14} fill="none" viewBox="0 0 24 24" stroke="#a3a6ff" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/>
+                              </svg>{lead.phone}</>
+                            ):<span style={{color:"#40485d"}}>—</span>}
+                          </div>
+                          {lead.dm_phone&&(
+                            <div style={{marginTop:3,color:"#7dd3fc",fontWeight:700,fontSize:12}}
+                              title={`Direct line${lead.firstName?" for "+lead.firstName:""} — skips the front desk`}>
+                              📱 {lead.dm_phone} <span style={{color:"#6b7398",fontWeight:400}}>direct</span>
+                            </div>
+                          )}
                         </div>
                         <div>
                           <ScoreRing score={score}/>
@@ -5709,8 +5948,21 @@ export default function App(){
                         {getInitials(lead)}</div>
                       <div style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:26,fontWeight:700,
                         color:"#dee5ff",marginBottom:4}}>
-                        {[lead.firstName,lead.lastName].filter(Boolean).join(" ")||lead.company}</div>
-                      <div style={{color:"#a3aac4",fontSize:15,marginBottom:16}}>{lead.company}</div>
+                        {lead.company||[lead.firstName,lead.lastName].filter(Boolean).join(" ")}</div>
+                      <div style={{color:"#a3aac4",fontSize:15,marginBottom:16}}>
+                        {[lead.city,lead.state].filter(Boolean).join(", ")||"\u00a0"}</div>
+                      {/* 👤 ASK FOR — the name is the asset the script earns; when
+                          we have one it is the loudest thing on the card. */}
+                      {(lead.firstName||"").trim()&&(
+                        <div style={{margin:"0 auto 16px",maxWidth:420,background:"#7dd3fc14",
+                          border:"1px solid #7dd3fc66",borderRadius:12,padding:"10px 16px"}}>
+                          <div style={{fontSize:"0.6rem",color:"#7dd3fc",fontWeight:700,letterSpacing:".12em",textTransform:"uppercase"}}>👤 Ask for</div>
+                          <div style={{fontSize:22,fontWeight:700,color:"#dee5ff",fontFamily:"'Space Grotesk',sans-serif",lineHeight:1.2}}>
+                            {[lead.firstName,lead.lastName].filter(Boolean).join(" ")}</div>
+                          {lead.title&&<div style={{fontSize:12,color:"#a3aac4",marginTop:2}}>{lead.title}</div>}
+                          {lead.reach_notes&&<div style={{fontSize:13,color:"#ffe083",fontWeight:600,marginTop:6}}>🕐 {lead.reach_notes}</div>}
+                        </div>
+                      )}
                       <div style={{display:"flex",justifyContent:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
                         <ScoreRing score={score}/>
                         <span className="pill" style={{background:info.color+"20",color:info.color,border:`1px solid ${info.color}30`}}>{info.label}</span>
@@ -5762,13 +6014,60 @@ export default function App(){
                           <span style={{color:"#69f6b8",fontWeight:600}}>✨ Never called — fresh lead</span>
                         )}
                       </div>
+                      {/* Step 1 of the script, visible BEFORE she dials — the
+                          front-desk line is decided by whether a name is on
+                          file, and that's what she needs in the first second. */}
+                      {lead.phone&&(()=>{
+                        const o=buildOpener(lead)
+                        return (
+                          <div style={{background:"#0f1930",borderRadius:12,padding:"12px 16px",marginBottom:12,textAlign:"left",
+                            border:"1px solid #7dd3fc25"}}>
+                            <div style={{fontSize:"0.6rem",color:"#7dd3fc",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",marginBottom:6}}>
+                              📞 Opening line{o.direct?" · direct line, they may answer":o.hasName?"":" · no name on file"}
+                            </div>
+                            <div style={{fontSize:15,color:"#dee5ff",fontWeight:600,lineHeight:1.45}}>&ldquo;{o.direct?o.step2:o.step1.ask}&rdquo;</div>
+                            <div style={{fontSize:11,color:"#a3aac4",marginTop:5,lineHeight:1.5}}>
+                              {o.direct?<>If a desk answers instead: &ldquo;{o.step1.ask}&rdquo;</>:o.step1.note}
+                            </div>
+                          </div>
+                        )
+                      })()}
+                      {/* 📱 DM direct line — shown ABOVE the switchboard because it
+                          skips step 1 entirely. Same tel:/Twilio paths, just a
+                          different number. */}
+                      {lead.dm_phone&&(
+                        <div style={{marginBottom:12,background:"#7dd3fc10",border:"1px solid #7dd3fc50",borderRadius:12,padding:"10px 14px"}}>
+                          <div style={{fontSize:"0.6rem",color:"#7dd3fc",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",marginBottom:6}}>
+                            📱 Direct line{lead.firstName?` — ${lead.firstName}`:""} · skips the front desk
+                          </div>
+                          <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,flexWrap:"wrap"}}>
+                            <a href={`tel:${String(lead.dm_phone).replace(/[^\d+]/g,"")}`}
+                              style={{fontFamily:"'Space Grotesk',sans-serif",fontSize:28,fontWeight:700,
+                                color:"#7dd3fc",letterSpacing:".04em",textDecoration:"none"}}>{lead.dm_phone}</a>
+                            {twilioCall?.ready&&(
+                              <button className="btn btn-p" style={{fontSize:12,padding:"8px 12px"}}
+                                onClick={()=>startTwilioCall(lead,lead.dm_phone)}
+                                title="Rings your phone first, then connects to the direct line with a local caller ID.">☎️ Call direct</button>
+                            )}
+                            <button title="Copy direct line"
+                              onClick={()=>{navigator.clipboard?.writeText(lead.dm_phone).then(()=>notify("📋 Direct line copied")).catch(()=>{})}}
+                              style={{fontSize:13,padding:"7px 12px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",
+                                border:"1px solid #40485d40",background:"transparent",color:"#a3aac4"}}>📋</button>
+                          </div>
+                        </div>
+                      )}
+                      {lead.phone&&lead.dm_phone&&(
+                        <div style={{fontSize:"0.6rem",color:"#a3aac4",fontWeight:700,letterSpacing:".1em",textTransform:"uppercase",marginBottom:6}}>
+                          ☎️ Main line
+                        </div>
+                      )}
                       {lead.phone&&twilioCall?.ready&&(
                         <button className="btn btn-p"
                           style={{width:"100%",padding:"13px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",
                             fontWeight:700,marginBottom:10}}
                           onClick={()=>startTwilioCall(lead)}
                           title="Rings your phone first, then connects with a local-area-code caller ID. Records where legal.">
-                          ☎️ Call — local caller ID
+                          ☎️ Call{lead.dm_phone?" main line":""} — local caller ID
                         </button>
                       )}
                       {lead.phone&&(
@@ -6137,8 +6436,13 @@ export default function App(){
             // retries, then oldest first — so the top row is always the most
             // important miss, no matter how long the list gets.
             const attemptedSince=l=>l.last_called_at&&tsLocalDate(l.last_called_at)>=l.callbackDate
-            const statusPrio={interested:0,interested_no_dm:1,callback:2}
+            // gatekeeper (3) is the new script's day-2 call — we have a name to
+            // ask for, so it outranks a routine retry. Within a status, a
+            // lead with a named contact comes before one without.
+            const statusPrio={interested:0,interested_no_dm:1,callback:2,gatekeeper:3}
+            const named=l=>(l.firstName||"").trim()?0:1
             const byUrgency=(a,b)=>((statusPrio[a.status]??9)-(statusPrio[b.status]??9))
+              ||(named(a)-named(b))
               ||a.callbackDate.localeCompare(b.callbackDate)
             const overdueAll=rest.filter(l=>l.callbackDate<today)
             const buckets = [
@@ -6267,6 +6571,8 @@ export default function App(){
                                 border:`1px solid ${info.color}30`,width:"fit-content"}}>{info.label}</span>
                               <div style={{fontSize:12,color:"#a3aac4",overflow:"hidden",
                                 display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>
+                                {lead.reach_notes?<><span style={{color:"#ffe083",fontWeight:600}}>🕐 {lead.reach_notes}</span><br/></>:""}
+                                {lead.dm_phone?<><span style={{color:"#7dd3fc"}}>📱</span> <span style={{color:"#7dd3fc",fontWeight:600}}>{lead.dm_phone}</span> direct<br/></>:""}
                                 {lead.phone?<><span style={{color:"#a3a6ff"}}>📞</span> {lead.phone}<br/></>:""}
                                 {lead.notes||""}
                               </div>
