@@ -1394,6 +1394,176 @@ def dialer_tz_bucket(state, now_utc=None) -> int:
         return TZ_BUCKET_OFF
     return TZ_BUCKET_LUNCH if hour in DIALER_LOCAL_LUNCH_HOURS else TZ_BUCKET_PRIME
 
+# ── Best-hour ranking (2026-10) ─────────────────────────────────────────────
+# PRIME/LUNCH/OFF treated every open hour alike. Cristine's own dials say they
+# are not: Jun 29-Oct 7, 7,160 placeable dials, rate a NON-gatekeeper picked up
+# by the prospect's local hour, with each state's own rate subtracted out (so
+# "10am" isn't just "Nevada"): 10am 11.4% · 11am 8.7 · 2pm 8.4 · 1pm 8.1 ·
+# 9am 7.3 · 3pm 7.3 · noon 7.1 · 4pm 4.2. 10am beats noon by 60%, yet most
+# dials landed at noon-1pm local because Eastern states hit lunch exactly
+# when her shift peaks.
+#
+# So every open hour gets a RANK from those measured scores, recomputed daily
+# from the last DIALER_HOUR_SCORE_DAYS. The rank replaces the bucket as the
+# dialer's tz sort key: as each market's clock moves, the queue serves
+# whichever states are at their best hour right now, and a market that hits
+# lunch sinks behind one that's at 10am — then comes back. Same contract as
+# the buckets: a SORT key, never a filter; OFF still sinks last; an unplaceable
+# lead still fails open on the fallback offset.
+#
+# Scores are shrunk toward a prior (overall rate; lunch hours penalised by
+# DIALER_LUNCH_PRIOR_PENALTY) with DIALER_HOUR_SCORE_PRIOR pseudo-dials, so a
+# thin hour can't jump the queue on a lucky week. With no data at all the
+# ranks reduce to exactly the old PRIME-then-LUNCH order.
+DIALER_HOUR_RANKING        = os.getenv("DIALER_HOUR_RANKING", "1") == "1"
+DIALER_HOUR_SCORE_DAYS     = int(os.getenv("DIALER_HOUR_SCORE_DAYS", "90"))
+DIALER_HOUR_SCORE_PRIOR    = float(os.getenv("DIALER_HOUR_SCORE_PRIOR", "200"))
+DIALER_HOUR_SCORE_MIN_DIALS = int(os.getenv("DIALER_HOUR_SCORE_MIN_DIALS", "500"))
+DIALER_LUNCH_PRIOR_PENALTY = float(os.getenv("DIALER_LUNCH_PRIOR_PENALTY", "0.15"))
+DIALER_HOUR_SCORE_REFRESH_H = float(os.getenv("DIALER_HOUR_SCORE_REFRESH_HOURS", "24"))
+TZ_RANK_OFF = 99   # off-hours rank: always after every open hour
+# "Reached a person who isn't the front desk" — the conversations she's short
+# of. Derived from CONTACT_OUTCOMES (defined further down, so read at call
+# time) so it can't drift from the leaderboard.
+def _dm_reach_outcomes() -> frozenset:
+    return frozenset(CONTACT_OUTCOMES) - {"gatekeeper"}
+
+_hour_rank_cache = {"at": 0.0, "scores": None, "meta": None}
+
+def _open_hours() -> list:
+    return [h for h in range(24) if DIALER_LOCAL_START_HOUR <= h < DIALER_LOCAL_END_HOUR]
+
+def _prior_hour_scores(overall: float) -> dict:
+    return {h: overall * ((1 - DIALER_LUNCH_PRIOR_PENALTY) if h in DIALER_LOCAL_LUNCH_HOURS else 1.0)
+            for h in _open_hours()}
+
+def score_hours(samples) -> dict:
+    """Pure: samples = iterable of (state_key, local_hour, reached_bool).
+    Returns {"scores": {hour: rate}, "counts": {hour: n}, "overall", "n"}.
+    State-adjusted (each dial's residual against its own state's rate), then
+    shrunk toward the prior. Fewer than DIALER_HOUR_SCORE_MIN_DIALS → priors."""
+    samples = list(samples)
+    n = len(samples)
+    if n < DIALER_HOUR_SCORE_MIN_DIALS:
+        return {"scores": _prior_hour_scores(1.0), "counts": {}, "overall": None, "n": n,
+                "source": "prior"}
+    overall = sum(1 for _, _, y in samples if y) / n
+    by_state = {}
+    for st, _, y in samples:
+        a = by_state.setdefault(st, [0, 0])
+        a[0] += 1; a[1] += 1 if y else 0
+    srate = {k: v[1] / v[0] for k, v in by_state.items()}
+    res, cnt = {}, {}
+    for st, h, y in samples:
+        res[h] = res.get(h, 0.0) + ((1 if y else 0) - srate[st])
+        cnt[h] = cnt.get(h, 0) + 1
+    prior = _prior_hour_scores(overall)
+    K = max(DIALER_HOUR_SCORE_PRIOR, 0.0)
+    scores = {}
+    for h in _open_hours():
+        nh = cnt.get(h, 0)
+        denom = nh + K
+        scores[h] = prior[h] if denom <= 0 else (res.get(h, 0.0) + nh * overall + K * prior[h]) / denom
+    return {"scores": scores, "counts": {h: cnt.get(h, 0) for h in _open_hours()},
+            "overall": overall, "n": n, "source": "measured"}
+
+def hour_ranks_from_scores(scores: dict) -> dict:
+    """{hour: dense rank}, 0 = best, for OPEN hours only. Scores are compared
+    at 0.1-point resolution so float noise can't split equal hours."""
+    open_h = _open_hours()
+    keyed = {h: round(float(scores.get(h, 0.0)) * 1000) for h in open_h}
+    distinct = sorted(set(keyed.values()), reverse=True)
+    pos = {v: i for i, v in enumerate(distinct)}
+    return {h: pos[keyed[h]] for h in open_h}
+
+def compute_dialer_hour_scores() -> dict:
+    """Walk recent call_outcomes + lead states and score each local hour.
+    Raises on a failed read rather than scoring a partial table."""
+    since = (datetime.utcnow() - timedelta(days=DIALER_HOUR_SCORE_DAYS)).strftime("%Y-%m-%d")
+    calls = _paginated_get(f"{SUPABASE_URL}/rest/v1/call_outcomes?select=leadId,outcome,calledAt"
+                           f"&calledAt=gte.{since}T00:00:00&order=id", max_pages=60)
+    leads = _paginated_get(f"{SUPABASE_URL}/rest/v1/leads?select=id,state&order=id", max_pages=60)
+    if not isinstance(calls, list) or not isinstance(leads, list) or not leads:
+        raise RuntimeError("hour-score read failed")
+    state_of = {l.get("id"): l.get("state") for l in leads}
+    reached = _dm_reach_outcomes()
+    samples = []
+    for c in calls:
+        st = state_of.get(c.get("leadId"))
+        ts = c.get("calledAt")
+        if not st or not ts:
+            continue
+        try:
+            t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        hour, fallback = lead_local_hour(st, t)
+        if fallback:
+            continue          # we'd only be guessing its hour
+        samples.append((str(st).strip().upper(), hour, c.get("outcome") in reached))
+    out = score_hours(samples)
+    out["computed_at"] = datetime.utcnow().isoformat()
+    out["days"] = DIALER_HOUR_SCORE_DAYS
+    return out
+
+def dialer_hour_ranks() -> dict:
+    """{hour: rank} for open hours. Request-path safe: reads the stored scores
+    (cached 30 min in memory), never computes; any failure → prior ranks,
+    which are the old PRIME/LUNCH order. Ranking off → priors too."""
+    if not DIALER_HOUR_RANKING:
+        return hour_ranks_from_scores(_prior_hour_scores(1.0))
+    if time.time() - _hour_rank_cache["at"] > 1800:     # "at" starts at 0 → first call loads
+        _hour_rank_cache["at"] = time.time()
+        try:
+            row = _settings_get_json("dialer_hour_scores") or {}
+            sc = {int(k): float(v) for k, v in (row.get("scores") or {}).items()}
+            if sc:
+                _hour_rank_cache["scores"] = sc
+                _hour_rank_cache["meta"] = {k: row.get(k) for k in
+                                            ("computed_at", "n", "overall", "source", "days", "counts")}
+        except Exception as e:
+            print(f"[HOUR-RANK] load failed, using priors: {e}")
+    sc = _hour_rank_cache["scores"] or _prior_hour_scores(1.0)
+    # Scores were stored for the window at compute time; an hour newly inside
+    # the window (env change) gets the prior so it is never missing a rank.
+    prior = _prior_hour_scores(sum(sc.values()) / len(sc) if sc else 1.0)
+    return hour_ranks_from_scores({h: sc.get(h, prior[h]) for h in _open_hours()})
+
+def dialer_tz_rank(state, now_utc=None, ranks=None) -> int:
+    """Sort key replacing the bucket: 0 = the best hour to be ringing this
+    lead's desk right now. OFF → TZ_RANK_OFF. Fails open like the bucket."""
+    hour, _ = lead_local_hour(state, now_utc)
+    if not (DIALER_LOCAL_START_HOUR <= hour < DIALER_LOCAL_END_HOUR):
+        return TZ_RANK_OFF
+    r = ranks if ranks is not None else dialer_hour_ranks()
+    return r.get(hour, 0)
+
+_hour_score_attempt = {"at": 0.0}
+
+def run_dialer_hour_scores_if_due():
+    """bg loop: recompute once per DIALER_HOUR_SCORE_REFRESH_HOURS. The
+    in-process attempt clock is the guard, NOT the stored row — a twin
+    service whose settings writes are RLS-dropped must not re-walk the call
+    table every tick (see the weekly-job guard)."""
+    if not DIALER_HOUR_RANKING:
+        return
+    if time.time() - _hour_score_attempt["at"] < DIALER_HOUR_SCORE_REFRESH_H * 3600:
+        return
+    _hour_score_attempt["at"] = time.time()
+    row = _settings_get_json("dialer_hour_scores") or {}
+    try:
+        last = datetime.fromisoformat(row.get("computed_at") or "")
+        if datetime.utcnow() - last < timedelta(hours=DIALER_HOUR_SCORE_REFRESH_H):
+            return
+    except ValueError:
+        pass
+    out = compute_dialer_hour_scores()
+    if not _settings_set_json("dialer_hour_scores", out):
+        print("[HOUR-RANK] could not store scores")
+        return
+    _hour_rank_cache["at"] = 0.0     # next read picks up the new scores
+    print(f"[HOUR-RANK] scored {out['n']} dials ({out['source']}): ranks={hour_ranks_from_scores(out['scores'])}")
+
 def _tz_lookup_for_client() -> dict:
     """state -> IANA tz, keyed by abbreviation AND upper-cased full name.
 
@@ -2959,6 +3129,11 @@ def _bg_maintenance_loop():
             run_hot_lead_digest_if_due()
         except Exception as e:
             print(f"[HOT-DIGEST] loop exception: {e}")
+        # Best-hour ranking for the dialer — recomputes once a day.
+        try:
+            run_dialer_hour_scores_if_due()
+        except Exception as e:
+            print(f"[HOUR-RANK] loop exception: {e}")
         # Daily once-called recycle — internal cooldown, no-ops most ticks.
         try:
             run_once_called_recycle_if_due()
@@ -6490,6 +6665,24 @@ def is_due_followup(lead: dict, today: str, now_utc: datetime) -> bool:
             pass
     return True
 
+@app.get("/api/admin/dialer-hour-scores")
+def admin_dialer_hour_scores(recompute: int = 0, user: str = Depends(verify_admin)):
+    """What the dialer's best-hour ranking is based on. recompute=1 rescores
+    now (two table walks) and stores the result."""
+    if recompute:
+        out = compute_dialer_hour_scores()
+        stored = _settings_set_json("dialer_hour_scores", out)
+        _hour_rank_cache["at"] = 0.0
+    else:
+        out = _settings_get_json("dialer_hour_scores") or {}
+        stored = None
+    return {"enabled": DIALER_HOUR_RANKING, "stored": stored,
+            "ranks": dialer_hour_ranks(), "window": [DIALER_LOCAL_START_HOUR, DIALER_LOCAL_END_HOUR],
+            "lunch_hours": sorted(DIALER_LOCAL_LUNCH_HOURS),
+            "scores_pct": {str(h): round(v * 100, 2) for h, v in (out.get("scores") or {}).items()}
+                          if out.get("source") == "measured" else {},
+            **{k: out.get(k) for k in ("computed_at", "n", "overall", "source", "days", "counts")}}
+
 @app.get("/api/dialer/queue")
 def dialer_queue(limit: int = 50, snooze_hours: int = 4,
                  user: str = Depends(verify_token)):
@@ -6573,16 +6766,18 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
         # Memoised per state: there are ~50 distinct values across thousands
         # of rows, and state_to_iana_tz() falls back to a linear scan of the
         # full-name table when a lead stores "Ohio" rather than "OH".
-        bucket_by_state = {}
+        bucket_by_state, rank_by_state = {}, {}
+        ranks = dialer_hour_ranks()
         decorated = []
         for l in out:
             st = l.get("state")
             key = st if isinstance(st, str) else repr(st)
             if key not in bucket_by_state:
                 bucket_by_state[key] = dialer_tz_bucket(st, now_utc)
+                rank_by_state[key] = dialer_tz_rank(st, now_utc, ranks)
             b = bucket_by_state[key]
             tz_counts[b] = tz_counts.get(b, 0) + 1
-            decorated.append((b, l))
+            decorated.append(((b, rank_by_state[key]), l))
         # Stable sort on the bucket ALONE. Python's sort is stable and `rows`
         # arrived in the PostgREST `order=` sequence (fewest calls, then oldest
         # contact, then best score), so that whole ladder survives untouched
@@ -6590,10 +6785,12 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
         # two definitions drifting apart.
         # Due follow-ups whose office is open come first, oldest due date
         # first; everything else keeps the bucket-then-ladder order.
+        # Outside the due group, the best-hour RANK orders the markets (see
+        # dialer_hour_ranks); the bucket is kept only for the OFF test/counts.
         def _key(pair):
-            b, l = pair
+            (b, rk), l = pair
             due = b != TZ_BUCKET_OFF and is_due_followup(l, today, now_utc)
-            return (0, (l.get("callbackDate") or "")[:10], b) if due else (1, "", b)
+            return (0, (l.get("callbackDate") or "")[:10], rk) if due else (1, "", rk)
         decorated.sort(key=_key)
         out = [l for _, l in decorated]
     else:
@@ -6608,6 +6805,7 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
             "due_followups": due_count,
             "tz_order": DIALER_TZ_ORDER,
             "tz_window": [DIALER_LOCAL_START_HOUR, DIALER_LOCAL_END_HOUR],
+            "hour_ranks": dialer_hour_ranks() if DIALER_TZ_ORDER else {},
             "tz_buckets": {"prime": tz_counts.get(TZ_BUCKET_PRIME, 0),
                            "lunch": tz_counts.get(TZ_BUCKET_LUNCH, 0),
                            "off_hours": tz_counts.get(TZ_BUCKET_OFF, 0)}}
@@ -7180,6 +7378,9 @@ def call_config(user: str = Depends(verify_token)):
                           "start_hour": DIALER_LOCAL_START_HOUR,
                           "end_hour": DIALER_LOCAL_END_HOUR,
                           "lunch_hours": sorted(DIALER_LOCAL_LUNCH_HOURS),
+                          # {hour: rank}, 0 = best — the client sorts on this
+                          # exactly as the server does (tzRanksFor in App.jsx).
+                          "hour_rank": {str(h): r for h, r in dialer_hour_ranks().items()},
                           "fallback_offset_hours": LEADFLOW_TZ_OFFSET_HOURS,
                           # Keyed by BOTH abbreviation and upper-cased full
                           # name ("OH" and "OHIO"), so the client resolves a
