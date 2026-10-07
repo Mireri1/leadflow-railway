@@ -2029,43 +2029,278 @@ def load_email_template(name: str = "tried-to-call") -> dict:
 VLM_SCRAPER_URL     = os.getenv("VLM_SCRAPER_URL", "").rstrip("/")
 VLM_SCRAPER_API_KEY = os.getenv("VLM_SCRAPER_API_KEY", "").strip()
 
-# Soft-negative phrases (e.g. "not now", "maybe later") classify as
-# negative for suppression purposes. Erring toward over-suppression is
-# cheaper than the complaint cost of a second cold email after a soft no.
-_NEGATIVE_PHRASES = (
-    "not interested", "no thanks", "no thank you", "no, thanks",
-    "please remove", "unsubscribe", "stop emailing", "stop contacting",
-    "do not contact", "do not email", "take me off", "remove me",
-    "already have", "have a vendor", "under contract", "go away",
-    "leave me alone", "this is spam", "cease",
-    "not now", "maybe later", "not at this time", "no interest",
-)
-_POSITIVE_PHRASES = (
-    "interested", "tell me more", "how much", "pricing", "quote",
-    "sounds good", "let's talk", "lets talk", "call me", "schedule",
-    "available", "when can", "set up a", "would like", "send me",
-    "more info", "more information",
+# ── Reply triage — one brain shared with vlm-scraper ──────────────────────
+# The old classify_reply_sentiment() was a keyword mirror of vlm-scraper's
+# retired classifier. Measured against real reply shapes it:
+#   • read our own QUOTED email ("...get you a quote", "hard to schedule")
+#     and called "Please stop" / "take us off your list" POSITIVE → lead
+#     flipped to interested + "worth a same-day call" Slack ping;
+#   • suppressed convertible objections ("interested, but we already have a
+#     vendor") and every "not now";
+#   • called "I'm not really interested" positive ("interested" substring).
+#
+# New flow (classify_reply):
+#   1. strip quoted history — only what the prospect typed is classified;
+#   2. deterministic opt-out rules (STOP / unsubscribe / remove me / bare
+#      "no") → hard no WITHOUT any network call, so compliance never depends
+#      on an API being up;
+#   3. otherwise POST to vlm-scraper /api/replies/classify, which runs the
+#      same Claude triage (lib/reply-classifier.js, pipeline 'vcc') that
+#      vlm-scraper uses on its own replies;
+#   4. if that is unreachable, a local port of vlm-scraper's heuristic.
+# ONLY not_interested / unsubscribe suppress. Objections and not_now stay live.
+REPLY_CLASSIFY_URL = (os.getenv("REPLY_CLASSIFY_URL", "").strip()
+                      or (f"{VLM_SCRAPER_URL}/api/replies/classify" if VLM_SCRAPER_URL else ""))
+REPLY_CLASSIFY_TIMEOUT = int(os.getenv("REPLY_CLASSIFY_TIMEOUT", "60"))
+REPLY_NOT_NOW_DEFAULT_DAYS = int(os.getenv("REPLY_NOT_NOW_DEFAULT_DAYS", "60"))
+REPLY_CATEGORIES = ("interested", "meeting_request", "question", "objection", "not_now",
+                    "referral", "not_interested", "unsubscribe", "auto_reply", "unclear")
+REPLY_OBJECTION_TYPES = ("has_vendor", "price", "timing", "no_need", "trust",
+                         "wrong_person", "too_small", "other")
+REPLY_NEXT_ACTIONS = ("reply_now", "book_call", "follow_up_later", "forward", "suppress", "none")
+HARD_NO_CATEGORIES = ("not_interested", "unsubscribe")
+REPLY_CATEGORY_LABELS = {
+    "interested": "Interested", "meeting_request": "Wants a call", "question": "Has a question",
+    "objection": "Objection", "not_now": "Not now", "referral": "Referral",
+    "not_interested": "Not interested", "unsubscribe": "Unsubscribe",
+    "auto_reply": "Auto-reply", "unclear": "Unclear",
+}
+
+# Where quoted history starts. Earliest match wins.
+_QUOTE_MARKERS = (
+    re.compile(r"^[ \t]*On\s[^\n]{0,250}(?:\n[^\n]{0,250})?\swrote:[ \t]*$", re.I | re.M),  # Gmail / Apple (may wrap)
+    re.compile(r"^[ \t]*-{2,}\s*Original Message\s*-{2,}", re.I | re.M),
+    re.compile(r"^[ \t]*_{10,}[ \t]*$", re.M),                                   # Outlook rule
+    re.compile(r"^[ \t]*\*?From:\*?\s[^\n]+\n[ \t]*\*?(?:Sent|Date):", re.I | re.M),  # Outlook header block
+    re.compile(r"^[ \t]*>", re.M),                                               # first '>' line
 )
 
-def classify_reply_sentiment(text: str) -> str:
-    """Cheap keyword classifier matching vlm-scraper's
-    classifyReplySentiment so the two systems agree on what counts as a
-    negative reply. Bare 'stop' / 'no' on its own line counts as negative
-    — those are the bulk of soft-opt-outs."""
-    t = (text or "").lower().strip()
-    if not t:
-        return "neutral"
-    # Single-word "stop" or "no" replies (very common opt-out style).
-    first_line = t.splitlines()[0].strip(" .!?")
-    if first_line in ("stop", "no", "remove", "unsubscribe"):
+def _split_quoted_reply(text: str):
+    """(what_they_typed, quoted_history). Our own template text lives in the
+    quoted part — classifying it is what made 'Please stop' read as positive."""
+    t = (text or "").replace("\r\n", "\n").replace("’", "'")
+    cut = len(t)
+    for rx in _QUOTE_MARKERS:
+        m = rx.search(t)
+        if m and m.start() < cut:
+            cut = m.start()
+    new, quoted = t[:cut].strip(), t[cut:].strip()
+    if not new:
+        # Bottom-posted / inline reply: keep every non-'>' line.
+        t2 = _QUOTE_MARKERS[0].sub("", t)
+        new = "\n".join(l for l in t2.splitlines() if not l.lstrip().startswith(">")).strip()
+    return new, quoted
+
+# Templates say "Reply STOP to opt out" — honour every common shape of it.
+# Kept in lockstep with vlm-scraper lib/reply-text.js explicitOptOutCategory()
+# (OPT_OUT_WHOLE / OPT_OUT_PHRASE / FLAT_NO) so both systems agree on what a
+# legal opt-out is without asking a model.
+_OPT_OUT_FIRST_LINE = re.compile(
+    r"^(?:stop|stop all|stop please|please stop|unsubscribe|unsub|remove|remove me|remove us|"
+    r"opt[\s-]?out|quit|cancel|end|stop\s+(?:emailing|contacting|sending|messaging)(?:\s+(?:me|us))?)$", re.I)
+_OPT_OUT_ANYWHERE = re.compile(
+    r"\b(?:unsubscribe|stop\s+(?:emailing|e-mailing|sending|contacting|messaging|spamming)|"
+    r"take\s+(?:me|us|this\s+(?:email|address))\s+off|"
+    r"remove\s+(?:me|us|this\s+(?:email|address)|my\s+(?:email|address)|our\s+(?:email|address))|"
+    r"(?:don't|do\s+not|never)\s+(?:email|e-mail|contact|message)\s+(?:me|us)|"
+    r"opt(?:ed)?[\s-]?out|opt\s+(?:me|us)\s+out|no\s+more\s+emails|this\s+is\s+spam|"
+    r"report(?:ed|ing)?\s+(?:this\s+|you\s+|it\s+)?(?:as\s+)?spam|leave\s+(?:me|us)\s+alone)\b", re.I)
+# Flat no — the old classifier's single-word rule, kept so hard-no behaviour
+# is unchanged (vlm-scraper FLAT_NO).
+_HARD_NO_FIRST_LINE = re.compile(
+    r"^(?:no|nope|no,?\s+thanks|no,?\s+thank\s+you|not\s+interested|no\s+interest)$", re.I)
+
+def _first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip().strip(" .!?,\"'")
+    return ""
+
+def _sentiment_from_category(category: str, convertible: bool = False) -> str:
+    """Legacy positive/neutral/negative — digests and audit rows still read it.
+    Mirrors vlm-scraper sentimentFromCategory()."""
+    if category in ("interested", "meeting_request", "question", "referral"):
+        return "positive"
+    if category == "objection":
+        return "neutral" if convertible else "negative"
+    if category in HARD_NO_CATEGORIES:
         return "negative"
-    for phrase in _NEGATIVE_PHRASES:
-        if phrase in t:
-            return "negative"
-    for phrase in _POSITIVE_PHRASES:
-        if phrase in t:
-            return "positive"
+    if category == "auto_reply":
+        return "auto_reply"
     return "neutral"
+
+# Local port of vlm-scraper heuristicClassify() — fallback only.
+# (vlm-scraper's list also has bare "please remove" — dropped here: "please
+# remove the old invoice" is not an opt-out, and the rule layer above already
+# catches "remove me / us / my email".)
+_H_UNSUB = ("unsubscribe", "remove me", "take me off", "stop emailing",
+            "stop contacting", "do not contact", "don't contact", "do not email",
+            "leave me alone", "go away", "cease", "report you", "reporting this", "spam")
+_H_NOT_INTERESTED = ("not interested", "no interest", "no thanks", "no thank you", "not for us",
+                     "we'll pass", "we will pass", "pass on this", "not a fit", "not looking")
+_H_OBJECTIONS = (
+    ("has_vendor", ("already have", "have a vendor", "have someone", "current vendor", "current provider",
+                    "under contract", "work with someone", "existing vendor", "already use",
+                    "already working with", "happy with our", "satisfied with our", "in-house", "in house")),
+    ("price", ("too expensive", "can't afford", "cannot afford", "no budget", "out of our budget",
+               "too much", "cheaper", "pricey")),
+    ("timing", ("not right now", "not at this time", "bad time", "busy season", "next quarter", "next year",
+                "circle back", "check back", "reach out in", "reach back", "follow up in", "touch base in",
+                "revisit", "later in the year", "after the", "not now", "maybe later")),
+    ("no_need", ("don't need", "do not need", "no need", "handle it ourselves", "do it ourselves",
+                 "don't use", "we don't do")),
+    ("trust", ("references", "proof", "reviews", "guarantee", "how do i know", "sounds too good", "scam")),
+    ("wrong_person", ("not the right person", "wrong person", "not my department", "don't handle",
+                      "not in charge", "not my decision")),
+    ("too_small", ("too small", "just me", "one person", "solo", "not big enough", "only have")),
+)
+_H_REFERRAL = ("reach out to", "contact my", "talk to my", "forward", "forwarded", "cc'd", "copied",
+               "the right person is", "you should talk to", "speak with", "handles that", "in charge of that")
+_H_MEETING = ("call me", "give me a call", "schedule", "set up a call", "set up a time", "hop on a call",
+              "quick call", "meeting", "zoom", "are you available", "when are you", "what time",
+              "my number is", "book a")
+_H_QUESTION = ("how does", "how do you", "what is", "what's", "what are", "do you", "can you", "is this",
+               "how much", "pricing", "price", "cost", "what areas", "where are you", "are you insured", "bonded")
+_H_INTEREST = ("interested", "tell me more", "sounds good", "let's talk", "lets talk", "love to",
+               "would like", "send me", "more info", "more information", "send over", "let's do it",
+               "sign me up", "yes please", "sure")
+
+def _h_has(text: str, phrases) -> bool:
+    return any(re.search(r"(^|[^a-z0-9])" + re.escape(p) + r"(?=$|[^a-z0-9])", text) for p in phrases)
+
+def _heuristic_classify_reply(text: str) -> dict:
+    t = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    if not t:
+        return {"category": "unclear", "confidence": 0.2, "summary": "Reply body could not be read."}
+    if _h_has(t, _H_UNSUB):
+        return {"category": "unsubscribe", "confidence": 0.8, "summary": "Asked to be removed."}
+    if _h_has(t, _H_REFERRAL):
+        return {"category": "referral", "confidence": 0.5, "next_action": "forward",
+                "summary": "Pointed us to someone else."}
+    objection = next((typ for typ, ph in _H_OBJECTIONS if _h_has(t, ph)), None)
+    # "not really interested" / "not that interested" — negation the phrase
+    # list misses, which then fell through to INTEREST ("interested").
+    negated = bool(re.search(r"\bnot\s+(?:\w+\s+){0,2}interested\b", t))
+    if (negated or _h_has(t, _H_NOT_INTERESTED)) and not objection:
+        return {"category": "not_interested", "confidence": 0.7, "summary": "Said they are not interested."}
+    if objection == "timing":
+        return {"category": "not_now", "objection_type": "timing", "convertible": True, "confidence": 0.6,
+                "next_action": "follow_up_later", "follow_up_days": 45, "summary": "Asked us to come back later."}
+    if objection:
+        conv = objection != "wrong_person"
+        return {"category": "objection", "objection_type": objection, "convertible": conv, "confidence": 0.55,
+                "next_action": "reply_now" if conv else "none",
+                "summary": "Pushed back without a hard no."}
+    if _h_has(t, _H_MEETING):
+        return {"category": "meeting_request", "confidence": 0.6, "next_action": "book_call",
+                "summary": "Wants to talk live."}
+    if _h_has(t, _H_INTEREST):
+        return {"category": "interested", "confidence": 0.6, "next_action": "reply_now",
+                "summary": "Expressed interest."}
+    if _h_has(t, _H_QUESTION) or "?" in t:
+        return {"category": "question", "confidence": 0.5, "next_action": "reply_now",
+                "summary": "Asked a question."}
+    return {"category": "unclear", "confidence": 0.3, "next_action": "reply_now",
+            "summary": "Could not determine intent — read it."}
+
+def _normalize_triage(d: dict, source: str) -> dict:
+    """Same invariants as vlm-scraper normalize(): hard nos always suppress,
+    not_now is always convertible timing, auto_reply/unsubscribe get no draft."""
+    d = d or {}
+    cat = d.get("category") if d.get("category") in REPLY_CATEGORIES else "unclear"
+    obj = d.get("objection_type") if d.get("objection_type") in REPLY_OBJECTION_TYPES else None
+    if cat not in ("objection", "not_now"):
+        obj = None
+    if cat == "not_now" and not obj:
+        obj = "timing"
+    conv = d.get("convertible") is True
+    if cat in HARD_NO_CATEGORIES or cat in ("auto_reply", "unclear"):
+        conv = False
+    if cat == "not_now":
+        conv = True
+    nxt = d.get("next_action") if d.get("next_action") in REPLY_NEXT_ACTIONS else "none"
+    if cat in HARD_NO_CATEGORIES:
+        nxt = "suppress"
+    if cat == "auto_reply":
+        nxt = "none"
+    fud = d.get("follow_up_days")
+    fud = fud if isinstance(fud, int) and not isinstance(fud, bool) and fud > 0 else None
+    if nxt == "follow_up_later" and not fud:
+        fud = 30
+    try:
+        conf = max(0.0, min(1.0, float(d.get("confidence") or 0)))
+    except (TypeError, ValueError):
+        conf = 0.0
+    draft = "" if cat in ("unsubscribe", "auto_reply") else str(d.get("suggested_reply") or "").strip()
+    return {"category": cat, "objection_type": obj, "convertible": conv, "confidence": conf,
+            "summary": str(d.get("summary") or "").strip()[:500], "next_action": nxt,
+            "follow_up_days": fud, "suggested_reply": draft[:2000],
+            "sentiment": _sentiment_from_category(cat, conv), "source": source}
+
+def _classify_reply_remote(reply_text: str, subject: str, our_email_text: str, lead: dict):
+    """Ask vlm-scraper's Claude triage. None on any failure (caller falls back)."""
+    if not (REPLY_CLASSIFY_URL and VLM_SCRAPER_API_KEY):
+        return None
+    lead = lead or {}
+    try:
+        r = req_lib.post(
+            REPLY_CLASSIFY_URL,
+            headers={"x-api-key": VLM_SCRAPER_API_KEY, "Content-Type": "application/json"},
+            json={
+                "pipeline": "vcc",
+                "reply_text": (reply_text or "")[:6000],
+                "subject_sent": re.sub(r"^\s*(?:(?:re|fw|fwd)\s*:\s*)+", "", subject or "", flags=re.I),
+                "our_email_text": (our_email_text or "")[:2500],
+                "contact": {"first_name": lead.get("firstName") or "", "last_name": lead.get("lastName") or "",
+                            "email": lead.get("email") or "", "title": lead.get("title") or ""},
+                "company": {"name": lead.get("company") or "", "city": lead.get("city") or "",
+                            "state": lead.get("state") or "", "industry": lead.get("industry") or ""},
+            },
+            timeout=REPLY_CLASSIFY_TIMEOUT,
+        )
+        if r.status_code != 200:
+            print(f"[REPLY-TRIAGE] classify endpoint HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        data = r.json()
+        if not isinstance(data, dict) or data.get("category") not in REPLY_CATEGORIES:
+            print(f"[REPLY-TRIAGE] classify endpoint returned unexpected body: {str(data)[:200]}")
+            return None
+        return data
+    except Exception as e:
+        print(f"[REPLY-TRIAGE] classify endpoint failed: {type(e).__name__}: {e}")
+        return None
+
+def classify_reply(body_text: str, subject: str = "", lead: dict = None) -> dict:
+    """Structured triage of one inbound reply. Never raises. Returns the
+    vlm-scraper shape plus `reply_text` (quote-stripped) for notes/Slack."""
+    new_text, quoted = _split_quoted_reply(body_text)
+    if not new_text:
+        out = _normalize_triage({"category": "unclear", "summary": "Reply body could not be read."}, "rule")
+    elif _OPT_OUT_FIRST_LINE.match(_first_line(new_text)) or _OPT_OUT_ANYWHERE.search(new_text):
+        out = _normalize_triage({"category": "unsubscribe", "confidence": 1.0,
+                                 "summary": "Asked to be removed (explicit opt-out)."}, "rule")
+    elif _HARD_NO_FIRST_LINE.match(_first_line(new_text)) and len(new_text.split()) <= 4:
+        out = _normalize_triage({"category": "not_interested", "confidence": 0.9,
+                                 "summary": "Flat no."}, "rule")
+    else:
+        remote = _classify_reply_remote(new_text, subject, quoted, lead)
+        if remote is not None:
+            out = _normalize_triage(remote, str(remote.get("source") or "vlm"))
+        else:
+            out = _normalize_triage(_heuristic_classify_reply(new_text), "heuristic")
+    out["reply_text"] = new_text
+    return out
+
+def classify_reply_sentiment(text: str) -> str:
+    """Back-compat wrapper (offline: rules + heuristic, no network)."""
+    new_text, _ = _split_quoted_reply(text)
+    if not new_text:
+        return "neutral"
+    if _OPT_OUT_FIRST_LINE.match(_first_line(new_text)) or _OPT_OUT_ANYWHERE.search(new_text) \
+            or _HARD_NO_FIRST_LINE.match(_first_line(new_text)):
+        return "negative"
+    s = _normalize_triage(_heuristic_classify_reply(new_text), "heuristic")["sentiment"]
+    return "neutral" if s == "auto_reply" else s
 
 def email_is_suppressed(email: str) -> bool:
     """Is this email on the global lead_suppressions table? Used as the
@@ -2111,23 +2346,27 @@ def add_to_suppression(email: str, reason: str = "negative_reply",
         print(f"[SUPPRESSION] add failed for {addr}: {e}")
         return False
 
-def _push_vlm_suppression(email: str, snippet: str = "") -> None:
+def _push_vlm_suppression(email: str, snippet: str = "", reason: str = "negative_reply",
+                          source: str = "leadflow_imap") -> None:
     """Tell vlm-scraper to add this email to its own suppression_list for
     both pipelines. Fire-and-forget — vlm-scraper unavailability must
-    not block our reply processing."""
+    not block our reply processing. Non-2xx is logged: a wrong
+    VLM_SCRAPER_API_KEY used to fail silently (401) forever."""
     if not (VLM_SCRAPER_URL and VLM_SCRAPER_API_KEY and email):
         return
     try:
-        req_lib.post(
+        r = req_lib.post(
             f"{VLM_SCRAPER_URL}/api/suppression/cross-sync",
             headers={"x-api-key": VLM_SCRAPER_API_KEY,
                      "Content-Type": "application/json"},
             json={"email": email.strip().lower(),
-                  "reason": "negative_reply",
-                  "source": "leadflow_imap",
+                  "reason": reason,
+                  "source": source,
                   "notes": (snippet or "")[:200]},
             timeout=5,
         )
+        if r.status_code not in (200, 201):
+            print(f"[SUPPRESSION] vlm cross-sync HTTP {r.status_code} for {email}: {r.text[:200]}")
     except Exception as e:
         print(f"[SUPPRESSION] vlm cross-sync failed for {email}: {e}")
 
@@ -2305,20 +2544,28 @@ def _is_auto_reply(subject: str, body: str, headers: dict) -> bool:
     return any(m in blob for m in AUTO_REPLY_MARKERS)
 
 def _extract_body_snippet(msg, max_len: int = 400) -> str:
-    """Pull a short text preview from a multipart email."""
+    """Pull the text of an email: text/plain first, stripped text/html as a
+    fallback (Outlook rich replies are often HTML-only — those used to come
+    through as '' and get classified 'neutral' → lead flipped to interested)."""
+    def _decode(part):
+        payload = part.get_payload(decode=True)
+        return payload.decode(part.get_content_charset() or "utf-8", errors="replace") if payload else ""
     try:
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = part.get_content_type()
-                disp  = str(part.get("Content-Disposition") or "")
-                if ctype == "text/plain" and "attachment" not in disp:
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        return payload.decode(part.get_content_charset() or "utf-8", errors="replace").strip()[:max_len]
-        else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                return payload.decode(msg.get_content_charset() or "utf-8", errors="replace").strip()[:max_len]
+        parts = list(msg.walk()) if msg.is_multipart() else [msg]
+        for want in ("text/plain", "text/html"):
+            for part in parts:
+                if part.get_content_type() != want or "attachment" in str(part.get("Content-Disposition") or ""):
+                    continue
+                txt = _decode(part)
+                if want == "text/html":
+                    txt = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", "", txt)
+                    txt = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li)>", "\n", txt)
+                    txt = re.sub(r"<[^>]+>", "", txt)
+                    txt = (txt.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<")
+                              .replace("&gt;", ">").replace("&#39;", "'").replace("&quot;", '"'))
+                    txt = re.sub(r"\n{3,}", "\n\n", txt)
+                if txt.strip():
+                    return txt.strip()[:max_len]
     except Exception as e:
         print(f"[IMAP-POLL] body extract failed: {e}")
     return ""
@@ -2689,26 +2936,85 @@ async def inbox_reply_send(request: Request):
     return HTMLResponse(f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
       <div style="text-align:center"><h2>✉️ Sent</h2><p style="color:#a3aac4">Reply delivered to {draft.get('to','')}.</p></div></body></html>""")
 
+# Statuses an inbound email must never overwrite. A won customer emailing
+# about an invoice is not a cold-email reply; it gets a note + Slack ping,
+# and only an explicit unsubscribe suppresses them.
+_REPLY_KEEP_STATUS = {"converted"}
+REPLY_PROCESSED_KEY = "reply_processed_ids"   # app_settings rolling dedup (Message-ID hashes)
+
+def _imap_fetch_headers(mbox, ids):
+    """One FETCH for every id: FLAGS + From/Subject/Message-ID, with PEEK so
+    nothing is marked read. Returns {seq_bytes: (header_msg, is_seen)}."""
+    out = {}
+    if not ids:
+        return out
+    typ, data = mbox.fetch(b",".join(ids), "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID)])")
+    if typ != "OK":
+        return out
+    for item in data or []:
+        if isinstance(item, tuple) and len(item) >= 2 and item[0]:
+            seq = item[0].split()[0]
+            out[seq] = (email_lib.message_from_bytes(item[1] or b""), b"\\Seen" in item[0])
+    return out
+
+def _reply_processed_load():
+    """(list, existed). Raises on a read failure — the caller must skip the
+    poll rather than treat 'unknown' as 'nothing processed' and re-handle a
+    week of replies (duplicate notes, status flips and Slack pings)."""
+    r = req_lib.get(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.{REPLY_PROCESSED_KEY}&select=value",
+                    headers=SB_ADMIN_HEADERS, timeout=10)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    rows = r.json()
+    if not rows or not rows[0].get("value"):
+        return [], False
+    val = json_lib.loads(rows[0]["value"])
+    return (val if isinstance(val, list) else []), True
+
 def imap_poll_replies():
-    """Connect to IMAP, scan unread messages, match to awaiting-email leads.
-    Returns a stats dict for the manual endpoint + activity panel."""
+    """Scan the last CAMPAIGN_SUPPRESSION_DAYS of the inbox, triage replies
+    from known leads, and act on them. Returns a stats dict for the manual
+    endpoint + activity panel.
+
+    Read/unread is NOT used for bookkeeping any more:
+      • every FETCH uses BODY.PEEK, so the poller never marks mail read
+        (the old FETCH (RFC822) implicitly set \\Seen on everything it
+        touched, which destroyed Eric's unread backstop), and
+      • already-handled messages are skipped by Message-ID hash
+        (app_settings.reply_processed_ids), so a reply Eric opens on his
+        phone before the next poll is still captured (the old UNSEEN search
+        silently skipped it — no status flip, no STOP suppression)."""
     if not (IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD):
         return {"ok": False, "error": "IMAP not configured"}
     if not _imap_poll_lock.acquire(blocking=False):
         return {"ok": False, "error": "another poll is running"}
 
-    stats = {"checked": 0, "matched": 0, "auto_replies_skipped": 0, "no_match": 0, "errors": 0}
+    stats = {"checked": 0, "matched": 0, "auto_replies_skipped": 0, "no_match": 0, "errors": 0,
+             "already_processed": 0, "by_category": {}}
     started = datetime.utcnow()
-    # rolling dedup for general-inbox Slack pings (emails stay UNREAD in Gmail)
+    # rolling dedup for general-inbox Slack pings
     notified_list = _settings_get_json("inbox_notified_ids") or []
     notified = set(notified_list)
     notified_new = []
     try:
+        processed_list, processed_existed = _reply_processed_load()
+    except Exception as e:
+        _imap_poll_lock.release()
+        return {"ok": False, "error": f"reply dedup state unavailable ({e}) — poll skipped"}
+    # First run after this change: the old poller left every message it had
+    # handled marked read, so treat already-read mail as processed once.
+    bootstrap = not processed_existed
+    processed = set(processed_list)
+    processed_new = []
+
+    def _done(h):
+        if h and h not in processed:
+            processed.add(h); processed_new.append(h)
+
+    try:
         try:
             # 30s timeout — without it, a slow Gmail handshake hangs forever
-            # and never releases the poll lock. Python 3.9+ supports timeout=
-            # on IMAP4_SSL directly; fall back to socket.setdefaulttimeout for
-            # older runtimes (Railway runs 3.11+ so this is belt + suspenders).
+            # and never releases the poll lock.
             try:
                 mbox = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=30)
             except TypeError:
@@ -2716,61 +3022,87 @@ def imap_poll_replies():
                 _socket.setdefaulttimeout(30)
                 mbox = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
             mbox.login(IMAP_USERNAME, IMAP_PASSWORD)
-            mbox.select(IMAP_FOLDER)
+            typ, _ = mbox.select(IMAP_FOLDER)
+            if typ != "OK":
+                return {"ok": False, "error": f"IMAP select '{IMAP_FOLDER}' failed: {typ}", "stats": stats}
         except Exception as e:
             stats["errors"] += 1
             return {"ok": False, "error": f"IMAP connect failed: {type(e).__name__}: {e}", "stats": stats}
 
         try:
-            # Only search the suppression window — older unread emails in a
-            # busy info@ inbox shouldn't be re-processed every cycle. IMAP
-            # SINCE format: "01-Jan-2026" (3-letter month, no leading 0 fine).
             since_dt = datetime.utcnow() - timedelta(days=CAMPAIGN_SUPPRESSION_DAYS)
             since_str = since_dt.strftime("%d-%b-%Y")
-            typ, data = mbox.search(None, f'(UNSEEN SINCE {since_str})')
+            typ, data = mbox.search(None, f'(SINCE {since_str})')
             if typ != "OK":
                 return {"ok": False, "error": f"IMAP search failed: {typ}", "stats": stats}
             ids = data[0].split() if data and data[0] else []
-            # Cap per-poll work — if 200 messages match, process the newest 100
-            # and let the next poll catch the rest.
-            MAX_PER_POLL = 100
-            if len(ids) > MAX_PER_POLL:
-                stats["truncated_from"] = len(ids)
-                ids = ids[-MAX_PER_POLL:]  # IMAP returns oldest-first; tail = newest
+            heads = _imap_fetch_headers(mbox, ids)
         except Exception as e:
             return {"ok": False, "error": f"IMAP search exception: {e}", "stats": stats}
 
+        # Drop what we've already handled BEFORE capping, so a busy inbox
+        # can't starve new replies behind 100 old ones.
+        todo = []
         for msg_id in ids:
+            hm, seen = heads.get(msg_id, (None, False))
+            if hm is None:
+                todo.append((msg_id, None, seen))
+                continue
+            pre_h = _inbox_msg_hash(str(hm.get("Message-ID", "") or ""),
+                                    _extract_from_email(_decode_header_str(hm.get("From", ""))),
+                                    _decode_header_str(hm.get("Subject", "")))
+            if pre_h in processed:
+                stats["already_processed"] += 1
+                continue
+            if bootstrap and seen:
+                _done(pre_h)
+                continue
+            todo.append((msg_id, pre_h, seen))
+        MAX_PER_POLL = 100
+        if len(todo) > MAX_PER_POLL:
+            stats["truncated_from"] = len(todo)
+            todo = todo[-MAX_PER_POLL:]  # IMAP returns oldest-first; tail = newest
+
+        for msg_id, pre_h, seen in todo:
             stats["checked"] += 1
             try:
-                typ, msg_data = mbox.fetch(msg_id, "(RFC822)")
-                if typ != "OK" or not msg_data or not msg_data[0]:
+                typ, msg_data = mbox.fetch(msg_id, "(BODY.PEEK[])")
+                if typ != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
                     stats["errors"] += 1
                     continue
-                raw = msg_data[0][1]
-                msg = email_lib.message_from_bytes(raw)
+                msg = email_lib.message_from_bytes(msg_data[0][1])
 
                 from_addr = _extract_from_email(_decode_header_str(msg.get("From", "")))
                 subject   = _decode_header_str(msg.get("Subject", ""))
                 headers   = {k.lower(): str(v) for k, v in msg.items()}
-                body      = _extract_body_snippet(msg)
+                body      = _extract_body_snippet(msg, max_len=8000)
                 to_addr   = _decode_header_str(msg.get("To", "")).lower()
+                h = pre_h or _inbox_msg_hash(headers.get("message-id", ""), from_addr, subject)
 
-                if _is_auto_reply(subject, body, headers):
+                # General-inbox Slack ping only for mail Eric hasn't opened —
+                # same audience as before now that we no longer search UNSEEN.
+                def _general():
+                    if seen:
+                        _done(h); return
+                    capped = stats.get("inbox_notified", 0) >= INBOX_NOTIFY_MAX_PER_POLL
+                    nh = _handle_general_inbox_email(from_addr, subject, body, headers, notified, stats)
+                    if nh:
+                        notified.add(nh); notified_new.append(nh)
+                    if not capped:
+                        _done(h)   # capped → retry next poll
+
+                if _is_auto_reply(subject, _split_quoted_reply(body)[0], headers):
                     stats["auto_replies_skipped"] += 1
-                    try: mbox.store(msg_id, "+FLAGS", "\\Seen")
-                    except: pass
+                    _done(h)
                     continue
 
                 if not from_addr:
                     stats["no_match"] += 1
+                    _done(h)
                     continue
 
                 # Tight match: this must look like a genuine reply to one of
-                # OUR sends, not just any email from a known lead. Require
-                # ANY of: (a) subject prefixed Re:/RE:/etc., (b) In-Reply-To
-                # header set, (c) addressed to our outreach address. If none
-                # match, this is some other inbound email we shouldn't react to.
+                # OUR sends, not just any email from a known lead.
                 is_re      = bool(re.match(r"^\s*(re|fw|fwd)\s*:", subject, re.IGNORECASE))
                 has_in_reply = bool(headers.get("in-reply-to") or headers.get("references"))
                 outreach_lower = (OUTREACH_EMAIL or "").lower()
@@ -2780,130 +3112,150 @@ def imap_poll_replies():
                     (reply_to_lower and reply_to_lower in to_addr)
                 )
                 if not (is_re or has_in_reply or addressed_to_us):
-                    stats.setdefault("not_a_reply", 0)
-                    stats["not_a_reply"] += 1
-                    h = _handle_general_inbox_email(from_addr, subject, body, headers, notified, stats)
-                    if h:
-                        notified.add(h); notified_new.append(h)
+                    stats["not_a_reply"] = stats.get("not_a_reply", 0) + 1
+                    _general()
                     continue
 
-                # Find a lead awaiting email reply with this email address.
-                # Prefer awaiting_email_reply; fall back to any lead with that email.
                 try:
                     lr = req_lib.get(
                         f"{SUPABASE_URL}/rest/v1/leads"
                         f"?email=ilike.{url_quote(from_addr)}"
-                        f"&order=updatedAt.desc&limit=5&select=id,company,firstName,lastName,status,assignedTo,notes",
+                        f"&order=updatedAt.desc&limit=5"
+                        f"&select=id,company,firstName,lastName,email,title,city,state,industry,status,assignedTo,notes",
                         headers=SB_HEADERS, timeout=10,
                     )
-                    leads = lr.json() if lr.status_code == 200 else []
+                    leads = lr.json() if lr.status_code == 200 else None
                 except Exception as e:
                     print(f"[IMAP-POLL] lead lookup failed for {from_addr}: {e}")
+                    leads = None
+                if leads is None:
                     stats["errors"] += 1
-                    continue
+                    continue          # not marked processed → retried next poll
 
                 if not isinstance(leads, list) or not leads:
                     stats["no_match"] += 1
-                    h = _handle_general_inbox_email(from_addr, subject, body, headers, notified, stats)
-                    if h:
-                        notified.add(h); notified_new.append(h)
+                    _general()
                     continue
 
-                # Prefer awaiting_email_reply lead; fall back to most recent
                 target = next((l for l in leads if l.get("status") == "awaiting_email_reply"), leads[0])
                 lead_id = target.get("id")
-                snippet = (body or "")[:300].replace("\n", " ").strip()
-                sentiment = classify_reply_sentiment(body or "")
-                is_negative = (sentiment == "negative")
+                tri = classify_reply(body, subject, target)
+                cat = tri["category"]
+                stats["by_category"][cat] = stats["by_category"].get(cat, 0) + 1
 
-                # Negative replies → status=do_not_contact + suppression
-                # row so future sequence steps (and any other campaign)
-                # won't re-touch this address. Positive/neutral keep the
-                # legacy "interested" handoff so reps can follow up.
-                new_status = "do_not_contact" if is_negative else "interested"
-                note_prefix = "🛑 Negative reply" if is_negative else "📧 Reply"
-                reply_note = (f"{note_prefix} ({datetime.utcnow().date().isoformat()}, "
-                              f"sentiment={sentiment}): {snippet}")
-
-                try:
-                    req_lib.patch(
-                        f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id))}",
-                        headers=SB_HEADERS,
-                        json={
-                            "status":    new_status,
-                            "notes":     (reply_note + "\n\n" + (target.get("notes") or ""))[:4000],
-                            "updatedAt": datetime.utcnow().isoformat(),
-                        },
-                        timeout=10,
-                    )
-                except Exception as e:
-                    print(f"[IMAP-POLL] lead update failed: {e}")
-                    stats["errors"] += 1
+                if cat == "auto_reply":       # Claude caught one the header check missed
+                    stats["auto_replies_skipped"] += 1
+                    _done(h)
                     continue
 
-                # Track + notify: audit row powers the digest counts; the
-                # Slack ping is the instant "someone replied!" notification.
-                audit_log("system", "email_reply", "lead", lead_id,
-                          {"sentiment": sentiment, "company": target.get("company"),
-                           "from": from_addr, "snippet": snippet[:200]})
-                try:
-                    # Only ping on a real matched reply — and never render an
-                    # empty body (attachment-only replies show a fallback).
-                    if from_addr and lead_id:
-                        emoji = "🛑" if is_negative else ("🔥" if sentiment == "positive" else "📬")
-                        said = snippet[:280].strip() or "(no readable text — check the inbox)"
-                        app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
-                        send_slack(
-                            f"{emoji} Email reply — {target.get('company') or from_addr}",
-                            f"*From:* {from_addr}\n*Sentiment:* {sentiment}\n*They said:* {said}"
-                            + ("\n\n_Said NO — added to suppression list. Do NOT call._" if is_negative
-                               else "\n\n_Lead flipped to *interested* — worth a same-day call._"),
-                            actions=[{"label": "Open LeadFlow", "url": app_url, "style": "primary"}],
-                        )
-                except Exception as e:
-                    print(f"[IMAP-POLL] reply slack failed: {e}")
+                cur_status = (target.get("status") or "").lower()
+                keep_status = cur_status in _REPLY_KEEP_STATUS
+                is_hard_no = cat in HARD_NO_CATEGORIES
+                suppress = is_hard_no and (not keep_status or cat == "unsubscribe")
+                today = datetime.utcnow().date().isoformat()
+                said = re.sub(r"\s+", " ", tri.get("reply_text") or "").strip()
+                snippet = said[:300]
+                label = REPLY_CATEGORY_LABELS.get(cat, cat)
+                if tri.get("objection_type"):
+                    label += f" ({tri['objection_type']})"
 
-                # Suppress + cross-sync to vlm-scraper. Both are fire-and-
-                # forget enough that a failure here doesn't block lead
-                # status patching above.
-                if is_negative:
-                    add_to_suppression(
-                        from_addr,
-                        reason="negative_reply",
-                        source="imap_poller",
-                        notes=f"reply: {snippet[:200]}",
+                patch = {"updatedAt": datetime.utcnow().isoformat()}
+                if keep_status:
+                    note_prefix = "📧 Reply"
+                elif is_hard_no:
+                    patch["status"] = "do_not_contact"
+                    note_prefix = "🛑 Negative reply"
+                elif cat == "not_now":
+                    days = tri.get("follow_up_days") or REPLY_NOT_NOW_DEFAULT_DAYS
+                    patch.update({"status": "callback",
+                                  "callbackDate": (datetime.utcnow() + timedelta(days=days)).date().isoformat(),
+                                  "followupsequence": None, "followupstep": None, "nextfollowup": None})
+                    # Not "📧 Reply (" — that stamp puts the lead on today's
+                    # Day Plan rung 1; a not-now belongs in Follow-Ups instead.
+                    note_prefix = "⏳ Not-now reply"
+                else:
+                    patch["status"] = "interested"
+                    note_prefix = "📧 Reply"
+                reply_note = (f"{note_prefix} ({today}, {label}, sentiment={tri['sentiment']}): "
+                              f"{tri.get('summary') or ''} — \"{snippet}\"")
+                patch["notes"] = (reply_note + "\n\n" + (target.get("notes") or ""))[:4000]
+
+                try:
+                    pr = req_lib.patch(
+                        f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(str(lead_id))}",
+                        headers=SB_HEADERS, json=patch, timeout=10,
                     )
+                    if pr.status_code >= 400:
+                        raise RuntimeError(f"HTTP {pr.status_code}: {pr.text[:200]}")
+                except Exception as e:
+                    print(f"[IMAP-POLL] lead update failed for {lead_id}: {e}")
+                    stats["errors"] += 1
+                    continue          # retried next poll
+
+                # Suppress + cross-sync BEFORE the Slack ping so a Slack
+                # outage can never leave a STOP un-suppressed.
+                if suppress:
+                    add_to_suppression(from_addr, reason="negative_reply", source="imap_poller",
+                                       notes=f"{cat}: {snippet[:180]}")
                     _push_vlm_suppression(from_addr, snippet)
                     stats["negative"] = stats.get("negative", 0) + 1
 
-                audit_log("imap_poller", "campaign_event", "lead", lead_id, {
-                    "event": "negative_reply" if is_negative else "reply",
-                    "from": from_addr, "subject": subject[:200],
-                    "snippet": snippet, "sentiment": sentiment,
-                })
-                # (Single Slack ping above — a second one here duplicated
-                # every reply notification.)
-                stats["matched"] += 1
+                audit_log("system", "email_reply", "lead", lead_id,
+                          {"sentiment": tri["sentiment"], "category": cat,
+                           "objection_type": tri.get("objection_type"),
+                           "convertible": tri.get("convertible"), "summary": tri.get("summary"),
+                           "classifier": tri.get("source"), "company": target.get("company"),
+                           "from": from_addr, "snippet": snippet[:200]})
+                try:
+                    emoji = ("🛑" if is_hard_no else "🔥" if cat in ("interested", "meeting_request")
+                             else "⏳" if cat == "not_now" else "🟠" if cat == "objection" else "📬")
+                    if suppress:
+                        tail = "\n\n_Hard no — added to suppression list (both systems). Do NOT call._"
+                    elif keep_status:
+                        tail = "\n\n_Existing customer — status left as is._"
+                    elif cat == "not_now":
+                        tail = f"\n\n_Snoozed — callback set for {patch.get('callbackDate')}. Not suppressed._"
+                    else:
+                        tail = "\n\n_Lead flipped to *interested* — worth a same-day call._"
+                    draft = tri.get("suggested_reply") or ""
+                    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+                    send_slack(
+                        f"{emoji} Email reply — {target.get('company') or from_addr}",
+                        f"*From:* {from_addr}\n*Triage:* {label}"
+                        + (f" · convertible" if tri.get("convertible") else "")
+                        + f"\n*Summary:* {tri.get('summary') or '—'}"
+                        + f"\n*They said:* {said[:280] or '(no readable text — check the inbox)'}"
+                        + (f"\n*Suggested reply:*\n>{draft[:600]}" if draft and not is_hard_no else "")
+                        + tail,
+                        actions=[{"label": "Open LeadFlow", "url": app_url, "style": "primary"}],
+                    )
+                except Exception as e:
+                    print(f"[IMAP-POLL] reply slack failed: {e}")
 
-                # Mark seen so we don't re-process
-                try: mbox.store(msg_id, "+FLAGS", "\\Seen")
-                except: pass
+                audit_log("imap_poller", "campaign_event", "lead", lead_id, {
+                    "event": "negative_reply" if is_hard_no else "reply",
+                    "category": cat, "from": from_addr, "subject": subject[:200],
+                    "snippet": snippet, "sentiment": tri["sentiment"],
+                })
+                stats["matched"] += 1
+                _done(h)
 
             except Exception as e:
                 print(f"[IMAP-POLL] error processing msg {msg_id}: {e}")
                 stats["errors"] += 1
 
         try: mbox.logout()
-        except: pass
+        except Exception: pass
 
-        # persist the general-inbox dedup list (rolling, capped at 400)
+        # persist both rolling dedup lists (chronological trim)
         if notified_new:
             try:
-                # chronological trim — a set would evict arbitrary (possibly
-                # recent) hashes and re-ping the same email
                 _settings_set_json("inbox_notified_ids", (notified_list + notified_new)[-400:])
             except Exception as e:
                 print(f"[INBOX] dedup persist failed: {e}")
+        if processed_new or bootstrap:
+            if not _settings_set_json(REPLY_PROCESSED_KEY, (processed_list + processed_new)[-3000:]):
+                print("[IMAP-POLL] processed-id persist failed — next poll may re-handle these messages")
 
         return {"ok": True, "stats": stats, "took_ms": int((datetime.utcnow()-started).total_seconds()*1000)}
     finally:
@@ -2927,8 +3279,13 @@ def _bg_maintenance_loop():
             try:
                 res = imap_poll_replies()
                 _imap_poll_state["last_result"] = res
-                if res.get("ok") and res.get("stats", {}).get("matched", 0) > 0:
-                    print(f"[IMAP-POLL] matched {res['stats']['matched']} replies this cycle")
+                if not res.get("ok"):
+                    # Was silent: a revoked Gmail app password looked exactly
+                    # like "no replies" in the logs for as long as it lasted.
+                    print(f"[IMAP-POLL] poll FAILED: {res.get('error')}")
+                elif res.get("stats", {}).get("matched", 0) > 0:
+                    print(f"[IMAP-POLL] matched {res['stats']['matched']} replies this cycle "
+                          f"{res['stats'].get('by_category')}")
             except Exception as e:
                 print(f"[IMAP-POLL] loop exception: {e}")
         # Drive the 3-touch email sequence: fire Touch 2/3 when due, release
@@ -12852,34 +13209,47 @@ def get_single_lead(lead_id: str, user: str = Depends(verify_token)):
 
 @app.post("/api/webhooks/resend/{secret}")
 async def resend_webhook(secret: str, request: Request):
-    """Receives email events from Resend (delivered/opened/clicked/bounced/
-    complained). lead_id is in the email's `tags` we set on send. Auth via
-    secret in URL path. Configure URL + this secret in Resend dashboard."""
+    """Receives email events from Resend (sent/delivered/opened/clicked/
+    bounced/complained/suppressed/failed). lead_id is in the email's `tags`
+    we set on send. Auth via secret in URL path. Configure URL + this secret
+    in Resend dashboard → Webhooks."""
     if not RESEND_WEBHOOK_SECRET or secret != RESEND_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
-    raw_body = ""
     try:
-        raw_body = (await request.body()).decode("utf-8", errors="replace")[:3000]
-        data = json_lib.loads(raw_body) if raw_body else {}
+        raw = await request.body()
+        # Parse the WHOLE body — truncating before json.loads turned any
+        # long payload into {} and the event was silently dropped.
+        data = json_lib.loads(raw.decode("utf-8", errors="replace")) if raw else {}
     except Exception:
         data = {}
 
-    # Resend payload shape: {type: "email.opened", created_at, data: {email_id, to, tags: [...], ...}}
-    etype  = (data.get("type") or "").lower()
+    etype   = (data.get("type") or "").lower()
     payload = data.get("data") or {}
-    tags = {t.get("name"): t.get("value") for t in (payload.get("tags") or []) if isinstance(t, dict)}
-    lead_id = tags.get("lead_id")
+    # Resend sends tags as an object map {"lead_id": "123", ...}. The old
+    # parser only understood the [{name, value}] array we SEND with, so every
+    # webhook resolved lead_id=None and no bounce/complaint was ever acted on.
+    raw_tags = payload.get("tags") or {}
+    if isinstance(raw_tags, dict):
+        tags = {str(k): ("" if v is None else str(v)) for k, v in raw_tags.items()}
+    else:
+        tags = {t.get("name"): t.get("value") for t in raw_tags if isinstance(t, dict)}
+    lead_id = tags.get("lead_id") or None
+    to_list = payload.get("to") or []
+    to_email = (to_list[0] if isinstance(to_list, list) and to_list else str(to_list or ""))
+    to_email = _extract_from_email(str(to_email))
+    bounce = payload.get("bounce") or {}
+    bounce_type = str(bounce.get("type") or "")
 
-    # Map Resend event types to our canonical event names so the activity panel
-    # can keep its existing category tallies.
     event_map = {
+        "email.sent":           "sent",
         "email.delivered":      "delivered",
         "email.opened":         "open",
         "email.clicked":        "click",
         "email.bounced":        "bounce",
         "email.complained":     "complaint",
         "email.unsubscribed":   "unsubscribe",
+        "email.suppressed":     "suppressed",
         "email.delivery_delayed":"delayed",
         "email.failed":         "failed",
     }
@@ -12887,34 +13257,54 @@ async def resend_webhook(secret: str, request: Request):
 
     audit_log("resend_webhook", "campaign_event", "lead", lead_id, {
         "event": event, "resend_type": etype, "email_id": payload.get("email_id"),
+        "message_id": payload.get("message_id"), "to": to_email,
+        "campaign": tags.get("campaign"), "step": tags.get("step"),
+        "bounce_type": bounce_type or None, "bounce_subtype": bounce.get("subType"),
     })
-    print(f"[RESEND-WEBHOOK] lead={lead_id} event={event} ({etype})")
+    print(f"[RESEND-WEBHOOK] lead={lead_id} to={to_email} event={event} ({etype})"
+          + (f" bounce={bounce_type}/{bounce.get('subType')}" if bounce else ""))
+
+    # Email-level suppression does not need a lead_id — the address is the
+    # thing that must never be mailed again (by either system).
+    hard_bounce = event == "bounce" and bounce_type.lower() != "transient"
+    if to_email and (hard_bounce or event in ("complaint", "suppressed", "unsubscribe")):
+        reason = {"bounce": "hard_bounce", "complaint": "spam_complaint",
+                  "suppressed": "resend_suppressed", "unsubscribe": "unsubscribe"}[event]
+        add_to_suppression(to_email, reason=reason, source="resend_webhook",
+                           notes=f"{etype} {bounce.get('message') or ''}"[:300])
+        if event in ("complaint", "unsubscribe"):
+            # A spam complaint is the hardest no there is — vlm-scraper must
+            # stop too. (Bounces stay local: the address is dead, not a "no".)
+            _push_vlm_suppression(to_email, f"resend {etype}", reason="spam_complaint"
+                                  if event == "complaint" else "unsubscribe", source="leadflow_resend")
 
     if not lead_id:
-        return {"ok": True, "no_lead_id": True}
+        return {"ok": True, "event": event, "no_lead_id": True}
 
-    # Bounce → clear email so we don't keep emailing into the void
-    if event == "bounce":
+    lid = url_quote(str(lead_id), safe="")
+    if hard_bounce or event == "suppressed":
+        # Dead address: clear it, and hand an in-sequence lead back to the
+        # dialer — otherwise it sat in awaiting_email_reply forever with the
+        # sequencer failing "lead has no email" every 10 minutes.
         try:
-            r = req_lib.get(
-                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}&select=notes",
-                headers=SB_HEADERS, timeout=10,
-            )
+            r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lid}&select=notes,status",
+                            headers=SB_HEADERS, timeout=10)
             existing = (r.json() or [{}])[0] if r.status_code == 200 else {}
-            req_lib.patch(
-                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
-                headers=SB_HEADERS,
-                json={"email": "", "updatedAt": datetime.utcnow().isoformat(),
-                      "notes": (existing.get("notes") or "") + f" | Email bounced {datetime.utcnow().date().isoformat()}"},
-                timeout=10,
-            )
+            patch = {"email": "", "updatedAt": datetime.utcnow().isoformat(),
+                     "notes": (existing.get("notes") or "")
+                              + f" | Email bounced {datetime.utcnow().date().isoformat()}"}
+            if existing.get("status") == "awaiting_email_reply":
+                patch.update({"status": "no_answer", "followupsequence": None,
+                              "followupstep": None, "nextfollowup": None})
+            req_lib.patch(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lid}",
+                          headers=SB_HEADERS, json=patch, timeout=10)
         except Exception as e:
             print(f"[RESEND-WEBHOOK] bounce update failed: {e}")
 
     elif event in ("complaint", "unsubscribe"):
         try:
             req_lib.patch(
-                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{url_quote(lead_id)}",
+                f"{SUPABASE_URL}/rest/v1/leads?id=eq.{lid}",
                 headers=SB_HEADERS,
                 json={"status": "do_not_contact", "updatedAt": datetime.utcnow().isoformat()},
                 timeout=10,
@@ -12922,8 +13312,7 @@ async def resend_webhook(secret: str, request: Request):
         except Exception as e:
             print(f"[RESEND-WEBHOOK] do_not_contact update failed: {e}")
 
-    # opens + clicks + delivered: audit-log only (already done above)
-
+    # sent / delivered / opens / clicks / delayed / transient bounce: audit only
     return {"ok": True, "event": event}
 
 class CorporateRequest(BaseModel):
