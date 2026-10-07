@@ -180,6 +180,16 @@ Oct 1–5: one urgent-care chain (American Current Care) was 72 leads and 9% of 
 - **The 5-min retick is held while a call modal is open.** A retick re-buckets → re-sorts → and `dialerIdx` is a POSITION, so the card behind the modal would become a different lead. Nothing is mislogged (CallModal closes over its lead object), but hanging up to a different company on screen is its own bug.
 - The dialer's `offHours` badge (8am–7pm local) is a **safety** warning — deliberately WIDER than the prioritisation window. Different jobs, different bounds; don't merge them.
 - Envs: `DIALER_TZ_ORDER` (0 = instant revert to the flat ordering), `DIALER_LOCAL_START_HOUR` (8), `DIALER_LOCAL_END_HOUR` (17, exclusive), `DIALER_LOCAL_LUNCH_HOURS` (12).
+- **Best-hour ranking (2026-10) — the tz sort key is now a RANK per local hour, not the PRIME/LUNCH bucket.**
+  - **Data:** Jun 29–Oct 7, 7,160 dials, measured as the rate at which a non-gatekeeper picked up, by the prospect's local hour, **with each state's own rate subtracted** (so "10am" isn't just "Nevada"). Results: 10am 11.4% · 11am 8.7 · 2pm 8.4 · 1pm 8.1 · 9am 7.3 · 3pm 7.3 · noon 7.1 · 4pm 4.2. So noon IS the dip and 1pm is not; don't add 13 to `DIALER_LOCAL_LUNCH_HOURS` on a hunch.
+  - **Ranking:** `dialer_hour_ranks()` turns the stored scores into a dense rank (0 = best) for open hours; off-hours rank `TZ_RANK_OFF` (99). The queue (`dialer_tz_rank`) and the client (`tzRanksFor`, from `dialer_tz.hour_rank` in `/api/call/config`) sort on it, and every 5-min tick re-sorts. As each market's clock moves, the states at their best hour go first; a market at lunch sinks and comes back. **Still a sort key, never a filter; due follow-ups still lead; OFF still last; buckets still drive the OFF test, the labels and `tz_buckets` counts.**
+  - **Scores:** `run_dialer_hour_scores_if_due()` (bg loop, every `DIALER_HOUR_SCORE_REFRESH_HOURS`=24) walks `DIALER_HOUR_SCORE_DAYS` (90) of calls and stores `app_settings.dialer_hour_scores`.
+    - They are shrunk toward a prior with `DIALER_HOUR_SCORE_PRIOR` (200) pseudo-dials; the prior is the overall rate, with configured lunch hours penalised `DIALER_LUNCH_PRIOR_PENALTY` (0.15).
+    - Below `DIALER_HOUR_SCORE_MIN_DIALS` (500) the scores ARE the priors, so the ranks reduce to exactly the old PRIME-then-LUNCH order. A failed read does the same.
+    - **Request paths only read** (30-min cache), never compute.
+    - The recompute is guarded by an **in-process** attempt clock, not the stored row, so a twin whose settings writes are RLS-dropped can't re-walk the call table every tick.
+  - **Parity:** frontend and backend ranks were cross-checked (25,440 instant×state decisions, both DST days, 0 mismatches). An old server without `hour_rank` → client rank = bucket.
+  - **Kill switch:** `DIALER_HOUR_RANKING=0` → prior ranks, i.e. the previous behaviour. Inspect via `GET /api/admin/dialer-hour-scores` (`?recompute=1` rescores now).
 
 ### React Hooks
 - Never use `useState`/`useEffect` inside IIFEs or conditionals

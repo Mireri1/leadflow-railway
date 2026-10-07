@@ -64,6 +64,38 @@ function isDueFollowUp(l, today, nowMs){
   return true
 }
 
+// {STATE: rank} — the dialer's tz SORT key, 0 = the best hour to be ringing
+// that desk right now. Ranks per local hour come from the server
+// (`dialer_tz.hour_rank`, measured pickup by prospect-local hour — see
+// dialer_hour_ranks() in backend/main.py) so this and dialer_tz_rank() order
+// the queue identically. Off-hours → TZ_RANK_OFF. Pure for the same reason as
+// tzBucketsFor. Without hour_rank (older server) the rank IS the bucket,
+// which is exactly the previous ordering.
+const TZ_RANK_OFF = 99
+function tzRanksFor(cfg, now){
+  const buckets = tzBucketsFor(cfg, now)
+  if(!buckets) return null
+  const hr = cfg.hour_rank
+  if(!hr || typeof hr!=="object" || !Object.keys(hr).length) return buckets
+  const sh = cfg.start_hour==null?8:cfg.start_hour
+  const eh = cfg.end_hour==null?17:cfg.end_hour
+  const hourIn = iana=>{
+    try{
+      const h = Number(new Intl.DateTimeFormat("en-US",
+        {timeZone:iana,hour:"numeric",hour12:false}).format(now))
+      return Number.isNaN(h) ? null : (h===24?0:h)
+    }catch{ return null }
+  }
+  const rankFor = h => h===null ? 0
+    : ((h<sh||h>=eh) ? TZ_RANK_OFF : (typeof hr[String(h)]==="number" ? hr[String(h)] : 0))
+  const out = {}
+  for(const st in cfg.state_timezones) out[st] = rankFor(hourIn(cfg.state_timezones[st]))
+  const fb = cfg.fallback_offset_hours
+  out[TZ_FALLBACK_KEY] = rankFor(typeof fb==="number"
+    ? ((now.getUTCHours()+fb)%24+24)%24 : null)
+  return out
+}
+
 const STATES = [
   "","AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
   "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
@@ -4785,6 +4817,9 @@ export default function App(){
   // is building an Intl.DateTimeFormat inside a sort comparator, which is
   // O(n log n) formatter constructions on every render.
   const tzBucketByState=useMemo(()=>tzBucketsFor(dialerTz,new Date()),[dialerTz,tzTick])
+  // Same tick, same instant semantics: the rank map that actually orders the
+  // dialer (best local hour first). Buckets stay for labels and the OFF test.
+  const tzRankByState=useMemo(()=>tzRanksFor(dialerTz,new Date()),[dialerTz,tzTick])
   // Bucket for one lead. Unknown / blank state → the fallback bucket, never
   // TZ_OFF, so it stays dialable.
   const tzBucketOf=useCallback(l=>{
@@ -4793,6 +4828,12 @@ export default function App(){
     return (k && k in tzBucketByState) ? tzBucketByState[k]
                                        : (tzBucketByState[TZ_FALLBACK_KEY]??TZ_PRIME)
   },[tzBucketByState])
+  const tzRankOf=useCallback(l=>{
+    if(!tzRankByState) return 0
+    const k=(l&&l.state?String(l.state):"").trim().toUpperCase()
+    return (k && k in tzRankByState) ? tzRankByState[k]
+                                     : (tzRankByState[TZ_FALLBACK_KEY]??0)
+  },[tzRankByState])
 
   if(!user) return <Login onLogin={u=>setUser(u)}/>
 
@@ -6108,13 +6149,14 @@ export default function App(){
                     const xa=(a.callbackDate||"").slice(0,10), xb=(b.callbackDate||"").slice(0,10)
                     if(xa!==xb) return xa<xb?-1:1
                   }
-                  // Prospect-local window FIRST: a lead whose office is open
-                  // beats a better-scored lead whose office is at lunch or
-                  // shut. Null-safe — tzBucketOf returns TZ_PRIME for every
-                  // lead when the config hasn't loaded, which collapses this
-                  // to the original ordering exactly.
-                  const ta=tzBucketOf(a), tb=tzBucketOf(b)
-                  if(ta!==tb) return ta-tb                              // open offices first
+                  // Best local hour FIRST: a lead whose desk is at its best
+                  // measured hour (e.g. 10am) beats one at lunch, and both
+                  // beat a shut office. Re-evaluated every 5-min tick, so a
+                  // market that hits lunch sinks and comes back after. Null-
+                  // safe — tzRankOf returns 0 for every lead when the config
+                  // hasn't loaded, which collapses this to the plain ladder.
+                  const ta=tzRankOf(a), tb=tzRankOf(b)
+                  if(ta!==tb) return ta-tb                              // best hour first
                   const ca=a.total_calls||0, cb=b.total_calls||0
                   if(ca!==cb) return ca-cb                              // fewest calls first
                   const la=a.last_called_at||"", lb=b.last_called_at||""
@@ -6200,9 +6242,15 @@ export default function App(){
                         let open=0,lunch=0,shut=0
                         dialerLeads.forEach(l=>{const b=tzBucketOf(l)
                           if(b===TZ_OFF) shut++; else if(b===TZ_LUNCH) lunch++; else open++})
-                        if(!lunch&&!shut) return null
+                        // Which local hour the queue is working first, so a
+                        // reshuffle at the top of the hour reads as intended.
+                        const top=dialerLeads.find(l=>tzBucketOf(l)!==TZ_OFF&&!dueNow(l))
+                        const tlt=top&&localTimeAt(top.state, dialerTz&&dialerTz.state_timezones)
+                        const bestLbl=tlt?`${((tlt.hour+11)%12)+1}${tlt.hour<12?"am":"pm"}`:""
+                        if(!lunch&&!shut&&!bestLbl) return null
                         return <span style={{color:"#6b7398"}}>
                           {" · "}{open} open{lunch?` · ${lunch} at lunch`:""}{shut?` · ${shut} closed`:""}
+                          {bestLbl&&<span title="The dialer puts offices at their best-answering local hour first and re-sorts as the clocks move">{` · ⏱ ${bestLbl}-local offices first`}</span>}
                         </span>
                       })()}
                     </div>
