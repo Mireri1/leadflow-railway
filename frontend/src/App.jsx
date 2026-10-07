@@ -2648,11 +2648,18 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         }
       }
       onSaved(); onClose()
-      // The desk gave an email for the decision-maker → open the composer on
-      // the "Front desk referred" script while the call is fresh. After
-      // onClose so the composer isn't stacked under this modal.
-      if(primary==="gatekeeper"&&dmEmailChanged&&dmEmail.trim()&&onEmail){
-        onEmail({...lead,...dmPatch(),status:"gatekeeper"})
+      // A new email came out of this call (typed in 👤 or read from the note)
+      // → open the composer while the call is fresh, on ANY outcome — her
+      // "send an email to …" notes are mostly logged as no-answer. Script:
+      // a decision-maker asked → "Asked for info"; the desk named someone →
+      // "Front desk referred"; a generic inbox → "Asked for info". Mirrors
+      // eod_email_content() in main.py, which sends it after her shift if
+      // she closes this without sending. After onClose so it isn't stacked.
+      if(dmEmailChanged&&dmEmail.trim()&&onEmail){
+        const dmTalked = ["answered","interested","interested_no_dm","callback","not_interested","converted"].includes(outcome)
+        const named = !!dmName.trim()
+        onEmail({...lead,...dmPatch(),status:primary==="gatekeeper"?"gatekeeper":lead.status,
+          _emailPreset: dmTalked ? "asked" : (named ? "referred" : "asked")})
       }
     }catch(ex){setModalError("Couldn't save — check your internet and try again.")}
     finally{setSave(false)}
@@ -3257,6 +3264,12 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
               <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} style={{resize:"vertical"}}
                 placeholder={secondary==="callback"?"What did they say? When should you call back?":"Dictate or type — then hit Smart-fill…"}/>
               <NoteAssist getNote={()=>notes} context={{company:lead.company,status:outcome}} onApply={applyAi}/>
+              {dmEmailChanged&&dmEmail.trim()&&(
+                <div style={{fontSize:11,color:"#a3aac4",marginTop:8}}>
+                  ✉️ Saving opens an email to <b style={{color:"#dee5ff"}}>{dmEmail.trim()}</b>. Close it without
+                  sending and it still goes out after your shift if your note says to send one.
+                </div>
+              )}
               {fxChips.length>0&&(
                 <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:8}}>
                   <span style={{fontSize:11,color:"#6b7398"}}>📝 From your note — saving:</span>
@@ -3404,7 +3417,8 @@ function EmailModal({lead,onClose,onSent}){
       subject:lead?.company?`Sorry we missed you — ${lead.company}`:"Sorry we missed you",
       body:`Hi ${_name},\n\nSorry we missed each other — we tried reaching you about cleaning service at ${_co}.\n\nVision Cleaning Company provides commercial cleaning on daily, weekly, bi-weekly, or monthly schedules, and we'd love to put a free, no-obligation quote together for you. If a call is tough to fit in, simply reply to this email with your approximate square footage and how often you'd like service, and we'll send a custom quote your way within 24 hours.\n\nYou can also learn more about us and the services we offer at https://visioncleaningcompanyllc.com.\n\nHope to connect soon.\n\n${SIG}`},
   }
-  const defaultPreset=["interested","callback","converted"].includes(lead?.status)?"asked"
+  const defaultPreset=(lead?._emailPreset&&PRESETS[lead._emailPreset])?lead._emailPreset
+    :["interested","callback","converted"].includes(lead?.status)?"asked"
     :lead?.status==="no_answer"?"missed":lead?.status==="gatekeeper"?"referred":"spoke"
 
   const [preset,setPreset]=useState(defaultPreset)
