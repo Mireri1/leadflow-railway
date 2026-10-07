@@ -1697,10 +1697,82 @@ def save_to_supabase(leads):
 # score → callable filter → cross-run dedup + insert (reusing save_to_supabase).
 # Keeps each fetcher tiny and guarantees they all inherit the same dedup + the
 # phone-unique safety. Returns a breakdown dict shaped like run_scrape's.
+# ── Corporate-controlled chains (2026-10) ────────────────────────────────────
+# Oct 1-5: 41 of 462 dials (9%) went to locations of ONE urgent-care chain
+# (American Current Care / Concentra) and every receptionist said the same
+# thing — corporate handles cleaning. NPI lists each location as its own
+# organisation, so the refill kept handing her the next one. A chain "stem" is
+# the first three distinctive-enough words of the company name; once a caller
+# says corporate decides, every other open location with the same stem is
+# parked and future ingests drop it.
+_CHAIN_DROP_WORDS = {"of", "the", "and", "a", "an", "at", "dba", "llc", "inc", "pc", "pllc", "pa",
+                     "ltd", "dds", "dmd", "md", "do", "corp", "co", "lp", "llp", "plc", "p", "c", "l"}
+# A stem made ONLY of these words describes a kind of business, not a brand —
+# "Family Urgent Care" in Reno and "Family Urgent Care" in Tampa are strangers.
+_CHAIN_GENERIC_WORDS = {
+    "dental", "dentistry", "dentist", "dentists", "urgent", "care", "medical", "medicine", "clinic",
+    "clinics", "health", "healthcare", "family", "center", "centre", "centers", "group", "associates",
+    "services", "physician", "physicians", "primary", "smile", "smiles", "ortho", "orthodontics",
+    "supply", "supplies", "equipment", "home", "community", "wellness", "practice", "office",
+    "professional", "pediatric", "pediatrics", "surgery", "surgical", "specialists", "partners",
+    "doctors", "doctor", "immediate", "express", "walk", "in", "first", "choice", "quality",
+    "premier", "advanced", "complete", "total", "modern", "general", "cosmetic", "implant",
+    "implants", "dialysis", "kidney", "renal", "dme", "durable", "pharmacy", "rehab",
+    "my", "your", "our", "new", "best", "all", "care", "md", "hospital", "system",
+}
+# Place / filler words: "Las Vegas Restaurant" and "Las Vegas Day School",
+# "Law Offices of A" and "Law Offices of B", are not one chain.
+_CHAIN_DROP_WORDS |= {"s", "st", "saint", "ste", "for", "in", "on", "to"}
+_CHAIN_GENERIC_WORDS |= {
+    "las", "vegas", "new", "york", "san", "los", "angeles", "francisco", "diego", "antonio", "north", "south", "east", "west", "central",
+    "northern", "southern", "eastern", "western", "mountain", "view", "valley", "city", "county",
+    "law", "offices", "children", "kids", "american", "national", "united", "metro", "greater",
+    "texas", "ohio", "missouri", "nevada", "kansas", "arizona", "florida", "california", "colorado",
+    "georgia", "carolina", "virginia", "jersey", "washington", "oregon", "utah", "idaho",
+}
+
+def chain_stem(company) -> str:
+    """'AMERICAN CURRENT CARE OF KANSAS, P.A.' -> 'american current'.
+    The first TWO significant words: a third is usually the location
+    ('Aspen Dental - Columbus'), which would split one chain into many.
+    Empty when the name is too generic to match other locations safely."""
+    t = re.sub(r"[^a-z0-9 ]", " ", (company or "").lower())
+    words = [w for w in t.split() if w not in _CHAIN_DROP_WORDS]
+    stem = words[:2]
+    if len(stem) < 2 or any(len(w) < 2 for w in stem) \
+            or all(w in _CHAIN_GENERIC_WORDS or w.isdigit() for w in stem):
+        return ""
+    return " ".join(stem)
+
+CORPORATE_HQ_SOURCE = "Corporate HQ (from caller)"
+_corp_stem_cache = {"at": 0.0, "stems": set()}
+def corporate_chain_stems(refresh: bool = False) -> set:
+    """Stems a caller has marked corporate-decides. Cached 5 min; fails open to
+    whatever was last loaded so a settings blip can't stop an ingest."""
+    if not refresh and time.time() - _corp_stem_cache["at"] < 300:
+        return _corp_stem_cache["stems"]
+    try:
+        rows = _settings_get_json("corporate_chain_stems") or []
+        _corp_stem_cache["stems"] = {r.get("stem") for r in rows if isinstance(r, dict) and r.get("stem")}
+        _corp_stem_cache["at"] = time.time()
+    except Exception as e:
+        print(f"[CORP] stem load failed: {e}")
+    return _corp_stem_cache["stems"]
+
+# NPI files every location of a chain as its own organisation; one refill once
+# brought 41 locations of a single chain. Cap how many of one brand a single
+# ingest may add — enough to learn whether it's corporate-run, not enough to
+# fill a day. 0 disables.
+CHAIN_MAX_PER_INGEST = int(os.getenv("CHAIN_MAX_PER_INGEST", "3"))
+_CHAIN_CAP_EXEMPT_RE = re.compile(r"dialysis|davita|fresenius|kidney|renal disease|esrd|nephrolog", re.I)
+
 def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: bool = True):
     now = datetime.utcnow().isoformat()
     staged, seen_batch_phones = [], set()
     dropped_uncallable = 0
+    dropped_corporate = dropped_chain_cap = 0
+    blocked = set() if source == CORPORATE_HQ_SOURCE else corporate_chain_stems()
+    per_stem = {}
     for r in (raw_leads or []):
         lead = {
             "company": clean(r.get("company", "")), "industry": r.get("industry", "") or "",
@@ -1715,6 +1787,18 @@ def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: 
         }
         if not lead["company"]:
             continue
+        stem = chain_stem(lead["company"])
+        if stem and stem in blocked:
+            dropped_corporate += 1      # a caller already heard "corporate decides"
+            continue
+        # Dialysis chains are exempt from the CAP (not from a caller's
+        # corporate block): DaVita/Fresenius local managers book walkthroughs
+        # themselves, and dialysis is a top vertical — never thin its supply.
+        if stem and CHAIN_MAX_PER_INGEST and source != CORPORATE_HQ_SOURCE \
+                and not _CHAIN_CAP_EXEMPT_RE.search(f"{lead['company']} {lead['industry']}"):
+            if per_stem.get(stem, 0) >= CHAIN_MAX_PER_INGEST:
+                dropped_chain_cap += 1
+                continue
         # In-batch dedup on real phones (the partial unique index lets multiple
         # phoneless rows coexist, so only collapse meaningfully-set phones).
         ph = lead["phone"]
@@ -1734,6 +1818,8 @@ def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: 
                 dropped_uncallable += 1
                 continue
         staged.append(lead)
+        if stem:
+            per_stem[stem] = per_stem.get(stem, 0) + 1
         if len(staged) >= FREE_SOURCE_MAX_ROWS:
             break
     saved, already_in_db = save_to_supabase(staged)
@@ -1741,9 +1827,11 @@ def ingest_leads(raw_leads, source: str, user: str = "system", callable_filter: 
         audit_log(user, "ingest_leads", "lead", None,
                   {"source": source, "saved": saved, "found": len(raw_leads or [])})
     print(f"[INGEST:{source}] found={len(raw_leads or [])} staged={len(staged)} "
-          f"saved={saved} dupes={already_in_db} dropped={dropped_uncallable}")
+          f"saved={saved} dupes={already_in_db} dropped={dropped_uncallable} "
+          f"corporate={dropped_corporate} chain_cap={dropped_chain_cap}")
     return {"found": len(raw_leads or []), "saved": saved,
-            "alreadyInDb": already_in_db, "droppedUncallable": dropped_uncallable}
+            "alreadyInDb": already_in_db, "droppedUncallable": dropped_uncallable,
+            "droppedCorporate": dropped_corporate, "droppedChainCap": dropped_chain_cap}
 
 # ── Phone line validation (Twilio Lookup v2, env-gated) ─────────────────────
 # Set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN in Railway to activate. ~$0.008/
@@ -12774,6 +12862,99 @@ async def resend_webhook(secret: str, request: Request):
     # opens + clicks + delivered: audit-log only (already done above)
 
     return {"ok": True, "event": event}
+
+class CorporateRequest(BaseModel):
+    dry_run: Optional[bool] = True
+    hq_phone: Optional[str] = ""
+
+_CORP_PARKABLE_STATUSES = "new,no_answer,called,gatekeeper"
+
+@app.post("/api/leads/{lead_id}/corporate")
+def mark_corporate(lead_id: int, body: CorporateRequest, user: str = Depends(verify_token)):
+    """A receptionist said corporate handles cleaning. Park this location and
+    every other OPEN location of the same chain (status new / no_answer /
+    called / gatekeeper — never one that showed interest), remember the chain
+    so future ingests skip it, and optionally save the corporate number as one
+    lead. dry_run (the default) only lists what would be parked, so the caller
+    confirms the matches first. Reversible: a manual status edit un-retires."""
+    r = req_lib.get(f"{SUPABASE_URL}/rest/v1/leads?id=eq.{int(lead_id)}"
+                    f"&select=id,company,industry,state,status,notes", headers=SB_HEADERS, timeout=15)
+    rows = r.json() if r.status_code == 200 else []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = rows[0]
+    stem = chain_stem(lead.get("company"))
+    siblings = []
+    if stem:
+        first = stem.split()[0]
+        cands = _paginated_get(
+            f"{SUPABASE_URL}/rest/v1/leads?select=id,company,state,status,notes"
+            f"&company=ilike.*{url_quote(first)}*&status=in.({_CORP_PARKABLE_STATUSES})&order=id")
+        siblings = [l for l in cands if l.get("id") != lead["id"]
+                    and chain_stem(l.get("company")) == stem]
+    preview = [{"id": l["id"], "company": l.get("company"), "state": l.get("state")} for l in siblings]
+    if body.dry_run is not False:
+        return {"dry_run": True, "stem": stem, "generic_name": not stem,
+                "count": len(siblings), "siblings": preview[:60]}
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    tag = (f"[corporate-decides] {today}: {user} was told {lead.get('company')}'s corporate "
+           f"office handles cleaning.")
+    now = datetime.utcnow().isoformat()
+    parked = 0
+    for l in [lead] + siblings:
+        rr = req_lib.patch(
+            f"{SUPABASE_URL}/rest/v1/leads?id=eq.{int(l['id'])}"
+            f"&status=not.in.(interested,interested_no_dm,callback,converted,retired,do_not_contact)",
+            headers=SB_HEADERS,
+            json={"status": "retired", "updatedAt": now,
+                  "notes": (tag + "\n" + (l.get("notes") or "")).strip()}, timeout=15)
+        if rr.status_code == 200:
+            try:
+                parked += len(rr.json())
+            except Exception:
+                parked += 1
+        elif rr.status_code == 204:
+            parked += 1
+    if stem:
+        try:
+            known = _settings_get_json("corporate_chain_stems") or []
+            if not any(isinstance(k, dict) and k.get("stem") == stem for k in known):
+                known.append({"stem": stem, "company": lead.get("company"), "by": user, "at": now})
+                _settings_set_json("corporate_chain_stems", known)
+            corporate_chain_stems(refresh=True)
+        except Exception as e:
+            print(f"[CORP] could not record stem {stem!r}: {e}")
+    hq_saved = 0
+    hq = normalize_us_phone(body.hq_phone or "")
+    if hq and is_valid_us_phone(hq):
+        res = ingest_leads([{
+            "company": f"{lead.get('company')} (corporate office)", "phone": hq,
+            "industry": lead.get("industry") or "", "state": lead.get("state") or "",
+            "notes": (f"[warm-list] Corporate office — decides cleaning for {parked} location(s) "
+                      f"we called. Number given by a receptionist on {today}."),
+        }], CORPORATE_HQ_SOURCE, user)
+        hq_saved = res.get("saved", 0)
+    audit_log(user, "mark_corporate", "lead", lead["id"],
+              {"stem": stem, "parked": parked, "siblings": [s["id"] for s in siblings][:200],
+               "hq_saved": hq_saved})
+    return {"dry_run": False, "stem": stem, "parked": parked, "hq_saved": hq_saved}
+
+@app.get("/api/admin/corporate-chains")
+def list_corporate_chains(user: str = Depends(verify_admin)):
+    return {"chains": _settings_get_json("corporate_chain_stems") or []}
+
+@app.post("/api/admin/corporate-chains/remove")
+def remove_corporate_chain(body: dict, user: str = Depends(verify_admin)):
+    """Stop skipping a chain at ingest. Leads already parked stay parked until
+    someone edits their status."""
+    stem = (body or {}).get("stem", "")
+    known = [k for k in (_settings_get_json("corporate_chain_stems") or [])
+             if not (isinstance(k, dict) and k.get("stem") == stem)]
+    _settings_set_json("corporate_chain_stems", known)
+    corporate_chain_stems(refresh=True)
+    audit_log(user, "remove_corporate_chain", "lead", None, {"stem": stem})
+    return {"removed": stem, "remaining": len(known)}
 
 @app.post("/api/leads/{lead_id}/find-dm")
 def find_dm(lead_id: str, user: str = Depends(verify_token)):

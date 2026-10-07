@@ -1966,6 +1966,11 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [aiSent,setAiSent]        = useState("")       // Haiku sentiment, embedded on the lead at save
   const [apptDate,setApptDate]    = useState("")       // walkthrough appointment (optional)
   const [apptArea,setApptArea]    = useState("")
+  // 🏢 "Corporate handles cleaning" — one receptionist's answer applies to
+  // every location of the chain, so saving parks them all (after a dry-run
+  // list she confirms) and future imports skip the chain.
+  const [corp,setCorp]       = useState(false)
+  const [hqPhone,setHqPhone] = useState("")
 
   // 👤 Who's in charge — the name + direct line are what the new script's
   // step 1 produces, so they get a home here that saves with the call (and
@@ -2098,6 +2103,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
 
   // Derive the flat outcome for storage (backward compatible)
   const outcome = primary==="answered" ? (secondary||"answered") : primary
+  const corpOn = corp && (primary==="gatekeeper"||outcome==="not_interested")
   const secDef = SECONDARY_OUTCOMES.find(s=>s.value===secondary)
   const needsQual = secDef?.needsQual || false
   const hasQualData = budgetFocus || vendorStatus || decisionMaker || timeline || qualified
@@ -2111,8 +2117,22 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     if(primary==="answered"&&!secondary){ setModalError("Select the call result."); return }
     if(needsQual&&!hasQualData){ setModalError("Fill out at least one qualification field below."); return }
     if(secondary==="callback"&&!cbDate){ setModalError("Please select a callback date."); return }
-    if(primary==="gatekeeper"&&!cbDate){ setModalError("Please pick a follow-up date."); return }
-    if(primary==="gatekeeper"&&!confirmFarDate(cbDate,"Follow-up")) return
+    if(primary==="gatekeeper"&&!corpOn&&!cbDate){ setModalError("Please pick a follow-up date."); return }
+    if(primary==="gatekeeper"&&!corpOn&&!confirmFarDate(cbDate,"Follow-up")) return
+    // Corporate: show exactly which locations get parked BEFORE anything
+    // saves, so a loose name match can't quietly shelve an unrelated business.
+    if(corpOn){
+      let dry
+      try{ dry = await api(`/api/leads/${lead.id}/corporate`,{method:"POST",body:JSON.stringify({dry_run:true})}) }
+      catch{ setModalError("Couldn't look up other locations — try again."); return }
+      const names = (dry.siblings||[]).map(x=>`• ${x.company}${x.state?` (${x.state})`:""}`)
+      const msg = dry.generic_name
+        ? `"${lead.company}" is too generic a name to match other locations safely — only THIS lead will be parked.\n\nContinue?`
+        : (names.length
+            ? `Corporate handles cleaning — park this lead AND ${dry.count} other open location${dry.count!==1?"s":""}?\n\n${names.slice(0,25).join("\n")}${names.length>25?`\n…and ${names.length-25} more`:""}\n\nNew leads from this chain will be skipped too. Leads already interested or on a callback are never touched.`
+            : `No other open locations of this chain found — park this lead, and skip the chain on future imports?`)
+      if(!window.confirm(msg)) return
+    }
     // Substantiation prompt. A flag Eric reads next week is worth far less than
     // the caller adding one line now, while they still remember the call. This
     // fires only when a CONVERSATION is claimed with nothing at all behind it —
@@ -2167,7 +2187,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       const callPayload = {
         leadId:lead.id, outcome, notes:fullNotes,
         duration:finalDuration,
-        callbackDate:(secondary==="callback"||primary==="gatekeeper")?cbDate:"",
+        callbackDate:(secondary==="callback"||(primary==="gatekeeper"&&!corpOn))?cbDate:"",
         calledBy:getUser(), calledAt:new Date().toISOString(),
         budgetfocus: budgetFocus||null, vendorstatus: vendorStatus||null,
         decisionmaker: decisionMaker||null, timeline: timeline||null,
@@ -2200,9 +2220,10 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // lead alive, so the lead status becomes `callback` (the call row
       // itself stays not_interested — that is what they said today).
       const renewalCb = (newRenewal && outcome!=="converted") ? renewalCallbackDate(contractEnds) : ""
-      const newCb = (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||renewalCb||"")
+      const newCb = corpOn ? ""
+        : (secondary==="callback"||primary==="gatekeeper") ? cbDate : (nextFollowUp||renewalCb||"")
       const cbPatch = newCb ? {callbackDate:newCb}
-        : (["not_interested","converted"].includes(outcome) ? {callbackDate:""} : {})
+        : ((corpOn||["not_interested","converted"].includes(outcome)) ? {callbackDate:""} : {})
       const leadStatus = (outcome==="not_interested" && renewalCb) ? "callback" : (statusMap[outcome]||"called")
       await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify({
         status:leadStatus,
@@ -2223,6 +2244,19 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       if(dmExtraChanged){
         try{ await saveDmExtra() }
         catch{ window.alert("Call saved. "+DM_PHONE_ERR) }
+      }
+      // Corporate decides → park this lead + every open sibling, record the
+      // chain, save the HQ number. The call itself is already saved, so a
+      // failure here keeps the modal open for a retry (callPostedRef guards
+      // against a duplicate call row).
+      if(corpOn){
+        try{
+          await api(`/api/leads/${lead.id}/corporate`,{method:"POST",
+            body:JSON.stringify({dry_run:false,hq_phone:hqPhone.trim()})})
+        }catch{
+          setModalError("Call saved, but parking the other locations FAILED — tap Save again to retry.")
+          return
+        }
       }
       // Booked a walkthrough → create the appointment (pending admin approval).
       // This is the revenue event — if it fails, KEEP the modal open and say so
@@ -2743,6 +2777,31 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
           </div>
         )}
 
+        {/* 🏢 Corporate handles cleaning → stop dialing every location of the
+            chain. One receptionist's answer applies to all of them. Oct 1-5:
+            one urgent-care chain was 72 leads and 9% of the week's dials,
+            every location saying "corporate decides". */}
+        {(primary==="gatekeeper"||outcome==="not_interested")&&(
+          <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:12,
+            border:`1px solid ${corp?"#f9731655":"#1e2a45"}`}}>
+            <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,color:corp?"#fdba74":"#a3aac4"}}>
+              <input type="checkbox" checked={corp} onChange={e=>setCorp(e.target.checked)}/>
+              🏢 Corporate / head office handles cleaning
+            </label>
+            {corp&&<>
+              <div style={{fontSize:11,color:"#a3aac4",margin:"8px 0"}}>
+                Parks this lead and every other open location of the same chain (you&apos;ll see the list before it saves)
+                and skips the chain on future imports. Leads already interested or on a callback are never touched.
+                {primary==="gatekeeper"?" No follow-up date needed.":""}
+              </div>
+              <div className="ff" style={{marginBottom:0,maxWidth:260}}>
+                <label>Corporate phone (optional) — saved as one warm lead</label>
+                <input value={hqPhone} onChange={e=>setHqPhone(e.target.value)} placeholder="(555) 555-5555" inputMode="tel"/>
+              </div>
+            </>}
+          </div>
+        )}
+
         {/* Qualification — shown when needed */}
         {needsQual&&(
           <div style={{marginBottom:16,background:"#060e20",borderRadius:10,padding:14,
@@ -2875,7 +2934,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
               (primary==="answered"&&!secondary)||
               (needsQual&&!hasQualData)||
               (secondary==="callback"&&!cbDate)||
-              (primary==="gatekeeper"&&!cbDate)}
+              (primary==="gatekeeper"&&!corpOn&&!cbDate)}
               style={{width:"100%",padding:"14px",fontSize:14,fontFamily:"'Space Grotesk',sans-serif",fontWeight:700}}>
               {saving?"Saving...":"Log Call"}
             </button>
