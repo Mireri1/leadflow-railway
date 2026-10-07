@@ -43,6 +43,27 @@ function tzBucketsFor(cfg, now){
   return out
 }
 
+// Due follow-ups lead the dialer. Mirrors is_due_followup() in
+// backend/main.py — keep the two in step. A lead she already reached
+// (callback / gatekeeper with a name and a time) used to sort behind every
+// never-dialed lead because the first ladder key was "fewest calls", so
+// 36 gatekeeper hand-offs in one week were never called back.
+const FOLLOWUP_RECALL_HOURS = 3       // tried this recently → let it rest
+const FOLLOWUP_MAX_OVERDUE_DAYS = 21  // older strays stay on the Follow-Ups tab
+const FOLLOWUP_DONE = new Set(["not_interested","converted","retired","do_not_contact","awaiting_email_reply"])
+function isDueFollowUp(l, today, nowMs){
+  const cb = (l&&l.callbackDate||"").slice(0,10)
+  if(!cb || cb>today) return false
+  const late = Math.round((new Date(today+"T12:00:00")-new Date(cb+"T12:00:00"))/86400000)
+  if(!(late<=FOLLOWUP_MAX_OVERDUE_DAYS)) return false
+  if(FOLLOWUP_DONE.has(l.status||"")) return false
+  if(l.last_called_at){
+    const t = Date.parse(l.last_called_at)
+    if(!Number.isNaN(t) && nowMs-t < FOLLOWUP_RECALL_HOURS*3600000) return false
+  }
+  return true
+}
+
 const STATES = [
   "","AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
   "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
@@ -5910,6 +5931,8 @@ export default function App(){
                   if(!SNOOZED_OUTCOMES.has(l.status)) return false
                   return l.last_called_at >= snoozeCutoff
                 }
+                const dueToday=localDate(), dueNowMs=Date.now()
+                const dueNow=l=>tzBucketOf(l)!==TZ_OFF && isDueFollowUp(l,dueToday,dueNowMs)
                 const dialerLeads=(allLeads.length?allLeads:leads).filter(l=>
                   (!l.assignedTo||l.assignedTo===user)
                   && !NO_DIAL_STATUSES.has(l.status)
@@ -5920,6 +5943,15 @@ export default function App(){
                   && (!dialerCity || (l.city||"").toLowerCase().startsWith(dialerCity.toLowerCase().trim()))
                   && (!dialerUnanswered || l.status==="no_answer")
                 ).slice().sort((a,b)=>{
+                  // A due follow-up whose office is open beats everything:
+                  // she already got through once, the person to ask for is
+                  // known. Oldest due date first among them.
+                  const da=dueNow(a), db=dueNow(b)
+                  if(da!==db) return da?-1:1
+                  if(da&&db){
+                    const xa=(a.callbackDate||"").slice(0,10), xb=(b.callbackDate||"").slice(0,10)
+                    if(xa!==xb) return xa<xb?-1:1
+                  }
                   // Prospect-local window FIRST: a lead whose office is open
                   // beats a better-scored lead whose office is at lunch or
                   // shut. Null-safe — tzBucketOf returns TZ_PRIME for every
@@ -6002,6 +6034,8 @@ export default function App(){
                     <div style={{textAlign:"center",color:"#a3aac4",fontSize:13,marginBottom:24,
                       fontFamily:"'Space Grotesk',sans-serif"}}>
                       {dialerLeads.length} unclaimed lead{dialerLeads.length!==1?"s":""} · showing {idx+1} of {dialerLeads.length}
+                      {(()=>{const n=dialerLeads.filter(dueNow).length
+                        return n?<span style={{color:"#fbbf24",fontWeight:600}}>{" · "}{n} follow-up{n!==1?"s":""} due first</span>:null})()}
                       {tzBucketByState&&(()=>{
                         // Composition of the queue by the prospect's own
                         // clock. Shown so the sort is visible rather than
@@ -6016,6 +6050,23 @@ export default function App(){
                         </span>
                       })()}
                     </div>
+                    {dueNow(lead)&&(()=>{
+                      // She got through before — say why this lead jumped the
+                      // queue before she dials. The 👤 ASK FOR banner on the
+                      // card below carries the name, title and callback info.
+                      const cb=(lead.callbackDate||"").slice(0,10)
+                      const late=cb<dueToday
+                      return(
+                      <div style={{background:"#fbbf2414",border:"1px solid #fbbf2455",borderRadius:14,
+                        padding:"12px 16px",marginBottom:12,textAlign:"left"}}>
+                        <div style={{color:"#fbbf24",fontWeight:700,fontSize:14}}>
+                          ⏰ Follow-up {late?`overdue since ${cb}`:"due today"}
+                          {lead.status==="gatekeeper"?" · reached the front desk last time":""}
+                        </div>
+                        {!(lead.firstName||"").trim()&&<div style={{color:"#dee5ff",fontSize:14,marginTop:4}}>
+                          No decision-maker name on file — ask who handles cleaning</div>}
+                      </div>)
+                    })()}
                     <div style={{background:"#0f1930",borderRadius:20,padding:40,textAlign:"center",marginBottom:16}}>
                       <div style={{width:80,height:80,borderRadius:"50%",background:ac+"22",margin:"0 auto 20px",
                         display:"flex",alignItems:"center",justifyContent:"center",
