@@ -1721,6 +1721,71 @@ function nextBusinessDay(){
   while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate() + 1)
   return localDate(d)
 }
+// "Thursday" said on the phone means the NEXT Thursday — strictly after today,
+// so "Thursday" on a Thursday is a week out, never a date already in progress.
+function nextWeekday(dow){
+  const d = new Date()
+  do { d.setDate(d.getDate() + 1) } while(d.getDay()!==dow)
+  return localDate(d)
+}
+const WEEKDAY_SHORT=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
+const MONTH_SHORT=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+// "2026-10-09" → "Thu Oct 9". Parsed as local noon so the day never shifts.
+function fmtDayShort(ymd){
+  if(!ymd) return ""
+  const d=new Date(ymd+"T12:00:00")
+  if(Number.isNaN(d.getTime())) return ymd
+  return `${WEEKDAY_SHORT[d.getDay()]} ${MONTH_SHORT[d.getMonth()]} ${d.getDate()}`
+}
+// Time-of-day the desk gives. Stored as words, not a clock time: callbackDate
+// is a DATE column and "around noon" is what she was actually told.
+const CALLBACK_TIMES=["in the morning","around 10am","around noon","early afternoon","around 2pm","around 4pm"]
+
+// ─── CallbackWhen — "call back Thursday at noon" in two taps ────────────────
+// The desk answers "when's a good time?" with a weekday and a rough time far
+// more often than a date. Day chips set callbackDate (the thing the dialer
+// and Follow-Ups sort on); the time rides on the call note and, when the
+// lead has no callback info yet, onto reach_notes so the dialer card says it.
+function CallbackWhen({cbDate,setCbDate,cbTime,setCbTime,accent,label}){
+  const today=localDate()
+  const days=[["Today",today],["Tomorrow",addDays(1)]]
+  for(const dow of [1,2,3,4,5]) days.push([WEEKDAY_SHORT[dow],nextWeekday(dow)])
+  days.push(["Next week",addDays(7)],["In 2 weeks",addDays(14)])
+  // Tomorrow on a Friday is Saturday — show it, but mark it, so the Friday
+  // "call tomorrow" lands on Monday with one more tap instead of a dead ring.
+  const chip=(on)=>({padding:"5px 10px",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"inherit",
+    background:on?accent+"22":"#0f1930",color:on?accent:"#a3aac4",border:`1px solid ${on?accent:"#1e2a45"}`})
+  return(
+    <div>
+      <div style={{fontSize:10,color:"#6b7398",letterSpacing:".08em",fontWeight:700,marginBottom:6}}>WHICH DAY</div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+        {days.map(([lbl,d])=>{
+          const wk=new Date(d+"T12:00:00").getDay(), weekend=wk===0||wk===6
+          return <button key={lbl} type="button" onClick={()=>setCbDate(d)} style={chip(cbDate===d)}
+            title={fmtDayShort(d)+(weekend?" — weekend":"")}>{lbl}{weekend?" ⚠":""}</button>
+        })}
+      </div>
+      <div style={{fontSize:10,color:"#6b7398",letterSpacing:".08em",fontWeight:700,marginBottom:6}}>WHAT TIME (optional)</div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+        {CALLBACK_TIMES.map(t=>(
+          <button key={t} type="button" onClick={()=>setCbTime(cbTime===t?"":t)} style={chip(cbTime===t)}>{t}</button>
+        ))}
+      </div>
+      <div style={{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}}>
+        <div className="ff" style={{maxWidth:200,marginBottom:0}}>
+          <label>{label||"Date"}</label>
+          <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+        </div>
+        <div className="ff" style={{flex:"1 1 160px",marginBottom:0}}>
+          <label>or type the time</label>
+          <input value={cbTime} onChange={e=>setCbTime(e.target.value)} placeholder='e.g. "12:30", "after 3pm"'/>
+        </div>
+        {cbDate&&<div style={{fontSize:13,color:accent,fontWeight:700,paddingBottom:8}}>
+          → {fmtDayShort(cbDate)}{cbTime?` ${cbTime}`:""}</div>}
+      </div>
+    </div>
+  )
+}
 // Contract renewal → callback date. "Under contract until March" means the
 // decision window opens ~2-3 months before: ring RENEWAL_LEAD_DAYS before the
 // 1st of that month, never earlier than tomorrow (a renewal this month or
@@ -1910,6 +1975,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const [dmTitle,setDmTitle] = useState(lead.title||"")
   const [dmPhone,setDmPhone] = useState(lead.dm_phone||"")
   const [dmReach,setDmReach] = useState(lead.reach_notes||"")   // "callback info": when/how to reach them
+  const [dmEmail,setDmEmail] = useState(lead.email||"")         // "just email them" — the desk often hands this over
+  const [cbTime,setCbTime]   = useState("")                      // "around noon" — rides the note + reach_notes
   const [contractEnds,setContractEnds] = useState((lead.contract_ends||"").slice(0,7))   // "YYYY-MM"
   const [dmEdit,setDmEdit]   = useState(false)
   const [savingDm,setSavingDm] = useState(false)
@@ -1919,9 +1986,15 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
   const dmTitleChanged = dmTitle.trim()!==(lead.title||"").trim()
   const dmPhoneChanged = dmPhone.trim()!==(lead.dm_phone||"").trim()
   const dmReachChanged = dmReach.trim()!==(lead.reach_notes||"").trim()
+  const dmEmailChanged = dmEmail.trim()!==(lead.email||"").trim()
+  // "Thu Oct 9 around noon" — what the desk said about WHEN. Stamped on the
+  // note; becomes the lead's callback info only when there is none yet (a
+  // standing "Tue/Thu mornings" must not be overwritten by one appointment).
+  const cbWhenPhrase = cbTime.trim() ? `${fmtDayShort(cbDate)} ${cbTime.trim()}`.trim() : ""
+  const reachFromWhen = !!cbWhenPhrase && !dmReach.trim()
   const contractEndsChanged = (contractEnds||"")!==(lead.contract_ends||"").slice(0,7)
-  const dmExtraChanged = dmPhoneChanged||dmReachChanged||contractEndsChanged
-  const dmDirty = dmNameChanged||dmTitleChanged||dmExtraChanged
+  const dmExtraChanged = dmPhoneChanged||dmReachChanged||contractEndsChanged||reachFromWhen
+  const dmDirty = dmNameChanged||dmTitleChanged||dmEmailChanged||dmExtraChanged
   // Name/title live on columns that have always existed, so they ride the
   // same PATCH as the outcome. dm_phone (009) and reach_notes (010) go in
   // their OWN PATCH — a missing column must only ever fail those two fields.
@@ -1929,6 +2002,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     const p={}
     if(dmNameChanged){ const parts=dmName.trim().split(/\s+/).filter(Boolean); p.firstName=parts[0]||""; p.lastName=parts.slice(1).join(" ") }
     if(dmTitleChanged) p.title=dmTitle.trim()
+    if(dmEmailChanged) p.email=dmEmail.trim()
     return p
   }
   const DM_PHONE_ERR="The direct line / callback info / contract end could NOT be stored — the leads table is missing the dm_phone, reach_notes or contract_ends column. Tell Eric to run backend/migrations/009, 010 and 011. (Name, title and the call itself saved fine.)"
@@ -1936,6 +2010,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     const body={updatedAt:new Date().toISOString()}
     if(dmPhoneChanged) body.dm_phone=dmPhone.trim()||null
     if(dmReachChanged) body.reach_notes=dmReach.trim()||null
+    else if(reachFromWhen) body.reach_notes=cbWhenPhrase
     if(contractEndsChanged) body.contract_ends=contractEnds?contractEnds+"-01":null
     const r=await api(`/api/leads/${lead.id}`,{method:"PATCH",body:JSON.stringify(body)})
     return Array.isArray(r)&&r[0] ? r[0] : body
@@ -1958,7 +2033,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     }catch(ex){ setDmSaveStatus("Couldn't save — "+(ex.message||"try again")) }
     finally{ setSavingDm(false) }
   }
-  function resetDm(){ setDmName(leadFullName); setDmTitle(lead.title||""); setDmPhone(lead.dm_phone||""); setDmReach(lead.reach_notes||""); setContractEnds((lead.contract_ends||"").slice(0,7)); setDmSaveStatus("") }
+  function resetDm(){ setDmName(leadFullName); setDmTitle(lead.title||""); setDmPhone(lead.dm_phone||""); setDmReach(lead.reach_notes||""); setDmEmail(lead.email||""); setContractEnds((lead.contract_ends||"").slice(0,7)); setDmSaveStatus("") }
   // Gatekeeper → ring back the NEXT business day, by name. The script's step 1
   // on a no-name lead is just "who handles facilities?" + hang up, so the whole
   // value of the call is the name captured above and the next-day retry.
@@ -2065,6 +2140,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
     }
     if(secondary==="callback"&&!confirmFarDate(cbDate,"Callback")) return
     if(apptDate&&!confirmFarDate(apptDate,"Walkthrough date")) return
+    if(dmEmailChanged&&dmEmail.trim()&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(dmEmail.trim())){
+      setModalError("That email doesn't look right — fix it or clear it."); return }
 
     setSave(true)
     try{
@@ -2076,8 +2153,12 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
       // "[renews YYYY-MM]" marks the call that captured the contract end —
       // the script-funnel analytics count it, and History shows it.
       const newRenewal = contractEndsChanged && contractEnds
+      // "Call back Thu Oct 9 around noon" — the time the desk gave has no
+      // column of its own, so it lives on the note where History shows it.
+      const hasCbDate = (secondary==="callback"||primary==="gatekeeper") && cbDate
+      const whenStamp = hasCbDate && cbWhenPhrase ? `Call back ${cbWhenPhrase} ·` : ""
       const fullNotes = [cbReason?`[${cbReason}]`:"", newName?`DM: ${dmName.trim()} ·`:"",
-        newRenewal?`[renews ${contractEnds}]`:"", notes].filter(Boolean).join(" ").trim()
+        whenStamp, newRenewal?`[renews ${contractEnds}]`:"", notes].filter(Boolean).join(" ").trim()
       // Per-call email follow-up: only meaningful when this was a failed dial
       // and the lead has the contact info we'd email + VCC is configured.
       const emailEligible = (primary==="no_answer"||primary==="voicemail")
@@ -2155,6 +2236,12 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
         }
       }
       onSaved(); onClose()
+      // The desk gave an email for the decision-maker → open the composer on
+      // the "Front desk referred" script while the call is fresh. After
+      // onClose so the composer isn't stacked under this modal.
+      if(primary==="gatekeeper"&&dmEmailChanged&&dmEmail.trim()&&onEmail){
+        onEmail({...lead,...dmPatch(),status:"gatekeeper"})
+      }
     }catch(ex){setModalError("Couldn't save — check your internet and try again.")}
     finally{setSave(false)}
   }
@@ -2431,6 +2518,7 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                           style={{color:"#7dd3fc",fontWeight:700,textDecoration:"none",fontSize:15}}>📱 Direct: {lead.dm_phone}</a>
                       : <span style={{color:"#6b7398",fontSize:12}}>📱 No direct line yet — ask for it when you reach them</span>}
                     {lead.phone&&<span style={{color:"#a3aac4",fontSize:12}}>☎️ Main: {lead.phone}</span>}
+                    {lead.email&&<span style={{color:"#a3aac4",fontSize:12}}>✉️ {lead.email}</span>}
                   </div>
                   {lead.contract_ends&&(
                     <div style={{marginTop:6,fontSize:13,color:"#c4b5fd",fontWeight:600}}>
@@ -2466,6 +2554,10 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                     <div className="ff" style={inp}>
                       <label>Direct line / cell</label>
                       <input value={dmPhone} onChange={e=>setDmPhone(e.target.value)} placeholder="(702) 555-0134" inputMode="tel"/>
+                    </div>
+                    <div className="ff" style={inp}>
+                      <label>Their email</label>
+                      <input type="email" value={dmEmail} onChange={e=>setDmEmail(e.target.value)} placeholder="name@company.com" inputMode="email"/>
                     </div>
                   </div>
                   <div className="ff" style={{marginTop:8,marginBottom:0}}>
@@ -2616,10 +2708,8 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                 </button>
               ))}
             </div>
-            <div className="ff">
-              <label>Callback Date</label>
-              <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
-            </div>
+            <CallbackWhen cbDate={cbDate} setCbDate={setCbDate} cbTime={cbTime} setCbTime={setCbTime}
+              accent="#8b5cf6" label="Callback date"/>
           </div>
         )}
 
@@ -2638,17 +2728,18 @@ function CallModal({lead: leadProp,onClose,onSaved,onEmail}){
                 ? <>Tomorrow&apos;s script opens with &ldquo;Hey, is <b style={{color:"#dee5ff"}}>{dmName.trim().split(/\s+/)[0]}</b> around?&rdquo;</>
                 : <>Type the name they gave you in <b style={{color:"#7dd3fc"}}>👤 Who&apos;s in charge</b> above — it saves with this call.</>}
             </div>
-            <div style={{display:"flex",gap:14,alignItems:"flex-end",flexWrap:"wrap"}}>
-              <div className="ff" style={{maxWidth:220,marginBottom:0}}>
-                <label>Call back on</label>
-                <input type="date" value={cbDate} onChange={e=>setCbDate(e.target.value)}/>
+            {(dmReach.trim()||lead.reach_notes)&&(
+              <div style={{fontSize:12,color:"#ffe083",fontWeight:600,marginBottom:8}}>
+                🕐 {dmReach.trim()||lead.reach_notes} <span style={{color:"#6b7398",fontWeight:400}}>— pick the day to match</span>
               </div>
-              {(dmReach.trim()||lead.reach_notes)&&(
-                <div style={{fontSize:12,color:"#ffe083",fontWeight:600,paddingBottom:8}}>
-                  🕐 {dmReach.trim()||lead.reach_notes} <span style={{color:"#6b7398",fontWeight:400}}>— pick the date to match</span>
-                </div>
-              )}
-            </div>
+            )}
+            <CallbackWhen cbDate={cbDate} setCbDate={setCbDate} cbTime={cbTime} setCbTime={setCbTime}
+              accent="#7dd3fc" label="Call back on"/>
+            {dmEmail.trim()&&!lead.email&&(
+              <div style={{fontSize:11,color:"#a3aac4",marginTop:8}}>
+                ✉️ Saving opens the <b style={{color:"#dee5ff"}}>Front desk referred</b> email to {dmEmail.trim()} — they haven&apos;t heard from us yet, so it says the desk pointed us to them.
+              </div>
+            )}
           </div>
         )}
 
@@ -2850,13 +2941,19 @@ function EmailModal({lead,onClose,onSent}){
       label:"🤝 We spoke",
       subject:lead?.company?`Following Up — ${lead.company}`:"Following Up",
       body:`Hi ${_name},\n\nThank you for taking our call today. It was great connecting with you.\n\nIf you'd like a free, no obligation estimate, simply reply to this email with your approximate square footage and how often you'd like service (daily, weekly, bi weekly, monthly) and we'll send a custom quote your way as soon as possible.\n\nYou can also learn more about Vision Cleaning Company and the services we offer at https://visioncleaningcompanyllc.com. Feel free to request your quote directly through our site any time.\n\nWe appreciate the opportunity and look forward to the chance to work with you.\n\n${SIG}`},
+    // The front desk gave us this person's name/email — they haven't heard
+    // from us yet, so "thanks for taking our call" would be wrong.
+    referred:{
+      label:"🚪 Front desk referred",
+      subject:lead?.company?`Cleaning at ${lead.company} — your front desk pointed me to you`:"Your front desk pointed me to you",
+      body:`Hi ${_name},\n\nI called ${_co} today and your front desk mentioned you're the right person to talk to about cleaning — I'll try you by phone as well.\n\nVision Cleaning Company provides commercial cleaning for medical offices, clinics, and other facilities on daily, weekly, bi-weekly, or monthly schedules, built around your hours. Every plan is customized and flat-rate.\n\nIf it's easier, simply reply with your approximate square footage and how often you'd like service, and we'll send a free, no-obligation quote within 24 hours. You can also learn more at https://visioncleaningcompanyllc.com.\n\nThanks — looking forward to connecting.\n\n${SIG}`},
     missed:{
       label:"📵 Missed call",
       subject:lead?.company?`Sorry we missed you — ${lead.company}`:"Sorry we missed you",
       body:`Hi ${_name},\n\nSorry we missed each other — we tried reaching you about cleaning service at ${_co}.\n\nVision Cleaning Company provides commercial cleaning on daily, weekly, bi-weekly, or monthly schedules, and we'd love to put a free, no-obligation quote together for you. If a call is tough to fit in, simply reply to this email with your approximate square footage and how often you'd like service, and we'll send a custom quote your way within 24 hours.\n\nYou can also learn more about us and the services we offer at https://visioncleaningcompanyllc.com.\n\nHope to connect soon.\n\n${SIG}`},
   }
   const defaultPreset=["interested","callback","converted"].includes(lead?.status)?"asked"
-    :lead?.status==="no_answer"?"missed":"spoke"
+    :lead?.status==="no_answer"?"missed":lead?.status==="gatekeeper"?"referred":"spoke"
 
   const [preset,setPreset]=useState(defaultPreset)
   const [toEmail,setToEmail]=useState(lead?.email||"")
