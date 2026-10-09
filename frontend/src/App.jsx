@@ -6503,16 +6503,20 @@ export default function App(){
                     const xa=(a.callbackDate||"").slice(0,10), xb=(b.callbackDate||"").slice(0,10)
                     if(xa!==xb) return xa<xb?-1:1
                   }
-                  // Best local hour FIRST: a lead whose desk is at its best
-                  // measured hour (e.g. 10am) beats one at lunch, and both
-                  // beat a shut office. Re-evaluated every 5-min tick, so a
-                  // market that hits lunch sinks and comes back after. Null-
-                  // safe — tzRankOf returns 0 for every lead when the config
-                  // hasn't loaded, which collapses this to the plain ladder.
+                  // Shut offices last, then FEWEST CALLS, then best local
+                  // hour as the tie-break — mirrors /api/dialer/queue exactly.
+                  // The hour rank must never outrank total_calls: when it did
+                  // (Oct 7-9) the one timezone at its best hour put thousands
+                  // of once-called April leads ahead of every never-dialed
+                  // lead elsewhere, and she redialled stale stock for two days.
+                  // Null-safe — tzRankOf returns 0 for every lead when the
+                  // config hasn't loaded, which collapses this to the ladder.
                   const ta=tzRankOf(a), tb=tzRankOf(b)
-                  if(ta!==tb) return ta-tb                              // best hour first
+                  const oa=ta>=TZ_RANK_OFF?1:0, ob=tb>=TZ_RANK_OFF?1:0
+                  if(oa!==ob) return oa-ob                              // shut offices sink
                   const ca=a.total_calls||0, cb=b.total_calls||0
                   if(ca!==cb) return ca-cb                              // fewest calls first
+                  if(ta!==tb) return ta-tb                              // then best hour
                   const la=a.last_called_at||"", lb=b.last_called_at||""
                   if(la!==lb) return la<lb?-1:1                         // oldest contact first ("" sorts before any date)
                   return (b.score||0)-(a.score||0)                      // tiebreak: highest score
