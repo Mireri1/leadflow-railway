@@ -6894,13 +6894,24 @@ def dialer_queue(limit: int = 50, snooze_hours: int = 4,
         # *within* each bucket — no need to restate it here and no risk of the
         # two definitions drifting apart.
         # Due follow-ups whose office is open come first, oldest due date
-        # first; everything else keeps the bucket-then-ladder order.
-        # Outside the due group, the best-hour RANK orders the markets (see
-        # dialer_hour_ranks); the bucket is kept only for the OFF test/counts.
+        # first. Everything else: OFF-hours last, then FEWEST CALLS, then the
+        # best-hour RANK (see dialer_hour_ranks) as the tie-break, then the
+        # PostgREST ladder (oldest contact, best score) via the stable sort.
+        #
+        # The rank must NOT come before total_calls. When it did (Oct 7-9),
+        # the one timezone at its best hour put its entire once-called April
+        # backlog (4,000+ WY/MT/UT rows from the previous caller) ahead of 369
+        # never-dialed leads in GA/OH/NV/MO, and the 4h snooze then served the
+        # same April rows again that afternoon — Cristine redialled the same
+        # stale leads for two days while fresh stock sat untouched. Best hour
+        # chooses AMONG equally-fresh leads; it never buries fresh stock.
         def _key(pair):
             (b, rk), l = pair
             due = b != TZ_BUCKET_OFF and is_due_followup(l, today, now_utc)
-            return (0, (l.get("callbackDate") or "")[:10], rk) if due else (1, "", rk)
+            if due:
+                return (0, 0, (l.get("callbackDate") or "")[:10], rk)
+            off = 1 if b == TZ_BUCKET_OFF else 0
+            return (1, off, l.get("total_calls") or 0, rk)
         decorated.sort(key=_key)
         out = [l for _, l in decorated]
     else:
