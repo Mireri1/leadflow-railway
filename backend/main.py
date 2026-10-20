@@ -8146,7 +8146,10 @@ def transcribe_call(payload: dict):
         except Exception as e:
             print(f"[TRANSCRIBE] call fetch failed: {e}")
 
-    skip = transcription_gate(call, payload)
+    # `force` is set only by the admin single-call backfill: an explicit ask
+    # for one named recording bypasses the cost gate. Never set it on the
+    # live webhook path.
+    skip = "" if payload.get("force") else transcription_gate(call, payload)
     if skip:
         print(f"[TRANSCRIBE] {rec_sid} skip:{skip} "
               f"(dur={payload.get('recording_duration_sec')}s "
@@ -8717,11 +8720,105 @@ def caller_qa(days: int = 30, caller: str = "", user: str = Depends(verify_admin
                     "is not a trend. avg_assertiveness reads LANGUAGE (hedging), "
                     "not tone: a transcript cannot show vocal confidence."}
 
+def _transcribe_backfill_single(call_id: int, cap: float, dry_run: bool, user: str) -> dict:
+    """Single-call mode of /api/admin/transcribe-backfill. No Twilio date scan
+    (the full scan is ~30s/day and 502s behind Railway's proxy on long
+    windows). Reads the call row's recording_sid / recording_duration_sec,
+    recovers the RecordingUrl from the call_recording audit row (falls back to
+    the canonical Twilio URL for the SID), and enqueues the SAME transcribe_call
+    job the live webhook does — so the transcript + analysis land where
+    /api/calls/{call_id}/intelligence reads them."""
+    try:
+        cr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}"
+                         f"&select=id,leadId,outcome,answered_by,recording_sid,recording_duration_sec,"
+                         f"transcription_status,calledAt", headers=SB_ADMIN_HEADERS, timeout=10)
+        rows = cr.json() if cr.status_code == 200 else []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"call lookup failed: {e}")
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"call {call_id} not found")
+    call = rows[0]
+    rec_sid = call.get("recording_sid") or ""
+    if not rec_sid:
+        raise HTTPException(status_code=404, detail=f"call {call_id} has no recording_sid")
+    lead_id = call.get("leadId")
+
+    # RecordingUrl + channels live only on the audit row the webhook wrote.
+    rec_url, channels, dur = "", 2, int(call.get("recording_duration_sec") or 0)
+    try:
+        ar = req_lib.get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.call_recording"
+                         f"&details=like.*{url_quote(rec_sid, safe='')}*"
+                         f"&select=details&order=created_at.desc&limit=1",
+                         headers=SB_ADMIN_HEADERS, timeout=10)
+        for a in (ar.json() if ar.status_code == 200 else []):
+            d = json_lib.loads(a.get("details") or "{}")
+            if d.get("recording_sid") == rec_sid:
+                rec_url = d.get("recording_url") or rec_url
+                channels = int(d.get("channels") or channels or 2)
+                if not dur:
+                    dur = int(float(d.get("duration") or 0))
+    except Exception as e:
+        print(f"[BACKFILL] single call {call_id}: audit lookup failed ({e}) — using canonical URL")
+    if not rec_url:
+        rec_url = (f"https://api.twilio.com/2010-04-01/Accounts/"
+                   f"{os.getenv('TWILIO_ACCOUNT_SID', '')}/Recordings/{rec_sid}")
+
+    # Eligibility: duplicate + machine still apply; short/disposition are
+    # deliberately NOT applied — the admin named this call.
+    reason = ""
+    try:
+        ex = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_transcripts"
+                         f"?recording_sid=eq.{url_quote(rec_sid, safe='')}&select=id",
+                         headers=SB_ADMIN_HEADERS, timeout=10)
+        if ex.status_code == 200 and ex.json():
+            reason = "duplicate"
+    except Exception as e:
+        print(f"[BACKFILL] single call {call_id}: duplicate check failed (continuing): {e}")
+    if not reason and (call.get("answered_by") or "").strip().lower() in _AMD_MACHINE:
+        reason = "machine"
+    cost = round(dur / 60.0 * DEEPGRAM_RATE_PER_MIN, 5)
+    if not reason and cost > cap:
+        reason = "over_budget"
+    eligible = not reason
+
+    enqueued = 0
+    if eligible and not dry_run:
+        job = {"recording_sid": rec_sid, "recording_url": rec_url,
+               "recording_duration_sec": dur, "channels": channels,
+               "lead_id": str(lead_id) if lead_id else None,
+               "call_id": call_id, "force": True}
+        if enqueue_job("transcribe_call", job, dedupe_key=rec_sid):
+            enqueued = 1
+            _patch_call(call_id, {"recording_sid": rec_sid, "recording_duration_sec": dur,
+                                  "transcription_status": "queued",
+                                  "transcription_skip_reason": None})
+        audit_log(user, "transcribe_backfill", "call", call_id,
+                  {"single": True, "recording_sid": rec_sid, "enqueued": enqueued, "projected_usd": cost})
+    print(f"[BACKFILL] single call {call_id}: {rec_sid} {dur}s "
+          f"{'eligible' if eligible else 'skip:' + reason} ${cost:.4f} "
+          f"enqueued={enqueued} (dry_run={dry_run})")
+    return {"call_id": call_id, "recording_sid": rec_sid, "lead_id": lead_id,
+            "recording_duration_sec": dur, "eligible": eligible,
+            "skip_reason": reason or None, "projected_deepgram_usd": cost,
+            "max_spend_usd": cap, "enqueued": enqueued, "dry_run": dry_run,
+            "previous_transcription_status": call.get("transcription_status"),
+            "forced_rules_bypassed": ["short", "disposition"]}
+
 @app.post("/api/admin/transcribe-backfill")
 def transcribe_backfill(days: int = 30, max_spend_usd: float = 25.0,
-                        dry_run: int = 1, user: str = Depends(verify_admin)):
+                        dry_run: int = 1, call_id: Optional[int] = None,
+                        user: str = Depends(verify_admin)):
     """Rollout step 5 — one-time sweep over recordings already sitting in
     Twilio that would pass the gate.
+
+    Params: `days` (1-90) window for the date-range scan · `max_spend_usd`
+    Deepgram ceiling, enforced before any enqueue · `dry_run` (DEFAULT 1)
+    project only · `call_id` SINGLE-CALL MODE: skip the date scan and
+    transcribe exactly this call_outcomes row by its stored recording_sid.
+    An admin naming one call is an explicit ask, so the `short` and
+    `disposition` gate rules are bypassed for it (`force` on the job); the
+    AMD `machine` rule, the duplicate check and max_spend_usd still apply.
+    404 when the call does not exist or has no recording_sid.
 
     dry_run=1 (the DEFAULT) enqueues nothing and returns the projected cost and
     skip distribution. Run it that way first: this is the one operation here
@@ -8736,6 +8833,8 @@ def transcribe_backfill(days: int = 30, max_spend_usd: float = 25.0,
         return {"error": "DEEPGRAM_API_KEY not set"}
     if not TRANSCRIBE_ENABLED and not dry_run:
         return {"error": "TRANSCRIBE_ENABLED is off — flip it before a live backfill"}
+    if call_id is not None:
+        return _transcribe_backfill_single(int(call_id), cap, bool(dry_run), user)
     since = (datetime.utcnow() - timedelta(days=days)).isoformat()
 
     # Recordings are recorded in audit_log by /twilio/recording-status, which is
