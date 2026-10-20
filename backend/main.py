@@ -5,7 +5,7 @@ LeadFlow Railway Backend — Google Places scraper
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt, os, re, time, json as json_lib, requests as _requests
 import imaplib, email as email_lib, threading
@@ -7057,9 +7057,17 @@ def _notify_angelo(appt):
               f"*Area:* {appt.get('area','—')}", f"*Booked by:* {appt.get('createdBy','—')}"]
     if appt.get("phone"): fields.append(f"*Phone:* {appt['phone']}")
     if appt.get("notes"): fields.append(f"*Notes:* {appt['notes']}")
+    if appt.get("transcript_summary"):
+        # A7: what was actually said on the booking call. Only warn-level checks
+        # can reach here — a block check removes the Approve button (A5).
+        fields.append(f"\n*From the booking call:* {appt['transcript_summary']}")
+        fields.append(f"*Prospect's next step:* {appt.get('transcript_next_step') or '—'}")
+        warns = [c for c in (appt.get("transcript_checks") or []) if c.get("severity") in ("warn", "block")]
+        if warns:
+            fields.append("*Heads-up from the transcript:*\n" + "\n".join(_appt_checks_lines(warns)))
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "✅ Approved appointment — start hiring", "emoji": True}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(fields)}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(fields)[:2900]}},
         {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Open in LeadFlow", "emoji": True}, "url": app_url, "style": "primary"}]},
     ]
     try:
@@ -7164,12 +7172,86 @@ def _get_walkthrough_followups():
     out.sort(key=lambda a: a.get("date") or "9999")
     return out
 
+def _appt_approve_token(lead_id):
+    """Signed approve token (7-day expiry). The same JWT rides the web link
+    (/appt-approve?t=) AND the Slack button `value`, so one secret and one
+    expiry govern both paths."""
+    return jwt.encode({"leadId": str(lead_id), "act": "approve_appt",
+                       "exp": datetime.utcnow() + timedelta(days=7)}, SECRET_KEY, algorithm=ALGORITHM)
+
 def _appt_approve_link(lead_id):
     """Signed one-click approve URL for the Slack ping (7-day expiry)."""
-    tok = jwt.encode({"leadId": str(lead_id), "act": "approve_appt",
-                      "exp": datetime.utcnow() + timedelta(days=7)}, SECRET_KEY, algorithm=ALGORITHM)
     app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
-    return f"{app_url}/appt-approve?t={tok}"
+    return f"{app_url}/appt-approve?t={_appt_approve_token(lead_id)}"
+
+# ── Slack Interactivity (approve inside Slack — no browser, no sign-in) ──────
+# Slack app config → Interactivity & Shortcuts → Request URL
+#   POST {APP_URL}/slack/interactions
+# and the app's Signing Secret → Railway SLACK_SIGNING_SECRET. Incoming-webhook
+# messages posted by the same app can carry `button` elements with an
+# `action_id`; the tap is delivered to that URL and the original message is
+# rewritten through the payload's `response_url` — no bot token needed.
+# With the secret UNSET, every button falls back to today's URL + /appt-approve
+# confirm page. /warm-lead keeps its (deprecated) verification token; this
+# endpoint uses signature verification only.
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
+SLACK_APPROVER_USER_IDS = {u.strip() for u in os.getenv("SLACK_APPROVER_USER_IDS", "").split(",") if u.strip()}
+SLACK_SIG_MAX_AGE_SEC = 300          # Slack's documented replay window
+print(f"[SLACK] appointment approvals: "
+      f"{'native buttons via /slack/interactions' if SLACK_SIGNING_SECRET else 'URL fallback via /appt-approve (SLACK_SIGNING_SECRET unset)'}"
+      f" · approvers={len(SLACK_APPROVER_USER_IDS)}")
+
+def _slack_sig_ok(secret: str, timestamp: str, signature: str, raw_body: bytes, now_ts=None) -> bool:
+    """Slack request signing: v0=HMAC-SHA256(secret, 'v0:{ts}:{body}'), compared
+    constant-time, and the timestamp must be within 5 minutes (replay guard).
+    Pure function of its inputs so it is unit-testable; the raw body MUST be
+    the bytes Slack sent — a re-serialised form does not verify."""
+    import hmac, hashlib
+    if not secret or not timestamp or not signature:
+        return False
+    try:
+        ts = int(float(timestamp))
+    except (TypeError, ValueError):
+        return False
+    now_ts = int(now_ts if now_ts is not None else time.time())
+    if abs(now_ts - ts) > SLACK_SIG_MAX_AGE_SEC:
+        return False
+    base = b"v0:" + str(ts).encode() + b":" + (raw_body or b"")
+    mac = "v0=" + hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, signature)
+
+def _slack_clock(now=None) -> str:
+    """'11:42 AM ET' for the in-channel audit line."""
+    now = now or datetime.utcnow()
+    local = now + timedelta(hours=BUSINESS_TZ_OFFSET_HOURS)
+    return local.strftime("%I:%M %p").lstrip("0") + " ET"
+
+def _appt_action_buttons(appt, with_reject=True):
+    """The approve controls for an appointment Slack message. Native (interactive)
+    when SLACK_SIGNING_SECRET is set, else the signed URL that opens the
+    /appt-approve confirm page. Both carry the same JWT."""
+    lead_id = appt.get("leadId")
+    if not SLACK_SIGNING_SECRET:
+        return [{"type": "button", "text": {"type": "plain_text", "text": "✅ Approve & send to Angelo", "emoji": True},
+                 "url": _appt_approve_link(lead_id), "style": "primary"}]
+    tok = _appt_approve_token(lead_id)
+    what = f"{appt.get('company') or '(unknown)'} · {(appt.get('date') or '—')[:16]}"
+    out = [{"type": "button", "action_id": "appt_approve", "style": "primary",
+            "text": {"type": "plain_text", "text": "✅ Approve & send to Angelo", "emoji": True},
+            "value": tok,
+            "confirm": {"title": {"type": "plain_text", "text": "Approve?"},
+                        "text": {"type": "mrkdwn", "text": what},
+                        "confirm": {"type": "plain_text", "text": "Approve"},
+                        "deny": {"type": "plain_text", "text": "Cancel"}}}]
+    if with_reject:
+        out.append({"type": "button", "action_id": "appt_reject", "style": "danger",
+                    "text": {"type": "plain_text", "text": "❌ Reject", "emoji": True},
+                    "value": tok,
+                    "confirm": {"title": {"type": "plain_text", "text": "Reject this appointment?"},
+                                "text": {"type": "mrkdwn", "text": f"{what}\nMarks it lost. Angelo is not notified."},
+                                "confirm": {"type": "plain_text", "text": "Reject"},
+                                "deny": {"type": "plain_text", "text": "Cancel"}}})
+    return out
 
 def _notify_pending_appointment(appt):
     """Ping the admin channel when a caller books a walkthrough — with a
@@ -7183,10 +7265,9 @@ def _notify_pending_appointment(appt):
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "🆕 Appointment pending your approval", "emoji": True}},
         {"type": "section", "text": {"type": "mrkdwn", "text": txt}},
-        {"type": "actions", "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve & send to Angelo", "emoji": True},
-             "url": _appt_approve_link(appt.get("leadId")), "style": "primary"},
-            {"type": "button", "text": {"type": "plain_text", "text": "Open LeadFlow", "emoji": True}, "url": app_url},
+        {"type": "actions", "elements": _appt_action_buttons(appt) + [
+            {"type": "button", "action_id": "appt_open",
+             "text": {"type": "plain_text", "text": "Open LeadFlow", "emoji": True}, "url": app_url},
         ]},
     ]
     try:
@@ -7245,6 +7326,166 @@ async def appt_approve_submit(request: Request):
     return HTMLResponse(f"""<html><body style="font-family:sans-serif;background:#060e20;color:#dee5ff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
       <div style="text-align:center"><h2>✅ Approved</h2>
       <p style="color:#a3aac4">{appt.get('company','')} sent to Angelo for hiring.</p></div></body></html>""")
+
+def _slack_appt_summary(appt) -> str:
+    return (f"*Company:* {appt.get('company','—')} · *When:* {appt.get('date','—')} · "
+            f"*Area:* {appt.get('area','—')}")
+
+def _slack_action_result(payload: dict, now=None) -> dict:
+    """Handle ONE Slack block_actions payload and return the message to post to
+    its response_url (replace_original for a decision, ephemeral for a refusal).
+    Side effects go through the SAME functions the board uses
+    (_approve_appointment → history + _notify_angelo), so Slack approval is
+    indistinguishable from a board approval downstream. Never raises."""
+    now = now or datetime.utcnow()
+    user = payload.get("user") or {}
+    uid = user.get("id") or ""
+    uname = user.get("username") or user.get("name") or uid or "someone"
+    actions = payload.get("actions") or []
+    action = next((a for a in actions if a.get("action_id") in ("appt_approve", "appt_reject", "appt_ping")), None)
+    if not action:
+        return {}                                   # appt_open (URL) or an unknown action → nothing to say
+    aid = action.get("action_id")
+    if aid == "appt_ping":
+        return {"replace_original": True, "text": f"👋 Interactivity works — tapped by @{uname} · {_slack_clock(now)}"}
+
+    def deny(text):
+        return {"response_type": "ephemeral", "replace_original": False, "text": text}
+
+    try:
+        tok = jwt.decode(action.get("value") or "", SECRET_KEY, algorithms=[ALGORITHM])
+        if tok.get("act") != "approve_appt":
+            raise ValueError("wrong act")
+        lead_id = str(tok["leadId"])
+    except jwt.ExpiredSignatureError:
+        return {"replace_original": True,
+                "text": "⌛ Link expired — approve from the LeadFlow Appointments board instead."}
+    except Exception as e:
+        print(f"[SLACK-IX] bad token from {uid}: {type(e).__name__}: {e}")
+        return deny("⚠️ This button's token is invalid — approve from the LeadFlow Appointments board.")
+
+    if uid not in SLACK_APPROVER_USER_IDS:
+        print(f"[SLACK-IX] {aid} by non-approver {uid} (@{uname}) on lead {lead_id} — refused")
+        audit_log(f"slack:{uname}", "appt_slack_unauthorized", "lead", lead_id, {"action": aid, "user_id": uid})
+        return deny("⛔ You're not on the approver list for appointments. Ask Eric to add your Slack ID to SLACK_APPROVER_USER_IDS.")
+
+    by = f"slack:{uname}"
+    if aid == "appt_approve":
+        appt = _settings_get_json(f"appt_{lead_id}")
+        if not appt:
+            return {"replace_original": True, "text": "🗑️ Appointment not found — it may have been removed from the board."}
+        already = appt.get("stage") == "approved"
+        if appt.get("stage") in ("confirmed", "won", "lost"):
+            return {"replace_original": True,
+                    "text": f"ℹ️ Already *{appt['stage']}* on the board — nothing changed.\n{_slack_appt_summary(appt)}"}
+        appt = _approve_appointment(lead_id, by) or appt
+        audit_log(by, "appt_approve_slack", "lead", lead_id, {"already": already, "user_id": uid})
+        head = (f"✅ Approved by @{uname} · {_slack_clock(now)} — sent to Angelo" if not already
+                else f"✅ Already approved — @{uname} tapped again at {_slack_clock(now)}; Angelo was not pinged twice")
+        return {"replace_original": True, "text": head,
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"{head}\n{_slack_appt_summary(appt)}"}}]}
+
+    # appt_reject → stage "lost" (APPT_STAGES has no separate rejected/cancelled
+    # stage — do not invent one). Angelo is NOT notified: he never got the
+    # approval, so a "walkthrough lost" card would be noise.
+    key = f"appt_{lead_id}"
+    appt = _settings_get_json(key)
+    if not appt:
+        return {"replace_original": True, "text": "🗑️ Appointment not found — it may have been removed from the board."}
+    if appt.get("stage") in ("won", "lost"):
+        return {"replace_original": True,
+                "text": f"ℹ️ Already *{appt['stage']}* on the board — nothing changed.\n{_slack_appt_summary(appt)}"}
+    iso = now.isoformat() + "Z"
+    prev_stage = appt.get("stage")
+    appt["stage"] = "lost"
+    appt.setdefault("history", []).append({"stage": "lost", "at": iso, "by": by, "reason": "rejected_from_slack"})
+    appt["updatedAt"] = iso
+    ok = _settings_set_json(key, appt)
+    audit_log(by, "appt_reject_slack", "lead", lead_id, {"ok": ok, "user_id": uid, "prev_stage": prev_stage})
+    if ok and prev_stage in ("approved", "confirmed"):
+        # Angelo already had this one — tell his channel it is off, exactly as
+        # the board's lost transition does. A pending reject stays silent.
+        _notify_walkthrough_update(appt, "lost", by)
+    head = (f"❌ Rejected by @{uname} · {_slack_clock(now)}" if ok
+            else f"⚠️ Reject by @{uname} did not save — try again from the board")
+    return {"replace_original": True, "text": head,
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"{head}\n{_slack_appt_summary(appt)}"}}]}
+
+def _dispatch_slack_interaction(payload: dict):
+    """Runs on a worker thread: do the work, then rewrite the original message
+    via response_url (valid 30 min). The HTTP handler has already acked Slack."""
+    try:
+        msg = _slack_action_result(payload)
+    except Exception as e:
+        print(f"[SLACK-IX] handler crashed: {type(e).__name__}: {e}")
+        msg = {"response_type": "ephemeral", "replace_original": False,
+               "text": f"⚠️ LeadFlow hit an error handling that tap ({type(e).__name__}) — use the board."}
+    url = payload.get("response_url")
+    if not msg or not url:
+        return
+    try:
+        r = req_lib.post(url, json=msg, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[SLACK-IX] response_url HTTP {r.status_code}: {r.text[:160]}")
+    except Exception as e:
+        print(f"[SLACK-IX] response_url post failed: {e}")
+
+@app.post("/slack/interactions")
+async def slack_interactions(request: Request):
+    """Slack Interactivity Request URL. Signature is verified on the RAW body
+    before anything is parsed; Slack must get its 200 within 3 seconds, so the
+    Supabase writes + Angelo ping + response_url rewrite run on a thread."""
+    if not SLACK_SIGNING_SECRET:
+        # Never "open": with no secret there is nothing to verify against.
+        raise HTTPException(status_code=503, detail="SLACK_SIGNING_SECRET not configured")
+    raw = await request.body()
+    if not _slack_sig_ok(SLACK_SIGNING_SECRET,
+                         request.headers.get("X-Slack-Request-Timestamp", ""),
+                         request.headers.get("X-Slack-Signature", ""), raw):
+        raise HTTPException(status_code=401, detail="Bad Slack signature")
+    from urllib.parse import parse_qs
+    try:
+        payload = json_lib.loads((parse_qs(raw.decode("utf-8")).get("payload") or ["{}"])[0])
+    except Exception as e:
+        print(f"[SLACK-IX] unparseable payload: {e}")
+        return Response(status_code=200)
+    if payload.get("type") != "block_actions":
+        return Response(status_code=200)           # url_verification etc. — ack and ignore
+    threading.Thread(target=_dispatch_slack_interaction, args=(payload,),
+                     daemon=True, name="slack-ix").start()
+    return Response(status_code=200)
+
+@app.get("/api/admin/slack-interactivity-test")
+def slack_interactivity_test(user: str = Depends(verify_admin)):
+    """Reports the interactivity config and posts a test message with a harmless
+    `appt_ping` button that rewrites itself when tapped. Same shape as
+    walkthrough-channel-test."""
+    out = {"signing_secret_set": bool(SLACK_SIGNING_SECRET),
+           "approver_ids_set": bool(SLACK_APPROVER_USER_IDS),
+           "approver_count": len(SLACK_APPROVER_USER_IDS),
+           "mode": "native" if SLACK_SIGNING_SECRET else "url_fallback",
+           "request_url": os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app") + "/slack/interactions"}
+    if not SLACK_WEBHOOK_URL:
+        return {**out, "sent": False, "detail": "SLACK_WEBHOOK_URL is not set — nothing to post to."}
+    if not SLACK_SIGNING_SECRET:
+        return {**out, "sent": False,
+                "detail": "SLACK_SIGNING_SECRET is NOT set — buttons fall back to the /appt-approve web page. "
+                          "Set it (Slack app → Basic Information → Signing Secret) and turn Interactivity on."}
+    blocks = [{"type": "section", "text": {"type": "mrkdwn",
+               "text": "🔧 *LeadFlow interactivity test* — tap the button. If this message rewrites itself, "
+                       "appointment approvals will work inside Slack."
+                       + ("" if SLACK_APPROVER_USER_IDS else
+                          "\n⚠️ SLACK_APPROVER_USER_IDS is empty — every Approve tap will be refused until it is set.")}},
+              {"type": "actions", "elements": [
+                  {"type": "button", "action_id": "appt_ping",
+                   "text": {"type": "plain_text", "text": "👋 Tap me", "emoji": True}, "value": "ping"}]}]
+    try:
+        r = req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
+        return {**out, "sent": r.status_code in (200, 204),
+                "detail": ("Posted. Tap the button in Slack — a 'dispatch_failed' error there means the "
+                           "Request URL is wrong or Interactivity is off in the Slack app.")}
+    except Exception as e:
+        return {**out, "sent": False, "detail": str(e)}
 
 # ── Twilio inbound (after-hours concierge + shift-hours forwarding) ──────────
 # Point the Twilio number's Voice webhook at POST {APP_URL}/twilio/voice.
@@ -8417,9 +8658,9 @@ def analyze_call(payload: dict):
           f"qa={(row['qa'] or {}).get('score')} "
           f"close={'missed' if (_co.get('existed') and not _co.get('taken')) else 'ok'} "
           f"flags={flags} ${cost}")
-    _apply_analysis(call_id, lead_id, row, caller_disp)
+    _apply_analysis(call_id, lead_id, row, caller_disp, tid=tid, full_text=text)
 
-def _apply_analysis(call_id, lead_id, row: dict, caller_disp: str):
+def _apply_analysis(call_id, lead_id, row: dict, caller_disp: str, tid=None, full_text=None):
     """Act on the analysis. Each step is independently wrapped: a failure to
     create a callback must not lose the stored analysis."""
     flags = row.get("flags") or []
@@ -8470,6 +8711,13 @@ def _apply_analysis(call_id, lead_id, row: dict, caller_disp: str):
                                {"label": "Next step", "value": row.get("next_step") or "—"}])
         except Exception as e:
             print(f"[ANALYZE] slack failed: {e}")
+    # Appointment ⇄ transcript cross-reference (see the APPT-TX section below).
+    # Idempotent per lead: the first transcript inside the window wins.
+    if tid and lead_id:
+        try:
+            _link_transcript_to_appointment(call_id, lead_id, row, tid, full_text=full_text)
+        except Exception as e:
+            print(f"[APPT-TX] link failed for lead {lead_id}: {type(e).__name__}: {e}")
 
 # The rep's outcome vocabulary and the analysis disposition enum are different
 # taxonomies; this maps one onto the other so "mismatch" means a real
@@ -8495,6 +8743,389 @@ def _dispositions_agree(caller_outcome: str, analysis_disposition: str) -> bool:
     if allowed is None:
         return True                      # unknown disposition — don't cry wolf
     return caller_outcome.strip().lower() in allowed
+
+# ── Appointment ⇄ transcript cross-reference (2026-10) ──────────────────────
+# Cristine books a walkthrough from the dialer; the transcript of that call
+# lands minutes later. On 2026-10-19 the prospect said on the call they were a
+# DIFFERENT company (Absolute Demo) from the record (Great Smile Dental) and
+# the appointment card + Slack ping both carried the wrong name. This chases
+# the appointment with the transcript: it links it, asks Claude whether the
+# transcript SUPPORTS each field of the record, and posts a second Slack
+# message. Checks are SURFACED, never applied — fixing the record (or
+# splitting a new lead) is Eric's call, exactly like disposition_mismatch.
+# The pending ping is never delayed to wait for a transcript.
+APPT_TRANSCRIPT_LINK_WINDOW_H  = int(os.getenv("APPT_TRANSCRIPT_LINK_WINDOW_H", "24"))
+APPT_TRANSCRIPT_TIMEOUT_MIN    = int(os.getenv("APPT_TRANSCRIPT_TIMEOUT_MIN", "20"))
+APPT_TRANSCRIPT_EVIDENCE_WORDS = 25
+
+# code → fixed severity. The model returns codes + verbatim evidence; the
+# severity is assigned HERE, never chosen by the model.
+APPT_CHECK_SEVERITY = {
+    "company_mismatch":     "block",   # prospect named a company that is not the record's
+    "date_mismatch":        "block",   # stated day/time disagrees with appt.date, or no date agreed
+    "no_commitment":        "block",   # "send me info" / "maybe" / "call back" — but a walkthrough was booked
+    "signer_absent":        "warn",    # someone else decides/signs, no name or role captured
+    "address_or_location":  "warn",    # different location / main office / multiple sites, record has none
+    "contact_name_missing": "warn",    # a name was given on the call, none on the record
+    "all_clear":            "ok",
+    "not_verified":         "warn",    # analysis unavailable — link anyway, say so
+}
+_APPT_SEV_RANK = {"block": 0, "warn": 1, "ok": 2}
+_APPT_SEV_EMOJI = {"block": "🛑", "warn": "⚠️", "ok": "✅"}
+
+_APPT_VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "checks": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "enum": [c for c in APPT_CHECK_SEVERITY if c != "not_verified"]},
+                "detail": {"type": "string"},
+                "evidence": {"type": "string"}},
+            "required": ["code", "detail", "evidence"], "additionalProperties": False}}},
+    "required": ["checks"], "additionalProperties": False,
+}
+
+_APPT_VERIFY_SYSTEM = (
+    "You cross-check ONE booked walkthrough appointment against the transcript of the sales "
+    "call it was booked on. Vision Cleaning Company sells recurring commercial cleaning; the "
+    "rep (`agent:`) books an on-site walkthrough with the prospect (`prospect:`).\n\n"
+    "THE TRANSCRIPT IS EVIDENCE. THE RECORD IS THE CLAIM. For each field of the record, ask "
+    "only: does the transcript support it? Do not infer intent, tone, enthusiasm or the "
+    "likelihood of the prospect showing up. Do not guess at anything that was not said.\n\n"
+    "Return one check per problem found, using exactly these codes:\n"
+    "- company_mismatch: the prospect names a business that is not the record's company "
+    "(a different name, a different business altogether — not a minor spelling variant "
+    "or an abbreviation of the same name).\n"
+    "- date_mismatch: the transcript states a day/time that disagrees with the record's date, "
+    "OR the record has a date but no day/time was agreed on the call.\n"
+    "- no_commitment: the prospect never actually agreed to a walkthrough — 'send me info', "
+    "'maybe', 'call me back', 'let me check' — yet an appointment was booked.\n"
+    "- signer_absent: the prospect says someone else decides or signs, and the record has no "
+    "name or role for that person.\n"
+    "- address_or_location: the prospect mentions a different location, a main office, or "
+    "multiple sites, and the record carries none of that.\n"
+    "- contact_name_missing: a contact name was given on the call and the record has none.\n"
+    "- all_clear: none of the above apply. Return ONLY this single check in that case.\n\n"
+    "RULES, NON-NEGOTIABLE:\n"
+    "- `evidence` MUST be a verbatim quote copied from the transcript, at most 25 words. If you "
+    "cannot quote it, do not return the check. Never paraphrase inside `evidence`.\n"
+    "- `detail` is one plain sentence saying what the record claims and what was said.\n"
+    "- Do not return a code twice. Do not invent codes. Do not return `all_clear` alongside "
+    "another code.\n"
+    "- Relative dates ('Thursday', 'next week') are resolved from the call date given in the "
+    "input, not from today."
+)
+
+def normalize_appt_checks(raw_checks, log_prefix="[APPT-TX]") -> list:
+    """Model output → trusted check list. Pure.
+    - severity comes from APPT_CHECK_SEVERITY, never from the payload;
+    - unknown codes are dropped with a log line (never a crash);
+    - a non-ok check with no evidence quote is dropped ("no quote → no check");
+    - evidence is clipped to APPT_TRANSCRIPT_EVIDENCE_WORDS words;
+    - duplicates collapse to the first; an empty result reads as all_clear;
+    - ordered block → warn → ok."""
+    out, seen = [], set()
+    for c in (raw_checks or []):
+        if not isinstance(c, dict):
+            print(f"{log_prefix} dropping non-dict check: {str(c)[:80]}")
+            continue
+        code = str(c.get("code") or "").strip().lower()
+        sev = APPT_CHECK_SEVERITY.get(code)
+        if not sev:
+            print(f"{log_prefix} dropping unknown check code {code!r}")
+            continue
+        if code in seen or code == "all_clear":
+            continue
+        evidence = " ".join(str(c.get("evidence") or "").split())
+        if sev != "ok" and code != "not_verified" and not evidence:
+            print(f"{log_prefix} dropping {code}: no evidence quote")
+            continue
+        words = evidence.split()
+        if len(words) > APPT_TRANSCRIPT_EVIDENCE_WORDS:
+            evidence = " ".join(words[:APPT_TRANSCRIPT_EVIDENCE_WORDS]) + "…"
+        seen.add(code)
+        out.append({"code": code, "severity": sev,
+                    "detail": " ".join(str(c.get("detail") or "").split())[:300],
+                    "evidence": evidence})
+    if not out:
+        out.append({"code": "all_clear", "severity": "ok",
+                    "detail": "Transcript agrees with the booking.", "evidence": ""})
+    out.sort(key=lambda c: _APPT_SEV_RANK.get(c["severity"], 9))
+    return out
+
+def appt_checks_worst(checks) -> str:
+    sevs = [c.get("severity") for c in (checks or [])]
+    for s in ("block", "warn"):
+        if s in sevs:
+            return s
+    return "ok"
+
+def appt_checks_has_block(checks) -> bool:
+    return appt_checks_worst(checks) == "block"
+
+def _not_verified_checks(reason: str) -> list:
+    return [{"code": "not_verified", "severity": "warn", "detail": reason, "evidence": ""}]
+
+def _verify_appointment_transcript(appt: dict, full_text: str, call_at: str = "") -> list:
+    """One structured Claude call (same SDK + output_config.format pattern as
+    analyze_call). Returns a normalised check list; on ANY failure returns a
+    single `not_verified` warn — linking the summary is still worth it."""
+    if not ANALYZE_ENABLED or not ANTHROPIC_API_KEY:
+        return _not_verified_checks("analysis unavailable (ANALYZE_ENABLED=0 or no API key)")
+    if not (full_text or "").strip():
+        return _not_verified_checks("transcript text empty")
+    record = {k: appt.get(k) for k in ("company", "date", "area", "notes", "phone", "createdBy") if appt.get(k)}
+    user_msg = (f"Call date (UTC): {call_at or 'unknown'}\n\n"
+                f"Appointment record (the claim):\n{json_lib.dumps(record, indent=1)}\n\n"
+                f"Transcript (the evidence):\n\n{full_text[:20000]}")
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp = client.messages.create(
+            model=ANALYSIS_MODEL, max_tokens=ANALYSIS_MAX_TOKENS,
+            system=_APPT_VERIFY_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+            output_config={"format": {"type": "json_schema", "schema": _APPT_VERIFY_SCHEMA},
+                           "effort": ANALYSIS_EFFORT},
+        )
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            print(f"[APPT-TX] verify hit max_tokens ({ANALYSIS_MAX_TOKENS})")
+        body = next((b.text for b in resp.content if b.type == "text"), "")
+        data = json_lib.loads(body)
+        return normalize_appt_checks(data.get("checks"))
+    except Exception as e:
+        print(f"[APPT-TX] verify failed: {type(e).__name__}: {e}")
+        return _not_verified_checks(f"analysis failed ({type(e).__name__})")
+
+def _appt_checks_lines(checks, include_ok=False) -> list:
+    lines = []
+    for c in checks or []:
+        if c.get("severity") == "ok" and not include_ok:
+            continue
+        line = f"{_APPT_SEV_EMOJI.get(c.get('severity'), '•')} `{c.get('code')}` — {c.get('detail') or ''}"
+        if c.get("evidence"):
+            line += f'\n      _"{c["evidence"]}"_'
+        lines.append(line)
+    return lines
+
+def _notify_appt_transcript(appt: dict, checks: list):
+    """A5: the second Slack message, same channel as the pending ping. Header by
+    worst severity. The Approve button is OMITTED when any check is `block` —
+    a block means the record is wrong, and approving it would send Angelo to
+    the wrong company. Eric fixes the record on the board first."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    company = appt.get("company") or "(unknown company)"
+    worst = appt_checks_worst(checks)
+    header = {"block": f"🛑 Transcript check — {company}: needs a look before approving",
+              "warn":  f"⚠️ Transcript check — {company}",
+              "ok":    f"🎙️ Transcript in — {company}"}[worst]
+    app_url = os.getenv("APP_URL", "https://leadflow-railway-production.up.railway.app")
+    call_at = (appt.get("transcript_call_at") or "")[:16].replace("T", " ")
+    body = (f"*Booked:* {appt.get('date','—')} · {appt.get('area','—')} · by {appt.get('createdBy','—')}"
+            + (f" · call at {call_at} UTC" if call_at else "") + "\n"
+            f"*What was said:* {appt.get('transcript_summary') or '—'}\n"
+            f"*Prospect's stated next step:* {appt.get('transcript_next_step') or '—'}")
+    lines = _appt_checks_lines(checks)
+    checks_txt = "*Checks*\n" + ("\n".join(lines) if lines else "✅ Transcript agrees with the booking.")
+    elements = []
+    if worst != "block" and appt.get("stage") == "pending":
+        elements += _appt_action_buttons(appt, with_reject=False)
+    elements.append({"type": "button", "action_id": "appt_transcript",
+                     "text": {"type": "plain_text", "text": "📄 Transcript", "emoji": True},
+                     "url": f"{app_url}/#/lead/{appt.get('leadId')}"})
+    elements.append({"type": "button", "action_id": "appt_open",
+                     "text": {"type": "plain_text", "text": "Open LeadFlow", "emoji": True}, "url": app_url})
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": header[:150], "emoji": True}},
+              {"type": "section", "text": {"type": "mrkdwn", "text": body[:2900]}},
+              {"type": "section", "text": {"type": "mrkdwn", "text": checks_txt[:2900]}},
+              {"type": "actions", "elements": elements}]
+    try:
+        r = req_lib.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=10)
+        if r.status_code not in (200, 204):
+            print(f"[APPT-TX] slack HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[APPT-TX] slack failed: {e}")
+
+def _parse_iso_utc(s):
+    """'2026-10-19T17:02:11.123Z' / '+00:00' / naive → naive UTC datetime, or None."""
+    if not s:
+        return None
+    try:
+        t = str(s).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+def _appt_in_link_window(appt: dict, now=None) -> bool:
+    now = now or datetime.utcnow()
+    created = _parse_iso_utc(appt.get("createdAt"))
+    if created is None:
+        return False
+    return (now - created) <= timedelta(hours=APPT_TRANSCRIPT_LINK_WINDOW_H)
+
+def _link_transcript_to_appointment(call_id, lead_id, row: dict, tid, full_text: str = None, now=None):
+    """A3. Called from _apply_analysis (independently wrapped there) and from
+    the timeout job's second chance. Returns the checks when it linked, else
+    None. FIRST transcript inside the window wins — `transcript_id` already
+    set → no overwrite, no second Slack message (that guard is what makes the
+    per-analysis hook idempotent)."""
+    if not lead_id or not tid:
+        return None
+    now = now or datetime.utcnow()
+    key = f"appt_{lead_id}"
+    appt = _settings_get_json(key)
+    if not appt:
+        return None
+    if not _appt_in_link_window(appt, now):
+        print(f"[APPT-TX] lead {lead_id}: appointment created {appt.get('createdAt')} is outside "
+              f"the {APPT_TRANSCRIPT_LINK_WINDOW_H}h window — not the booking call")
+        return None
+    if appt.get("transcript_id"):
+        return None
+    if full_text is None:
+        try:
+            tr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_transcripts?id=eq.{tid}&select=full_text",
+                             headers=SB_ADMIN_HEADERS, timeout=15)
+            full_text = ((tr.json() or [{}])[0] or {}).get("full_text") or "" if tr.status_code == 200 else ""
+        except Exception as e:
+            print(f"[APPT-TX] transcript {tid} fetch failed: {e}")
+            full_text = ""
+    call_at = ""
+    if call_id:
+        try:
+            cr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?id=eq.{call_id}&select=calledAt",
+                             headers=SB_HEADERS, timeout=10)
+            call_at = ((cr.json() or [{}])[0] or {}).get("calledAt") or "" if cr.status_code == 200 else ""
+        except Exception:
+            pass
+    checks = _verify_appointment_transcript(appt, full_text or "", call_at)
+    appt["transcript_id"] = tid
+    appt["transcript_call_id"] = call_id
+    appt["transcript_call_at"] = call_at or None
+    appt["transcript_summary"] = (row.get("summary") or "")[:600]
+    appt["transcript_next_step"] = row.get("next_step")
+    appt["transcript_checks"] = checks
+    appt["transcript_linked_at"] = now.isoformat() + "Z"
+    if not _settings_set_json(key, appt):
+        # Still post: the Slack message is the point; the stored keys are the
+        # record for the board. A lost persist is logged, not swallowed.
+        print(f"[APPT-TX] lead {lead_id}: persist of transcript link FAILED — posting anyway")
+    _notify_appt_transcript(appt, checks)
+    audit_log("system", "appt_transcript_linked", "lead", lead_id,
+              {"transcript_id": tid, "call_id": call_id, "checks": [c["code"] for c in checks]})
+    print(f"[APPT-TX] lead {lead_id}: transcript {tid} linked → {[c['code'] for c in checks]}")
+    return checks
+
+def _appt_latest_skip_reason(lead_id, since_iso: str) -> dict:
+    """The most recent transcribe_skip audit row for this lead since the
+    appointment was in play → {reason, duration} or {}."""
+    try:
+        r = req_lib.get(f"{SUPABASE_URL}/rest/v1/audit_log?action=eq.transcribe_skip"
+                        f"&resource_id=eq.{url_quote(str(lead_id), safe='')}"
+                        f"&created_at=gte.{url_quote(since_iso, safe='')}"
+                        f"&select=details,created_at&order=created_at.desc&limit=1",
+                        headers=SB_ADMIN_HEADERS, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        if rows:
+            d = rows[0].get("details")
+            return json_lib.loads(d) if isinstance(d, str) else (d or {})
+    except Exception as e:
+        print(f"[APPT-TX] skip lookup failed: {e}")
+    return {}
+
+def appt_no_transcript_line(appt: dict, skip: dict, call_outcome: str = "") -> str:
+    """A6 text. Pure. The actual gate reason when we have it; the generic
+    three-way line otherwise. A silent gap should read as a signal."""
+    company = appt.get("company") or "(unknown company)"
+    reason = (skip or {}).get("reason") or ""
+    if reason == "short":
+        dur = (skip or {}).get("duration")
+        return (f"🔇 No transcript for the {company} appointment — the booking call recording was "
+                f"{dur}s, under the {TRANSCRIBE_MIN_SEC}s transcription floor." if dur is not None else
+                f"🔇 No transcript for the {company} appointment — the booking call was under {TRANSCRIBE_MIN_SEC}s.")
+    if reason == "machine":
+        return f"🔇 No transcript for the {company} appointment — Twilio flagged the booking call as an answering machine."
+    if reason == "disposition":
+        return (f"🔇 No transcript for the {company} appointment — the booking call was logged as "
+                f"{call_outcome or 'voicemail/no-answer'}, so it was not transcribed.")
+    return (f"🔇 No transcript for the {company} appointment — booking call was under {TRANSCRIBE_MIN_SEC}s, "
+            f"not answered by a human, or placed outside the dialer.")
+
+def appt_transcript_timeout(payload: dict):
+    """A6 job (kind appt_transcript_timeout, enqueued on appointment CREATE,
+    run_after +APPT_TRANSCRIPT_TIMEOUT_MIN). Never raises → never retries.
+    Three outcomes: already linked → nothing; an analysis for this lead exists
+    but the appointment was created AFTER it ran (she booked from the lead row
+    minutes later, so the _apply_analysis hook found no appt) → link it now;
+    otherwise post the 🔇 line with the real skip reason when there is one.
+    If the pipeline is visibly still in flight (a transcript row with no
+    analysis yet) it defers ONCE, then reports whatever it finds."""
+    try:
+        lead_id = str(payload.get("lead_id") or "")
+        if not lead_id:
+            return
+        key = f"appt_{lead_id}"
+        appt = _settings_get_json(key)
+        if not appt or appt.get("transcript_id"):
+            return
+        created = _parse_iso_utc(appt.get("createdAt")) or datetime.utcnow()
+        since = (created - timedelta(hours=2)).isoformat()      # the booking call precedes the save
+        # Second chance: an analysis that landed before the appointment existed.
+        try:
+            ar = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_analyses?lead_id=eq.{url_quote(lead_id, safe='')}"
+                             f"&created_at=gte.{url_quote(since, safe='')}"
+                             f"&select=call_id,transcript_id,summary,next_step,created_at"
+                             f"&order=created_at.desc&limit=1",
+                             headers=SB_ADMIN_HEADERS, timeout=10)
+            arows = ar.json() if ar.status_code == 200 else []
+        except Exception as e:
+            print(f"[APPT-TX] analysis lookup failed: {e}"); arows = []
+        if arows:
+            a = arows[0]
+            _link_transcript_to_appointment(a.get("call_id"), lead_id, a, a.get("transcript_id"))
+            return
+        # In flight? A transcript row without an analysis yet → defer once.
+        in_flight = False
+        try:
+            tr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_transcripts?lead_id=eq.{url_quote(lead_id, safe='')}"
+                             f"&created_at=gte.{url_quote(since, safe='')}&select=id&limit=1",
+                             headers=SB_ADMIN_HEADERS, timeout=10)
+            in_flight = tr.status_code == 200 and bool(tr.json())
+        except Exception:
+            pass
+        if in_flight and not payload.get("deferred"):
+            enqueue_job("appt_transcript_timeout", {**payload, "deferred": 1},
+                        dedupe_key=f"appt_{lead_id}:deferred",
+                        delay_sec=APPT_TRANSCRIPT_TIMEOUT_MIN * 60)
+            print(f"[APPT-TX] lead {lead_id}: transcript in flight, analysis pending — deferred once")
+            return
+        skip = _appt_latest_skip_reason(lead_id, since)
+        outcome = ""
+        if skip.get("reason") == "disposition":
+            try:
+                cr = req_lib.get(f"{SUPABASE_URL}/rest/v1/call_outcomes?leadId=eq.{url_quote(lead_id, safe='')}"
+                                 f"&calledAt=gte.{url_quote(since, safe='')}&select=outcome&order=calledAt.desc&limit=1",
+                                 headers=SB_HEADERS, timeout=10)
+                outcome = ((cr.json() or [{}])[0] or {}).get("outcome") or "" if cr.status_code == 200 else ""
+            except Exception:
+                pass
+        line = appt_no_transcript_line(appt, skip, outcome)
+        if SLACK_WEBHOOK_URL:
+            try:
+                req_lib.post(SLACK_WEBHOOK_URL, json={"text": line}, timeout=10)
+            except Exception as e:
+                print(f"[APPT-TX] slack failed: {e}")
+        audit_log("system", "appt_transcript_missing", "lead", lead_id, {"skip": skip or None})
+        print(f"[APPT-TX] lead {lead_id}: {line}")
+    except Exception as e:
+        print(f"[APPT-TX] timeout job failed (not retried): {type(e).__name__}: {e}")
+
+_JOB_HANDLERS["appt_transcript_timeout"] = appt_transcript_timeout
 
 _JOB_HANDLERS["transcribe_call"] = transcribe_call
 _JOB_HANDLERS["analyze_call"] = analyze_call
@@ -8993,6 +9624,12 @@ async def upsert_appointment(lead_id: str, request: Request, user: str = Depends
             pass
     if not existing:
         _notify_pending_appointment(appt)   # Slack ping w/ one-click approve
+        # A6: if no transcript chases this booking, say so (create only — an
+        # edit is not a new booking). Only meaningful when transcription is on;
+        # with it off the gap is not a signal, and run_jobs_once is idle anyway.
+        if TRANSCRIBE_ENABLED:
+            enqueue_job("appt_transcript_timeout", {"lead_id": str(lead_id)},
+                        dedupe_key=f"appt_{lead_id}", delay_sec=APPT_TRANSCRIPT_TIMEOUT_MIN * 60)
     return appt
 
 @app.get("/api/appointments")
