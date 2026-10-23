@@ -8632,6 +8632,24 @@ def transcripts_search(q: str = "", caller: str = "", since: str = "",
             break
     return {"results": out, "total": len(out), "query": q}
 
+@app.get("/api/admin/transcripts/export")
+def transcripts_export(since: str = "", limit: int = 500, offset: int = 0,
+                       user: str = Depends(verify_admin)):
+    """Full transcript text for offline review (admin). `search` returns a
+    400-char snippet so the panel stays light; this is the bulk read behind a
+    coaching pass, keyed by recording_sid so rows enqueued by the backfill
+    (whose call_id is null — the recording is older than the 20-min lookup
+    window) can still be joined to call_outcomes.recording_sid. Read-only."""
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+    filt = [f"order=created_at.desc", f"offset={offset}"]
+    if since.strip():
+        filt.append(f"created_at=gte.{url_quote(since.strip(), safe='')}")
+    rows = _intel_rows("call_transcripts", "&".join(filt),
+                       "id,call_id,lead_id,recording_sid,duration_sec,full_text,created_at",
+                       limit)
+    return {"results": rows, "count": len(rows), "offset": offset}
+
 @app.get("/api/admin/caller-qa")
 def caller_qa(days: int = 30, caller: str = "", user: str = Depends(verify_admin)):
     """Per-caller coaching rollup — the view that answers "is this caller
