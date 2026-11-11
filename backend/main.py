@@ -12526,6 +12526,14 @@ def email_setup_status(user: str = Depends(verify_admin)):
 
     last = _imap_poll_state.get("last_run")
     last_result = _imap_poll_state.get("last_result")
+    imap_configured = bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD)
+    # "ready" must mean the poller WORKS, not merely that the three env vars
+    # are set. On 2026-11-11 Gmail had been rejecting the app password
+    # (AUTHENTICATIONFAILED) on every 10-min tick while this said ready=true,
+    # so the daily health check stayed green and the UI showed nothing.
+    # None = no poll yet (just booted) — fail open so a fresh deploy isn't red.
+    last_poll_ok = None if last_result is None else bool(last_result.get("ok"))
+    reply_ready = imap_configured and last_poll_ok is not False
 
     return {
         "send_path": {
@@ -12541,16 +12549,18 @@ def email_setup_status(user: str = Depends(verify_admin)):
             "ready":                     bool(secret),
         },
         "reply_path": {
-            "imap_configured":           bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+            "imap_configured":           imap_configured,
+            "last_poll_ok":              last_poll_ok,
+            "last_poll_error":           (last_result or {}).get("error") if last_poll_ok is False else None,
             "imap_server":               IMAP_SERVER or None,
             "imap_username":             IMAP_USERNAME or None,
             "imap_folder":               IMAP_FOLDER,
             "poll_interval_minutes":     IMAP_POLL_INTERVAL_MINUTES,
             "last_poll_run_at":          last,
             "last_poll_result":          last_result,
-            "ready":                     bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+            "ready":                     reply_ready,
         },
-        "all_ready": bool(RESEND_API_KEY and secret and IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+        "all_ready": bool(RESEND_API_KEY and secret and reply_ready),
     }
 
 @app.get("/api/leads/emailed-flags")

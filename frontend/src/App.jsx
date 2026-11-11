@@ -10822,7 +10822,8 @@ function CampaignsPage(){
           <div style={{fontWeight:700,color:"#ffe083",marginBottom:6}}>⚠ Setup incomplete</div>
           {!setup.send_path?.ready&&<div>• Resend not configured — set RESEND_API_KEY in Railway</div>}
           {!setup.webhook_path?.ready&&<div>• Webhook secret missing — set RESEND_WEBHOOK_SECRET in Railway, paste URL in Resend dashboard</div>}
-          {!setup.reply_path?.ready&&<div>• IMAP not configured — replies won't auto-flip lead status. Set IMAP_SERVER + IMAP_USERNAME + IMAP_PASSWORD in Railway</div>}
+          {!setup.reply_path?.ready&&!setup.reply_path?.imap_configured&&<div>• IMAP not configured — replies won't auto-flip lead status. Set IMAP_SERVER + IMAP_USERNAME + IMAP_PASSWORD in Railway</div>}
+          {!setup.reply_path?.ready&&setup.reply_path?.imap_configured&&<div>• Reply poller is FAILING — replies aren't being read. Last error: {setup.reply_path?.last_poll_error||"unknown"}. An AUTHENTICATIONFAILED here means the Gmail app password was revoked — generate a new one and update IMAP_PASSWORD in Railway.</div>}
         </div>
       )}
 
