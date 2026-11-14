@@ -3099,6 +3099,11 @@ def _bg_maintenance_loop():
                 _imap_poll_state["last_result"] = res
                 if res.get("ok") and res.get("stats", {}).get("matched", 0) > 0:
                     print(f"[IMAP-POLL] matched {res['stats']['matched']} replies this cycle")
+                elif not res.get("ok"):
+                    # A failed poll used to leave no trace anywhere but the
+                    # in-memory state dict — an invalid Gmail app password
+                    # silently stopped every reply from reaching the CRM.
+                    print(f"[IMAP-POLL] FAILED: {res.get('error')}")
             except Exception as e:
                 print(f"[IMAP-POLL] loop exception: {e}")
         # Drive the 3-touch email sequence: fire Touch 2/3 when due, release
@@ -12526,6 +12531,16 @@ def email_setup_status(user: str = Depends(verify_admin)):
 
     last = _imap_poll_state.get("last_run")
     last_result = _imap_poll_state.get("last_result")
+    imap_configured = bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD)
+    # "ready" used to mean "the three env vars are set". On 2026-11-14 the
+    # poller had been failing every 10 minutes with Gmail
+    # [AUTHENTICATIONFAILED] (revoked app password) while this endpoint —
+    # and the nightly health check that reads it — still said ready:true.
+    # A reply path that cannot log in is not ready: once a poll has run,
+    # its result decides. None (no poll yet, e.g. the first minute after a
+    # deploy) still counts as ready so a restart doesn't trip the check.
+    last_poll_ok = (last_result or {}).get("ok") if last_result else None
+    reply_ready = imap_configured and last_poll_ok is not False
 
     return {
         "send_path": {
@@ -12548,9 +12563,11 @@ def email_setup_status(user: str = Depends(verify_admin)):
             "poll_interval_minutes":     IMAP_POLL_INTERVAL_MINUTES,
             "last_poll_run_at":          last,
             "last_poll_result":          last_result,
-            "ready":                     bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+            "last_poll_ok":              last_poll_ok,
+            "last_error":                (last_result or {}).get("error") if last_poll_ok is False else None,
+            "ready":                     reply_ready,
         },
-        "all_ready": bool(RESEND_API_KEY and secret and IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+        "all_ready": bool(RESEND_API_KEY and secret and reply_ready),
     }
 
 @app.get("/api/leads/emailed-flags")
