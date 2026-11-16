@@ -12526,6 +12526,23 @@ def email_setup_status(user: str = Depends(verify_admin)):
 
     last = _imap_poll_state.get("last_run")
     last_result = _imap_poll_state.get("last_result")
+    imap_configured = bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD)
+    # A poll that RAN and FAILED (revoked Gmail app password, lockout, DNS)
+    # means replies are not being read, however complete the env vars are.
+    # Before this the status read "ready" straight through an
+    # AUTHENTICATIONFAILED loop, so the nightly check and the admin panel
+    # both showed green while every reply sat unread. A lock collision
+    # ("another poll is running") is transient, not a failure.
+    last_poll_ok = None
+    last_poll_error = None
+    if isinstance(last_result, dict):
+        err = str(last_result.get("error") or "")
+        if last_result.get("ok"):
+            last_poll_ok = True
+        elif "another poll is running" not in err:
+            last_poll_ok = False
+            last_poll_error = err or "last poll failed"
+    reply_ready = imap_configured and last_poll_ok is not False
 
     return {
         "send_path": {
@@ -12548,9 +12565,11 @@ def email_setup_status(user: str = Depends(verify_admin)):
             "poll_interval_minutes":     IMAP_POLL_INTERVAL_MINUTES,
             "last_poll_run_at":          last,
             "last_poll_result":          last_result,
-            "ready":                     bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+            "last_poll_ok":              last_poll_ok,
+            "last_poll_error":           last_poll_error,
+            "ready":                     reply_ready,
         },
-        "all_ready": bool(RESEND_API_KEY and secret and IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+        "all_ready": bool(RESEND_API_KEY and secret and reply_ready),
     }
 
 @app.get("/api/leads/emailed-flags")
