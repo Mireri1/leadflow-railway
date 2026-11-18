@@ -12526,6 +12526,16 @@ def email_setup_status(user: str = Depends(verify_admin)):
 
     last = _imap_poll_state.get("last_run")
     last_result = _imap_poll_state.get("last_result")
+    imap_configured = bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD)
+    # "ready" must mean "replies are actually being read", not "env vars are
+    # set". 2026-11-18: the poller had been failing every 10 min with
+    # [AUTHENTICATIONFAILED] (rotated Gmail app password) while this endpoint
+    # kept answering ready=true, so the nightly health check read the reply
+    # path as healthy. A poll that has not run yet still counts as ready
+    # (startup grace); a poll that ran and failed does not.
+    last_poll_ok = None if not isinstance(last_result, dict) else bool(last_result.get("ok"))
+    last_poll_error = (last_result or {}).get("error") if isinstance(last_result, dict) else None
+    reply_ready = imap_configured and last_poll_ok is not False
 
     return {
         "send_path": {
@@ -12548,9 +12558,11 @@ def email_setup_status(user: str = Depends(verify_admin)):
             "poll_interval_minutes":     IMAP_POLL_INTERVAL_MINUTES,
             "last_poll_run_at":          last,
             "last_poll_result":          last_result,
-            "ready":                     bool(IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+            "last_poll_ok":              last_poll_ok,
+            "last_poll_error":           last_poll_error,
+            "ready":                     reply_ready,
         },
-        "all_ready": bool(RESEND_API_KEY and secret and IMAP_SERVER and IMAP_USERNAME and IMAP_PASSWORD),
+        "all_ready": bool(RESEND_API_KEY and secret and reply_ready),
     }
 
 @app.get("/api/leads/emailed-flags")
